@@ -1,10 +1,11 @@
-//! The root view. Owns the buffers, hosts every action handler, and draws the
-//! chrome around the panes.
+//! The root view. Owns the buffers, hosts every application action handler, and
+//! draws the chrome around the panes.
 //!
 //! Action handlers live here rather than on `RequestView` on purpose: dispatch
-//! travels up the focus tree, and `Workspace` is the one element guaranteed to be
-//! on that path no matter which region holds focus. Handlers that need buffer
-//! state reach into the active `RequestView` through its entity.
+//! travels up the focus tree, and `Workspace` is the one element guaranteed to be on
+//! that path no matter which region holds focus — including when focus is inside a
+//! `TextInput` nested two levels down. Handlers that need buffer state reach into the
+//! active `RequestView` through its entity.
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -13,14 +14,15 @@ use gpui::{
 use zuno_core::RequestSpec;
 
 use crate::actions::{
-    FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, SendRequest, ToggleTheme,
+    AddHeader, AddQuery, CycleMethod, CycleMethodBack, FocusBody, FocusNext, FocusPrev,
+    FocusResponse, FocusUrl, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
 };
-use crate::request_view::RequestView;
+use crate::request_view::{RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
 pub struct Workspace {
     focus_handle: FocusHandle,
-    /// One entry per open request. Only `active_ix` is rendered in M1.0 — the tab
+    /// One entry per open request. Only `active_ix` is rendered in M1.1 — the tab
     /// strip arrives in M2, but the ownership shape is already right.
     views: Vec<Entity<RequestView>>,
     active_ix: usize,
@@ -30,10 +32,10 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let view = cx.new(|cx| RequestView::new(RequestSpec::sample(), cx));
 
-        // Start focused on the URL bar — the loop begins with typing a URL, and
-        // it puts a RequestView on the focus path so its key contexts are live
-        // from the first frame.
-        let url_focus = view.read(cx).url_focus.clone();
+        // Start focused on the URL bar — the loop begins with typing a URL, and it
+        // puts the URL input on the focus path so its key context is live from the
+        // first frame.
+        let url_focus = view.read(cx).url_focus(cx);
         window.focus(&url_focus);
 
         Self {
@@ -43,35 +45,35 @@ impl Workspace {
         }
     }
 
-    fn active(&self) -> Option<Entity<RequestView>> {
+    pub fn active(&self) -> Option<Entity<RequestView>> {
         self.views.get(self.active_ix).cloned()
     }
 
     /// `Window::focus` refreshes the whole window internally, so there's no
-    /// `cx.notify()` here — the child `RequestView` repaints (and updates its
-    /// focus ring) on its own. It also no-ops when the handle is already focused,
-    /// which means a redundant notify would cost a frame for nothing.
+    /// `cx.notify()` here — the child `RequestView` repaints (and updates its focus
+    /// ring) on its own. It also no-ops when the handle is already focused, so a
+    /// redundant notify would cost a frame for nothing.
     fn focus_region(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-        pick: impl Fn(&RequestView) -> FocusHandle,
+        pick: impl Fn(&RequestView, &App) -> FocusHandle,
     ) {
         let Some(view) = self.active() else { return };
-        let handle = pick(view.read(cx));
+        let handle = pick(view.read(cx), cx);
         window.focus(&handle);
     }
 
     fn focus_url(&mut self, _: &FocusUrl, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_region(window, cx, |view| view.url_focus.clone());
+        self.focus_region(window, cx, |view, cx| view.url_focus(cx));
     }
 
     fn focus_body(&mut self, _: &FocusBody, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_region(window, cx, |view| view.body_focus.clone());
+        self.focus_region(window, cx, |view, _| view.body_focus.clone());
     }
 
     fn focus_response(&mut self, _: &FocusResponse, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_region(window, cx, |view| view.response_focus.clone());
+        self.focus_region(window, cx, |view, _| view.response_focus.clone());
     }
 
     fn focus_next(&mut self, _: &FocusNext, window: &mut Window, _: &mut Context<Self>) {
@@ -82,45 +84,128 @@ impl Workspace {
         window.focus_prev();
     }
 
+    fn cycle_method(&mut self, _: &CycleMethod, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_method(true, cx));
+        }
+    }
+
+    fn cycle_method_back(&mut self, _: &CycleMethodBack, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_method(false, cx));
+        }
+    }
+
+    fn add_header(&mut self, _: &AddHeader, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.add_row(RowKind::Header, window, cx));
+        }
+    }
+
+    fn add_query(&mut self, _: &AddQuery, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.add_row(RowKind::Query, window, cx));
+        }
+    }
+
+    /// Row actions target whichever row currently holds focus, so there's no
+    /// "selected row" index to keep valid across insertions and deletions.
+    fn toggle_row(&mut self, _: &ToggleRow, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let handled = view.update(cx, |view, cx| view.toggle_focused_row(window, cx));
+        if !handled {
+            self.set_status("Focus a header or query row first", cx);
+        }
+    }
+
+    fn remove_row(&mut self, _: &RemoveRow, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let handled = view.update(cx, |view, cx| view.remove_focused_row(window, cx));
+        if !handled {
+            self.set_status("Focus a header or query row first", cx);
+        }
+    }
+
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         cx.global_mut::<Theme>().toggle();
         // A theme change repaints every window, not just this view.
         cx.refresh_windows();
     }
 
-    /// Placeholder until the engine lands in M1.2. It exists so that action
-    /// dispatch — including the context-scoped `enter` binding in the URL bar —
-    /// is observably wired rather than assumed.
+    /// Placeholder until the engine lands in M1.2.
+    ///
+    /// Assembling and dumping the spec is the honest stand-in: it shows exactly what
+    /// *would* go on the wire, and it's the acceptance test for M1.1 — type a
+    /// request, see the correct spec come back.
     fn send_request(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
+        let spec = view.read(cx).spec(cx);
+
+        eprintln!("{spec:#?}");
+
+        let summary = describe_spec(&spec);
         view.update(cx, |view, cx| {
-            view.status = Some(SharedString::from(
-                "Send dispatched — the HTTP engine lands in M1.2, so nothing left the machine.",
-            ));
+            view.status = Some(summary);
             cx.notify();
         });
     }
 
-    fn focused_region(&self, window: &Window, cx: &App) -> &'static str {
+    fn set_status(&mut self, message: &str, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            let message = SharedString::from(message.to_string());
+            view.update(cx, |view, cx| {
+                view.status = Some(message);
+                cx.notify();
+            });
+        }
+    }
+
+    fn focused_region(&self, window: &Window, cx: &App) -> SharedString {
         let Some(view) = self.views.get(self.active_ix) else {
-            return "—";
+            return SharedString::from("—");
         };
         let view = view.read(cx);
 
-        if view.url_focus.is_focused(window) {
-            "URL"
-        } else if view.body_focus.is_focused(window) {
-            "Body"
-        } else if view.response_focus.is_focused(window) {
-            "Response"
-        } else {
-            "Window"
+        if view.url_focus(cx).is_focused(window) {
+            return SharedString::from("URL");
         }
+        if view.body_focus.is_focused(window) {
+            return SharedString::from("Body");
+        }
+        if view.response_focus.is_focused(window) {
+            return SharedString::from("Response");
+        }
+        if let Some((kind, ix)) = view.focused_row(window, cx) {
+            let label = match kind {
+                RowKind::Header => "header",
+                RowKind::Query => "query",
+            };
+            return SharedString::from(format!("{label} row {}", ix + 1));
+        }
+        SharedString::from("Window")
     }
 
     fn status_message(&self, cx: &App) -> Option<SharedString> {
         self.views.get(self.active_ix)?.read(cx).status.clone()
     }
+}
+
+/// A one-line summary of what would be sent. Counts only enabled rows, since
+/// that's what actually goes on the wire.
+pub fn describe_spec(spec: &RequestSpec) -> SharedString {
+    let url = if spec.url.is_empty() {
+        "(no url)"
+    } else {
+        spec.url.as_str()
+    };
+    SharedString::from(format!(
+        "{} {} · {} headers · {} query · body {} — spec dumped to stderr (engine lands in M1.2)",
+        spec.method.as_str(),
+        url,
+        spec.enabled_headers().count(),
+        spec.enabled_query().count(),
+        spec.body.label(),
+    ))
 }
 
 impl Focusable for Workspace {
@@ -137,7 +222,7 @@ impl Render for Workspace {
         let title = self
             .views
             .get(self.active_ix)
-            .map(|view| SharedString::from(view.read(cx).spec.name.clone()))
+            .map(|view| SharedString::from(view.read(cx).name.clone()))
             .unwrap_or_else(|| SharedString::from("No request"));
 
         div()
@@ -149,6 +234,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_response))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::cycle_method))
+            .on_action(cx.listener(Self::cycle_method_back))
+            .on_action(cx.listener(Self::add_header))
+            .on_action(cx.listener(Self::add_query))
+            .on_action(cx.listener(Self::toggle_row))
+            .on_action(cx.listener(Self::remove_row))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::send_request))
             .size_full()
@@ -186,7 +277,7 @@ fn titlebar(title: SharedString, theme: &Theme) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child("M1.0 · shell".to_string()),
+                        .child("M1.1 · editable".to_string()),
                 ),
         )
         .child(
@@ -198,12 +289,11 @@ fn titlebar(title: SharedString, theme: &Theme) -> impl IntoElement {
 }
 
 fn status_bar(
-    focused_region: &'static str,
+    focused_region: SharedString,
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str =
-        "Ctrl+L url · Ctrl+B body · Ctrl+Shift+R response · Tab cycle · Ctrl+Enter send · Ctrl+Q quit";
+    const HINTS: &str = "Ctrl+M method · Ctrl+Shift+H header · Ctrl+Shift+Y query · Alt+T mute · Ctrl+Shift+K delete · Ctrl+Enter send";
 
     div()
         .flex()
@@ -224,14 +314,26 @@ fn status_bar(
                 .flex_row()
                 .items_center()
                 .gap_2()
+                .min_w(gpui::px(0.))
                 .child(
                     div()
+                        .flex_none()
                         .text_color(theme.accent)
                         .child(format!("focus: {focused_region}")),
                 )
                 .children(message.map(|message| {
-                    div().text_color(theme.text_muted).child(message)
+                    div()
+                        .flex_1()
+                        .min_w(gpui::px(0.))
+                        .truncate()
+                        .text_color(theme.text_muted)
+                        .child(message)
                 })),
         )
-        .child(div().text_color(theme.text_muted).child(HINTS.to_string()))
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(HINTS.to_string()),
+        )
 }

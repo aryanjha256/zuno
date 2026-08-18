@@ -7,7 +7,7 @@
 //! with a single `cx.theme().clone()` — that keeps the immutable global borrow
 //! from colliding with the `&mut Context` needed to build elements.
 
-use gpui::{App, Global, Hsla, SharedString, rgb};
+use gpui::{App, Global, Hsla, SharedString, hsla, rgb};
 use zuno_core::{Method, StatusClass};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,11 @@ pub struct Theme {
     // Lines
     pub border: Hsla,
     pub border_focused: Hsla,
+
+    // Text editing
+    pub cursor: Hsla,
+    /// Translucent — it paints *under* the glyphs, so it must not hide them.
+    pub selection: Hsla,
 
     // Text
     pub text: Hsla,
@@ -104,6 +109,9 @@ impl Theme {
             border: rgb(0x2e2e35).into(),
             border_focused: rgb(0x5b8def).into(),
 
+            cursor: rgb(0x7fa9f5).into(),
+            selection: hsla(0.61, 0.72, 0.62, 0.32),
+
             text: rgb(0xe4e4e7).into(),
             text_muted: rgb(0x8b8b94).into(),
             text_on_accent: rgb(0xffffff).into(),
@@ -145,6 +153,9 @@ impl Theme {
 
             border: rgb(0xdededf).into(),
             border_focused: rgb(0x3b6fd4).into(),
+
+            cursor: rgb(0x2c5cc0).into(),
+            selection: hsla(0.61, 0.70, 0.55, 0.26),
 
             text: rgb(0x1c1c1f).into(),
             text_muted: rgb(0x6b6b74).into(),

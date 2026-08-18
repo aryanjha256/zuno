@@ -57,15 +57,16 @@ zuno/
         ├── actions.rs      ✅ every keyboard-reachable verb, in one place
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
-        ├── request_view.rs ✅ one buffer: spec + response + focus handles
+        ├── request_view.rs ✅ one buffer: inputs + response + derived spec()
         ├── request_pane.rs ✅ method, URL bar, headers/query tables, body
         ├── response_pane.rs✅ status line, timing, headers, body viewer
-        └── input/             (M1.1)
-            ├── text_input.rs  single-line input primitive
-            └── editor.rs      multi-line body editor
+        ├── tests.rs        ✅ headless end-to-end tests (GPUI test platform)
+        └── input/
+            ├── text_input.rs ✅ single-line input primitive
+            └── editor.rs        multi-line body editor (M1.4)
 ```
 
-Two refinements the implementation forced, both worth recording:
+Three refinements the implementation forced, all worth recording:
 
 - **`request_view.rs` is the buffer level** that §11's hedge asked for. `Workspace` owns
   `Vec<Entity<RequestView>>` + `active_ix`; a `RequestView` owns one `RequestSpec`, its latest
@@ -74,7 +75,14 @@ Two refinements the implementation forced, both worth recording:
   state of its own.
 - **All action handlers live on `Workspace`**, not on the panes. Action dispatch travels up the
   focus tree, and `Workspace` is the one element guaranteed to be on that path regardless of
-  which region holds focus. Handlers that need buffer state reach in through the entity.
+  which region holds focus — including when focus is inside a `TextInput` nested two levels
+  down. Handlers that need buffer state reach in through the entity.
+- **There is no stored `RequestSpec`.** The `TextInput` entities own their text, and
+  `RequestView::spec(cx)` assembles a spec on demand. The alternative — keeping a spec field
+  and mirroring every keystroke into it — means two copies of every string and a desync bug
+  waiting in each one. Deriving instead makes it structurally impossible for the request that
+  goes on the wire to disagree with what's on screen. Non-text state (`method`, `body`,
+  `settings`, per-row `enabled`) lives on `RequestView`, since nothing else owns it.
 
 **Why a workspace and not just modules?** Two concrete wins:
 
@@ -342,9 +350,18 @@ M1 plan, in cost order:
 
 | Piece | Scope | Approach |
 |---|---|---|
-| `TextInput` (single-line) | URL bar, header cells, param cells | Adapt `examples/input.rs`; translate `cmd-` → `ctrl-` |
-| `Editor` (multi-line) | Request body only | Same input handler over a rope; soft-wrap off |
+| `TextInput` (single-line) ✅ | URL bar, header cells, param cells | Adapted from `examples/input.rs`; every `cmd-` translated to `ctrl-` |
+| `Editor` (multi-line) | Request body only (M1.4) | Same input handler over a rope; soft-wrap off |
 | Response body | — | Read-only rows; **no editor at all** |
+
+**Five deliberate changes from the upstream example**, made while adapting it in M1.1:
+theme-driven colors instead of hardcoded literals; text style *inherited* from the parent div
+(which is what lets one `TextInput` serve both the URL bar and the tiny table cells);
+a caller-supplied key context identifier (see §10's note on leaf-only predicate matching);
+newline sanitization moved into `replace_text_in_range` so it covers the IME and drop paths and
+not just paste; and `character_index_for_point` returning `None` instead of asserting — the
+example's `assert_eq!(last_layout.text, self.content)` panics whenever the placeholder is
+showing, because an empty input lays out placeholder text rather than content.
 
 **Explicitly deferred to M3+:** syntax highlighting (needs tree-sitter plus a highlight
 cache), autocomplete, multi-cursor, code folding in the *editor*, bracket matching. The
@@ -448,9 +465,28 @@ visibly, theme toggles.
 > theming, and focus dispatch are correct *before* any text editing exists. The URL bar and body
 > region are real focus targets with real key contexts; they simply don't accept keystrokes yet.
 
-**M1.1 — Input.** `TextInput` adapted from the gpui example. URL bar + method dropdown +
-headers table. `RequestSpec` fully editable. *Done when:* you can type a real request and
-`{:?}` the correct spec.
+**M1.1 — Input. ✅ Shipped.** `TextInput` (~570 lines) adapted from gpui's `examples/input.rs`
+with theme-driven colors, inherited text style, grapheme-aware movement, IME composition, and
+clipboard. URL bar, method cycling, and fully editable headers/query tables — add, mute,
+remove, by keyboard or mouse. `RequestSpec` derived on demand. `SendRequest` dumps the
+assembled spec to stderr as the honest stand-in for the engine. 8 headless GPUI tests.
+
+> **Three GPUI facts worth keeping.** (1) Key context predicates match only the *leaf*
+> context — `Identifier(name) => contexts.last().contains(name)` — so nesting a `key_context`
+> div around an input does **not** let a binding target it. Both identifiers have to go in one
+> context string (`"TextInput UrlBar"`), which works because `KeyContext::parse` accepts
+> whitespace-separated identifiers. (2) `TabStopNode` orders by tab_index path *then* paint
+> order, so leaving every input at the default tab_index 0 makes visual order the tab order for
+> free. (3) A focus handle needs an explicit `.tab_stop(true)` or `focus_next()` skips it
+> entirely — the bug the `tab`-reaches-the-value-cell test now guards.
+
+> *Done when:* you can type a real request and get the correct spec back — now enforced by
+> `typed_text_reaches_the_derived_spec` rather than by eyeballing it.
+>
+> **Two things deliberately not built.** A method *dropdown* needs an anchored popover; cycling
+> via `Ctrl+M` / click covers the same ground for now, and the popover is worth building once
+> rather than twice. The body stays read-only until M1.4 — a multi-line editor is a different
+> build from a single-line one, and pretending otherwise is how M1 stalls (§7).
 
 **M1.2 — Engine.** Tokio thread, `Engine::send`, `Event` stream, `build.rs` with typed URL
 errors. Still no fancy rendering — dump the response as plain text. *Done when:* real request

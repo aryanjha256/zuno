@@ -7,6 +7,14 @@ edition.workspace = true
 gpui.workspace = true
 zuno-core.workspace = true
 
+unicode-segmentation.workspace = true
+
+# GPUI's headless test platform, which is the only way to drive real keystrokes and
+# focus through the app without a display server. Dev-only, so `cargo build` keeps
+# the default feature set.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [[bin]]
 name = "zuno"
 path = "src/main.rs"

@@ -12,3 +12,6 @@ zuno-core = { path = "core" }
 
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
+# Grapheme-aware cursor movement. Already in the tree via gpui, so this pins the
+# same version rather than adding a second copy.
+unicode-segmentation = "1.13"
