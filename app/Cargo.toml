@@ -1,0 +1,12 @@
+[package]
+name = "zuno"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui.workspace = true
+zuno-core.workspace = true
+
+[[bin]]
+name = "zuno"
+path = "src/main.rs"
