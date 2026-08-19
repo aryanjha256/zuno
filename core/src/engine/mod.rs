@@ -211,6 +211,7 @@ struct ClientKey {
     follow_redirects: bool,
     max_redirects: u8,
     accept_encodings: bool,
+    cookie_store: bool,
 }
 
 impl From<&RequestSettings> for ClientKey {
@@ -220,6 +221,7 @@ impl From<&RequestSettings> for ClientKey {
             follow_redirects: settings.follow_redirects,
             max_redirects: settings.max_redirects,
             accept_encodings: settings.accept_encodings,
+            cookie_store: settings.cookie_store,
         }
     }
 }
@@ -263,7 +265,7 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         .brotli(key.accept_encodings)
         .deflate(key.accept_encodings)
         .zstd(key.accept_encodings)
-        .cookie_store(true)
+        .cookie_store(key.cookie_store)
         .build()
         .map_err(|error| EngineError::Build {
             reason: error.to_string(),

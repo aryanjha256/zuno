@@ -113,6 +113,41 @@ pub struct RequestView {
 
 impl RequestView {
     pub fn new(spec: RequestSpec, cx: &mut Context<Self>) -> Self {
+        let mut view = Self {
+            id: spec.id,
+            name: String::new(),
+            method: Method::Get,
+            url: cx.new(|cx| TextInput::new("", "", "UrlBar", cx)),
+            headers: Vec::new(),
+            query: Vec::new(),
+            body_editor: cx.new(|cx| Editor::new("", "Request body…", cx)),
+            body_kind: RawKind::Json,
+            settings: RequestSettings::default(),
+            response: None,
+            diff: None,
+            history: Vec::new(),
+            body_view: None,
+            body_task: None,
+            inflight: None,
+            error: None,
+            status: None,
+            // Higher than the inputs' default 0, so Tab reaches every text field first
+            // and only then leaves for the response pane. The body editor sets its own
+            // handle to tab_stop, at the default index, so it lands with the inputs.
+            response_focus: cx.focus_handle().tab_index(2).tab_stop(true),
+        };
+        view.load(spec, cx);
+        view
+    }
+
+    /// Replace this buffer's contents with a different request.
+    ///
+    /// Used by curl import. Deliberately in-place rather than swapping in a fresh
+    /// entity: replacing the entity invalidates every handle to it and resets focus, and
+    /// the buffer's *identity* hasn't changed — only what's in it.
+    ///
+    /// `response_focus` is intentionally not rebuilt, so focus survives the swap.
+    pub fn load(&mut self, spec: RequestSpec, cx: &mut Context<Self>) {
         let url = cx.new(|cx| {
             TextInput::new(spec.url.clone(), "https://api.example.com/…", "UrlBar", cx)
         });
@@ -147,31 +182,27 @@ impl RequestView {
         };
         let body_editor = cx.new(|cx| Editor::new(body_text, "Request body…", cx));
 
-        Self {
-            id: spec.id,
-            name: spec.name,
-            method: spec.method,
-            url,
-            headers,
-            query,
-            body_editor,
-            body_kind,
-            settings: spec.settings,
-            // No canned response any more — the pane starts empty and fills from a
-            // real request.
-            response: None,
-            diff: None,
-            history: Vec::new(),
-            body_view: None,
-            body_task: None,
-            inflight: None,
-            error: None,
-            status: None,
-            // Higher than the inputs' default 0, so Tab reaches every text field first
-            // and only then leaves for the response pane. The body editor sets its own
-            // handle to tab_stop, at the default index, so it lands with the inputs.
-            response_focus: cx.focus_handle().tab_index(2).tab_stop(true),
-        }
+        self.id = spec.id;
+        self.name = spec.name;
+        self.method = spec.method;
+        self.url = url;
+        self.headers = headers;
+        self.query = query;
+        self.body_editor = body_editor;
+        self.body_kind = body_kind;
+        self.settings = spec.settings;
+
+        // A different request has no relationship to the last one's response.
+        self.response = None;
+        self.diff = None;
+        self.history.clear();
+        self.body_view = None;
+        self.body_task = None;
+        self.inflight = None;
+        self.error = None;
+        self.status = None;
+
+        cx.notify();
     }
 
     /// Assemble the request exactly as it currently appears on screen.

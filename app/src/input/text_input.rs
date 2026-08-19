@@ -72,6 +72,13 @@ pub struct TextInput {
 
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the text is shifted left, in pixels.
+    ///
+    /// A single-line input can't wrap and can't grow, so text longer than the box has to
+    /// scroll. Without this the overflow clip hides the end of a long URL with no way to
+    /// reach it. Recomputed each prepaint to keep the cursor in view, which is what makes
+    /// it feel like an input rather than a viewport you have to drive.
+    scroll_offset: Pixels,
     is_selecting: bool,
 }
 
@@ -99,6 +106,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_offset: px(0.),
             is_selecting: false,
         }
     }
@@ -256,7 +264,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_offset)
     }
 
     /// Graphemes, not chars — so an emoji or a combining sequence moves as one
@@ -439,11 +447,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_offset,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_offset,
                 bounds.bottom(),
             ),
         ))
@@ -466,7 +474,7 @@ impl EntityInputHandler for TextInput {
             return None;
         }
 
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_offset)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -520,6 +528,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    scroll_offset: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -570,6 +579,7 @@ impl Element for TextElement {
         let selected_range = input.selected_range.clone();
         let cursor_offset = input.cursor_offset();
         let marked_range = input.marked_range.clone();
+        let previous_scroll_offset = input.scroll_offset;
 
         // Font and size are inherited from the parent div, which is what lets one
         // TextInput serve both the URL bar and the small table cells.
@@ -624,13 +634,30 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
+        // Scroll just enough to keep the cursor inside the box, then clamp so the text
+        // never scrolls past its end or leaves a gap when it fits.
+        let cursor_x = line.x_for_index(cursor_offset);
+        let visible = bounds.size.width;
+        let caret = px(2.);
+
+        let mut scroll_offset = previous_scroll_offset;
+        if cursor_x - scroll_offset > visible - caret {
+            scroll_offset = cursor_x - visible + caret;
+        }
+        if cursor_x - scroll_offset < px(0.) {
+            scroll_offset = cursor_x;
+        }
+        let max_offset = (line.width - visible + caret).max(px(0.));
+        scroll_offset = scroll_offset.max(px(0.)).min(max_offset);
+
+        let origin_x = bounds.left() - scroll_offset;
+
         let (selection, cursor) = if selected_range.is_empty() {
-            let cursor_x = line.x_for_index(cursor_offset);
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_x, bounds.top()),
+                        point(origin_x + cursor_x, bounds.top()),
                         size(px(1.5), bounds.bottom() - bounds.top()),
                     ),
                     theme.cursor,
@@ -641,11 +668,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            origin_x + line.x_for_index(selected_range.start),
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            origin_x + line.x_for_index(selected_range.end),
                             bounds.bottom(),
                         ),
                     ),
@@ -659,6 +686,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll_offset,
         }
     }
 
@@ -691,8 +719,15 @@ impl Element for TextElement {
         };
         // Ignore rather than unwrap: a failed glyph paint should not take the window
         // down mid-frame.
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .ok();
+        // Shifted by the scroll offset; the parent's `overflow_hidden` provides the clip
+        // that keeps the overflow from painting over its neighbours.
+        line.paint(
+            point(bounds.left() - prepaint.scroll_offset, bounds.top()),
+            window.line_height(),
+            window,
+            cx,
+        )
+        .ok();
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
@@ -703,6 +738,7 @@ impl Element for TextElement {
         self.input.update(cx, |input, _| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_offset = prepaint.scroll_offset;
         });
     }
 }

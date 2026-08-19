@@ -19,9 +19,10 @@
 //! Only the lines intersecting the viewport are shaped, using the scroll handle's offset.
 //! Pasting a 50,000-line body should cost a scroll-region shape, not 50,000 of them.
 //!
-//! Soft-wrap is off and long lines are clipped horizontally rather than wrapped — matching
-//! §7. Horizontal scrolling needs the widest line measured, which means shaping every
-//! line, so it waits for a later milestone.
+//! Soft-wrap is off (§7). Long lines scroll horizontally instead of wrapping, with the
+//! offset following the cursor — clamped against the *cursor's* line width rather than the
+//! widest visible line, which would jitter as you scroll vertically. That avoids having to
+//! measure every line just to know how far right the content goes.
 
 use std::ops::Range;
 
@@ -55,6 +56,10 @@ pub struct Editor {
     last_layouts: Vec<(usize, ShapedLine)>,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Pixels,
+    /// Horizontal scroll, in pixels. Vertical scrolling is the container's job; this is
+    /// ours, because soft-wrap is off and long lines otherwise run off the edge with no
+    /// way to reach them.
+    h_offset: Pixels,
     is_selecting: bool,
 }
 
@@ -75,6 +80,7 @@ impl Editor {
             last_layouts: Vec::new(),
             last_bounds: None,
             last_line_height: px(16.),
+            h_offset: px(0.),
             is_selecting: false,
         }
     }
@@ -328,7 +334,9 @@ impl Editor {
             .last_layouts
             .iter()
             .find(|(ix, _)| *ix == line)
-            .map(|(_, layout)| layout.closest_index_for_x(position.x - bounds.left()))
+            .map(|(_, layout)| {
+                layout.closest_index_for_x(position.x - bounds.left() + self.h_offset)
+            })
             // Off-screen line: clamp to its end rather than guessing.
             .unwrap_or_else(|| self.line_end(line) - self.line_start(line));
 
@@ -534,13 +542,14 @@ impl EntityInputHandler for Editor {
         let line_start = self.line_start(line);
         let top = element_bounds.top() + self.last_line_height * (line as f32);
 
+        let origin_x = element_bounds.left() - self.h_offset;
         Some(Bounds::from_corners(
             point(
-                element_bounds.left() + layout.x_for_index(range.start.saturating_sub(line_start)),
+                origin_x + layout.x_for_index(range.start.saturating_sub(line_start)),
                 top,
             ),
             point(
-                element_bounds.left() + layout.x_for_index(range.end.saturating_sub(line_start)),
+                origin_x + layout.x_for_index(range.end.saturating_sub(line_start)),
                 top + self.last_line_height,
             ),
         ))
@@ -618,10 +627,10 @@ struct EditorElement {
 
 struct Prepaint {
     lines: Vec<(usize, ShapedLine)>,
-    first_line: usize,
     line_height: Pixels,
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
+    h_offset: Pixels,
 }
 
 impl IntoElement for EditorElement {
@@ -685,6 +694,7 @@ impl Element for EditorElement {
         let last_line = (first_line + visible).min(editor.line_count());
 
         let is_empty = editor.content.is_empty();
+        let previous_h_offset = editor.h_offset;
         let selection = editor.selection.clone();
         let cursor_offset = editor.cursor();
         let cursor_line = editor.line_of(cursor_offset);
@@ -724,15 +734,43 @@ impl Element for EditorElement {
             let layout = window
                 .text_system()
                 .shape_line(text, font_size, &runs, None);
+            lines.push((line_ix, layout));
+        }
 
+        // Horizontal scroll, driven by the cursor's line. Long lines are not wrapped
+        // (§7), so without this the end of a long JSON line is unreachable — the same
+        // problem the URL bar had. Clamped against the cursor line's own width rather
+        // than the widest visible line, which would jitter as you scroll vertically.
+        let mut h_offset = previous_h_offset;
+        if let Some((_, layout)) = lines.iter().find(|(ix, _)| *ix == cursor_line) {
+            let cursor_x = layout.x_for_index(cursor_offset - editor.line_start(cursor_line));
+            let visible = bounds.size.width;
+            let caret = px(2.);
+
+            if cursor_x - h_offset > visible - caret {
+                h_offset = cursor_x - visible + caret;
+            }
+            if cursor_x - h_offset < px(0.) {
+                h_offset = cursor_x;
+            }
+            let max_offset = (layout.width - visible + caret).max(px(0.));
+            h_offset = h_offset.max(px(0.)).min(max_offset);
+        }
+
+        let origin_x = bounds.left() - h_offset;
+
+        for (line_ix, layout) in &lines {
+            let line_ix = *line_ix;
+            let line_start = editor.line_start(line_ix);
+            let line_end = editor.line_end(line_ix);
             let top = bounds.top() + line_height * (line_ix as f32);
 
             // Selection segment for this line, if any.
             if !selection.is_empty() && selection.start <= line_end && selection.end >= line_start {
                 let from = selection.start.max(line_start) - line_start;
                 let to = selection.end.min(line_end) - line_start;
-                let x_from = bounds.left() + layout.x_for_index(from);
-                let mut x_to = bounds.left() + layout.x_for_index(to);
+                let x_from = origin_x + layout.x_for_index(from);
+                let mut x_to = origin_x + layout.x_for_index(to);
 
                 // A selection continuing past this line should visibly cover the newline.
                 if selection.end > line_end {
@@ -747,22 +785,20 @@ impl Element for EditorElement {
             }
 
             if selection.is_empty() && line_ix == cursor_line {
-                let x = bounds.left() + layout.x_for_index(cursor_offset - line_start);
+                let x = origin_x + layout.x_for_index(cursor_offset - line_start);
                 cursor = Some(fill(
                     Bounds::new(point(x, top), size(px(1.5), line_height)),
                     theme.cursor,
                 ));
             }
-
-            lines.push((line_ix, layout));
         }
 
         Prepaint {
             lines,
-            first_line,
             line_height,
             cursor,
             selections,
+            h_offset,
         }
     }
 
@@ -789,7 +825,10 @@ impl Element for EditorElement {
 
         let line_height = prepaint.line_height;
         for (line_ix, layout) in &prepaint.lines {
-            let origin = point(bounds.left(), bounds.top() + line_height * (*line_ix as f32));
+            let origin = point(
+                bounds.left() - prepaint.h_offset,
+                bounds.top() + line_height * (*line_ix as f32),
+            );
             layout.paint(origin, line_height, window, cx).ok();
         }
 
@@ -800,12 +839,12 @@ impl Element for EditorElement {
         }
 
         let lines = std::mem::take(&mut prepaint.lines);
-        let first_line = prepaint.first_line;
+        let h_offset = prepaint.h_offset;
         self.editor.update(cx, |editor, _| {
             editor.last_layouts = lines;
             editor.last_bounds = Some(bounds);
             editor.last_line_height = line_height;
-            let _ = first_line;
+            editor.h_offset = h_offset;
         });
     }
 }

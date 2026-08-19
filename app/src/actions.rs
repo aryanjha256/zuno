@@ -27,6 +27,7 @@ actions!(
         ToggleRow,
         RemoveRow,
         CycleBodyKind,
+        ImportCurl,
         // Response viewer
         FoldAll,
         UnfoldAll,

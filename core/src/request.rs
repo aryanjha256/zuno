@@ -133,9 +133,8 @@ impl RawKind {
 
 /// The request body.
 ///
-/// `Raw::text` is a plain `String` for now. It becomes a rope-backed
-/// `TextBuffer` in M1.4, when the multi-line editor lands and edit operations
-/// start mattering. Nothing edits it yet, so the swap is contained.
+/// `Raw::text` is a plain `String`, and stays one — the rope was dropped in M1.4 after
+/// measuring that a line-index rescan is ~10µs on a 100KB body. See architecture.md §7.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Body {
     #[default]
@@ -190,13 +189,29 @@ pub enum MultipartValue {
     File(PathBuf),
 }
 
+/// `#[serde(default)]` at the container level is load-bearing for persistence: any field
+/// missing from a saved session is filled from `Default`, so adding a setting can't break
+/// files written by an older build. Adding `cookie_store` without this made every existing
+/// session fail to deserialize and silently fall back to the sample request.
+///
+/// `RequestSpec` deliberately does *not* do this — it must stay strict enough that a
+/// corrupt file is rejected rather than quietly becoming an empty request. New fields
+/// there need a per-field `#[serde(default)]` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RequestSettings {
     pub timeout: Option<Duration>,
     pub follow_redirects: bool,
     pub max_redirects: u8,
     pub verify_tls: bool,
     pub accept_encodings: bool,
+    /// Whether responses' cookies are remembered and replayed on later requests.
+    ///
+    /// Defaults to `true`, matching Postman and browsers — it's usually what you want
+    /// when the second request depends on the first one's login. But it does make
+    /// requests non-independent, so it has to be *visible and switchable* rather than
+    /// silently hardcoded on, which is what it was before.
+    pub cookie_store: bool,
 }
 
 impl Default for RequestSettings {
@@ -207,6 +222,7 @@ impl Default for RequestSettings {
             max_redirects: 10,
             verify_tls: true,
             accept_encodings: true,
+            cookie_store: true,
         }
     }
 }
@@ -301,6 +317,36 @@ mod tests {
         let mut spec = RequestSpec::default();
         spec.url = "{{baseUrl}}/users?id=".to_string();
         assert_eq!(spec.url, "{{baseUrl}}/users?id=");
+    }
+
+    #[test]
+    fn a_session_missing_a_newer_setting_still_loads() {
+        // Regression: exactly the shape written before `cookie_store` existed. Without
+        // the container-level serde default this fails with "missing field", and a real
+        // saved session gets silently discarded.
+        let json = r#"{
+            "id": 1,
+            "name": "Saved earlier",
+            "method": "Get",
+            "url": "https://jsonplaceholder.typicode.com/posts",
+            "query": [],
+            "headers": [],
+            "body": "Empty",
+            "settings": {
+                "timeout": { "secs": 30, "nanos": 0 },
+                "follow_redirects": true,
+                "max_redirects": 10,
+                "verify_tls": true,
+                "accept_encodings": true
+            }
+        }"#;
+
+        let spec: RequestSpec = serde_json::from_str(json).expect("an older session should load");
+        assert_eq!(spec.url, "https://jsonplaceholder.typicode.com/posts");
+        assert!(
+            spec.settings.cookie_store,
+            "a missing setting should take its default, not fail the load"
+        );
     }
 
     #[test]

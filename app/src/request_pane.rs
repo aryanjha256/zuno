@@ -171,6 +171,9 @@ fn url_bar(view: &RequestView, theme: &Theme, focused: bool) -> Div {
     div()
         .flex_1()
         .min_w(px(0.))
+        // `truncate()` styles text overflow; it does not clip a custom-painted element.
+        // Without this the shaped URL paints straight over the Send button.
+        .overflow_hidden()
         .px_2()
         .py_1()
         .rounded_md()
@@ -363,11 +366,18 @@ fn render_row(
                     }),
                 ),
         )
-        .child(div().flex_none().w(px(160.)).child(row.name.clone()))
+        .child(
+            div()
+                .flex_none()
+                .w(px(160.))
+                .overflow_hidden()
+                .child(row.name.clone()),
+        )
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
+                .overflow_hidden()
                 .text_color(theme.text_muted)
                 .child(row.value.clone()),
         )

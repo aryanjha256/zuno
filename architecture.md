@@ -50,7 +50,8 @@ zuno/
 │       │   ├── mod.rs      ✅ JsonOutline, Row, Span, visible_rows
 │       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
-│       └── diff.rs         ✅ ResponseDiff — summary comparison of two runs
+│       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
+│       └── curl.rs         ✅ curl command line -> RequestSpec
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
     └── src/
@@ -58,6 +59,7 @@ zuno/
         ├── actions.rs      ✅ every keyboard-reachable verb, in one place
         ├── engine.rs       ✅ the Engine as a global (one pool per process)
         ├── body_view.rs    ✅ body classification + fold state
+        ├── chrome.rs       ✅ titlebar + window controls + resize edges (CSD)
         ├── session.rs      ✅ scratch-request persistence (path is a global, for tests)
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
@@ -73,7 +75,7 @@ zuno/
 
 Three refinements the implementation forced, all worth recording:
 
-- **`request_view.rs` is the buffer level** that §11's hedge asked for. `Workspace` owns
+- **`request_view.rs` is the buffer level** that §12's tabs hedge asked for. `Workspace` owns
   `Vec<Entity<RequestView>>` + `active_ix`; a `RequestView` owns one `RequestSpec`, its latest
   response, and the three focus handles. `request_pane` and `response_pane` are its two render
   halves — plain functions for now, promoted to entities in M1.1 when the request side grows
@@ -605,7 +607,88 @@ and session restore of the scratch request. 27 new tests.
 
 > **Session persistence is a global, not a constant path.** The suite drives `SendRequest`, and a
 > send is a save point — without an injectable path, running `cargo test` would overwrite the
-> developer's own session file.
+> developer's own session file. (It did, once, before the path was made injectable.)
+
+---
+
+### M1.5 — Fixes and curl import ✅
+
+Three nuisances and one feature, before planning M2.
+
+**Save on every exit path.** `session::save` was reachable only from the Send and Quit
+*actions*, so closing the window with the window manager's button lost every edit since the
+last send. Now `Workspace` registers `cx.on_app_quit`, and `main` registers
+`cx.on_window_closed` → `cx.quit()` — GPUI does not quit on last-window-close by default, so
+without the second hook the process would linger with nothing on screen *and* never reach the
+first. Note SIGTERM still bypasses both; that's the OS's call, not something to paper over.
+
+**The cookie jar is a setting, not a hardcoded surprise.** It was `.cookie_store(true)` in the
+client builder with nothing in the model and nothing on screen, which quietly made every
+request non-independent. It's now `RequestSettings::cookie_store`, defaulting to `true` to match
+Postman and browsers, and it fragments the client cache correctly.
+
+> **The bug that fix caused, and the rule it produced.** Adding `cookie_store` broke
+> deserialization of every session written by an earlier build — `missing field cookie_store` —
+> so a real saved session silently fell back to the sample. `RequestSettings` now carries a
+> container-level `#[serde(default)]`, so any future setting is tolerated. `RequestSpec`
+> deliberately stays strict, because a corrupt file must be rejected rather than quietly become
+> an empty request; new fields *there* need a per-field `#[serde(default)]`. There's a
+> regression test pinned to the exact pre-`cookie_store` JSON shape.
+
+**curl import** (`Ctrl+Shift+V`, from the clipboard). Handles the full realistic flag set —
+`-X`, `-H`, `-d`/`--data-raw`/`--data-binary`/`--json`, `-F`, `-u` (→ Basic auth, base64 written
+inline rather than adding a dependency), `-G`, `-b`, `-A`, `-e`, `-k`, `-L`, `--max-time`,
+`--compressed` — plus shell tokenization with single/double/`$'…'` quoting and line
+continuations. 35 tests.
+
+> **Two decisions.** (1) **Unknown flags are reported, not fatal.** curl has hundreds of
+> options, most about output; refusing an import over one unrecognised flag would break the
+> feature exactly where it's most useful. Anything skipped comes back in `ignored` and is named
+> in the status bar, so an import never silently loses part of a command. (2) **The query string
+> stays in the URL** rather than being split into editable rows — splitting means decode then
+> re-encode, which can invalidate a signed URL, and presigned URLs are precisely what people
+> paste.
+
+> **A faithfulness trap worth knowing.** `curl -d 'a=1'` with no `Content-Type` sends
+> `application/x-www-form-urlencoded`. Import adds that header explicitly, because otherwise
+> Zuno would infer `text/plain` from the raw-body kind and the imported request would behave
+> differently from the command it came from.
+
+> **And one where faithful was wrong.** curl treats any bare word as a hostname, so
+> `curl this is garbage` parses with `url = "this"`. Faithful, and useless as an import —
+> pasting arbitrary text would quietly build a nonsense request. Import now requires either the
+> `curl` word or something that actually looks like a URL.
+
+**Window chrome.** `WindowOptions::window_decorations` defaults to `None`, so GPUI was never
+told which mode to use and the window came up **client-decorated with nothing drawing the
+decorations** — no close/minimize/maximize, and no way to resize. Confirmed by logging
+`window.window_decorations()`, which reported `Client { tiling: … }`.
+
+`chrome.rs` now draws them: an app-named titlebar that drags to move and double-clicks to
+maximize, platform-aware control buttons (`WindowControls` says which the compositor supports),
+and eight invisible 6px resize strips — corners emitted last, because later children win
+hit-testing and a corner has to beat the two edges it overlaps. Client-side is also the right
+mode to commit to on Wayland: GNOME prefers CSD and won't reliably draw a server titlebar.
+
+**A rendering bug the screenshot caught, and the feature it was hiding.** A long URL painted
+straight over the Send button, and long header values pushed the row's `×` out of view.
+`truncate()` sets text-overflow *styling*, which does nothing to a custom-painted element like
+`TextInput`'s shaped line — that needs a real `overflow_hidden()` clip.
+
+Clipping alone only converted the bug into a worse one: the hidden text became unreachable. Both
+`TextInput` and `Editor` now carry a **horizontal scroll offset that follows the cursor** —
+recomputed each prepaint, clamped so the text never scrolls past its end or leaves a gap when it
+fits. Hit-testing and the IME rectangle both undo the offset, or clicking in a scrolled input
+would land on the wrong character. The `overflow_hidden` clip is what makes it safe to paint
+outside the box, so the two fixes are one mechanism.
+
+In the editor the clamp uses the *cursor's* line width rather than the widest visible line —
+the latter would make the scroll limit jitter as you scroll vertically, and would mean measuring
+every line to know how far right the content goes.
+
+**Still deliberately absent:** tabs, collections, the `Ctrl+P` / `Ctrl+K` palettes, environments
+and variables, syntax highlighting, a method dropdown, a settings panel, and a history browser.
+The navigation thesis from `what.md` is entirely M2.
 
 **Deferred by design, and it's worth naming them so they stop feeling like omissions:**
 tabs/buffers, collections, the `Ctrl+P` / `Ctrl+K` palettes, environments and variables, auth
@@ -613,9 +696,33 @@ schemes, scripting, syntax highlighting, cookie jar UI, certificates. All of the
 
 ---
 
-## 11. Two open decisions
+## 11. Built, but not reachable from the UI
 
-Neither blocks M1. Both get cheaper to decide with a working loop in hand.
+Worth knowing before building anything in M2: **there is more product in here than the window
+shows.** Each of these is honoured on every request and has no way to see or change it. Most are
+UI work, not engine work.
+
+| Capability | State |
+|---|---|
+| **Cookie jar** | **On by default.** `RequestSettings::cookie_store`, matching Postman and browsers. Nothing on screen says so, and it makes consecutive requests non-independent — the second carries the first's cookies. Wants an indicator or a toggle. |
+| Timeout (30s) | Applied per request; not editable |
+| Redirect following + max hops | Honoured; not editable |
+| TLS verification toggle | Honoured; not editable. curl import sets it from `-k` |
+| gzip / brotli / deflate / zstd | Negotiated; not editable |
+| Form and binary bodies | The engine sends both correctly; the UI can only author raw bodies |
+| Multipart bodies | Modeled, and curl import parses `-F` — but the engine returns `UnsupportedBody`. The one item here that is *not* just UI work |
+| Response history | 10 deep, newest first. Only the diff surfaces it; there's no way to browse back |
+| Custom HTTP methods | `Method::Other` sends anything; the UI only cycles the seven common verbs |
+
+A settings panel and a history browser would each expose several of these at once, which makes
+them unusually cheap for the value.
+
+---
+
+## 12. Open decisions
+
+Deliberately **not** pre-answered. Each got cheaper to decide once the loop worked, and a
+confident guess written down now would mislead more than it helps.
 
 **Persistence format.** "Local-first" fits both SQLite and a git-diffable file tree
 (Bruno-style, one file per request). My recommendation: **file tree for collections**
@@ -624,10 +731,38 @@ philosophy) plus **SQLite for ephemeral state only** — history, response cache
 session. M1 needs neither: serde the scratch request to a single file on quit and move on.
 The `Serialize` derives from §3 keep this reversible.
 
-**Tabs in M1 or M2?** `what.md` treats request-tabs-as-editor-buffers as thesis-level, but
-`idea.md` scopes M1 to a single loop. I've put tabs in M2 above, on the reasoning that a
-tab strip over a loop that doesn't yet feel good just multiplies a mediocre experience. The
-counter-argument is real though: buffer semantics influence how `RequestSpec` ownership and
-dirty-tracking are modeled, and that's cheaper to get right early than to retrofit. If you
-lean that way, the concrete hedge is to have `Workspace` own `Vec<Entity<RequestPane>>` with
-an `active_ix` from the start, and simply not render a tab strip until M2.
+**Tabs.** The hedge from the original §11 was taken: `Workspace` already owns
+`Vec<Entity<RequestView>>` with an `active_ix`, so the ownership shape is right and only the tab
+strip is missing. Two things are still undecided — what a *dirty* buffer means once requests come
+from collections rather than a scratch file, and whether curl import should replace the active
+buffer (what it does now) or open a new one. `RequestView::load` exists for the first behaviour;
+the second is a one-line change once tabs render.
+
+**Where `Ctrl+P` and `Ctrl+K` get their content.** These are the thesis features from `what.md`
+and neither exists. Note the dependency: `Ctrl+P` "find any request" is meaningless until
+collections exist, which is why curl import came first — it's how requests get *into* the app at
+all. A palette over one scratch request would be theatre.
+
+**The cookie jar's visibility** (new). It's on and invisible. Options: a status-bar
+indicator, a per-request toggle, or a jar viewer. Leaning toward an indicator plus a toggle in the
+settings panel that several other items in §11 also need — that section lists them.
+
+---
+
+## 13. What Milestone 1 delivered, and what it didn't
+
+**Done:** the full loop — author a request (URL, method, ordered toggleable headers and query
+params, multi-line body editor), send it over real HTTP with streaming progress and cancellation,
+read the response through a virtualized JSON viewer that handles 10MB at 60fps, diff it against
+the previous run, and come back to it after a restart. Plus curl import, light/dark themes,
+window chrome, and 176 tests across three layers.
+
+**Not done, and it's the important half:** the *navigation* thesis. `what.md` named `Ctrl+P`,
+`Ctrl+K`, fuzzy search across collections, and request-tabs-as-editor-buffers as the defining
+features — the things that would make this Zed-like rather than Postman-like. None of them exist.
+There is one request, no tabs, no collections, no palette.
+
+That's the honest framing to carry into M2: **the loop is excellent and the differentiator is
+unbuilt.** Also absent: syntax highlighting, a method dropdown (cycling only), horizontal scroll
+limits in the editor clamped per-line rather than per-document, a settings panel, and form or
+multipart body authoring.

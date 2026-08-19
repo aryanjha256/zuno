@@ -9,13 +9,13 @@
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Window, div,
+    ParentElement, Render, SharedString, Styled, Subscription, Window, div,
 };
 use zuno_core::RequestSpec;
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
     UnfoldAll,
 };
 use crate::engine::ActiveEngine;
@@ -24,6 +24,10 @@ use crate::theme::{ActiveTheme, Theme};
 
 pub struct Workspace {
     focus_handle: FocusHandle,
+    /// Last title handed to the OS, so `set_window_title` isn't called every frame.
+    window_title: String,
+    /// Holding the quit subscription is what keeps it alive.
+    _quit_subscription: Subscription,
     /// One entry per open request. Only `active_ix` is rendered in M1.1 — the tab
     /// strip arrives in M2, but the ownership shape is already right.
     views: Vec<Entity<RequestView>>,
@@ -43,8 +47,23 @@ impl Workspace {
         let url_focus = view.read(cx).url_focus(cx);
         window.focus(&url_focus);
 
+        // Save on *every* quit path, not just Ctrl+Q. Before this, closing the window
+        // with the window manager's button lost every edit made since the last send —
+        // `session::save` was only reachable from the Send and Quit actions.
+        let quit_subscription = cx.on_app_quit(|workspace, cx| {
+            if let Some(view) = workspace.active() {
+                let spec = view.read(cx).spec(cx);
+                crate::session::save(&spec, cx);
+            }
+            // The hook wants a future; there is nothing to await, since the write is
+            // synchronous and must finish before the process goes away.
+            async {}
+        });
+
         Self {
             focus_handle: cx.focus_handle(),
+            window_title: String::new(),
+            _quit_subscription: quit_subscription,
             views: vec![view],
             active_ix: 0,
         }
@@ -137,6 +156,42 @@ impl Workspace {
         }
     }
 
+    /// Replace the current request with one parsed from a curl command on the clipboard.
+    ///
+    /// Reading the clipboard rather than opening a paste dialog is deliberate: the whole
+    /// value of this feature is that "Copy as cURL" in devtools is one keystroke away
+    /// from a request you can edit. Once tabs land in M2 this should open a *new* buffer
+    /// instead of replacing the active one.
+    fn import_curl(&mut self, _: &ImportCurl, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            self.set_status("Nothing on the clipboard — copy a curl command first", cx);
+            return;
+        };
+
+        let import = match zuno_core::curl::parse(&text) {
+            Ok(import) => import,
+            Err(error) => {
+                self.set_status(&format!("Could not import: {error}"), cx);
+                return;
+            }
+        };
+
+        // An import never silently drops part of the command — anything skipped is named.
+        let message = if import.ignored.is_empty() {
+            format!("Imported {}", import.spec.method.as_str())
+        } else {
+            format!("Imported — ignored {}", import.ignored.join(", "))
+        };
+
+        let Some(view) = self.active() else { return };
+        view.update(cx, |view, cx| view.load(import.spec, cx));
+
+        let url_focus = view.read(cx).url_focus(cx);
+        window.focus(&url_focus);
+        self.set_status(&message, cx);
+        cx.notify();
+    }
+
     fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.set_all_folded(true, cx));
@@ -170,13 +225,9 @@ impl Workspace {
         view.update(cx, |view, cx| view.send(&engine, cx));
     }
 
-    /// Save before quitting. Handled here rather than at app level because this is where
-    /// the active request is reachable.
+    /// `on_app_quit` does the saving, so this only has to ask the app to quit — one save
+    /// path instead of one per exit route.
     fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active() {
-            let spec = view.read(cx).spec(cx);
-            crate::session::save(&spec, cx);
-        }
         cx.quit();
     }
 
@@ -199,6 +250,7 @@ impl Workspace {
             });
         }
     }
+
 
     fn focused_region(&self, window: &Window, cx: &App) -> SharedString {
         let Some(view) = self.views.get(self.active_ix) else {
@@ -247,6 +299,15 @@ impl Render for Workspace {
             .map(|view| SharedString::from(view.read(cx).name.clone()))
             .unwrap_or_else(|| SharedString::from("No request"));
 
+        // The window title tracks the request, so the taskbar entry is useful even
+        // though we draw our own titlebar. Only written when it changes — this runs every
+        // frame.
+        let window_title = format!("{title} — Zuno");
+        if self.window_title != window_title {
+            window.set_window_title(&window_title);
+            self.window_title = window_title;
+        }
+
         div()
             .id("zuno")
             .key_context("Zuno")
@@ -263,6 +324,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_row))
             .on_action(cx.listener(Self::remove_row))
             .on_action(cx.listener(Self::cycle_body_kind))
+            .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
@@ -275,52 +337,23 @@ impl Render for Workspace {
             .bg(theme.bg)
             .text_color(theme.text)
             .text_sm()
-            .child(titlebar(title, &theme))
+            .relative()
+            .child(crate::chrome::titlebar(title, &theme, window))
             .children(self.active())
             .child(status_bar(focused_region, status_message, &theme))
+            // Last, so the edge strips sit above the panes for hit-testing.
+            .children(crate::chrome::resize_handles(window))
     }
+
 }
 
-fn titlebar(title: SharedString, theme: &Theme) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .flex_none()
-        .px_3()
-        .py_2()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(div().text_sm().text_color(theme.text).child(title))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.text_muted)
-                        .child("M1.4 · the loop".to_string()),
-                ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.text_muted)
-                .child(format!("{} · Ctrl+Shift+T", theme.appearance.label())),
-        )
-}
 
 fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+M method · Ctrl+Shift+H header · Alt+T mute · Ctrl+Enter send · Esc cancel · Alt+F/E fold";
+    const HINTS: &str = "Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Shift+H header · Ctrl+Enter send · Esc cancel · Alt+F/E fold";
 
     div()
         .flex()

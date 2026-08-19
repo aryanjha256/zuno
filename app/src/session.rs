@@ -1,6 +1,6 @@
 //! Persisting the scratch request across restarts.
 //!
-//! The smallest useful slice of the persistence story (architecture.md §11): one file
+//! The smallest useful slice of the persistence story (architecture.md §12): one file
 //! holding the request you were last working on, so reopening Zuno puts you back where
 //! you were instead of at a sample. Collections, environments, and the git-diffable file
 //! tree are still M2 — deliberately, since that format choice gets cheaper to make with

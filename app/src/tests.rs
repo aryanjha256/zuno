@@ -820,6 +820,68 @@ async fn a_failure_clears_the_diff_but_keeps_the_baseline(cx: &mut TestAppContex
     });
 }
 
+// ---------------------------------------------------------------------------
+// curl import
+// ---------------------------------------------------------------------------
+
+fn put_on_clipboard(cx: &mut VisualTestContext, text: &str) {
+    let text = text.to_string();
+    cx.update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)));
+}
+
+#[gpui::test]
+async fn a_curl_command_on_the_clipboard_becomes_the_request(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    put_on_clipboard(
+        &mut cx,
+        r#"curl 'https://api.example.com/v2/items?page=2' \
+  -H 'accept: application/json' \
+  -H 'content-type: application/json' \
+  --data-raw '{"name":"zuno"}' \
+  --compressed"#,
+    );
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+
+    // The buffer is loaded in place, so the handle taken at open is still the right one.
+    let spec = spec_of(&view, &mut cx);
+
+    assert_eq!(spec.method, Method::Post);
+    assert_eq!(spec.url, "https://api.example.com/v2/items?page=2");
+    assert_eq!(spec.headers.len(), 2);
+    assert_eq!(spec.name, "items");
+    assert!(matches!(
+        spec.body,
+        Body::Raw { kind: RawKind::Json, .. }
+    ));
+}
+
+#[gpui::test]
+async fn an_unparseable_clipboard_reports_instead_of_wrecking_the_request(
+    cx: &mut TestAppContext,
+) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let before = spec_of(&view, &mut cx);
+    // Genuinely unparseable: an unbalanced quote. (Prose is rejected too, but by the
+    // NotCurl guard rather than the tokenizer.)
+    put_on_clipboard(&mut cx, "curl 'https://x.test/a");
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+
+    // `NoUrl` is the failure here, and the existing request must be untouched.
+    let after = spec_of(&view, &mut cx);
+    assert_eq!(before.url, after.url);
+    assert_eq!(before.method, after.method);
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    assert!(
+        status.is_some_and(|s| s.contains("Could not import")),
+        "the failure should be reported"
+    );
+}
+
 #[gpui::test]
 async fn newlines_never_enter_a_single_line_input(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);

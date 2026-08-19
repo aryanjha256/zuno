@@ -9,6 +9,7 @@ mod timing;
 
 mod actions;
 mod body_view;
+mod chrome;
 mod engine;
 mod input;
 mod request_pane;
@@ -24,12 +25,13 @@ use std::time::Instant;
 
 use gpui::{
     App, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, px, size,
+    WindowDecorations, WindowOptions, px, size,
 };
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, Quit, RemoveRow, SendRequest,
+    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, Quit, RemoveRow,
+    SendRequest,
     ToggleRow,
     ToggleTheme, UnfoldAll,
 };
@@ -75,6 +77,17 @@ fn main() {
             eprintln!("[zuno] could not start the HTTP engine: {error}");
         }
         session::install(cx);
+
+        // Without this, closing the last window leaves the process running with nothing
+        // on screen — GPUI does not quit on last-window-close by default. Quitting here
+        // is also what makes `Workspace`'s `on_app_quit` save hook fire on that path.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
         boot.mark("engine + session");
 
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
@@ -86,10 +99,17 @@ fn main() {
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(720.), px(480.))),
+                // Explicit, because the default is `None` — which left the window
+                // client-decorated with nothing drawing the decorations: no buttons and
+                // no resize. `chrome.rs` draws both.
+                window_decorations: Some(WindowDecorations::Client),
                 app_id: Some("dev.zuno.Zuno".to_string()),
                 ..Default::default()
             },
-            |window: &mut Window, cx| cx.new(|cx| Workspace::new(window, cx)),
+            |window: &mut Window, cx| {
+                timing!("decorations          {:?}", window.window_decorations());
+                cx.new(|cx| Workspace::new(window, cx))
+            },
         )
         .expect("failed to open the Zuno window");
 
@@ -129,6 +149,8 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("alt-t", ToggleRow, None),
         KeyBinding::new("ctrl-shift-k", RemoveRow, None),
         KeyBinding::new("ctrl-shift-b", CycleBodyKind, None),
+        // Paste-special: import a curl command from the clipboard.
+        KeyBinding::new("ctrl-shift-v", ImportCurl, None),
         // --- Response viewer ---
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
