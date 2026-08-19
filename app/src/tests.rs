@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use gpui::{TestAppContext, VisualTestContext};
 use zuno_core::{EngineError, Method, RequestSpec, ResponseData};
 
+use crate::body_view::BodyView;
 use crate::request_view::RequestView;
 use crate::theme::{Appearance, Theme};
 use crate::workspace::Workspace;
@@ -425,6 +426,179 @@ async fn edits_made_before_sending_are_the_ones_that_go_out(cx: &mut TestAppCont
         cx.update(|_, cx| view.read(cx).response.clone())
     });
     assert_eq!(response.status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// The response viewer (M1.3) — a real response, indexed off-thread
+// ---------------------------------------------------------------------------
+
+/// Wait until the background body index has landed.
+fn wait_for_body(
+    view: &gpui::Entity<RequestView>,
+    cx: &mut VisualTestContext,
+) -> (bool, usize, usize) {
+    wait_for(cx, "the body index", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx).body_view.as_ref().map(|body| {
+                (
+                    body.is_json(),
+                    body.row_count(),
+                    body.outline().map(|o| o.len()).unwrap_or(0),
+                )
+            })
+        })
+    })
+}
+
+#[gpui::test]
+async fn a_json_response_is_indexed_off_thread(cx: &mut TestAppContext) {
+    const BODY: &str = "{\"a\":1,\"b\":[2,3]}";
+    let response: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{BODY}",
+            BODY.len()
+        )
+        .into_boxed_str(),
+    );
+
+    let base = serve_once(response);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/json"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let (is_json, visible, total) = wait_for_body(&view, &mut cx);
+    assert!(is_json, "an application/json body should be parsed");
+    // { , "a":1 , "b":[ , 2 , 3 , ] , }
+    assert_eq!(total, 7);
+    assert_eq!(visible, 7, "nothing folded initially");
+}
+
+#[gpui::test]
+async fn folding_hides_rows_without_losing_them(cx: &mut TestAppContext) {
+    const BODY: &str = "{\"outer\":{\"x\":1,\"y\":2},\"z\":3}";
+    let response: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{BODY}",
+            BODY.len()
+        )
+        .into_boxed_str(),
+    );
+
+    let base = serve_once(response);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/json"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let (_, visible_before, total) = wait_for_body(&view, &mut cx);
+    assert_eq!(visible_before, total);
+
+    // Row 1 is the nested object's open row.
+    cx.update(|_, cx| view.update(cx, |view, cx| view.toggle_fold(1, cx)));
+    cx.run_until_parked();
+
+    let visible_after = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
+    assert!(
+        visible_after < visible_before,
+        "folding should hide rows ({visible_after} vs {visible_before})"
+    );
+
+    // The rows still exist — folding is a view concern, not a data one.
+    let still_total = cx.update(|_, cx| {
+        view.read(cx)
+            .body_view
+            .as_ref()
+            .unwrap()
+            .outline()
+            .unwrap()
+            .len()
+    });
+    assert_eq!(still_total, total, "folding must not discard rows");
+}
+
+#[gpui::test]
+async fn a_non_json_response_falls_back_to_lines(cx: &mut TestAppContext) {
+    const RESPONSE: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: 11\r\n\
+         \r\n\
+         one\ntwo\nsix";
+
+    let base = serve_once(RESPONSE);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/text"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let (is_json, rows, _) = wait_for_body(&view, &mut cx);
+    assert!(!is_json, "text/plain should not be parsed as JSON");
+    assert_eq!(rows, 3, "three lines");
+}
+
+#[gpui::test]
+async fn malformed_json_shows_raw_text_with_a_notice(cx: &mut TestAppContext) {
+    const RESPONSE: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 8\r\n\
+         \r\n\
+         {\"a\":1,}";
+
+    let base = serve_once(RESPONSE);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/bad"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let (is_json, rows, _) = wait_for_body(&view, &mut cx);
+    assert!(!is_json, "invalid JSON must not be shown as parsed");
+    assert!(rows > 0, "the raw body must still be visible");
+
+    let notice = cx.update(|_, cx| {
+        view.read(cx)
+            .body_view
+            .as_ref()
+            .unwrap()
+            .notice
+            .as_ref()
+            .map(|n| format!("{n:?}"))
+    });
+    assert!(
+        notice.is_some_and(|n| n.contains("ParseFailed")),
+        "the user must be told why it isn't a tree"
+    );
+}
+
+#[gpui::test]
+async fn resending_reindexes_the_new_body(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let first = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{first}/one"));
+    cx.simulate_keystrokes("ctrl-enter");
+    let (is_json, _, _) = wait_for_body(&view, &mut cx);
+    assert!(is_json);
+
+    const TEXT: &str = "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: 5\r\n\
+         \r\n\
+         plain";
+    let second = serve_once(TEXT);
+    type_url(&mut cx, &format!("{second}/two"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    // The stale JSON index must be replaced, not kept alongside.
+    let is_json = wait_for(&mut cx, "the reindexed body", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .body_view
+                .as_ref()
+                .map(BodyView::is_json)
+                .filter(|is_json| !is_json)
+        })
+    });
+    assert!(!is_json);
 }
 
 #[gpui::test]

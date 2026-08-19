@@ -15,7 +15,8 @@ use zuno_core::RequestSpec;
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    FocusPrev, FocusResponse, FocusUrl, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    FocusPrev, FocusResponse, FocusUrl, FoldAll, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::request_view::{RequestView, RowKind};
@@ -127,6 +128,18 @@ impl Workspace {
         }
     }
 
+    fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.set_all_folded(true, cx));
+        }
+    }
+
+    fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.set_all_folded(false, cx));
+        }
+    }
+
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         cx.global_mut::<Theme>().toggle();
         // A theme change repaints every window, not just this view.
@@ -226,6 +239,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_query))
             .on_action(cx.listener(Self::toggle_row))
             .on_action(cx.listener(Self::remove_row))
+            .on_action(cx.listener(Self::fold_all))
+            .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
@@ -264,7 +279,7 @@ fn titlebar(title: SharedString, theme: &Theme) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child("M1.2 · live".to_string()),
+                        .child("M1.3 · viewer".to_string()),
                 ),
         )
         .child(
@@ -280,7 +295,7 @@ fn status_bar(
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+M method · Ctrl+Shift+H header · Alt+T mute · Ctrl+Enter send · Esc cancel";
+    const HINTS: &str = "Ctrl+M method · Ctrl+Shift+H header · Alt+T mute · Ctrl+Enter send · Esc cancel · Alt+F/E fold";
 
     div()
         .flex()

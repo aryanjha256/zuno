@@ -8,6 +8,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Zuno builds warning-free; make CI enforce that rather than relying on someone
+  # noticing. Safe to apply globally: Cargo builds registry dependencies with
+  # `--cap-lints allow`, so this only fails on the workspace's own crates.
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   build:

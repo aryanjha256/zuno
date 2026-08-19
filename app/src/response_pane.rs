@@ -4,22 +4,38 @@
 //! than a single future: status and headers paint at TTFB, and a downloading body shows
 //! bytes arriving instead of a frozen pane.
 //!
-//! The body renders as plain monospace lines. M1.3 replaces that with `JsonOutline` +
-//! `uniform_list` so a 50MB payload stays at 60fps; a throwaway renderer beats a
-//! half-built tokenizer in the meantime.
+//! The body is rendered through `uniform_list` over a pre-built index, so only the
+//! visible rows become elements — that's what keeps a 10MB payload scrolling. Both the
+//! JSON outline and the raw-text fallback are virtualized, because a 10MB text body has
+//! just as many rows as a 10MB JSON one.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Div, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, px,
+    Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, Styled, Window, div, px, uniform_list,
 };
-use zuno_core::{EngineError, Header, ResponseData, StatusClass};
+use zuno_core::{
+    EngineError, Header, JsonOutline, LineIndex, ResponseData, Row, RowKind, ScalarKind,
+    StatusClass,
+};
 
+use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView};
 use crate::theme::Theme;
 
-pub fn render(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoElement {
+/// Fixed row height. `uniform_list` measures one item and assumes the rest match, so
+/// every row must agree — that constraint is exactly what buys O(visible) rendering.
+const ROW_HEIGHT: f32 = 18.0;
+const INDENT: f32 = 13.0;
+
+pub fn render(
+    view: &RequestView,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<RequestView>,
+) -> impl IntoElement {
     let focused = view.response_focus.is_focused(window);
 
     let pane = div()
@@ -48,8 +64,8 @@ pub fn render(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoEl
             .child(status_line(response, theme))
             .child(section_header("Headers", theme))
             .child(headers_table(&response.headers, theme))
-            .child(section_header("Body", theme))
-            .child(body_region(response, theme)),
+            .child(body_header(view, theme, cx))
+            .child(body_region(view, theme, cx)),
         None => pane.child(empty_state(theme)),
     }
 }
@@ -263,29 +279,328 @@ fn header_row(header: &Header, theme: &Theme) -> Div {
         )
 }
 
-fn body_region(response: &ResponseData, theme: &Theme) -> impl IntoElement {
-    let lines: Vec<String> = match response.body_as_str() {
-        Some("") => vec!["(empty body)".to_string()],
-        Some(text) => text.lines().map(str::to_string).collect(),
-        // A non-UTF-8 body is a normal outcome, not an error. M1.3 gives it a real hex
-        // view.
-        None => vec![format!(
-            "{} of binary data ({})",
-            format_bytes(response.body.len() as u64),
-            response.content_type().unwrap_or("unknown content type")
-        )],
+// ---------------------------------------------------------------------------
+// Body: virtualized
+// ---------------------------------------------------------------------------
+
+/// The Body section header, carrying row count and the fold-all / parse-anyway actions.
+fn body_header(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>) -> Div {
+    let detail = match &view.body_view {
+        None => SharedString::from("indexing…"),
+        Some(body) => match &body.kind {
+            BodyKind::Empty => SharedString::from("empty"),
+            BodyKind::Binary { len } => {
+                SharedString::from(format!("{} binary", format_bytes(*len as u64)))
+            }
+            BodyKind::Json(outline) => SharedString::from(format!(
+                "{} rows · {} shown",
+                outline.len(),
+                body.row_count()
+            )),
+            BodyKind::Text(lines) => SharedString::from(format!("{} lines", lines.len())),
+        },
+    };
+
+    let mut header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child("Body".to_string());
+
+    let mut actions = div().flex().flex_row().items_center().gap_2().child(detail);
+
+    if view.body_view.as_ref().is_some_and(BodyView::is_json) {
+        actions = actions
+            .child(text_button("fold-all", "fold all", theme, cx, |view, cx| {
+                view.set_all_folded(true, cx)
+            }))
+            .child(text_button("unfold-all", "expand", theme, cx, |view, cx| {
+                view.set_all_folded(false, cx)
+            }));
+    }
+
+    // The explicit escape hatch for an over-the-cap body. Never parse silently, and
+    // never refuse silently either.
+    if let Some(BodyNotice::TooLarge { .. }) = view.body_view.as_ref().and_then(|b| b.notice.clone())
+    {
+        actions = actions.child(text_button(
+            "parse-anyway",
+            "parse as JSON anyway",
+            theme,
+            cx,
+            |view, cx| view.force_parse_body(cx),
+        ));
+    }
+
+    header = header.child(actions);
+    header
+}
+
+fn text_button(
+    id: &'static str,
+    label: &'static str,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+    action: impl Fn(&mut RequestView, &mut Context<RequestView>) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_1()
+        .rounded_sm()
+        .text_color(theme.accent)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.bg_hover))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |view, _: &MouseDownEvent, _, cx| action(view, cx)),
+        )
+        .child(label.to_string())
+}
+
+fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>) -> Div {
+    let container = div().flex_1().flex().flex_col().min_h(px(0.));
+
+    let Some(body) = &view.body_view else {
+        return container.child(centered_note("Indexing response…", theme));
+    };
+
+    let notice = body.notice.as_ref().map(|notice| notice_bar(notice, theme));
+
+    let list = match &body.kind {
+        BodyKind::Empty => centered_note("(empty body)", theme).into_any_element(),
+        BodyKind::Binary { len } => centered_note(
+            &format!("{} of binary data", format_bytes(*len as u64)),
+            theme,
+        )
+        .into_any_element(),
+        BodyKind::Json(outline) => {
+            json_list(outline.clone(), body.visible(), theme, cx).into_any_element()
+        }
+        BodyKind::Text(lines) => text_list(lines.clone(), theme).into_any_element(),
+    };
+
+    container.children(notice).child(list)
+}
+
+/// The virtualized JSON view.
+///
+/// `uniform_list` only builds elements for the visible range, so this stays O(visible)
+/// no matter how many rows exist. The closure captures two `Arc`s and the theme — never
+/// the fold flags, which would be a megabyte-scale clone per frame (see `is_folded_at`).
+fn json_list(
+    outline: Arc<JsonOutline>,
+    visible: Arc<Vec<u32>>,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> impl IntoElement {
+    let row_theme = theme.clone();
+    let mono = theme.mono.clone();
+    let view = cx.entity().downgrade();
+    let count = visible.len();
+
+    uniform_list("json-body", count, move |range, _window, _cx| {
+        range
+            .map(|visible_ix| {
+                let row_ix = visible[visible_ix] as usize;
+                let Some(row) = outline.row(row_ix).copied() else {
+                    return div().h(px(ROW_HEIGHT));
+                };
+                let folded = row.kind.is_open() && is_folded_at(&visible, visible_ix, row_ix);
+                json_row(&outline, row, row_ix, folded, &row_theme, view.clone())
+            })
+            .collect()
+    })
+    .flex_1()
+    .px_2()
+    .font_family(mono)
+    .text_xs()
+}
+
+fn json_row(
+    outline: &JsonOutline,
+    row: Row,
+    row_ix: usize,
+    folded: bool,
+    theme: &Theme,
+    view: gpui::WeakEntity<RequestView>,
+) -> Div {
+    let mut line = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(ROW_HEIGHT))
+        .pl(px(4.0 + row.depth as f32 * INDENT));
+
+    // Fold affordance. Only containers get one, and clicking anywhere on the marker
+    // toggles — a 1px chevron would be unusable.
+    if row.kind.is_open() {
+        let marker = if folded { "▸" } else { "▾" };
+        line = line.child(
+            div()
+                .id(("fold", row_ix))
+                .flex_none()
+                .w(px(12.))
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|style| style.text_color(theme.accent))
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    let _ = view.update(cx, |view, cx| view.toggle_fold(row_ix, cx));
+                })
+                .child(marker.to_string()),
+        );
+    } else {
+        line = line.child(div().flex_none().w(px(12.)));
+    }
+
+    if !row.key.is_none() {
+        line = line
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.syntax.key)
+                    .child(outline.text(row.key).to_string()),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.syntax.punct)
+                    .child(": ".to_string()),
+            );
+    }
+
+    let (text, color) = match row.kind {
+        RowKind::Scalar(kind) => (
+            outline.text(row.value).to_string(),
+            match kind {
+                ScalarKind::String => theme.syntax.string,
+                ScalarKind::Number => theme.syntax.number,
+                ScalarKind::Bool | ScalarKind::Null => theme.syntax.literal,
+            },
+        ),
+        RowKind::ObjectOpen if folded => (
+            format!("{{ … {} }}", plural(row.child_count)),
+            theme.syntax.punct,
+        ),
+        RowKind::ArrayOpen if folded => (
+            format!("[ … {} ]", plural(row.child_count)),
+            theme.syntax.punct,
+        ),
+        RowKind::ObjectOpen => ("{".to_string(), theme.syntax.punct),
+        RowKind::ArrayOpen => ("[".to_string(), theme.syntax.punct),
+        RowKind::ObjectClose => ("}".to_string(), theme.syntax.punct),
+        RowKind::ArrayClose => ("]".to_string(), theme.syntax.punct),
+    };
+
+    line = line.child(div().flex_none().text_color(color).child(text));
+
+    if row.trailing_comma {
+        line = line.child(
+            div()
+                .flex_none()
+                .text_color(theme.syntax.punct)
+                .child(",".to_string()),
+        );
+    }
+
+    line
+}
+
+fn plural(count: u32) -> String {
+    if count == 1 {
+        "1 item".to_string()
+    } else {
+        format!("{count} items")
+    }
+}
+
+/// The virtualized raw-text view — the fallback for non-JSON, over-cap, and
+/// failed-to-parse bodies. Also virtualized: a 10MB text body has just as many rows.
+fn text_list(lines: Arc<LineIndex>, theme: &Theme) -> impl IntoElement {
+    let row_theme = theme.clone();
+    let mono = theme.mono.clone();
+    let count = lines.len();
+
+    uniform_list("text-body", count, move |range, _window, _cx| {
+        range
+            .map(|ix| {
+                let (text, truncated) = lines.line(ix);
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(px(ROW_HEIGHT))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(row_theme.text)
+                            .child(text.to_string()),
+                    );
+
+                if truncated {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .pl(px(6.))
+                            .text_color(row_theme.text_muted)
+                            .child("… line truncated for display".to_string()),
+                    );
+                }
+                row
+            })
+            .collect()
+    })
+    .flex_1()
+    .px_2()
+    .font_family(mono)
+    .text_xs()
+}
+
+fn notice_bar(notice: &BodyNotice, theme: &Theme) -> Div {
+    let (color, message) = match notice {
+        BodyNotice::TooLarge { len } => (
+            theme.status_client_error,
+            format!(
+                "{} is over the {} auto-parse limit — showing raw text",
+                format_bytes(*len as u64),
+                format_bytes(crate::body_view::MAX_AUTO_PARSE as u64)
+            ),
+        ),
+        BodyNotice::ParseFailed { message } => (
+            theme.status_server_error,
+            format!("not valid JSON: {message} — showing raw text"),
+        ),
     };
 
     div()
-        .id("response-body")
-        .flex_1()
-        .min_h(px(0.))
-        .p_2()
-        .overflow_y_scroll()
-        .font_family(theme.mono.clone())
+        .flex_none()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_elevated)
+        .border_b_1()
+        .border_color(color)
         .text_xs()
         .text_color(theme.text)
-        .child(div().flex().flex_col().children(lines))
+        .child(message)
+}
+
+fn centered_note(message: &str, theme: &Theme) -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(message.to_string())
 }
 
 fn empty_state(theme: &Theme) -> Div {

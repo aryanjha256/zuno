@@ -46,9 +46,10 @@ zuno/
 │       │   ├── error.rs    ✅ EngineError — owned, Clone, renderable
 │       │   ├── build.rs    ✅ RequestSpec -> reqwest::Request (pure, unit-tested)
 │       │   └── run.rs      ✅ execution, streaming, event emission
-│       ├── json/              (M1.3)
-│       │   ├── mod.rs         JsonOutline (the stable interface)
-│       │   └── flatten.rs     bytes -> Vec<Row> (swappable parser)
+│       ├── json/           ✅
+│       │   ├── mod.rs      ✅ JsonOutline, Row, Span, visible_rows
+│       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
+│       ├── lines.rs        ✅ LineIndex for the raw-text fallback
 │       └── text/              (M1.4)
 │           └── buffer.rs      rope-backed text buffer + edit ops
 └── app/                    ✅ zuno — the GPUI binary
@@ -57,6 +58,7 @@ zuno/
         ├── main.rs         ✅ bootstrap: window, keymap, theme, engine, boot timing
         ├── actions.rs      ✅ every keyboard-reachable verb, in one place
         ├── engine.rs       ✅ the Engine as a global (one pool per process)
+        ├── body_view.rs    ✅ body classification + fold state
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
@@ -335,11 +337,18 @@ and it eliminates millions of small allocations during the flatten pass.
 **Folding** is `visible: Vec<u32>` rebuilt on toggle, using `subtree_len` to skip folded
 ranges. O(rows), which is fine — and moved to the background executor above a threshold.
 
-**On the parser:** start with `serde_json::Value` for correctness, then replace `flatten.rs`
-with a span-emitting tokenizer when it hurts. `JsonOutline`'s public interface is the
-contract; the UI never learns which parser is behind it. Be aware `Value` allocates the whole
-tree, so it *will* hurt somewhere in the 10–50MB range — that's the signal to swap, not a
-reason to hand-roll a tokenizer on day one.
+**On the parser — this plan was wrong.** The original idea was "start with
+`serde_json::Value`, swap in a span-emitting tokenizer when it hurts". That was never viable:
+**`Value` discards byte offsets**, and every `Span` above depends on them. A position-tracking
+parser wasn't a later optimisation, it was the only way to build this at all. `flatten.rs` is
+therefore a hand-written tokenizer from the start — ~330 lines, and **iterative rather than
+recursive**, because a viewer eats arbitrary server output and deeply nested JSON is a trivial
+way to blow a recursive parser's stack (there's a 50,000-deep test).
+
+It is deliberately **permissive about string contents and strict about structure**: `\u`
+escapes aren't validated beyond "a byte follows the backslash", because this is an inspector,
+not a validator, and refusing to display a response over a malformed escape is unhelpful.
+Structural errors *are* rejected, since flattening them would produce nonsense.
 
 **Set a hard, visible cap.** Above ~10MB, default to a raw/line-oriented view with an explicit
 "parse as JSON anyway" affordance. Pretty-printing a 200MB body is a bad idea at any speed.
@@ -397,8 +406,8 @@ The numbers that make "Zed-level feel" testable rather than aspirational:
 | Keystroke → glyph painted | **< 16 ms** (one frame) | — (M1.1) |
 | `Send` keypress → bytes on wire | **< 5 ms** | not yet isolated |
 | Response arrives → status + headers painted | **< 50 ms** (at TTFB, not completion) | structural ✅ |
-| 10 MB JSON → first paint | **< 300 ms**, parse fully off-thread | — (M1.3) |
-| Scrolling any response | **60 fps sustained** | — (M1.3) |
+| 10 MB JSON → first paint | **< 300 ms**, parse fully off-thread | **48 ms** ✅ |
+| Scrolling any response | **60 fps sustained** | structural ✅ |
 
 ### The startup budget needs recalibrating
 
@@ -540,9 +549,36 @@ units, end-to-end over real sockets, and full-stack through simulated keystrokes
 > (3) `Progress` is throttled to one event per 33ms; per-chunk emission floods the channel with
 > events the UI cannot paint.
 
-**M1.3 — Response viewer.** `JsonOutline` + `uniform_list`. Status line, timing, headers
-table. Folding. The >10MB raw-view cap. *Done when:* a 10MB JSON response scrolls at 60fps
-and the UI never blocks.
+**M1.3 — Response viewer. ✅ Shipped.** `JsonOutline` + `uniform_list`, folding by click or
+`Alt+F`/`Alt+E`, the >10MB cap with an explicit *parse as JSON anyway*, and a virtualized
+raw-text fallback. 44 new tests, including a perf suite.
+
+> **Measured (release, 10.5MB / 1.31M rows):** flatten **47.9 ms (209 MB/s)**, `visible_rows`
+> **6.7 ms** unfolded and **7.3 µs** with the root folded, line index **5.7 ms**. All of it on
+> a background executor, so the UI thread sees only a finished index.
+
+> **Four things worth remembering.**
+>
+> 1. **The raw fallback needed virtualizing too.** A 10MB *text* body has just as many rows as a
+>    10MB JSON one; rendering it as `Vec<String>` would have blocked exactly as hard. Hence
+>    `LineIndex` — byte spans, same shape as `Row`.
+> 2. **Minified JSON is one 10MB line.** Virtualization doesn't help when there's a single row,
+>    because shaping that one text run stalls the frame regardless. Lines are truncated at 4KB
+>    for *display*, on a UTF-8 boundary, and the row says so rather than silently ending early.
+> 3. **Fold state is inferred from the visible index at render time, not captured.** The render
+>    closure must be `'static`, so capturing the `Vec<bool>` of fold flags would clone ~1.3MB
+>    every frame. Instead `is_folded_at` uses the fact that an unfolded open row is always
+>    followed by row `ix + 1` — anything else means the subtree was skipped. The closure holds
+>    two `Arc`s and nothing else.
+> 4. **Content-Type is a hint, not an oracle.** Plenty of real APIs return JSON as `text/plain`
+>    or with no type at all, so the first non-whitespace byte is sniffed too. But an explicit
+>    `text/html` is respected — an HTML error page that happens to start with `{` must not be
+>    parsed as JSON.
+
+> **The cap is a memory limit, not a speed limit.** 10MB flattens in 48ms; the problem is that
+> it produces 1.31M rows at ~32 bytes each, so the index costs more than the body. Past the cap
+> the user gets a raw view and an explicit button, because silently spending hundreds of MB is
+> worse than asking.
 
 **M1.4 — The loop.** Multi-line body editor. Resend, response diffing against the previous
 run, request-local history, session restore of the scratch request. *Done when:* the full

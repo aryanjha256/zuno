@@ -8,6 +8,7 @@
 mod timing;
 
 mod actions;
+mod body_view;
 mod engine;
 mod input;
 mod request_pane;
@@ -27,7 +28,8 @@ use gpui::{
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    FocusPrev, FocusResponse, FocusUrl, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    FocusPrev, FocusResponse, FocusUrl, FoldAll, Quit, RemoveRow, SendRequest, ToggleRow,
+    ToggleTheme, UnfoldAll,
 };
 use crate::input::text_input;
 use crate::theme::{Appearance, Theme};
@@ -123,6 +125,9 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-y", AddQuery, None),
         KeyBinding::new("alt-t", ToggleRow, None),
         KeyBinding::new("ctrl-shift-k", RemoveRow, None),
+        // --- Response viewer ---
+        KeyBinding::new("alt-f", FoldAll, None),
+        KeyBinding::new("alt-e", UnfoldAll, None),
         // --- Request lifecycle ---
         KeyBinding::new("ctrl-enter", SendRequest, None),
         KeyBinding::new("enter", SendRequest, Some("UrlBar")),

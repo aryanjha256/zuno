@@ -22,6 +22,7 @@ use zuno_core::{
     RequestSpec, ResponseData,
 };
 
+use crate::body_view::BodyView;
 use crate::input::TextInput;
 use crate::theme::ActiveTheme;
 use crate::{request_pane, response_pane};
@@ -91,6 +92,9 @@ pub struct RequestView {
     pub settings: RequestSettings,
 
     pub response: Option<ResponseData>,
+    /// The indexed body. `None` while it's still being built off-thread.
+    pub body_view: Option<BodyView>,
+    body_task: Option<Task<()>>,
     pub inflight: Option<InFlight>,
     pub error: Option<EngineError>,
     pub status: Option<SharedString>,
@@ -139,6 +143,8 @@ impl RequestView {
             // No canned response any more — the pane starts empty and fills from a
             // real request.
             response: None,
+            body_view: None,
+            body_task: None,
             inflight: None,
             error: None,
             status: None,
@@ -200,6 +206,8 @@ impl RequestView {
 
         self.error = None;
         self.response = None;
+        self.body_view = None;
+        self.body_task = None;
         self.status = None;
 
         // Consume the event stream on the foreground executor. `update` fails once the
@@ -246,6 +254,7 @@ impl RequestView {
                 );
                 self.inflight = None;
                 self.response = Some(*response);
+                self.index_body(false, cx);
                 cx.notify();
                 false
             }
@@ -300,6 +309,69 @@ impl RequestView {
 
     pub fn is_sending(&self) -> bool {
         self.inflight.is_some()
+    }
+
+    // ---- body indexing ------------------------------------------------------
+
+    /// Classify and index the response body on a background thread.
+    ///
+    /// Parsing 10MB of JSON is ~48ms and allocates 1.3M rows; doing that inline would
+    /// drop three frames and defeat the entire point of the viewer. Only the finished
+    /// index crosses back (architecture.md §1, rule 2).
+    ///
+    /// Note `background_executor().spawn` rather than `cx.background_spawn` — the latter
+    /// doesn't exist in gpui 0.2.2.
+    pub fn index_body(&mut self, force_parse: bool, cx: &mut Context<Self>) {
+        let Some(response) = &self.response else {
+            self.body_view = None;
+            self.body_task = None;
+            return;
+        };
+
+        let body = response.body.clone(); // Bytes: refcount bump, not a copy
+        let content_type = response.content_type().map(str::to_string);
+        let len = body.len();
+
+        self.body_view = None;
+        let build = cx
+            .background_executor()
+            .spawn(async move { BodyView::build(body, content_type, force_parse) });
+
+        self.body_task = Some(cx.spawn(async move |this, cx| {
+            let started = std::time::Instant::now();
+            let view = build.await;
+            let elapsed = started.elapsed();
+
+            let _ = this.update(cx, |this, cx| {
+                timing!(
+                    "body     index {:>9.2?}  {len} bytes  {} rows",
+                    elapsed,
+                    view.row_count()
+                );
+                this.body_view = Some(view);
+                cx.notify();
+            });
+        }));
+    }
+
+    pub fn toggle_fold(&mut self, row_ix: usize, cx: &mut Context<Self>) {
+        if let Some(body) = self.body_view.as_mut() {
+            body.toggle_fold(row_ix);
+            cx.notify();
+        }
+    }
+
+    pub fn set_all_folded(&mut self, folded: bool, cx: &mut Context<Self>) {
+        if let Some(body) = self.body_view.as_mut() {
+            body.set_all_folded(folded);
+            cx.notify();
+        }
+    }
+
+    /// Parse an over-the-cap body anyway, at the user's explicit request.
+    pub fn force_parse_body(&mut self, cx: &mut Context<Self>) {
+        self.index_body(true, cx);
+        cx.notify();
     }
 
     // ---- structural edits ---------------------------------------------------
@@ -432,6 +504,6 @@ impl Render for RequestView {
             .overflow_hidden()
             .child(request_pane::render(self, &theme, window, cx))
             .child(div().w(px(1.)).flex_none().bg(theme.border))
-            .child(response_pane::render(self, &theme, window))
+            .child(response_pane::render(self, &theme, window, cx))
     }
 }

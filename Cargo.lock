@@ -7627,6 +7627,7 @@ dependencies = [
 name = "zuno"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "gpui",
  "unicode-segmentation",
  "zuno-core",

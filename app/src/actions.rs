@@ -26,6 +26,9 @@ actions!(
         AddQuery,
         ToggleRow,
         RemoveRow,
+        // Response viewer
+        FoldAll,
+        UnfoldAll,
         // Request lifecycle
         SendRequest,
         CancelRequest,

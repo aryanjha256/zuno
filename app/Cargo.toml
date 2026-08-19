@@ -7,6 +7,8 @@ edition.workspace = true
 gpui.workspace = true
 zuno-core.workspace = true
 
+bytes.workspace = true
+
 unicode-segmentation.workspace = true
 
 # GPUI's headless test platform, which is the only way to drive real keystrokes and
