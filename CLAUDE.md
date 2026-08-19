@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 176 tests, ~4s
+cargo test --workspace                   # 197 tests, ~4s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -59,6 +59,11 @@ Breaking any of these is a bug, not a tradeoff.
    harness. The suite drives `SendRequest`, and a send is a save point.
 7. **New `RequestSettings` fields need serde defaults.** The container carries
    `#[serde(default)]`; keep it. `RequestSpec` stays strict on purpose.
+8. **`session::Session`'s fields stay required — no `#[serde(default)]`.** Required fields are
+   what let `parse` tell a v1 envelope apart from M1's bare `RequestSpec`. Default `tabs` and a
+   legacy file parses as an envelope with zero tabs, silently discarding the user's request
+   instead of migrating it. Change the shape by bumping `CURRENT_VERSION` and adding a fallback,
+   the way the bare-spec path works.
 
 ## GPUI 0.2.2 — verify, don't remember
 
@@ -146,5 +151,10 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
 - Actions, not direct calls, for anything a button and a keybinding share.
 - Every action handler lives on `Workspace`, because dispatch travels up the focus tree and
   `Workspace` is always on it.
+- **Anything that changes which buffer is active goes through `Workspace::activate`.** A
+  `FocusHandle` belongs to the entity that created it, so switching `active_ix` without moving
+  focus leaves it inside the old view — and after a close, inside a dropped one, where no key
+  context matches and the whole keymap goes dead with nothing on screen explaining why. Removing
+  the focus move from `activate` fails five tests; that's deliberate.
 - Errors are typed and renderable. `EngineError::is_local()` separates "nothing left the
   machine" from a network failure, which is a real distinction to a person debugging.

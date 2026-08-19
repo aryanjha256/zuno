@@ -29,11 +29,9 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, Quit, RemoveRow,
-    SendRequest,
-    ToggleRow,
-    ToggleTheme, UnfoldAll,
+    AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
+    FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
+    PrevTab, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -141,6 +139,14 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-r", FocusResponse, None),
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrev, None),
+        // --- Buffers (global) ---
+        //
+        // `ctrl-tab` is a distinct keystroke from bare `tab` above, so tab-cycling focus
+        // within a request and cycling between requests don't collide.
+        KeyBinding::new("ctrl-t", NewTab, None),
+        KeyBinding::new("ctrl-w", CloseTab, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         // --- Request editing (global) ---
         KeyBinding::new("ctrl-m", CycleMethod, None),
         KeyBinding::new("ctrl-shift-m", CycleMethodBack, None),

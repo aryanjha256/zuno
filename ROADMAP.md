@@ -59,24 +59,42 @@ These decide phase order, and they're the durable part of this document.
 
 The thesis milestone. Concrete, because it's next.
 
-**Tabs.** `Workspace` already owns `Vec<Entity<RequestView>>` with an `active_ix`, so only the
-strip and the switching are missing. Cheapest large win available: it's what makes the "20–100+
-open requests" claim from `idea.md` true, and `RequestView::load` already exists for reusing a
-buffer. Open questions in §12: what *dirty* means once requests come from collections, and whether
-curl import should open a new tab rather than replace the active one.
+**Tabs — done.** What makes the "20–100+ open requests" claim from `idea.md` true.
 
-**Collections and a persistence format.** The decision deferred since M1.0 (§12). The standing
-recommendation is a git-diffable file tree for collections plus SQLite for ephemeral state only
-(history, response cache, window session) — but decide it now, with the loop working, rather than
-inheriting the guess. `RequestSpec` has carried `Serialize`/`Deserialize` since M1.0 for this.
+Built in two slices, in that order for a reason. First the *session format*: a versioned envelope
+in `app/src/session.rs` that still reads M1's single-spec file, because persistence was the only
+part of tabs that could silently destroy work — the quit hook saved `active()` alone, so a strip
+landing first would have dropped every other open request on exit. Then the verbs and the strip:
+`NewTab`/`CloseTab`/`NextTab`/`PrevTab` on `ctrl-t`/`ctrl-w`/`ctrl-tab`/`ctrl-shift-tab`, a strip
+that hides itself at one buffer, click and middle-click, and curl import opening a new buffer
+instead of replacing the active one.
+
+Worth correcting an earlier version of this file: "only the strip and the switching are missing"
+was wrong. It counted the `Vec<Entity<RequestView>>` field as readiness and missed both that
+persistence was single-buffer and that switching needs focus to travel with it — a `FocusHandle`
+belongs to its creating entity, so a switch that only moves `active_ix` leaves the keymap dead.
+
+*Left over, deliberately:* no reordering, no rename (tab labels derive from the URL — see
+`label_for`), and `dirty` still unanswered until collections give it a baseline.
+
+**Collections.** The half of §12 still open — the window-session half is decided and shipped. The
+standing recommendation is a git-diffable file tree; decide it now, with the loop working, rather
+than inheriting the guess. `RequestSpec` has carried `Serialize`/`Deserialize` since M1.0 for this.
+Note *dirty* state is deliberately unanswered until this lands: there's no baseline to be dirty
+against without it.
 
 **The picker primitive.** See principle 2. An overlay, a filter input, fuzzy scoring, keyboard
 selection, and a `Vec` of candidates it doesn't know the meaning of.
 
 **`Ctrl+P` — find any request.** The picker over collections.
 
-**`Ctrl+K` — command palette.** The same picker over the action registry. `actions.rs` is already
-the single list of every keyboard-reachable verb, which is most of what a palette needs.
+**`Ctrl+K` — command palette.** The same picker over the action registry. Budget more than
+"`actions.rs` already lists the verbs" suggests: `actions!` generates *types*, not an iterable
+registry. The runtime list is `cx.all_action_names()` (with `cx.build_action` to dispatch by name),
+but it returns namespaced strings for *every* registered action — including the ~20
+`text_input::`/`editor::` ones that must not appear in a palette — and carries no human labels or
+keybinding hints. A curated label table is real work, not a lookup. `actions.rs` also isn't the
+single list: its own header points at `input::text_input` for the editing verbs.
 
 > **Done when:** you can hold 50 requests open across collections, reach any of them by name
 > without touching the mouse, run any command from the palette, and nothing about it feels slower

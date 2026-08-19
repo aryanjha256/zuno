@@ -9,14 +9,15 @@
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, Styled, Subscription, Window, div,
+    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, div, px,
 };
-use zuno_core::RequestSpec;
+use zuno_core::{RequestId, RequestSpec};
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
-    UnfoldAll,
+    AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
+    FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
+    PrevTab, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::request_view::{RequestView, RowKind};
@@ -28,33 +29,37 @@ pub struct Workspace {
     window_title: String,
     /// Holding the quit subscription is what keeps it alive.
     _quit_subscription: Subscription,
-    /// One entry per open request. Only `active_ix` is rendered in M1.1 — the tab
-    /// strip arrives in M2, but the ownership shape is already right.
+    /// One entry per open request; only `active_ix` is rendered as a pane. Every mutation
+    /// goes through `activate`, which is what keeps focus and `active_ix` from disagreeing.
     views: Vec<Entity<RequestView>>,
     active_ix: usize,
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // Reopen where you left off. A missing or unreadable session falls back to the
-        // sample request rather than an empty window.
-        let spec = crate::session::load(cx).unwrap_or_else(RequestSpec::sample);
-        let view = cx.new(|cx| RequestView::new(spec, cx));
+        // Reopen where you left off. A missing or unreadable session falls back to one
+        // sample request rather than an empty window. `session::load` guarantees a
+        // non-empty `tabs` and an in-range `active`, so neither is re-checked here.
+        let session = crate::session::load(cx)
+            .unwrap_or_else(|| crate::session::Session::single(RequestSpec::sample()));
+        let active_ix = session.active;
+        let views: Vec<_> = session
+            .tabs
+            .into_iter()
+            .map(|spec| cx.new(|cx| RequestView::new(spec, cx)))
+            .collect();
 
-        // Start focused on the URL bar — the loop begins with typing a URL, and it
-        // puts the URL input on the focus path so its key context is live from the
-        // first frame.
-        let url_focus = view.read(cx).url_focus(cx);
+        // Start focused on the URL bar of the buffer that was in front — the loop begins
+        // with typing a URL, and it puts that input on the focus path so its key context
+        // is live from the first frame.
+        let url_focus = views[active_ix].read(cx).url_focus(cx);
         window.focus(&url_focus);
 
         // Save on *every* quit path, not just Ctrl+Q. Before this, closing the window
         // with the window manager's button lost every edit made since the last send —
         // `session::save` was only reachable from the Send and Quit actions.
         let quit_subscription = cx.on_app_quit(|workspace, cx| {
-            if let Some(view) = workspace.active() {
-                let spec = view.read(cx).spec(cx);
-                crate::session::save(&spec, cx);
-            }
+            crate::session::save(&workspace.session(cx), cx);
             // The hook wants a future; there is nothing to await, since the write is
             // synchronous and must finish before the process goes away.
             async {}
@@ -64,13 +69,120 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             window_title: String::new(),
             _quit_subscription: quit_subscription,
-            views: vec![view],
-            active_ix: 0,
+            views,
+            active_ix,
         }
     }
 
     pub fn active(&self) -> Option<Entity<RequestView>> {
         self.views.get(self.active_ix).cloned()
+    }
+
+    /// How many buffers are open. The strip renders from `render`'s own collected list, so
+    /// this stays test-only until something in the UI needs the bare count.
+    #[cfg(test)]
+    pub fn tab_count(&self) -> usize {
+        self.views.len()
+    }
+
+    /// Move focus into a buffer's URL bar and repaint.
+    ///
+    /// Every switch has to end here. A `FocusHandle` belongs to the entity that made it,
+    /// so after the active buffer changes, focus is still sitting inside the *old* view —
+    /// and after a close it's inside a dropped one, where no key context matches and the
+    /// keymap goes dead with nothing on screen explaining why.
+    fn activate(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.views.get(ix) else { return };
+        self.active_ix = ix;
+
+        let url_focus = view.read(cx).url_focus(cx);
+        window.focus(&url_focus);
+        // Unlike `focus_region`, this needs the notify: the strip and the title change
+        // even when `window.focus` finds the handle already focused.
+        cx.notify();
+    }
+
+    /// Ids have to be distinct across buffers, and nothing hands them out — `sample()`
+    /// hardcodes 1 and `default()` 0. Highest-plus-one is enough for a session's lifetime
+    /// and needs no counter to persist and keep in sync.
+    fn next_id(&self, cx: &App) -> RequestId {
+        let highest = self
+            .views
+            .iter()
+            .map(|view| view.read(cx).id.0)
+            .max()
+            .unwrap_or(0);
+        RequestId(highest + 1)
+    }
+
+    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        let spec = RequestSpec {
+            id: self.next_id(cx),
+            ..RequestSpec::default()
+        };
+        self.open(spec, window, cx);
+    }
+
+    /// Add a buffer and switch to it. Shared by `NewTab` and curl import.
+    fn open(&mut self, spec: RequestSpec, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| RequestView::new(spec, cx));
+        self.views.push(view);
+        self.activate(self.views.len() - 1, window, cx);
+    }
+
+    /// Closing the last buffer leaves a fresh one rather than an empty window.
+    ///
+    /// An empty `views` would make `active()` return `None`, which every action handler
+    /// treats as "do nothing" — the window would still be there, silently inert. Ctrl+W
+    /// also shouldn't quit the app; that's Ctrl+Q's job.
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.views.is_empty() {
+            return;
+        }
+
+        self.views.remove(self.active_ix);
+
+        if self.views.is_empty() {
+            let spec = RequestSpec::default();
+            self.open(spec, window, cx);
+            return;
+        }
+
+        // Closing the last tab in the strip moves left; anything else keeps the index,
+        // which now points at what was to the right — the behaviour every editor has.
+        let next = self.active_ix.min(self.views.len() - 1);
+        self.activate(next, window, cx);
+    }
+
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.views.is_empty() {
+            return;
+        }
+        // Wraps, so cycling never dead-ends at either edge.
+        let next = (self.active_ix + 1) % self.views.len();
+        self.activate(next, window, cx);
+    }
+
+    fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.views.is_empty() {
+            return;
+        }
+        let prev = (self.active_ix + self.views.len() - 1) % self.views.len();
+        self.activate(prev, window, cx);
+    }
+
+    /// The persistable state of every open buffer.
+    ///
+    /// Walks *all* views, not just the active one. Saving only `active()` was correct
+    /// while one buffer was the only buffer; with a tab strip coming it would quietly
+    /// discard every other open request on quit.
+    fn session(&self, cx: &App) -> crate::session::Session {
+        let tabs = self
+            .views
+            .iter()
+            .map(|view| view.read(cx).spec(cx))
+            .collect();
+        crate::session::Session::new(tabs, self.active_ix)
     }
 
     /// `Window::focus` refreshes the whole window internally, so there's no
@@ -156,12 +268,16 @@ impl Workspace {
         }
     }
 
-    /// Replace the current request with one parsed from a curl command on the clipboard.
+    /// Open a request parsed from a curl command on the clipboard in a **new** buffer.
     ///
     /// Reading the clipboard rather than opening a paste dialog is deliberate: the whole
     /// value of this feature is that "Copy as cURL" in devtools is one keystroke away
-    /// from a request you can edit. Once tabs land in M2 this should open a *new* buffer
-    /// instead of replacing the active one.
+    /// from a request you can edit.
+    ///
+    /// It replaced the active buffer until tabs existed, which was only ever defensible
+    /// because there was nowhere else to put the result — an import over unsaved work
+    /// destroyed it with no undo. `RequestView::load` still exists for genuine in-place
+    /// replacement; it just isn't what an import is.
     fn import_curl(&mut self, _: &ImportCurl, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             self.set_status("Nothing on the clipboard — copy a curl command first", cx);
@@ -183,13 +299,16 @@ impl Workspace {
             format!("Imported — ignored {}", import.ignored.join(", "))
         };
 
-        let Some(view) = self.active() else { return };
-        view.update(cx, |view, cx| view.load(import.spec, cx));
-
-        let url_focus = view.read(cx).url_focus(cx);
-        window.focus(&url_focus);
+        // The parsed spec carries `RequestId::default()`, which would collide with the
+        // buffer already holding id 0.
+        let spec = RequestSpec {
+            id: self.next_id(cx),
+            ..import.spec
+        };
+        self.open(spec, window, cx);
+        // After `open`, so the status lands on the new buffer rather than the one that
+        // happened to be in front when the import ran.
         self.set_status(&message, cx);
-        cx.notify();
     }
 
     fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -219,9 +338,9 @@ impl Workspace {
         };
 
         // A send is a natural checkpoint: persist here so a crash costs at most the
-        // edits made since the last one.
-        let spec = view.read(cx).spec(cx);
-        crate::session::save(&spec, cx);
+        // edits made since the last one. Every buffer is written, not just the one being
+        // sent — the checkpoint is the window's state, not this request's.
+        crate::session::save(&self.session(cx), cx);
         view.update(cx, |view, cx| view.send(&engine, cx));
     }
 
@@ -296,8 +415,17 @@ impl Render for Workspace {
         let title = self
             .views
             .get(self.active_ix)
-            .map(|view| SharedString::from(view.read(cx).name.clone()))
+            .map(|view| view.read(cx).label(cx))
             .unwrap_or_else(|| SharedString::from("No request"));
+
+        // Collected before building elements: the closures below borrow `cx` mutably, so
+        // the labels can't be read from the views while they're alive.
+        let tabs: Vec<(usize, SharedString, bool)> = self
+            .views
+            .iter()
+            .enumerate()
+            .map(|(ix, view)| (ix, view.read(cx).label(cx), ix == self.active_ix))
+            .collect();
 
         // The window title tracks the request, so the taskbar entry is useful even
         // though we draw our own titlebar. Only written when it changes — this runs every
@@ -317,6 +445,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_response))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::cycle_method))
             .on_action(cx.listener(Self::cycle_method_back))
             .on_action(cx.listener(Self::add_header))
@@ -339,6 +471,7 @@ impl Render for Workspace {
             .text_sm()
             .relative()
             .child(crate::chrome::titlebar(title, &theme, window))
+            .children(tab_strip(tabs, &theme, cx))
             .children(self.active())
             .child(status_bar(focused_region, status_message, &theme))
             // Last, so the edge strips sit above the panes for hit-testing.
@@ -348,12 +481,84 @@ impl Render for Workspace {
 }
 
 
+/// The strip of open buffers.
+///
+/// Hidden entirely at one buffer: a single tab is a row of chrome that says nothing, and
+/// the window title already names the request. It appears the moment there's a choice to
+/// make, which is also the moment it starts carrying information.
+fn tab_strip(
+    tabs: Vec<(usize, SharedString, bool)>,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> Option<impl IntoElement> {
+    if tabs.len() < 2 {
+        return None;
+    }
+
+    Some(
+        div()
+            .id("tab-strip")
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_none()
+            .w_full()
+            // Many tabs must scroll rather than squeeze every label into illegibility.
+            // `overflow_x_scroll` lives on `StatefulInteractiveElement`, hence the `.id()`.
+            .overflow_x_scroll()
+            .bg(theme.bg_panel)
+            .border_b_1()
+            .border_color(theme.border)
+            .children(tabs.into_iter().map(|(ix, label, active)| {
+                div()
+                    .id(("tab", ix))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_none()
+                    .max_w(px(180.))
+                    // A long label must clip, not push its neighbours off the strip.
+                    .overflow_hidden()
+                    .px_3()
+                    .py_1()
+                    .border_r_1()
+                    .border_color(theme.border)
+                    // The active tab is marked by a top rule in the accent colour rather
+                    // than by text weight: reflowing on switch would shift every label.
+                    .border_t_2()
+                    .border_color(if active { theme.accent } else { theme.bg_panel })
+                    .bg(if active { theme.bg } else { theme.bg_panel })
+                    .text_xs()
+                    .text_color(if active { theme.text } else { theme.text_muted })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.bg_hover))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, _: &MouseDownEvent, window, cx| {
+                            workspace.activate(ix, window, cx);
+                        }),
+                    )
+                    // Middle-click closes, the convention every browser and editor shares.
+                    // It closes *that* tab, not the active one, so it activates first.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |workspace, _: &MouseDownEvent, window, cx| {
+                            workspace.activate(ix, window, cx);
+                            workspace.close_tab(&CloseTab, window, cx);
+                        }),
+                    )
+                    .child(label)
+            })),
+    )
+}
+
 fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Shift+H header · Ctrl+Enter send · Esc cancel · Alt+F/E fold";
+    const HINTS: &str = "Ctrl+T tab · Ctrl+Tab switch · Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Shift+H header · Ctrl+Enter send · Esc cancel";
 
     div()
         .flex()

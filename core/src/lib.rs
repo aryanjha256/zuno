@@ -22,6 +22,6 @@ pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;
 pub use request::{
     Body, FormField, Header, Method, MultipartField, MultipartValue, QueryParam, RawKind,
-    RequestId, RequestSettings, RequestSpec,
+    RequestId, RequestSettings, RequestSpec, label_for,
 };
 pub use response::{HttpVersion, ResponseData, SizeInfo, StatusClass, Timing};

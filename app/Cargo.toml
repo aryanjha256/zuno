@@ -8,6 +8,9 @@ gpui.workspace = true
 zuno-core.workspace = true
 
 bytes.workspace = true
+# The session envelope is defined here, not in core: which buffers are open is window
+# state, not part of the request model a future CLI would share.
+serde.workspace = true
 serde_json.workspace = true
 
 unicode-segmentation.workspace = true

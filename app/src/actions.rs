@@ -19,6 +19,11 @@ actions!(
         FocusResponse,
         FocusNext,
         FocusPrev,
+        // Buffers
+        NewTab,
+        CloseTab,
+        NextTab,
+        PrevTab,
         // Request editing
         CycleMethod,
         CycleMethodBack,

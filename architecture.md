@@ -725,18 +725,51 @@ Deliberately **not** pre-answered. Each got cheaper to decide once the loop work
 confident guess written down now would mislead more than it helps.
 
 **Persistence format.** "Local-first" fits both SQLite and a git-diffable file tree
-(Bruno-style, one file per request). My recommendation: **file tree for collections**
+(Bruno-style, one file per request). The recommendation stands: **file tree for collections**
 (git-diffable collections are a genuine differentiator and match the local-first
-philosophy) plus **SQLite for ephemeral state only** — history, response cache, window
-session. M1 needs neither: serde the scratch request to a single file on quit and move on.
-The `Serialize` derives from §3 keep this reversible.
+philosophy) plus **ephemeral state kept separately** — history, response cache, window session.
 
-**Tabs.** The hedge from the original §11 was taken: `Workspace` already owns
-`Vec<Entity<RequestView>>` with an `active_ix`, so the ownership shape is right and only the tab
-strip is missing. Two things are still undecided — what a *dirty* buffer means once requests come
-from collections rather than a scratch file, and whether curl import should replace the active
-buffer (what it does now) or open a new one. `RequestView::load` exists for the first behaviour;
-the second is a one-line change once tabs render.
+*Half of this is now decided and shipped.* The window-session half lives in `app/src/session.rs`
+as a versioned JSON envelope (`Session { version, active, tabs }`) — deliberately in `app/`, not
+`core/`, because which buffers are open is window state, not part of the request model a future
+CLI would share. JSON rather than SQLite for now: it's one file, one write on quit, and nothing
+about the shape forecloses moving history and the response cache into SQLite later, which is where
+that dependency would actually pay for itself. **Still open: the collections format itself** — the
+file tree above is a recommendation, not yet a commitment.
+
+The envelope reads M1's bare-`RequestSpec` file as a single tab, and that fallback *is* the
+migration path; see invariant 8 in `CLAUDE.md` for the constraint that keeps it working.
+
+**Tabs — decided and built.** `Workspace` owns `Vec<Entity<RequestView>>` with an `active_ix`,
+restores every saved buffer, and persists all of them on quit and on send.
+
+Three decisions worth recording, since each had a plausible alternative:
+
+- **Focus travels with the switch, via a single `activate`.** A `FocusHandle` belongs to the entity
+  that made it, so setting `active_ix` alone leaves focus in the old view — and after a close, in a
+  dropped one, where no key context matches and every binding silently stops working. Funnelling
+  all four verbs plus both mouse paths through `activate` is what makes that unforgettable rather
+  than a rule to remember. Rejected: letting each handler move focus itself, which is how the bug
+  gets reintroduced.
+- **Closing the last buffer opens a fresh one; it does not quit.** An empty `views` makes `active()`
+  return `None`, which every handler reads as "do nothing" — a window that is still there and
+  silently inert. Rejected: quitting on the last close, which conflates Ctrl+W with Ctrl+Q and can
+  lose work.
+- **Tab labels derive from the URL** (`label_for` in `core/src/request.rs`), not from
+  `RequestSpec::name`. Nothing can edit `name` — it's only ever set from the URL at import — so a
+  request since pointed elsewhere would keep advertising its old target, which is exactly what a
+  real session file showed. The derivation is shared with curl import's `derive_name` so the two
+  can't drift, and takes `&str`s rather than a `&RequestSpec` because the strip asks every buffer
+  every frame and `spec()` clones every header. A rename action should later prefer a user-set
+  `name`, which needs a way to distinguish "typed" from "guessed".
+
+Curl import now opens a **new** buffer. Replacing was only defensible while there was nowhere else
+to put the result; an import over unsaved work destroyed it with no undo. `RequestView::load`
+remains for genuine in-place replacement.
+
+Still deliberately **unanswered: what a *dirty* buffer means.** With no collections there is no
+saved baseline to be dirty against, so any meaning invented now would be rewritten when the
+collection format lands. Also absent by choice: tab reordering and renaming.
 
 **Where `Ctrl+P` and `Ctrl+K` get their content.** These are the thesis features from `what.md`
 and neither exists. Note the dependency: `Ctrl+P` "find any request" is meaningless until
@@ -763,6 +796,13 @@ features — the things that would make this Zed-like rather than Postman-like. 
 There is one request, no tabs, no collections, no palette.
 
 That's the honest framing to carry into M2: **the loop is excellent and the differentiator is
-unbuilt.** Also absent: syntax highlighting, a method dropdown (cycling only), horizontal scroll
-limits in the editor clamped per-line rather than per-document, a settings panel, and form or
-multipart body authoring.
+unbuilt.** Also absent: syntax highlighting, a method dropdown (cycling only), a settings panel,
+and form or multipart body authoring.
+
+**Known defect, not a missing feature.** The editor clamps horizontal scroll per-line rather than
+per-document, so the offset jumps when the cursor moves between lines of different lengths. It sat
+in the list above for a while, which is a good way for a bug to never get fixed — it isn't waiting
+on a milestone, it's just wrong.
+
+The counts in this section describe M1 as shipped and are deliberately not updated as work
+continues; `CLAUDE.md` carries the live test count.

@@ -289,9 +289,89 @@ impl RequestSpec {
     }
 }
 
+/// A short label for a tab strip or a picker row.
+///
+/// Takes the raw strings rather than a `&RequestSpec` because the caller that matters is
+/// a tab strip, and assembling a spec per tab per frame would clone every header — see
+/// `RequestView::spec`. Borrows, so the caller decides whether to allocate.
+///
+/// Derived from the **current URL** in preference to `name`, because nothing can edit
+/// `name` yet: it is only ever set from the URL at import time, so a request since pointed
+/// elsewhere would otherwise keep advertising its old target. `name` wins only when there's
+/// no URL to derive from — a brand-new buffer, where "Untitled" is the honest answer.
+///
+/// When a rename action exists this should prefer a user-set `name`, which needs a way to
+/// tell "the user typed this" from "the importer guessed it". There isn't one today.
+pub fn label_for<'a>(url: &'a str, name: &'a str) -> &'a str {
+    let derived = label_from_url(url);
+    if !derived.is_empty() {
+        derived
+    } else if !name.is_empty() {
+        name
+    } else {
+        "Untitled"
+    }
+}
+
+/// The last meaningful piece of a URL — its final path segment, or the host when there
+/// isn't one. Empty when nothing usable is there.
+fn label_from_url(url: &str) -> &str {
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let path = without_scheme.split(['?', '#']).next().unwrap_or("");
+
+    let segment = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .next_back()
+        .unwrap_or("");
+
+    if segment.is_empty() || segment.contains(':') {
+        // Bare host, or host:port — the segment found was the authority, not a path.
+        without_scheme.split(['/', '?', '#']).next().unwrap_or("")
+    } else {
+        segment
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_label_comes_from_the_last_path_segment() {
+        assert_eq!(label_for("https://api.example.com/v1/users", ""), "users");
+        // A trailing slash must not produce an empty label — real pasted URLs have them.
+        assert_eq!(label_for("https://api.example.com/v1/users/", ""), "users");
+        // Query and fragment are not part of the name.
+        assert_eq!(label_for("https://api.example.com/posts?page=2#top", ""), "posts");
+    }
+
+    #[test]
+    fn a_bare_host_labels_as_the_host() {
+        assert_eq!(label_for("https://api.example.com", ""), "api.example.com");
+        assert_eq!(label_for("http://localhost:8080", ""), "localhost:8080");
+    }
+
+    #[test]
+    fn a_label_tracks_the_url_rather_than_a_stale_name() {
+        // The case that motivated deriving: a request imported as one thing and since
+        // pointed somewhere else must not keep advertising the old target.
+        assert_eq!(
+            label_for("https://jsonplaceholder.typicode.com/posts", "anchorsForUser"),
+            "posts"
+        );
+    }
+
+    #[test]
+    fn nothing_to_derive_from_falls_back_to_the_name_then_to_untitled() {
+        // A brand-new buffer has no URL at all.
+        assert_eq!(label_for("", ""), "Untitled");
+        assert_eq!(label_for("", "Scratch"), "Scratch");
+        // A URL that is only a scheme is as good as empty.
+        assert_eq!(label_for("https://", ""), "Untitled");
+        // Partially typed, which is what the strip sees on most keystrokes.
+        assert_eq!(label_for("https://api.exa", ""), "api.exa");
+    }
 
     #[test]
     fn disabled_rows_are_excluded_from_the_wire() {

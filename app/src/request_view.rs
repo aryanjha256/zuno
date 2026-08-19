@@ -205,6 +205,14 @@ impl RequestView {
         cx.notify();
     }
 
+    /// This buffer's tab label, derived live from the URL as it's typed.
+    ///
+    /// Deliberately *not* `spec(cx).label()`: the strip asks every buffer for this on every
+    /// frame, and `spec` clones the URL, every header, every query param, and the body.
+    pub fn label(&self, cx: &App) -> SharedString {
+        SharedString::from(zuno_core::label_for(self.url.read(cx).text(), &self.name).to_string())
+    }
+
     /// Assemble the request exactly as it currently appears on screen.
     ///
     /// This is what M1.2's engine will send and what M2 will persist. Both get the

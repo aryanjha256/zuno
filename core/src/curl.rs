@@ -353,30 +353,14 @@ fn parse_form_field(raw: &str) -> Option<MultipartField> {
 
 /// A readable name from the URL's last path segment, so an imported request isn't
 /// called "Untitled".
+///
+/// Shares `label_from_url` with `RequestSpec::label` — the tab strip wants the same
+/// derivation, and two copies would drift.
 fn derive_name(url: &str) -> String {
-    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
-    let path = without_scheme.split(['?', '#']).next().unwrap_or("");
-
-    let segment = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .next_back()
-        .unwrap_or("");
-
-    if segment.is_empty() || segment.contains(':') {
-        // Bare host, or host:port — use the host itself.
-        let host = without_scheme
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("Imported");
-        if host.is_empty() {
-            "Imported".to_string()
-        } else {
-            host.to_string()
-        }
-    } else {
-        segment.to_string()
-    }
+    // "Imported" rides in as the fallback name, which is precisely what `label_for`'s
+    // second argument is for. Sharing the derivation with the tab strip means the two
+    // can't drift.
+    crate::request::label_for(url, "Imported").to_string()
 }
 
 // ---------------------------------------------------------------------------
