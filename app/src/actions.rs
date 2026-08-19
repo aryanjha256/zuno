@@ -28,6 +28,7 @@ actions!(
         RemoveRow,
         // Request lifecycle
         SendRequest,
+        CancelRequest,
         // Application
         ToggleTheme,
         Quit,

@@ -10,17 +10,38 @@
 //! Fields that aren't text (`method`, `body`, `settings`, row `enabled` flags) are
 //! plain state here, since nothing else owns them.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, div, px,
+    SharedString, Styled, Task, Window, div, px,
 };
 use zuno_core::{
-    Body, Header, Method, QueryParam, RequestId, RequestSettings, RequestSpec, ResponseData,
+    Body, Engine, EngineError, Event, Header, JobId, Method, QueryParam, RequestId, RequestSettings,
+    RequestSpec, ResponseData,
 };
 
 use crate::input::TextInput;
 use crate::theme::ActiveTheme;
 use crate::{request_pane, response_pane};
+
+/// What's known about a request that hasn't finished yet.
+///
+/// Populated incrementally from the engine's event stream, which is the point of the
+/// stream existing: status and headers land at TTFB, byte counts while the body
+/// downloads.
+pub struct InFlight {
+    pub job: JobId,
+    pub status: Option<(u16, String)>,
+    pub headers: Vec<Header>,
+    pub ttfb: Option<Duration>,
+    pub received: usize,
+    pub total: Option<usize>,
+    /// Holding the task is what keeps the event loop alive; dropping it stops
+    /// consumption. Never read — that's the whole contract.
+    _task: Task<()>,
+}
 
 /// One editable row of the headers or query tables. `enabled` lives here rather
 /// than in the inputs because muting a row must not disturb what you typed.
@@ -70,6 +91,8 @@ pub struct RequestView {
     pub settings: RequestSettings,
 
     pub response: Option<ResponseData>,
+    pub inflight: Option<InFlight>,
+    pub error: Option<EngineError>,
     pub status: Option<SharedString>,
 
     pub body_focus: FocusHandle,
@@ -113,7 +136,11 @@ impl RequestView {
             query,
             body: spec.body,
             settings: spec.settings,
-            response: Some(ResponseData::sample()),
+            // No canned response any more — the pane starts empty and fills from a
+            // real request.
+            response: None,
+            inflight: None,
+            error: None,
             status: None,
             // Higher than the inputs' default 0, so Tab reaches every text field
             // first and only then leaves for the body and response panes.
@@ -157,6 +184,122 @@ impl RequestView {
 
     pub fn url_focus(&self, cx: &App) -> FocusHandle {
         self.url.read(cx).focus_handle(cx)
+    }
+
+    // ---- the send loop ------------------------------------------------------
+
+    /// Submit the request as it currently appears on screen.
+    pub fn send(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) {
+        // Hitting Send again must abandon the previous attempt immediately. Without
+        // this, a rapid resend leaves the old socket draining and the new response can
+        // land behind a stale one.
+        self.cancel(engine, cx);
+
+        let spec = self.spec(cx);
+        let (job, events) = engine.send(spec);
+
+        self.error = None;
+        self.response = None;
+        self.status = None;
+
+        // Consume the event stream on the foreground executor. `update` fails once the
+        // view is gone, which ends the loop.
+        let task = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                match this.update(cx, |this, cx| this.apply(event, cx)) {
+                    Ok(true) => {}
+                    _ => break,
+                }
+            }
+        });
+
+        self.inflight = Some(InFlight {
+            job,
+            status: None,
+            headers: Vec::new(),
+            ttfb: None,
+            received: 0,
+            total: None,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    /// Returns false when the event should end the loop.
+    fn apply(&mut self, event: Event, cx: &mut Context<Self>) -> bool {
+        // A cancelled or superseded job can still have events queued. Ignore anything
+        // that isn't the request we're currently waiting on.
+        let Some(current) = self.inflight.as_ref().map(|inflight| inflight.job) else {
+            return false;
+        };
+        if event.job() != current {
+            return true;
+        }
+
+        match event {
+            Event::Done { response, .. } => {
+                timing!(
+                    "request  ttfb {:>9.2?}  total {:>9.2?}  {} bytes",
+                    response.timing.ttfb,
+                    response.timing.total,
+                    response.size.decoded
+                );
+                self.inflight = None;
+                self.response = Some(*response);
+                cx.notify();
+                false
+            }
+            Event::Failed { error, .. } => {
+                self.inflight = None;
+                self.error = Some(error);
+                cx.notify();
+                false
+            }
+            Event::Started { .. } => true,
+            Event::Head {
+                status,
+                status_text,
+                headers,
+                ttfb,
+                ..
+            } => {
+                if let Some(inflight) = self.inflight.as_mut() {
+                    inflight.status = Some((status, status_text));
+                    inflight.headers = headers;
+                    inflight.ttfb = Some(ttfb);
+                }
+                cx.notify();
+                true
+            }
+            Event::Progress {
+                received, total, ..
+            } => {
+                if let Some(inflight) = self.inflight.as_mut() {
+                    inflight.received = received;
+                    inflight.total = total;
+                }
+                cx.notify();
+                true
+            }
+        }
+    }
+
+    /// Abandon an in-flight request. Returns whether there was one.
+    ///
+    /// Cancellation has two halves and needs both: dropping the task stops the UI
+    /// consuming events, and `Engine::cancel` is what actually stops the socket.
+    pub fn cancel(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) -> bool {
+        let Some(inflight) = self.inflight.take() else {
+            return false;
+        };
+        engine.cancel(inflight.job);
+        drop(inflight);
+        cx.notify();
+        true
+    }
+
+    pub fn is_sending(&self) -> bool {
+        self.inflight.is_some()
     }
 
     // ---- structural edits ---------------------------------------------------

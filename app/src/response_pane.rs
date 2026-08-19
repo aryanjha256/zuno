@@ -1,17 +1,22 @@
 //! The response half of a buffer: status, timing, headers, body.
 //!
-//! The body is rendered as plain monospace lines here. In M1.3 this becomes
-//! `JsonOutline` + `uniform_list` so a 50MB payload stays at 60fps; the plain
-//! renderer is deliberately throwaway rather than a half-built tokenizer.
+//! Four states, and the in-flight one is the reason the engine reports a stream rather
+//! than a single future: status and headers paint at TTFB, and a downloading body shows
+//! bytes arriving instead of a frozen pane.
+//!
+//! The body renders as plain monospace lines. M1.3 replaces that with `JsonOutline` +
+//! `uniform_list` so a 50MB payload stays at 60fps; a throwaway renderer beats a
+//! half-built tokenizer in the meantime.
+
+use std::time::Duration;
 
 use gpui::{
     Div, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use std::time::Duration;
-use zuno_core::{Header, ResponseData};
+use zuno_core::{EngineError, Header, ResponseData, StatusClass};
 
-use crate::request_view::RequestView;
+use crate::request_view::{InFlight, RequestView};
 use crate::theme::Theme;
 
 pub fn render(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoElement {
@@ -30,16 +35,124 @@ pub fn render(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoEl
         .border_l_1()
         .border_color(theme.focus_border(focused));
 
+    // Order matters: an in-flight request outranks the previous response, and an error
+    // outranks a stale success.
+    if let Some(inflight) = &view.inflight {
+        return pane.child(in_flight(inflight, theme));
+    }
+    if let Some(error) = &view.error {
+        return pane.child(failure(error, theme));
+    }
     match &view.response {
         Some(response) => pane
             .child(status_line(response, theme))
             .child(section_header("Headers", theme))
-            .child(headers_table(response, theme))
+            .child(headers_table(&response.headers, theme))
             .child(section_header("Body", theme))
             .child(body_region(response, theme)),
         None => pane.child(empty_state(theme)),
     }
 }
+
+// ---------------------------------------------------------------------------
+// In flight
+// ---------------------------------------------------------------------------
+
+fn in_flight(inflight: &InFlight, theme: &Theme) -> Div {
+    let headline = match &inflight.status {
+        // Status known already — the response head arrived, the body is still coming.
+        Some((status, text)) => SharedString::from(format!("{status} {text}")),
+        None => SharedString::from("Waiting for response…"),
+    };
+    let status_color = inflight
+        .status
+        .as_ref()
+        .map(|(status, _)| theme.status_color(StatusClass::of(*status)))
+        .unwrap_or(theme.text_muted);
+
+    let progress = match (inflight.received, inflight.total) {
+        (0, _) => SharedString::from("Ctrl+C or Escape to cancel"),
+        (received, Some(total)) => SharedString::from(format!(
+            "{} of {} ({:.0}%)",
+            format_bytes(received as u64),
+            format_bytes(total as u64),
+            (received as f64 / total.max(1) as f64) * 100.0
+        )),
+        (received, None) => SharedString::from(format!("{} received", format_bytes(received as u64))),
+    };
+
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(status_color)
+                .child(headline),
+        )
+        .child(div().text_xs().text_color(theme.text_muted).child(progress));
+
+    if let Some(ttfb) = inflight.ttfb {
+        column = column.child(
+            div()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(format!("TTFB {}", format_duration(ttfb))),
+        );
+    }
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .p_4()
+        .child(column)
+}
+
+// ---------------------------------------------------------------------------
+// Failure
+// ---------------------------------------------------------------------------
+
+fn failure(error: &EngineError, theme: &Theme) -> Div {
+    // A local failure means nothing left the machine — worth saying, because it tells
+    // the user this is their request to fix, not the network's.
+    let (label, label_color) = if error.is_local() {
+        ("Request not sent", theme.status_client_error)
+    } else {
+        ("Request failed", theme.status_server_error)
+    };
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .p_4()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(label_color)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .max_w(px(460.))
+                .text_xs()
+                .text_color(theme.text)
+                .child(error.to_string()),
+        )
+}
+
+// ---------------------------------------------------------------------------
+// Completed response
+// ---------------------------------------------------------------------------
 
 fn status_line(response: &ResponseData, theme: &Theme) -> Div {
     let status_color = theme.status_color(response.status_class());
@@ -74,14 +187,22 @@ fn status_line(response: &ResponseData, theme: &Theme) -> Div {
             format!("TTFB {}", format_duration(response.timing.ttfb)),
             theme,
         ))
-        .child(meta(
-            format!(
-                "{} on the wire · {} decoded",
-                format_bytes(response.size.wire),
-                format_bytes(response.size.decoded)
-            ),
-            theme,
-        ))
+        .child(meta(size_label(response), theme))
+}
+
+/// Wire size is only interesting when it differs from decoded — that difference is how
+/// you see compression happened. reqwest drops Content-Length once it decompresses, in
+/// which case there is nothing to compare.
+fn size_label(response: &ResponseData) -> String {
+    if response.size.wire == response.size.decoded {
+        format_bytes(response.size.decoded)
+    } else {
+        format!(
+            "{} on the wire · {} decoded",
+            format_bytes(response.size.wire),
+            format_bytes(response.size.decoded)
+        )
+    }
 }
 
 fn meta(text: impl Into<SharedString>, theme: &Theme) -> Div {
@@ -104,11 +225,11 @@ fn section_header(title: &str, theme: &Theme) -> Div {
         .child(title.to_string())
 }
 
-fn headers_table(response: &ResponseData, theme: &Theme) -> Div {
+fn headers_table(headers: &[Header], theme: &Theme) -> Div {
     div()
         .flex()
         .flex_col()
-        .children(response.headers.iter().map(|header| header_row(header, theme)))
+        .children(headers.iter().map(|header| header_row(header, theme)))
 }
 
 fn header_row(header: &Header, theme: &Theme) -> Div {
@@ -144,9 +265,10 @@ fn header_row(header: &Header, theme: &Theme) -> Div {
 
 fn body_region(response: &ResponseData, theme: &Theme) -> impl IntoElement {
     let lines: Vec<String> = match response.body_as_str() {
+        Some("") => vec!["(empty body)".to_string()],
         Some(text) => text.lines().map(str::to_string).collect(),
-        // A non-UTF-8 body is a normal outcome, not an error. M1.3 gives it a
-        // real hex view.
+        // A non-UTF-8 body is a normal outcome, not an error. M1.3 gives it a real hex
+        // view.
         None => vec![format!(
             "{} of binary data ({})",
             format_bytes(response.body.len() as u64),
@@ -184,6 +306,10 @@ fn empty_state(theme: &Theme) -> Div {
                 .child("Ctrl+Enter to send".to_string()),
         )
 }
+
+// ---------------------------------------------------------------------------
+// Formatting
+// ---------------------------------------------------------------------------
 
 /// Sub-millisecond responses are real (localhost), so don't round them to "0 ms".
 fn format_duration(duration: Duration) -> String {

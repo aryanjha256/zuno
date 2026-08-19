@@ -12,6 +12,29 @@ zuno-core = { path = "core" }
 
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+http = "1"
+
+# HTTP. Used directly rather than through gpui's re-exported `http_client`, which is
+# shaped for Zed's own fetching (GitHub release downloads, proxy plumbing). An API
+# testing client needs the opposite of an abstraction: per-request TLS and redirect
+# control, streaming bodies, and raw header access. See architecture.md §9.
+reqwest = { version = "0.13", default-features = false, features = [
+    # 0.13 renamed the TLS features: `rustls-tls` became `rustls`.
+    "rustls",
+    "stream",
+    "gzip",
+    "brotli",
+    "deflate",
+    "zstd",
+    "cookies",
+    "http2",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+url = "2"
+# Runtime-agnostic channel: written from tokio tasks, awaited on gpui's smol executor.
+async-channel = "2"
+futures-util = "0.3"
 # Grapheme-aware cursor movement. Already in the tree via gpui, so this pins the
 # same version rather than adding a second copy.
 unicode-segmentation = "1.13"

@@ -1,0 +1,39 @@
+version: 2
+
+updates:
+  # Rust dependencies. All of Zuno's versions are declared in the root
+  # `[workspace.dependencies]` table, so Dependabot only needs the workspace root.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+    groups:
+      # Patch bumps are almost never interesting individually, so batch them into one
+      # PR. Minor and major updates are deliberately left ungrouped — see below.
+      cargo-patch:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+
+    # Why minor updates get their own PR:
+    #
+    # For a `0.x` crate the minor number is effectively the major — `reqwest = "0.12"`
+    # expands to `>=0.12.0, <0.13.0` and can never reach 0.13. Dependabot still labels
+    # 0.12 -> 0.13 as a *minor* update, so batching minors would bury exactly the kind
+    # of change that needs review. Zuno already shipped one milestone a full major line
+    # behind for this reason (architecture.md §9), so these stay individually visible.
+
+  # Keep the CI workflow's actions current too; `actions/checkout@v4` goes stale
+  # quietly and nothing in the build fails to tell you.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

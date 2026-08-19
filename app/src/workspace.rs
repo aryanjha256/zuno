@@ -14,9 +14,10 @@ use gpui::{
 use zuno_core::RequestSpec;
 
 use crate::actions::{
-    AddHeader, AddQuery, CycleMethod, CycleMethodBack, FocusBody, FocusNext, FocusPrev,
-    FocusResponse, FocusUrl, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
+    FocusPrev, FocusResponse, FocusUrl, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
 };
+use crate::engine::ActiveEngine;
 use crate::request_view::{RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
@@ -132,22 +133,25 @@ impl Workspace {
         cx.refresh_windows();
     }
 
-    /// Placeholder until the engine lands in M1.2.
-    ///
-    /// Assembling and dumping the spec is the honest stand-in: it shows exactly what
-    /// *would* go on the wire, and it's the acceptance test for M1.1 — type a
-    /// request, see the correct spec come back.
     fn send_request(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
-        let spec = view.read(cx).spec(cx);
 
-        eprintln!("{spec:#?}");
+        let Some(engine) = cx.engine() else {
+            self.set_status("The HTTP engine failed to start — restart Zuno", cx);
+            return;
+        };
 
-        let summary = describe_spec(&spec);
-        view.update(cx, |view, cx| {
-            view.status = Some(summary);
-            cx.notify();
-        });
+        view.update(cx, |view, cx| view.send(&engine, cx));
+    }
+
+    fn cancel_request(&mut self, _: &CancelRequest, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let Some(engine) = cx.engine() else { return };
+
+        let cancelled = view.update(cx, |view, cx| view.cancel(&engine, cx));
+        if cancelled {
+            self.set_status("Cancelled", cx);
+        }
     }
 
     fn set_status(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -190,24 +194,6 @@ impl Workspace {
     }
 }
 
-/// A one-line summary of what would be sent. Counts only enabled rows, since
-/// that's what actually goes on the wire.
-pub fn describe_spec(spec: &RequestSpec) -> SharedString {
-    let url = if spec.url.is_empty() {
-        "(no url)"
-    } else {
-        spec.url.as_str()
-    };
-    SharedString::from(format!(
-        "{} {} · {} headers · {} query · body {} — spec dumped to stderr (engine lands in M1.2)",
-        spec.method.as_str(),
-        url,
-        spec.enabled_headers().count(),
-        spec.enabled_query().count(),
-        spec.body.label(),
-    ))
-}
-
 impl Focusable for Workspace {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -242,6 +228,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::remove_row))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::send_request))
+            .on_action(cx.listener(Self::cancel_request))
             .size_full()
             .flex()
             .flex_col()
@@ -277,7 +264,7 @@ fn titlebar(title: SharedString, theme: &Theme) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child("M1.1 · editable".to_string()),
+                        .child("M1.2 · live".to_string()),
                 ),
         )
         .child(
@@ -293,7 +280,7 @@ fn status_bar(
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+M method · Ctrl+Shift+H header · Ctrl+Shift+Y query · Alt+T mute · Ctrl+Shift+K delete · Ctrl+Enter send";
+    const HINTS: &str = "Ctrl+M method · Ctrl+Shift+H header · Alt+T mute · Ctrl+Enter send · Esc cancel";
 
     div()
         .flex()

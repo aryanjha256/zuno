@@ -4,7 +4,11 @@
 //! input are real; the HTTP engine (M1.2) and the multi-line body editor (M1.4) are
 //! not. See architecture.md §10.
 
+#[macro_use]
+mod timing;
+
 mod actions;
+mod engine;
 mod input;
 mod request_pane;
 mod request_view;
@@ -22,8 +26,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddHeader, AddQuery, CycleMethod, CycleMethodBack, FocusBody, FocusNext, FocusPrev,
-    FocusResponse, FocusUrl, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
+    FocusPrev, FocusResponse, FocusUrl, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
 };
 use crate::input::text_input;
 use crate::theme::{Appearance, Theme};
@@ -35,21 +39,17 @@ use crate::workspace::Workspace;
 /// startup is GPUI platform init before any Zuno code runs — see architecture.md §8.
 struct Boot {
     start: Instant,
-    enabled: bool,
 }
 
 impl Boot {
     fn new() -> Self {
         Self {
             start: Instant::now(),
-            enabled: std::env::var_os("ZUNO_TIMING").is_some(),
         }
     }
 
     fn mark(&self, stage: &str) {
-        if self.enabled {
-            eprintln!("[zuno] {stage:<20} {:>9.2?}", self.start.elapsed());
-        }
+        timing!("{stage:<20} {:>9.2?}", self.start.elapsed());
     }
 }
 
@@ -64,6 +64,14 @@ fn main() {
         register_keymap(cx);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         boot.mark("theme + keymap");
+
+        // A failure here is reported inline on the first send rather than blocking
+        // startup — an API client that won't open because a thread failed to spawn is
+        // worse than one that opens and explains itself.
+        if let Err(error) = engine::install(cx) {
+            eprintln!("[zuno] could not start the HTTP engine: {error}");
+        }
+        boot.mark("engine");
 
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
         cx.open_window(
@@ -118,6 +126,7 @@ fn register_keymap(cx: &mut App) {
         // --- Request lifecycle ---
         KeyBinding::new("ctrl-enter", SendRequest, None),
         KeyBinding::new("enter", SendRequest, Some("UrlBar")),
+        KeyBinding::new("escape", CancelRequest, None),
         // --- Application ---
         KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
         KeyBinding::new("ctrl-q", Quit, None),

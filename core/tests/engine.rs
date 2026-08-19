@@ -1,0 +1,386 @@
+//! End-to-end engine tests against a real socket.
+//!
+//! M1.2's acceptance criterion is "a real request goes out, real bytes come back, and
+//! Escape cancels mid-flight". A mocked transport would prove none of that, so these
+//! run against a throwaway HTTP server on localhost — about 60 lines of `std::net`,
+//! no test dependencies.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread::JoinHandle;
+use std::time::Duration;
+
+use zuno_core::{Body, Engine, EngineError, Event, Header, Method, RawKind, RequestSpec};
+
+// ---------------------------------------------------------------------------
+// A minimal one-shot HTTP server
+// ---------------------------------------------------------------------------
+
+/// Accept one connection, capture the raw request, reply with `response`.
+/// Returns the base URL and a handle yielding the request text the client sent.
+fn serve_once(response: &'static str) -> (String, JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let request = read_request(&mut stream);
+        stream.write_all(response.as_bytes()).expect("write");
+        stream.flush().expect("flush");
+        request
+    });
+
+    (format!("http://{addr}"), handle)
+}
+
+/// Accept one connection and then never reply, so a request stays in flight.
+fn serve_never() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let handle = std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            // Hold the connection open until the test process exits.
+            std::thread::sleep(Duration::from_secs(60));
+            drop(stream);
+        }
+    });
+
+    (format!("http://{addr}"), handle)
+}
+
+/// Read headers, then exactly `Content-Length` more bytes. A single `read` can split
+/// mid-request, which would make assertions about the body flaky.
+fn read_request(stream: &mut TcpStream) -> String {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+
+    loop {
+        let read = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if let Some(end) = find_subslice(&buffer, b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buffer[..end]).to_string();
+            let expected = content_length(&head);
+            if buffer.len() - (end + 4) >= expected {
+                break;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&buffer).to_string()
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn content_length(head: &str) -> usize {
+    head.lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|line| line.split(':').nth(1))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Drain a job's event stream to completion, returning every event in order.
+fn drain(events: &async_channel_shim::Receiver) -> Vec<Event> {
+    let mut collected = Vec::new();
+    while let Ok(event) = events.recv_blocking() {
+        collected.push(event);
+    }
+    collected
+}
+
+/// The engine returns `async_channel::Receiver<Event>`; alias it so tests don't need
+/// async-channel as a direct dependency.
+mod async_channel_shim {
+    pub type Receiver = async_channel::Receiver<zuno_core::Event>;
+}
+
+fn spec_for(url: String) -> RequestSpec {
+    RequestSpec {
+        url,
+        // Short, so a broken cancel fails fast instead of hanging for 30s.
+        settings: zuno_core::RequestSettings {
+            timeout: Some(Duration::from_secs(3)),
+            ..Default::default()
+        },
+        ..RequestSpec::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const OK_JSON: &str = "HTTP/1.1 200 OK\r\n\
+     Content-Type: application/json\r\n\
+     Content-Length: 11\r\n\
+     \r\n\
+     {\"ok\":true}";
+
+#[test]
+fn a_real_request_goes_out_and_real_bytes_come_back() {
+    let (base, server) = serve_once(OK_JSON);
+    let engine = Engine::new().expect("engine");
+
+    let mut spec = spec_for(format!("{base}/health"));
+    spec.headers = vec![Header::new("X-Zuno-Test", "1")];
+
+    let (job, events) = engine.send(spec);
+    let events = drain(&events);
+
+    // What the server actually received.
+    let request = server.join().expect("server thread");
+    assert!(
+        request.starts_with("GET /health HTTP/1.1\r\n"),
+        "unexpected request line in:\n{request}"
+    );
+    assert!(
+        request.to_ascii_lowercase().contains("x-zuno-test: 1"),
+        "custom header missing from:\n{request}"
+    );
+
+    // Every event belongs to the job we submitted.
+    assert!(events.iter().all(|event| event.job() == job));
+
+    assert!(
+        matches!(events.first(), Some(Event::Started { .. })),
+        "first event should be Started, got {:?}",
+        events.first()
+    );
+
+    // Head must arrive before the body is complete — that's what lets the status line
+    // paint at TTFB rather than at completion.
+    let head_ix = events
+        .iter()
+        .position(|event| matches!(event, Event::Head { .. }))
+        .expect("a Head event");
+    let done_ix = events
+        .iter()
+        .position(|event| matches!(event, Event::Done { .. }))
+        .expect("a Done event");
+    assert!(head_ix < done_ix, "Head must precede Done");
+
+    let Some(Event::Head { status, headers, .. }) = events.get(head_ix) else {
+        unreachable!()
+    };
+    assert_eq!(*status, 200);
+    assert!(headers.iter().any(|h| h.name == "content-type"));
+
+    let Some(Event::Done { response, .. }) = events.get(done_ix) else {
+        unreachable!()
+    };
+    assert_eq!(response.status, 200);
+    assert_eq!(response.status_text, "OK");
+    assert_eq!(response.body_as_str(), Some("{\"ok\":true}"));
+    assert_eq!(response.size.decoded, 11);
+    assert_eq!(
+        response.content_type(),
+        Some("application/json"),
+        "response headers should be readable by name"
+    );
+    assert!(
+        response.timing.total >= response.timing.ttfb,
+        "total ({:?}) must not be less than ttfb ({:?})",
+        response.timing.total,
+        response.timing.ttfb
+    );
+}
+
+#[test]
+fn a_post_sends_its_body_and_a_derived_content_type() {
+    let (base, server) = serve_once(OK_JSON);
+    let engine = Engine::new().expect("engine");
+
+    let mut spec = spec_for(format!("{base}/items"));
+    spec.method = Method::Post;
+    spec.body = Body::Raw {
+        text: "{\"name\":\"zuno\"}".to_string(),
+        kind: RawKind::Json,
+    };
+
+    let (_, events) = engine.send(spec);
+    drain(&events);
+
+    let request = server.join().expect("server thread");
+    assert!(request.starts_with("POST /items HTTP/1.1\r\n"), "{request}");
+    assert!(
+        request.to_ascii_lowercase().contains("content-type: application/json"),
+        "Content-Type should be filled in from the body kind:\n{request}"
+    );
+    assert!(
+        request.ends_with("{\"name\":\"zuno\"}"),
+        "body missing from:\n{request}"
+    );
+}
+
+#[test]
+fn query_params_reach_the_request_line() {
+    let (base, server) = serve_once(OK_JSON);
+    let engine = Engine::new().expect("engine");
+
+    let mut spec = spec_for(format!("{base}/search?q=rust"));
+    spec.query = vec![
+        zuno_core::QueryParam::new("page", "2"),
+        zuno_core::QueryParam {
+            enabled: false,
+            name: "debug".into(),
+            value: "1".into(),
+        },
+    ];
+
+    let (_, events) = engine.send(spec);
+    drain(&events);
+
+    let request = server.join().expect("server thread");
+    assert!(
+        request.starts_with("GET /search?q=rust&page=2 HTTP/1.1\r\n"),
+        "unexpected request line in:\n{request}"
+    );
+    assert!(!request.contains("debug"), "disabled param was sent:\n{request}");
+}
+
+#[test]
+fn a_local_failure_never_touches_the_network() {
+    let engine = Engine::new().expect("engine");
+
+    // No server, no listener — this must fail before any socket is opened.
+    let spec = spec_for("{{baseUrl}}/users".to_string());
+    let (_, events) = engine.send(spec);
+    let events = drain(&events);
+
+    let failure = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Failed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("a Failed event");
+
+    assert!(matches!(failure, EngineError::UnresolvedVariable { .. }));
+    assert!(failure.is_local(), "{failure:?} should be classed as local");
+    assert!(
+        !events.iter().any(|event| matches!(event, Event::Head { .. })),
+        "a local failure must not produce a Head event"
+    );
+}
+
+#[test]
+fn a_refused_connection_is_reported_as_a_connect_error() {
+    let engine = Engine::new().expect("engine");
+
+    // Bind then immediately drop, so the port is almost certainly closed.
+    let addr = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr")
+    };
+
+    let (_, events) = engine.send(spec_for(format!("http://{addr}/")));
+    let events = drain(&events);
+
+    let failure = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Failed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("a Failed event");
+
+    assert!(
+        matches!(failure, EngineError::Connect { .. }),
+        "expected a Connect error, got {failure:?}"
+    );
+    assert!(!failure.is_local());
+}
+
+#[test]
+fn cancel_abandons_a_request_mid_flight() {
+    let (base, _server) = serve_never();
+    let engine = Engine::new().expect("engine");
+
+    let (job, events) = engine.send(spec_for(format!("{base}/slow")));
+
+    // Wait for the job to actually start before cancelling, so this tests
+    // cancellation rather than a race with submission.
+    let first = events.recv_blocking().expect("Started");
+    assert!(matches!(first, Event::Started { .. }));
+
+    engine.cancel(job);
+
+    // Aborting the task drops the sender, which closes the channel with no terminal
+    // event. If cancel were a no-op we'd instead see Failed(Timeout) after 3s.
+    let remaining = drain(&events);
+    assert!(
+        !remaining.iter().any(Event::is_terminal),
+        "cancelled job still produced a terminal event: {remaining:?}"
+    );
+}
+
+/// Localhost tests never exercise DNS, rustls, ALPN, or content decoding. This one
+/// does — and is `#[ignore]`d so CI never depends on the internet.
+///
+/// Run with: `cargo test -p zuno-core --test engine -- --ignored`
+#[test]
+#[ignore = "requires network access"]
+fn a_real_https_request_works_end_to_end() {
+    let engine = Engine::new().expect("engine");
+
+    let mut spec = spec_for("https://example.com/".to_string());
+    spec.settings.timeout = Some(Duration::from_secs(20));
+    spec.headers = vec![Header::new("Accept", "text/html")];
+
+    let (_, events) = engine.send(spec);
+    let events = drain(&events);
+
+    if let Some(Event::Failed { error, .. }) = events.iter().find(|e| e.is_terminal()) {
+        panic!("live request failed: {error}");
+    }
+
+    let Some(Event::Done { response, .. }) = events.iter().find(|e| e.is_terminal()) else {
+        panic!("no terminal event: {events:?}");
+    };
+
+    assert_eq!(response.status, 200);
+    assert!(!response.body.is_empty(), "empty body over TLS");
+    assert!(
+        response.timing.ttfb > Duration::ZERO,
+        "TTFB should be measurable over a real network"
+    );
+    eprintln!(
+        "live: {} {} · {} · ttfb {:?} · total {:?} · {} bytes decoded",
+        response.status,
+        response.status_text,
+        response.version.as_str(),
+        response.timing.ttfb,
+        response.timing.total,
+        response.size.decoded
+    );
+}
+
+#[test]
+fn the_connection_pool_survives_a_resend() {
+    // Two sends with identical settings must reuse one client — that reuse is what
+    // makes hitting Send twice feel instant.
+    let engine = Engine::new().expect("engine");
+
+    for _ in 0..2 {
+        let (base, server) = serve_once(OK_JSON);
+        let (_, events) = engine.send(spec_for(format!("{base}/ping")));
+        let events = drain(&events);
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::Done { .. })),
+            "resend did not complete: {events:?}"
+        );
+        server.join().expect("server thread");
+    }
+}

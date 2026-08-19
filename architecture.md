@@ -41,10 +41,11 @@ zuno/
 │       ├── lib.rs          ✅
 │       ├── request.rs      ✅ RequestSpec, Method, Header, Body
 │       ├── response.rs     ✅ ResponseData, Timing, SizeInfo, StatusClass
-│       ├── engine/            (M1.2)
-│       │   ├── mod.rs         Engine handle, Job, Event
-│       │   ├── build.rs       RequestSpec -> reqwest::Request
-│       │   └── run.rs         tokio runtime, execution, cancellation
+│       ├── engine/         ✅
+│       │   ├── mod.rs      ✅ Engine handle, Command, Event, client cache
+│       │   ├── error.rs    ✅ EngineError — owned, Clone, renderable
+│       │   ├── build.rs    ✅ RequestSpec -> reqwest::Request (pure, unit-tested)
+│       │   └── run.rs      ✅ execution, streaming, event emission
 │       ├── json/              (M1.3)
 │       │   ├── mod.rs         JsonOutline (the stable interface)
 │       │   └── flatten.rs     bytes -> Vec<Row> (swappable parser)
@@ -53,8 +54,10 @@ zuno/
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
     └── src/
-        ├── main.rs         ✅ bootstrap: window, keymap, theme, boot timing
+        ├── main.rs         ✅ bootstrap: window, keymap, theme, engine, boot timing
         ├── actions.rs      ✅ every keyboard-reachable verb, in one place
+        ├── engine.rs       ✅ the Engine as a global (one pool per process)
+        ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
         ├── request_view.rs ✅ one buffer: inputs + response + derived spec()
@@ -174,6 +177,16 @@ pub struct Timing {
 
 `body: Bytes` is load-bearing. It makes the body cheap to clone into a background task, and
 it's what lets the JSON viewer hold *byte spans* instead of copied strings (§6).
+
+**Two limitations found while implementing M1.2**, both inherited from reqwest:
+
+- **Response header order is not wire order.** `http::HeaderMap`'s iteration order across
+  different names is an implementation detail. Duplicates of the *same* name do stay in
+  received order, so `collect_headers` stable-sorts by name: deterministic and readable,
+  without scrambling duplicates. True wire order needs a lower-level client than reqwest.
+- **`Timing.dns` / `connect` / `tls` stay `None`.** reqwest exposes no per-stage connection
+  timings; getting them needs a custom hyper connector. `ttfb` and `total` are real. This is
+  exactly why those three were typed as `Option` from the start rather than `Duration`.
 
 ---
 
@@ -382,8 +395,8 @@ The numbers that make "Zed-level feel" testable rather than aspirational:
 |---|---|---|
 | Cold start → interactive window | **< 100 ms** | 189 ms (M1.0, release, warm) — see below |
 | Keystroke → glyph painted | **< 16 ms** (one frame) | — (M1.1) |
-| `Send` keypress → bytes on wire | **< 5 ms** | — (M1.2) |
-| Response arrives → status + headers painted | **< 50 ms** (at TTFB, not completion) | — (M1.2) |
+| `Send` keypress → bytes on wire | **< 5 ms** | not yet isolated |
+| Response arrives → status + headers painted | **< 50 ms** (at TTFB, not completion) | structural ✅ |
 | 10 MB JSON → first paint | **< 300 ms**, parse fully off-thread | — (M1.3) |
 | Scrolling any response | **60 fps sustained** | — (M1.3) |
 
@@ -420,22 +433,32 @@ is a budget you've already blown.
 
 ---
 
-## 9. Dependencies to add
+## 9. Dependencies
+
+> **Rule, learned the hard way.** Check the registry (`cargo info <crate>`) before writing a
+> version requirement — do not write it from memory. A caret requirement pins the *major*
+> line, and for `0.x` crates the minor **is** the major: `"0.12"` means `>=0.12.0, <0.13.0`
+> and can never reach 0.13. `reqwest` was declared `"0.12"` here and silently stayed a whole
+> major line behind while 0.13.4 was current. Every other crate was declared at its latest
+> major (`"1"`, `"2"`), so resolution picked the newest release and they were all current —
+> which is exactly why the one mistake was easy to miss.
+
+Declared below; all verified current against crates.io.
 
 ```toml
-# core/Cargo.toml
-reqwest      = { version = "0.12", default-features = false,
-                 features = ["rustls-tls", "stream", "gzip", "brotli", "deflate", "cookies"] }
-tokio        = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# core/Cargo.toml — versions verified, not remembered
+reqwest      = { version = "0.13", default-features = false,
+                 features = ["rustls", "stream", "gzip", "brotli",
+                             "deflate", "zstd", "cookies", "http2"] }
+tokio        = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+async-channel = "2"          # runtime-agnostic: tokio writes, smol reads
+futures-util = "0.3"
 bytes        = "1"
 http         = "1"
+url          = "2"
 serde        = { version = "1", features = ["derive"] }
-serde_json   = "1"
-ropey        = "1"
 thiserror    = "2"
-anyhow       = "1"
-[dev-dependencies]
-criterion    = "0.5"
+# M1.3+: serde_json, ropey, criterion
 
 # app/Cargo.toml
 gpui         = "0.2.2"
@@ -488,12 +511,34 @@ assembled spec to stderr as the honest stand-in for the engine. 8 headless GPUI 
 > rather than twice. The body stays read-only until M1.4 — a multi-line editor is a different
 > build from a single-line one, and pretending otherwise is how M1 stalls (§7).
 
-**M1.2 — Engine.** Tokio thread, `Engine::send`, `Event` stream, `build.rs` with typed URL
-errors. Still no fancy rendering — dump the response as plain text. *Done when:* real request
-goes out, real bytes come back, `Escape` cancels mid-flight, timing prints under `ZUNO_TIMING=1`.
+**M1.2 — Engine. ✅ Shipped.** Dedicated tokio thread, `Engine::send` returning an event
+stream, per-settings client cache, `build.rs` with typed errors, streaming body with throttled
+progress, two-part cancellation. Response pane gained in-flight and failure states; the Send
+button becomes Cancel while a request is live. 40 tests across three layers: pure build-time
+units, end-to-end over real sockets, and full-stack through simulated keystrokes.
 
-> **This is the milestone that proves the thesis.** Ship nothing else until the
-> type → send → see-something loop is genuinely tight. Everything after this is presentation.
+> **Verified:** a real request goes out and real bytes come back (`a_real_request_goes_out_and_
+> real_bytes_come_back`, over a real socket), `Escape` cancels mid-flight
+> (`escape_cancels_an_in_flight_request`), and `ZUNO_TIMING=1` prints per-request ttfb/total.
+> A separate `#[ignore]`d test hits real HTTPS — 200 over HTTP/2, TTFB 74.7ms — because
+> localhost never exercises DNS, rustls, or ALPN. It stays ignored so CI never depends on the
+> internet.
+
+> **The bug worth remembering.** `Url::parse("https://{{baseUrl}}/users")` **succeeds** — it
+> reads the placeholder as a hostname. Zuno would have done a DNS lookup for a literal
+> `{{baseurl}}` and reported "could not connect to {{baseurl}}". Unresolved `{{…}}` is now
+> caught before parsing, in the URL and in header names and values (sending
+> `Authorization: Bearer {{token}}` literally is worse than failing). Deliberately *not*
+> checked in bodies, where `{{` occurs legitimately inside JSON.
+
+> **Three design points.** (1) `EngineError` owns all its data so it's `Clone` and can travel
+> the event channel into view state — and `is_local()` distinguishes "nothing left the machine"
+> from a network failure, which is what the response pane uses to say *Request not sent* rather
+> than *Request failed*. (2) Clients are cached per distinct TLS/redirect/encoding combination,
+> because those are client-level in reqwest while timeout is per-request — one client per
+> request would have thrown away the connection pooling that makes resend feel instant.
+> (3) `Progress` is throttled to one event per 33ms; per-chunk emission floods the channel with
+> events the UI cannot paint.
 
 **M1.3 — Response viewer.** `JsonOutline` + `uniform_list`. Status line, timing, headers
 table. Folding. The >10MB raw-view cap. *Done when:* a 10MB JSON response scrolls at 60fps

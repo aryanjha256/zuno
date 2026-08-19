@@ -9,19 +9,24 @@
 //! That makes them a genuine regression net for the two things most likely to break
 //! silently: key context scoping and the derived-spec wiring.
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
+
 use gpui::{TestAppContext, VisualTestContext};
-use zuno_core::{Method, RequestSpec};
+use zuno_core::{EngineError, Method, RequestSpec, ResponseData};
 
 use crate::request_view::RequestView;
 use crate::theme::{Appearance, Theme};
 use crate::workspace::Workspace;
 
-/// Boot a window the same way `main` does, so the keymap and theme under test are
-/// the real ones rather than a test-only arrangement.
+/// Boot a window the same way `main` does, so the keymap, theme, and engine under test
+/// are the real ones rather than a test-only arrangement.
 fn open_workspace(cx: &mut TestAppContext) -> (gpui::Entity<RequestView>, VisualTestContext) {
     cx.update(|cx| {
         cx.set_global(Theme::new(Appearance::Dark, "monospace".into()));
         crate::register_keymap(cx);
+        crate::engine::install(cx).expect("engine");
     });
 
     let window = cx.add_window(|window, cx| Workspace::new(window, cx));
@@ -35,6 +40,76 @@ fn open_workspace(cx: &mut TestAppContext) -> (gpui::Entity<RequestView>, Visual
 
 fn spec_of(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> RequestSpec {
     cx.update(|_, cx| view.read(cx).spec(cx))
+}
+
+/// The engine runs on its own OS thread, so its events arrive asynchronously from
+/// gpui's point of view. `run_until_parked` alone returns while the consuming task is
+/// still awaiting the channel, so poll it against a deadline.
+fn wait_for<T>(
+    cx: &mut VisualTestContext,
+    what: &str,
+    mut probe: impl FnMut(&mut VisualTestContext) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        cx.run_until_parked();
+        if let Some(value) = probe(cx) {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+const OK_JSON: &str = "HTTP/1.1 200 OK\r\n\
+     Content-Type: application/json\r\n\
+     Content-Length: 11\r\n\
+     \r\n\
+     {\"ok\":true}";
+
+/// A one-shot HTTP server on an ephemeral port. Returns its base URL.
+fn serve_once(response: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// Accept a connection and never reply, so a request stays in flight.
+fn serve_never() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::thread::sleep(Duration::from_secs(30));
+            drop(stream);
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// A port that was bound and released, so connecting to it is refused.
+fn closed_port() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    drop(listener);
+    format!("http://{addr}")
+}
+
+fn type_url(cx: &mut VisualTestContext, url: &str) {
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input(url);
 }
 
 #[gpui::test]
@@ -180,6 +255,176 @@ async fn text_editing_keys_are_scoped_to_focused_inputs(cx: &mut TestAppContext)
         "https://a.",
         "backspace outside a TextInput must not reach one"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The send loop (M1.2) — keystroke through the engine and back into view state
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn ctrl_enter_sends_and_the_response_lands_in_the_view(cx: &mut TestAppContext) {
+    let base = serve_once(OK_JSON);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/health"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let response: ResponseData = wait_for(&mut cx, "a response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.status_text, "OK");
+    assert_eq!(response.body_as_str(), Some("{\"ok\":true}"));
+    assert_eq!(response.content_type(), Some("application/json"));
+    assert!(response.timing.total >= response.timing.ttfb);
+
+    // In-flight state must be cleared, and no error recorded.
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(!view.is_sending(), "still marked as sending after completion");
+        assert!(view.error.is_none(), "unexpected error: {:?}", view.error);
+    });
+}
+
+#[gpui::test]
+async fn the_url_bar_enter_key_also_sends(cx: &mut TestAppContext) {
+    let base = serve_once(OK_JSON);
+    let (view, mut cx) = open_workspace(cx);
+
+    // Bare `enter` is bound only under the UrlBar context, and focus starts there.
+    type_url(&mut cx, &format!("{base}/health"));
+    cx.simulate_keystrokes("enter");
+
+    let response: ResponseData = wait_for(&mut cx, "a response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+    assert_eq!(response.status, 200);
+}
+
+#[gpui::test]
+async fn a_connection_failure_is_shown_and_not_mistaken_for_a_response(
+    cx: &mut TestAppContext,
+) {
+    let base = closed_port();
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let error: EngineError = wait_for(&mut cx, "an error", |cx| {
+        cx.update(|_, cx| view.read(cx).error.clone())
+    });
+
+    assert!(
+        matches!(error, EngineError::Connect { .. }),
+        "expected a Connect error, got {error:?}"
+    );
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.response.is_none(), "a failure must not leave a response");
+        assert!(!view.is_sending());
+    });
+}
+
+#[gpui::test]
+async fn a_local_failure_is_reported_without_touching_the_network(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    // No server anywhere — an unresolved variable must fail before any socket opens.
+    type_url(&mut cx, "{{baseUrl}}/users");
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let error: EngineError = wait_for(&mut cx, "an error", |cx| {
+        cx.update(|_, cx| view.read(cx).error.clone())
+    });
+
+    assert!(matches!(error, EngineError::UnresolvedVariable { .. }));
+    assert!(error.is_local());
+}
+
+#[gpui::test]
+async fn escape_cancels_an_in_flight_request(cx: &mut TestAppContext) {
+    let base = serve_never();
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/slow"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    // Confirm it really is in flight before cancelling, so this tests cancellation and
+    // not a race with submission.
+    wait_for(&mut cx, "the request to start", |cx| {
+        cx.update(|_, cx| view.read(cx).is_sending().then_some(()))
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(!view.is_sending(), "escape did not clear the in-flight state");
+        assert!(view.response.is_none());
+        assert!(
+            view.error.is_none(),
+            "a cancellation is not a failure, but got {:?}",
+            view.error
+        );
+    });
+}
+
+#[gpui::test]
+async fn resending_replaces_the_previous_response(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let first = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{first}/one"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the first response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    const SECOND: &str = "HTTP/1.1 404 Not Found\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: 9\r\n\
+         \r\n\
+         not found";
+    let second = serve_once(SECOND);
+    type_url(&mut cx, &format!("{second}/two"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let response: ResponseData = wait_for(&mut cx, "the second response", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .response
+                .clone()
+                .filter(|response| response.status == 404)
+        })
+    });
+    assert_eq!(response.body_as_str(), Some("not found"));
+}
+
+#[gpui::test]
+async fn edits_made_before_sending_are_the_ones_that_go_out(cx: &mut TestAppContext) {
+    let base = serve_once(OK_JSON);
+    let (view, mut cx) = open_workspace(cx);
+
+    // The whole point of deriving the spec instead of storing one: what's on screen at
+    // the moment of Send is what gets sent.
+    type_url(&mut cx, &format!("{base}/derived"));
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("X-Derived");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("yes");
+
+    let spec = spec_of(&view, &mut cx);
+    assert!(spec.url.ends_with("/derived"));
+    assert_eq!(spec.headers.last().unwrap().name, "X-Derived");
+
+    cx.simulate_keystrokes("ctrl-enter");
+    let response: ResponseData = wait_for(&mut cx, "a response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+    assert_eq!(response.status, 200);
 }
 
 #[gpui::test]

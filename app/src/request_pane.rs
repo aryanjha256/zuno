@@ -14,7 +14,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
-use crate::actions::SendRequest;
+use crate::actions::{CancelRequest, SendRequest};
 use crate::request_view::{KeyValueRow, RequestView, RowKind};
 use crate::theme::Theme;
 
@@ -83,7 +83,7 @@ fn toolbar(
         .border_color(theme.border)
         .child(method_chip(view, theme, cx))
         .child(url_bar(view, theme, url_focused))
-        .child(send_button(theme, cx))
+        .child(send_button(theme, view.is_sending(), cx))
 }
 
 /// Clicking cycles the method; right-click cycles back. A real dropdown needs an
@@ -135,28 +135,43 @@ fn url_bar(view: &RequestView, theme: &Theme, focused: bool) -> Div {
         .child(view.url.clone())
 }
 
-fn send_button(theme: &Theme, cx: &mut gpui::Context<RequestView>) -> impl IntoElement {
-    div()
+/// One button, two states. While a request is in flight the only useful thing it can
+/// do is abandon it, so it says so rather than offering a second Send.
+///
+/// Both branches dispatch an action rather than calling the logic directly, so the
+/// button and its keybinding can never drift apart.
+fn send_button(theme: &Theme, sending: bool, cx: &mut gpui::Context<RequestView>) -> impl IntoElement {
+    let base = div()
         .id("send-button")
         .flex_none()
         .px_3()
         .py_1()
         .rounded_md()
-        .bg(theme.accent)
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme.text_on_accent)
         .cursor_pointer()
-        .hover(|style| style.opacity(0.85))
-        // Dispatch the action rather than calling the send logic directly, so the
-        // button and Ctrl+Enter can never drift apart.
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|_, _: &MouseDownEvent, window, cx| {
-                window.dispatch_action(Box::new(SendRequest), cx);
-            }),
-        )
-        .child("Send".to_string())
+        .hover(|style| style.opacity(0.85));
+
+    if sending {
+        base.bg(theme.status_client_error)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(Box::new(CancelRequest), cx);
+                }),
+            )
+            .child("Cancel".to_string())
+    } else {
+        base.bg(theme.accent)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(Box::new(SendRequest), cx);
+                }),
+            )
+            .child("Send".to_string())
+    }
 }
 
 fn count_label(enabled: usize, total: usize) -> SharedString {
