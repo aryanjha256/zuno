@@ -50,8 +50,7 @@ zuno/
 │       │   ├── mod.rs      ✅ JsonOutline, Row, Span, visible_rows
 │       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
-│       └── text/              (M1.4)
-│           └── buffer.rs      rope-backed text buffer + edit ops
+│       └── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
     └── src/
@@ -59,6 +58,7 @@ zuno/
         ├── actions.rs      ✅ every keyboard-reachable verb, in one place
         ├── engine.rs       ✅ the Engine as a global (one pool per process)
         ├── body_view.rs    ✅ body classification + fold state
+        ├── session.rs      ✅ scratch-request persistence (path is a global, for tests)
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
@@ -68,7 +68,7 @@ zuno/
         ├── tests.rs        ✅ headless end-to-end tests (GPUI test platform)
         └── input/
             ├── text_input.rs ✅ single-line input primitive
-            └── editor.rs        multi-line body editor (M1.4)
+            └── editor.rs     ✅ multi-line body editor
 ```
 
 Three refinements the implementation forced, all worth recording:
@@ -122,8 +122,8 @@ pub enum Body {
     Empty,                                     // named Empty, not None, so it never
                                                // reads as an Option at a match site
     Raw { text: String, kind: RawKind },       // Json | Text | Xml | Html
-                                               // String becomes a rope-backed TextBuffer in
-                                               // M1.4; nothing edits it before then
+                                               // Stays a String — the rope was dropped
+                                               // in M1.4, see §7
     Form(Vec<FormField>),
     Multipart(Vec<MultipartField>),
     Binary(PathBuf),
@@ -373,7 +373,7 @@ M1 plan, in cost order:
 | Piece | Scope | Approach |
 |---|---|---|
 | `TextInput` (single-line) ✅ | URL bar, header cells, param cells | Adapted from `examples/input.rs`; every `cmd-` translated to `ctrl-` |
-| `Editor` (multi-line) | Request body only (M1.4) | Same input handler over a rope; soft-wrap off |
+| `Editor` (multi-line) ✅ | Request body only | Same input handler; **no rope** — see below; soft-wrap off |
 | Response body | — | Read-only rows; **no editor at all** |
 
 **Five deliberate changes from the upstream example**, made while adapting it in M1.1:
@@ -390,9 +390,12 @@ cache), autocomplete, multi-cursor, code folding in the *editor*, bracket matchi
 "excellent request/code editor" in `idea.md` is a milestone of its own — treating it as a
 sub-task of M1 is the most likely way this project stalls.
 
-Use `ropey` for the buffer rather than `String`. Not for M1's tiny bodies, but because
-`TextBuffer`'s edit API is the thing everything else builds on, and changing it later touches
-every call site.
+**The rope was dropped, deliberately.** Two things decided it. `ropey`'s current release is
+`2.0.0-beta.1`, so a stable version requirement won't even resolve to it. And the benefit is
+unmeasurable at these sizes: request bodies are hand-authored, so a 100KB body means the line
+index rescan is a ~10µs `memchr` sweep per keystroke against a 16ms frame budget. One text
+model shared with `TextInput` is worth more than an O(log n) edit nobody can feel. Revisit when
+bodies routinely exceed ~1MB, or when in-buffer undo history needs cheap snapshots.
 
 ---
 
@@ -580,9 +583,29 @@ raw-text fallback. 44 new tests, including a perf suite.
 > the user gets a raw view and an explicit button, because silently spending hundreds of MB is
 > worse than asking.
 
-**M1.4 — The loop.** Multi-line body editor. Resend, response diffing against the previous
-run, request-local history, session restore of the scratch request. *Done when:* the full
-edit → resend → compare cycle is pure keyboard and feels instant.
+**M1.4 — The loop. ✅ Shipped.** Multi-line body editor (line-aware movement, per-line
+Home/End, auto-indented newlines, cross-line selection, IME, viewport-only shaping), body-kind
+cycling, `ResponseDiff` against the previous run with a summary bar, ten-deep response history,
+and session restore of the scratch request. 27 new tests.
+
+> **The bug worth remembering.** `compute_line_starts` originally dropped the final line start
+> when content ended in `\n`, copied from `LineIndex`. In a *viewer* that's right — a phantom
+> blank line at the end is noise. In an *editor* it's wrong twice over: the last line's text came
+> back as `"a\n"`, which trips `shape_line`'s newline assertion, and pressing Enter at the end of
+> the buffer left the cursor with no row to sit on. The two types now differ on purpose, and the
+> reason is commented in both.
+
+> **Three design points.** (1) The diff is a *summary* — status, timing, size, which headers
+> moved, whether the body is byte-identical — because the loop's question is "did my change do
+> anything?", and a full inline body diff would bury that signal. (2) `date`, `age`,
+> `x-request-id` and friends are excluded from header comparison; otherwise "headers changed"
+> would be permanently true and therefore worthless. (3) A failed send **keeps** the last good
+> response as the diff baseline while showing the error, so the next successful send still has
+> something to compare against.
+
+> **Session persistence is a global, not a constant path.** The suite drives `SendRequest`, and a
+> send is a save point — without an injectable path, running `cargo test` would overwrite the
+> developer's own session file.
 
 **Deferred by design, and it's worth naming them so they stop feeling like omissions:**
 tabs/buffers, collections, the `Ctrl+P` / `Ctrl+K` palettes, environments and variables, auth

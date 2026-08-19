@@ -5,14 +5,16 @@
 //! knows about rendering, colors, or key bindings.
 //!
 //! Landed so far: the request and response models (M1.0), the HTTP engine (M1.2), the
-//! JSON outline and line index (M1.3). Still to come: `text` (M1.4).
+//! JSON outline and line index (M1.3), response diffing (M1.4).
 
+pub mod diff;
 pub mod engine;
 pub mod json;
 pub mod lines;
 pub mod request;
 pub mod response;
 
+pub use diff::ResponseDiff;
 pub use engine::{Engine, EngineError, Event, JobId};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;

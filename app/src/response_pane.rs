@@ -17,8 +17,8 @@ use gpui::{
     ParentElement, SharedString, Styled, Window, div, px, uniform_list,
 };
 use zuno_core::{
-    EngineError, Header, JsonOutline, LineIndex, ResponseData, Row, RowKind, ScalarKind,
-    StatusClass,
+    EngineError, Header, JsonOutline, LineIndex, ResponseData, ResponseDiff, Row, RowKind,
+    ScalarKind, StatusClass,
 };
 
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
@@ -62,6 +62,7 @@ pub fn render(
     match &view.response {
         Some(response) => pane
             .child(status_line(response, theme))
+            .children(view.diff.as_ref().map(|diff| diff_bar(diff, theme)))
             .child(section_header("Headers", theme))
             .child(headers_table(&response.headers, theme))
             .child(body_header(view, theme, cx))
@@ -219,6 +220,81 @@ fn size_label(response: &ResponseData) -> String {
             format_bytes(response.size.decoded)
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diff against the previous run
+// ---------------------------------------------------------------------------
+
+/// One line answering "did my change do anything?".
+///
+/// Deliberately terse. Timing and size always wobble between runs, so they're shown as
+/// context but never make the bar claim something changed — that's `is_quiet`'s job.
+fn diff_bar(diff: &ResponseDiff, theme: &Theme) -> Div {
+    let (accent, headline) = if diff.is_quiet() {
+        (
+            theme.text_muted,
+            SharedString::from("same as last run"),
+        )
+    } else if let Some((before, after)) = diff.status {
+        (
+            theme.status_color(StatusClass::of(after)),
+            SharedString::from(format!("status {before} → {after}")),
+        )
+    } else {
+        (theme.accent, SharedString::from("changed since last run"))
+    };
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .flex_none()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_elevated)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(accent)
+                .child(headline),
+        );
+
+    if diff.body_changed {
+        let lines = match diff.line_delta {
+            0 => "body changed".to_string(),
+            delta => format!("body {delta:+} lines"),
+        };
+        row = row.child(meta(lines, theme));
+    }
+
+    if diff.header_change_count() > 0 {
+        let mut parts = Vec::new();
+        if !diff.headers_added.is_empty() {
+            parts.push(format!("+{}", diff.headers_added.len()));
+        }
+        if !diff.headers_removed.is_empty() {
+            parts.push(format!("-{}", diff.headers_removed.len()));
+        }
+        if !diff.headers_changed.is_empty() {
+            parts.push(format!("~{}", diff.headers_changed.len()));
+        }
+        row = row.child(meta(format!("headers {}", parts.join(" ")), theme));
+    }
+
+    if diff.size_delta != 0 {
+        row = row.child(meta(format!("{:+} bytes", diff.size_delta), theme));
+    }
+    if diff.duration_delta_ms != 0 {
+        row = row.child(meta(format!("{:+} ms", diff.duration_delta_ms), theme));
+    }
+
+    row
 }
 
 fn meta(text: impl Into<SharedString>, theme: &Theme) -> Div {

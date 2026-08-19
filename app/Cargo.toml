@@ -8,6 +8,7 @@ gpui.workspace = true
 zuno-core.workspace = true
 
 bytes.workspace = true
+serde_json.workspace = true
 
 unicode-segmentation.workspace = true
 

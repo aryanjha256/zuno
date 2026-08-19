@@ -26,6 +26,7 @@ actions!(
         AddQuery,
         ToggleRow,
         RemoveRow,
+        CycleBodyKind,
         // Response viewer
         FoldAll,
         UnfoldAll,

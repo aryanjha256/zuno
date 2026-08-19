@@ -14,7 +14,7 @@ use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
 use gpui::{TestAppContext, VisualTestContext};
-use zuno_core::{EngineError, Method, RequestSpec, ResponseData};
+use zuno_core::{Body, EngineError, Method, RawKind, RequestSpec, ResponseData};
 
 use crate::body_view::BodyView;
 use crate::request_view::RequestView;
@@ -28,6 +28,9 @@ fn open_workspace(cx: &mut TestAppContext) -> (gpui::Entity<RequestView>, Visual
         cx.set_global(Theme::new(Appearance::Dark, "monospace".into()));
         crate::register_keymap(cx);
         crate::engine::install(cx).expect("engine");
+        // Persistence must not touch the developer's real session file — the tests
+        // drive SendRequest, and a send is a save point.
+        crate::session::install_at(cx, None);
     });
 
     let window = cx.add_window(|window, cx| Workspace::new(window, cx));
@@ -111,6 +114,12 @@ fn closed_port() -> String {
 fn type_url(cx: &mut VisualTestContext, url: &str) {
     cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input(url);
+}
+
+/// Focus the body editor and empty it. The sample request ships a body and the editor
+/// opens with the cursor at offset 0, so typing without this prepends.
+fn clear_body(cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("ctrl-b ctrl-a backspace");
 }
 
 #[gpui::test]
@@ -599,6 +608,216 @@ async fn resending_reindexes_the_new_body(cx: &mut TestAppContext) {
         })
     });
     assert!(!is_json);
+}
+
+// ---------------------------------------------------------------------------
+// The loop (M1.4) — body editor and diffing
+// ---------------------------------------------------------------------------
+
+#[gpui::test]
+async fn the_body_editor_accepts_multiple_lines(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    clear_body(&mut cx);
+    cx.simulate_input("{");
+    // Bare `enter` inserts a newline here, where it *sends* in the URL bar. Same key,
+    // two meanings, separated only by key context.
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("  \"a\": 1");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("}");
+
+    let spec = spec_of(&view, &mut cx);
+    let Body::Raw { text, kind } = &spec.body else {
+        panic!("expected a raw body, got {:?}", spec.body);
+    };
+    assert_eq!(*kind, RawKind::Json);
+    assert!(text.contains('\n'), "newlines should survive: {text:?}");
+    assert_eq!(text.lines().count(), 3, "{text:?}");
+    assert!(text.starts_with('{'));
+    assert!(text.contains("\"a\": 1"), "{text:?}");
+}
+
+#[gpui::test]
+async fn enter_in_the_body_editor_does_not_send(cx: &mut TestAppContext) {
+    let base = serve_once(OK_JSON);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/never"));
+    clear_body(&mut cx);
+    cx.simulate_input("hello");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(!view.is_sending(), "enter in the editor must not start a request");
+        assert!(view.response.is_none());
+    });
+}
+
+#[gpui::test]
+async fn a_new_line_inherits_the_previous_indent(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    clear_body(&mut cx);
+    cx.simulate_input("    indented");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("next");
+
+    let spec = spec_of(&view, &mut cx);
+    let Body::Raw { text, .. } = &spec.body else {
+        panic!("expected a raw body");
+    };
+    let second = text.lines().nth(1).expect("a second line");
+    assert_eq!(second, "    next", "indent should carry over: {text:?}");
+}
+
+#[gpui::test]
+async fn vertical_movement_lands_on_the_line_above(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    clear_body(&mut cx);
+    cx.simulate_input("aaa");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_input("bbb");
+
+    // Up then Home puts the cursor at the start of the first line; typing there proves
+    // where it landed.
+    cx.simulate_keystrokes("up home");
+    cx.simulate_input("X");
+
+    let spec = spec_of(&view, &mut cx);
+    let Body::Raw { text, .. } = &spec.body else {
+        panic!("expected a raw body");
+    };
+    assert_eq!(text.lines().next(), Some("Xaaa"), "{text:?}");
+}
+
+#[gpui::test]
+async fn a_blank_body_sends_nothing_at_all(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    clear_body(&mut cx);
+
+    // An empty editor must mean no body, not an empty JSON body with a Content-Type.
+    assert_eq!(spec_of(&view, &mut cx).body, Body::Empty);
+}
+
+#[gpui::test]
+async fn the_body_kind_cycles(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    clear_body(&mut cx);
+    cx.simulate_input("x");
+    assert!(matches!(
+        spec_of(&view, &mut cx).body,
+        Body::Raw { kind: RawKind::Json, .. }
+    ));
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    assert!(matches!(
+        spec_of(&view, &mut cx).body,
+        Body::Raw { kind: RawKind::Text, .. }
+    ));
+}
+
+#[gpui::test]
+async fn the_first_run_has_nothing_to_diff_against(cx: &mut TestAppContext) {
+    let base = serve_once(OK_JSON);
+    let (view, mut cx) = open_workspace(cx);
+
+    type_url(&mut cx, &format!("{base}/one"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for_body(&view, &mut cx);
+
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.diff.is_none(), "no previous run exists");
+        assert!(view.history.is_empty());
+    });
+}
+
+#[gpui::test]
+async fn a_changed_response_is_diffed_against_the_previous_run(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let first = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{first}/one"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for_body(&view, &mut cx);
+
+    const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 12\r\n\
+         \r\n\
+         {\"e\":\"gone\"}";
+    let second = serve_once(NOT_FOUND);
+    type_url(&mut cx, &format!("{second}/two"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let diff = wait_for(&mut cx, "a diff", |cx| {
+        cx.update(|_, cx| view.read(cx).diff.clone())
+    });
+
+    assert_eq!(diff.status, Some((200, 404)));
+    assert!(diff.body_changed);
+    assert!(!diff.is_quiet());
+
+    // The superseded response is retained for comparison.
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.history.len(), 1);
+        assert_eq!(view.history[0].status, 200);
+    });
+}
+
+#[gpui::test]
+async fn an_identical_resend_reports_no_change(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let first = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{first}/same"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for_body(&view, &mut cx);
+
+    // Byte-identical response from a fresh server. Only timing differs, and timing
+    // alone must never claim a change.
+    let second = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{second}/same"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let diff = wait_for(&mut cx, "a diff", |cx| {
+        cx.update(|_, cx| view.read(cx).diff.clone())
+    });
+    assert!(diff.is_quiet(), "expected a quiet diff, got {diff:?}");
+}
+
+#[gpui::test]
+async fn a_failure_clears_the_diff_but_keeps_the_baseline(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let first = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{first}/ok"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for_body(&view, &mut cx);
+
+    let dead = closed_port();
+    type_url(&mut cx, &format!("{dead}/gone"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    wait_for(&mut cx, "an error", |cx| {
+        cx.update(|_, cx| view.read(cx).error.clone())
+    });
+
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.diff.is_none(), "a failed run has nothing to compare");
+        assert!(
+            view.response.is_some(),
+            "the last good response is the baseline for the next send"
+        );
+    });
 }
 
 #[gpui::test]

@@ -1,8 +1,7 @@
 //! The request half of a buffer: method, URL, headers, query, body.
 //!
-//! Editable as of M1.1. The URL and every table cell is a real `TextInput`; rows can
-//! be added, muted, and removed by keyboard or mouse. The body stays read-only until
-//! the multi-line editor lands in M1.4.
+//! Fully editable: the URL and every table cell is a `TextInput`, the body is a
+//! multi-line `Editor`, and rows can be added, muted, and removed by keyboard or mouse.
 //!
 //! These are functions rather than an entity, but they take `&mut Context<RequestView>`
 //! so they can build `cx.listener` click handlers. `&RequestView` and
@@ -11,7 +10,7 @@
 
 use gpui::{
     Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    SharedString, Styled, Window, div, px,
 };
 
 use crate::actions::{CancelRequest, SendRequest};
@@ -27,6 +26,8 @@ pub fn render(
     // Read focus state before any `&mut cx` use below — the immutable borrow from
     // `read` has to end first.
     let url_focused = view.url_focus(cx).is_focused(window);
+    let body_focused = view.body_focus(cx).is_focused(window);
+    let body_lines = view.body_editor.read(cx).line_count();
 
     let header_detail = count_label(
         view.headers.iter().filter(|row| row.enabled).count(),
@@ -61,8 +62,55 @@ pub fn render(
             cx,
         ))
         .child(rows_table(&view.query, RowKind::Query, theme, cx))
-        .child(section_header_plain("Body", view.body_label(), theme))
-        .child(body_region(view, theme, window))
+        .child(body_header(view, body_lines, theme, cx))
+        .child(body_region(view, theme, body_focused))
+}
+
+/// The Body header, with a clickable body-kind chip (`Ctrl+Shift+B` does the same).
+fn body_header(
+    view: &RequestView,
+    lines: usize,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child("Body".to_string())
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(format!("{lines} lines"))
+                .child(
+                    div()
+                        .id("body-kind")
+                        .px_1()
+                        .rounded_sm()
+                        .text_color(theme.accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.bg_hover))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _: &MouseDownEvent, _, cx| {
+                                view.cycle_body_kind(cx)
+                            }),
+                        )
+                        .child(view.body_label()),
+                ),
+        )
 }
 
 fn toolbar(
@@ -234,22 +282,6 @@ fn section_header(
         )
 }
 
-fn section_header_plain(title: &str, detail: SharedString, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .px_3()
-        .py_1()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.text_muted)
-        .child(title.to_string())
-        .child(detail)
-}
 
 fn rows_table(
     rows: &[KeyValueRow],
@@ -358,17 +390,10 @@ fn render_row(
         )
 }
 
-fn body_region(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoElement {
-    let focused = view.body_focus.is_focused(window);
-    let lines: Vec<String> = match &view.body {
-        zuno_core::Body::Raw { text, .. } => text.lines().map(str::to_string).collect(),
-        _ => vec!["(no body)".to_string()],
-    };
-
+/// The editor entity renders itself; this only supplies the frame, the focus ring, and
+/// the inherited text style it shapes with.
+fn body_region(view: &RequestView, theme: &Theme, focused: bool) -> impl IntoElement {
     div()
-        .id("body-editor")
-        .key_context("BodyEditor")
-        .track_focus(&view.body_focus)
         .flex_1()
         .min_h(px(0.))
         .m_2()
@@ -377,9 +402,8 @@ fn body_region(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoE
         .bg(theme.bg)
         .border_1()
         .border_color(theme.focus_border(focused))
-        .overflow_y_scroll()
         .font_family(theme.mono.clone())
         .text_xs()
         .text_color(theme.text)
-        .child(div().flex().flex_col().children(lines))
+        .child(view.body_editor.clone())
 }

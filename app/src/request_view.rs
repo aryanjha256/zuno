@@ -18,14 +18,17 @@ use gpui::{
     SharedString, Styled, Task, Window, div, px,
 };
 use zuno_core::{
-    Body, Engine, EngineError, Event, Header, JobId, Method, QueryParam, RequestId, RequestSettings,
-    RequestSpec, ResponseData,
+    Body, Engine, EngineError, Event, Header, JobId, Method, QueryParam, RawKind, RequestId,
+    RequestSettings, RequestSpec, ResponseData, ResponseDiff,
 };
 
 use crate::body_view::BodyView;
-use crate::input::TextInput;
+use crate::input::{Editor, TextInput};
 use crate::theme::ActiveTheme;
 use crate::{request_pane, response_pane};
+
+/// How many previous responses to keep for comparison.
+pub const HISTORY_LIMIT: usize = 10;
 
 /// What's known about a request that hasn't finished yet.
 ///
@@ -87,11 +90,17 @@ pub struct RequestView {
     pub url: Entity<TextInput>,
     pub headers: Vec<KeyValueRow>,
     pub query: Vec<KeyValueRow>,
-    /// Still read-only in M1.1 — the multi-line editor is M1.4.
-    pub body: Body,
+    /// The editor owns the body text, exactly as the inputs own theirs — `spec()` reads
+    /// through to it rather than mirroring into a field.
+    pub body_editor: Entity<Editor>,
+    pub body_kind: RawKind,
     pub settings: RequestSettings,
 
     pub response: Option<ResponseData>,
+    /// How the current response differs from the one before it. `None` on the first run.
+    pub diff: Option<ResponseDiff>,
+    /// Previous responses, newest first, capped at `HISTORY_LIMIT`.
+    pub history: Vec<ResponseData>,
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
@@ -99,7 +108,6 @@ pub struct RequestView {
     pub error: Option<EngineError>,
     pub status: Option<SharedString>,
 
-    pub body_focus: FocusHandle,
     pub response_focus: FocusHandle,
 }
 
@@ -131,6 +139,14 @@ impl RequestView {
             })
             .collect();
 
+        // The model still supports form, multipart, and binary bodies; the UI only
+        // authors raw ones so far, so anything else opens as an empty raw body.
+        let (body_text, body_kind) = match &spec.body {
+            Body::Raw { text, kind } => (text.clone(), *kind),
+            _ => (String::new(), RawKind::Json),
+        };
+        let body_editor = cx.new(|cx| Editor::new(body_text, "Request body…", cx));
+
         Self {
             id: spec.id,
             name: spec.name,
@@ -138,19 +154,22 @@ impl RequestView {
             url,
             headers,
             query,
-            body: spec.body,
+            body_editor,
+            body_kind,
             settings: spec.settings,
             // No canned response any more — the pane starts empty and fills from a
             // real request.
             response: None,
+            diff: None,
+            history: Vec::new(),
             body_view: None,
             body_task: None,
             inflight: None,
             error: None,
             status: None,
-            // Higher than the inputs' default 0, so Tab reaches every text field
-            // first and only then leaves for the body and response panes.
-            body_focus: cx.focus_handle().tab_index(1).tab_stop(true),
+            // Higher than the inputs' default 0, so Tab reaches every text field first
+            // and only then leaves for the response pane. The body editor sets its own
+            // handle to tab_stop, at the default index, so it lands with the inputs.
             response_focus: cx.focus_handle().tab_index(2).tab_stop(true),
         }
     }
@@ -183,13 +202,38 @@ impl RequestView {
                     value: row.value.read(cx).text().to_string(),
                 })
                 .collect(),
-            body: self.body.clone(),
+            body: self.body(cx),
             settings: self.settings.clone(),
+        }
+    }
+
+    /// A blank editor means no body at all, not an empty raw one — sending
+    /// `Content-Type: application/json` with zero bytes confuses servers.
+    fn body(&self, cx: &App) -> Body {
+        let text = self.body_editor.read(cx).text();
+        if text.trim().is_empty() {
+            Body::Empty
+        } else {
+            Body::Raw {
+                text: text.to_string(),
+                kind: self.body_kind,
+            }
         }
     }
 
     pub fn url_focus(&self, cx: &App) -> FocusHandle {
         self.url.read(cx).focus_handle(cx)
+    }
+
+    pub fn body_focus(&self, cx: &App) -> FocusHandle {
+        self.body_editor.read(cx).focus_handle(cx)
+    }
+
+    pub fn cycle_body_kind(&mut self, cx: &mut Context<Self>) {
+        const KINDS: [RawKind; 4] = [RawKind::Json, RawKind::Text, RawKind::Xml, RawKind::Html];
+        let current = KINDS.iter().position(|k| *k == self.body_kind).unwrap_or(0);
+        self.body_kind = KINDS[(current + 1) % KINDS.len()];
+        cx.notify();
     }
 
     // ---- the send loop ------------------------------------------------------
@@ -205,10 +249,11 @@ impl RequestView {
         let (job, events) = engine.send(spec);
 
         self.error = None;
-        self.response = None;
         self.body_view = None;
         self.body_task = None;
         self.status = None;
+        // `response` and `diff` are deliberately left in place until the new response
+        // lands, so `apply` can diff against them.
 
         // Consume the event stream on the foreground executor. `update` fails once the
         // view is gone, which ends the loop.
@@ -253,6 +298,17 @@ impl RequestView {
                     response.size.decoded
                 );
                 self.inflight = None;
+
+                // Diff against the run this one replaces, then retire it to history.
+                let previous = self.response.take();
+                self.diff = previous
+                    .as_ref()
+                    .map(|previous| ResponseDiff::between(previous, &response));
+                if let Some(previous) = previous {
+                    self.history.insert(0, previous);
+                    self.history.truncate(HISTORY_LIMIT);
+                }
+
                 self.response = Some(*response);
                 self.index_body(false, cx);
                 cx.notify();
@@ -260,6 +316,12 @@ impl RequestView {
             }
             Event::Failed { error, .. } => {
                 self.inflight = None;
+                // The last successful response is deliberately kept: the pane shows the
+                // error instead (a failure outranks a stale success), but keeping it
+                // preserves the baseline so the *next* successful send still has
+                // something to diff against. The diff itself has to go — it described a
+                // comparison that no longer holds.
+                self.diff = None;
                 self.error = Some(error);
                 cx.notify();
                 false
@@ -479,10 +541,7 @@ impl RequestView {
     }
 
     pub fn body_label(&self) -> SharedString {
-        SharedString::from(match &self.body {
-            Body::Raw { kind, .. } => kind.label(),
-            other => other.label(),
-        })
+        SharedString::from(self.body_kind.label())
     }
 
 }

@@ -1,8 +1,8 @@
 //! Zuno — a native API client built around the feeling of Zed.
 //!
-//! Milestone 1.1: the request is editable. Theme, focus, key dispatch, and text
-//! input are real; the HTTP engine (M1.2) and the multi-line body editor (M1.4) are
-//! not. See architecture.md §10.
+//! Milestone 1.4: the full loop. Editable request including a multi-line body editor,
+//! live HTTP, a virtualized response viewer, and diffing against the previous run.
+//! See architecture.md §10.
 
 #[macro_use]
 mod timing;
@@ -14,6 +14,7 @@ mod input;
 mod request_pane;
 mod request_view;
 mod response_pane;
+mod session;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -28,10 +29,11 @@ use gpui::{
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    FocusPrev, FocusResponse, FocusUrl, FoldAll, Quit, RemoveRow, SendRequest, ToggleRow,
+    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, Quit, RemoveRow, SendRequest,
+    ToggleRow,
     ToggleTheme, UnfoldAll,
 };
-use crate::input::text_input;
+use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
 use crate::workspace::Workspace;
 
@@ -64,7 +66,6 @@ fn main() {
         let mono = theme::pick_mono_font(cx);
         cx.set_global(Theme::new(Appearance::Dark, mono));
         register_keymap(cx);
-        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         boot.mark("theme + keymap");
 
         // A failure here is reported inline on the first send rather than blocking
@@ -73,7 +74,8 @@ fn main() {
         if let Err(error) = engine::install(cx) {
             eprintln!("[zuno] could not start the HTTP engine: {error}");
         }
-        boot.mark("engine");
+        session::install(cx);
+        boot.mark("engine + session");
 
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
         cx.open_window(
@@ -103,8 +105,9 @@ fn main() {
 /// - GPUI's `Identifier` predicate matches only the *leaf* key context, so the
 ///   editing bindings below reach a `TextInput` because its own context string
 ///   carries both identifiers (`"TextInput UrlBar"`), not because of nesting.
-/// - Bare `enter` sends only while the URL bar has focus, leaving `enter` free to
-///   mean "newline" once the body editor accepts keystrokes in M1.4.
+/// - Bare `enter` sends under `UrlBar` and inserts a newline under `BodyEditor`. Two
+///   bindings for the same key, disambiguated purely by context — the reason contexts
+///   had to be set up in M1.0 rather than retrofitted.
 ///
 /// Linux/Windows use `ctrl`; the macOS `cmd` variants get added alongside these when
 /// there's a macOS build. GPUI's own `examples/input.rs` — the basis for the text
@@ -125,6 +128,7 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-y", AddQuery, None),
         KeyBinding::new("alt-t", ToggleRow, None),
         KeyBinding::new("ctrl-shift-k", RemoveRow, None),
+        KeyBinding::new("ctrl-shift-b", CycleBodyKind, None),
         // --- Response viewer ---
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
@@ -150,5 +154,11 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-c", text_input::Copy, Some("TextInput")),
         KeyBinding::new("ctrl-v", text_input::Paste, Some("TextInput")),
         KeyBinding::new("ctrl-x", text_input::Cut, Some("TextInput")),
+        // --- Line-aware editing, only inside the multi-line body editor ---
+        KeyBinding::new("up", editor::Up, Some("BodyEditor")),
+        KeyBinding::new("down", editor::Down, Some("BodyEditor")),
+        KeyBinding::new("shift-up", editor::SelectUp, Some("BodyEditor")),
+        KeyBinding::new("shift-down", editor::SelectDown, Some("BodyEditor")),
+        KeyBinding::new("enter", editor::Newline, Some("BodyEditor")),
     ]);
 }

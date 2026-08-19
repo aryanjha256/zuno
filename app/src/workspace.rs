@@ -15,7 +15,7 @@ use zuno_core::RequestSpec;
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CycleMethod, CycleMethodBack, FocusBody, FocusNext,
-    FocusPrev, FocusResponse, FocusUrl, FoldAll, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
+    CycleBodyKind, FocusPrev, FocusResponse, FocusUrl, FoldAll, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme,
     UnfoldAll,
 };
 use crate::engine::ActiveEngine;
@@ -32,7 +32,10 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let view = cx.new(|cx| RequestView::new(RequestSpec::sample(), cx));
+        // Reopen where you left off. A missing or unreadable session falls back to the
+        // sample request rather than an empty window.
+        let spec = crate::session::load(cx).unwrap_or_else(RequestSpec::sample);
+        let view = cx.new(|cx| RequestView::new(spec, cx));
 
         // Start focused on the URL bar — the loop begins with typing a URL, and it
         // puts the URL input on the focus path so its key context is live from the
@@ -71,7 +74,7 @@ impl Workspace {
     }
 
     fn focus_body(&mut self, _: &FocusBody, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_region(window, cx, |view, _| view.body_focus.clone());
+        self.focus_region(window, cx, |view, cx| view.body_focus(cx));
     }
 
     fn focus_response(&mut self, _: &FocusResponse, window: &mut Window, cx: &mut Context<Self>) {
@@ -128,6 +131,12 @@ impl Workspace {
         }
     }
 
+    fn cycle_body_kind(&mut self, _: &CycleBodyKind, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_body_kind(cx));
+        }
+    }
+
     fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.set_all_folded(true, cx));
@@ -154,7 +163,21 @@ impl Workspace {
             return;
         };
 
+        // A send is a natural checkpoint: persist here so a crash costs at most the
+        // edits made since the last one.
+        let spec = view.read(cx).spec(cx);
+        crate::session::save(&spec, cx);
         view.update(cx, |view, cx| view.send(&engine, cx));
+    }
+
+    /// Save before quitting. Handled here rather than at app level because this is where
+    /// the active request is reachable.
+    fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            let spec = view.read(cx).spec(cx);
+            crate::session::save(&spec, cx);
+        }
+        cx.quit();
     }
 
     fn cancel_request(&mut self, _: &CancelRequest, _: &mut Window, cx: &mut Context<Self>) {
@@ -186,7 +209,7 @@ impl Workspace {
         if view.url_focus(cx).is_focused(window) {
             return SharedString::from("URL");
         }
-        if view.body_focus.is_focused(window) {
+        if view.body_focus(cx).is_focused(window) {
             return SharedString::from("Body");
         }
         if view.response_focus.is_focused(window) {
@@ -239,6 +262,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_query))
             .on_action(cx.listener(Self::toggle_row))
             .on_action(cx.listener(Self::remove_row))
+            .on_action(cx.listener(Self::cycle_body_kind))
+            .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::toggle_theme))
@@ -279,7 +304,7 @@ fn titlebar(title: SharedString, theme: &Theme) -> impl IntoElement {
                     div()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child("M1.3 · viewer".to_string()),
+                        .child("M1.4 · the loop".to_string()),
                 ),
         )
         .child(
