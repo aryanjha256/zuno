@@ -98,6 +98,8 @@ enum Command {
     Cancel {
         job: JobId,
     },
+    /// Throw away every cached client, and with them every cookie jar.
+    ClearCookies,
 }
 
 pub struct Engine {
@@ -157,6 +159,23 @@ impl Engine {
     pub fn cancel(&self, job: JobId) {
         let _ = self.commands.send(Command::Cancel { job });
     }
+
+    /// Forget every stored cookie.
+    ///
+    /// **Why this has to exist for the cookie toggle to make sense.** `cookie_store` is
+    /// part of `ClientKey`, so turning it off doesn't empty a jar — it routes the request
+    /// through a *different* cached client. Turning it back on returns you to the original
+    /// client with every previous cookie intact, so without this you could switch cookies
+    /// off, back on, and still be silently logged in. A toggle alone would create the
+    /// confusion it was added to remove.
+    ///
+    /// Implemented by dropping the cached clients rather than reaching into a jar: reqwest
+    /// owns the store behind `cookie_store(true)` and exposes no way to clear it, and the
+    /// next request rebuilds a client with an empty one. The cost is the connection pool,
+    /// which is why this is an explicit action and not something a toggle does implicitly.
+    pub fn clear_cookies(&self) {
+        let _ = self.commands.send(Command::ClearCookies);
+    }
 }
 
 /// The engine thread's main loop.
@@ -199,6 +218,11 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                         handle.abort();
                     }
                 }
+                // In-flight jobs hold their own `Client` clone, so they finish against the
+                // old jar. Only later requests see the fresh one — which is the behaviour
+                // you want: clearing cookies shouldn't sabotage a response you're waiting
+                // on.
+                Command::ClearCookies => clients.clear(),
             }
         }
     });
@@ -237,6 +261,11 @@ struct ClientCache {
 }
 
 impl ClientCache {
+    /// Drop every client, so the next request builds a fresh one with an empty jar.
+    fn clear(&mut self) {
+        self.clients.clear();
+    }
+
     fn get(&mut self, settings: &RequestSettings) -> Result<Client, EngineError> {
         let key = ClientKey::from(settings);
 

@@ -43,6 +43,15 @@ actions!(
         // Response viewer
         FoldAll,
         UnfoldAll,
+        // Settings
+        OpenSettings,
+        SettingNext,
+        SettingPrev,
+        SettingIncrease,
+        SettingDecrease,
+        SettingConfirm,
+        SettingsDismiss,
+        ClearCookies,
         // Request lifecycle
         SaveRequest,
         SendRequest,

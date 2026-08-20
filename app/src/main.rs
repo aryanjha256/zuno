@@ -19,6 +19,7 @@ mod request_pane;
 mod request_view;
 mod response_pane;
 mod session;
+mod settings_panel;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -34,8 +35,9 @@ use gpui::{
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenPalette, OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit,
-    RemoveRow,
+    OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
+    PickerPrev, PrevTab, Quit, RemoveRow, SettingConfirm, SettingDecrease, SettingIncrease,
+    SettingNext, SettingPrev, SettingsDismiss,
     SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
@@ -188,6 +190,17 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("up", PickerPrev, Some("Picker")),
         KeyBinding::new("enter", PickerConfirm, Some("Picker")),
         KeyBinding::new("escape", PickerDismiss, Some("Picker")),
+        // --- The settings panel ---
+        //
+        // Registered after the globals for the same reason as the picker block above: a
+        // context-less binding ties on depth, and later registration breaks the tie.
+        KeyBinding::new("ctrl-,", OpenSettings, None),
+        KeyBinding::new("down", SettingNext, Some("SettingsPanel")),
+        KeyBinding::new("up", SettingPrev, Some("SettingsPanel")),
+        KeyBinding::new("right", SettingIncrease, Some("SettingsPanel")),
+        KeyBinding::new("left", SettingDecrease, Some("SettingsPanel")),
+        KeyBinding::new("enter", SettingConfirm, Some("SettingsPanel")),
+        KeyBinding::new("escape", SettingsDismiss, Some("SettingsPanel")),
         // --- Text editing, scoped to any focused TextInput ---
         KeyBinding::new("backspace", text_input::Backspace, Some("TextInput")),
         KeyBinding::new("delete", text_input::Delete, Some("TextInput")),

@@ -384,3 +384,78 @@ fn the_connection_pool_survives_a_resend() {
         server.join().expect("server thread");
     }
 }
+
+/// A server that hands out a cookie on every response, and reports what it received.
+///
+/// Two connections rather than one, because clearing the jar drops the client and so the
+/// pooled connection with it — the second request arrives on a fresh socket.
+fn serve_twice_setting_a_cookie() -> (String, JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let handle = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept");
+            seen.push(read_request(&mut stream));
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/json\r\n\
+                  Set-Cookie: session=abc123; Path=/\r\n\
+                  Content-Length: 2\r\n\
+                  \r\n\
+                  {}",
+            );
+            let _ = stream.flush();
+        }
+        seen
+    });
+
+    (format!("http://{addr}"), handle)
+}
+
+#[test]
+fn a_cookie_from_one_response_is_replayed_on_the_next_request() {
+    // The behaviour that is on by default and invisible in the UI: consecutive requests
+    // are *not* independent. Asserted here so the settings panel's indicator is describing
+    // something real rather than something assumed.
+    let engine = Engine::new().expect("engine");
+    let (base, server) = serve_twice_setting_a_cookie();
+
+    let (_, first) = engine.send(spec_for(format!("{base}/login")));
+    drain(&first);
+    let (_, second) = engine.send(spec_for(format!("{base}/me")));
+    drain(&second);
+
+    let seen = server.join().expect("server thread");
+    assert!(!seen[0].to_lowercase().contains("cookie:"), "first: {}", seen[0]);
+    assert!(
+        seen[1].to_lowercase().contains("cookie: session=abc123"),
+        "the second request should carry the first's cookie, got:\n{}",
+        seen[1]
+    );
+}
+
+#[test]
+fn clearing_cookies_stops_them_being_replayed() {
+    // Why `clear_cookies` exists at all: `cookie_store` is part of `ClientKey`, so toggling
+    // it off and back on returns you to the same client with the same jar. Without this,
+    // there would be no way to end a session from inside Zuno.
+    let engine = Engine::new().expect("engine");
+    let (base, server) = serve_twice_setting_a_cookie();
+
+    let (_, first) = engine.send(spec_for(format!("{base}/login")));
+    drain(&first);
+
+    engine.clear_cookies();
+
+    let (_, second) = engine.send(spec_for(format!("{base}/me")));
+    drain(&second);
+
+    let seen = server.join().expect("server thread");
+    assert!(
+        !seen[1].to_lowercase().contains("cookie:"),
+        "the cookie survived a clear:\n{}",
+        seen[1]
+    );
+}

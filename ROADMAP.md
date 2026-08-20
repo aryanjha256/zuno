@@ -129,7 +129,9 @@ every `zuno::` action to be either offered or explicitly excluded with a reason.
 
 ## M3 — Reuse
 
-Directional. The theme is *stop retyping things*.
+The theme is *stop retyping things*. Started out of order on purpose: the settings panel came first
+because principle 3 outranked the listed sequence — it exposed five already-built capabilities for
+one modal, and the cookie jar was silently making consecutive requests non-independent.
 
 **Environments and variables.** The engine already *detects* unresolved `{{var}}` and refuses to
 send — so the failure path exists and substitution is the actual work. Needs a scope model
@@ -140,9 +142,24 @@ question in this milestone that isn't purely mechanical.
 proves it). Bearer is trivial. OAuth flows are a genuine project and should be scoped separately
 rather than smuggled in here.
 
-**Settings panel.** Principle 3 — surfaces six of §11's capabilities at once. Cheap enough to pull
-forward into M2 if it starts getting in the way; the cookie jar in particular is on by default and
-invisible, which makes consecutive requests non-independent with nothing on screen saying so.
+**Settings panel — done**, pulled forward ahead of environments. `Ctrl+,` surfaces the five §11
+capabilities that were honoured on every request with no way to see them: cookie jar, timeout,
+redirects and hop limit, TLS verification, encodings. (This file used to say six. Counting them,
+it's five — the rest need their own UI, not a toggle.)
+
+Two things it turned out not to be:
+
+- **Not pure UI.** The cookie jar is shared per client-config across the whole process, so toggling
+  cookies off routes through a different cached client rather than emptying a jar — and toggling
+  back restores it. A toggle alone would have shipped the confusion it was meant to remove, so
+  `Engine::clear_cookies` landed with it.
+- **Not a global settings screen.** These are per-request, because `RequestSettings` already lives
+  on `RequestSpec` and persists per collection file. Global defaults need the same
+  global → environment → request scope model that environments has to build below; building a
+  second one here would mean discarding one.
+
+The status bar now carries a `cookies on` badge. That's the half that actually saves the hour: the
+toggle says what will happen, the badge says what *is* happening.
 
 **History browser.** Ten responses per request are already retained; only the diff surfaces them.
 

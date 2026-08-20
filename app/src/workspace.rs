@@ -19,12 +19,14 @@ use zuno_core::{RequestId, RequestSpec, collection};
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenPalette, OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit,
-    RemoveRow,
+    ClearCookies, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
+    PickerPrev, PrevTab, Quit, RemoveRow, SettingConfirm, SettingDecrease, SettingIncrease,
+    SettingNext, SettingPrev, SettingsDismiss,
     SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
+use crate::settings_panel::{SettingsEvent, SettingsPanel};
 use crate::request_view::{RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
@@ -43,6 +45,15 @@ pub struct Workspace {
     picker: Option<PickerState>,
     /// Holding the task is what keeps the collection scan alive; dropping it cancels.
     picker_scan: Option<Task<()>>,
+    /// The settings panel, while it's open.
+    settings: Option<SettingsState>,
+}
+
+/// The settings panel and the subscription that lets it close, for the same reason
+/// `PickerState` pairs them: either alone leaves a modal nothing can dismiss.
+struct SettingsState {
+    panel: Entity<SettingsPanel>,
+    _subscription: Subscription,
 }
 
 /// The picker plus the subscription that lets it be closed. Dropping either without the
@@ -98,6 +109,7 @@ impl Workspace {
             active_ix,
             picker: None,
             picker_scan: None,
+            settings: None,
         }
     }
 
@@ -452,6 +464,143 @@ impl Workspace {
         self.close_picker(window, cx);
     }
 
+    /// Open the settings panel over the active buffer's `RequestSettings`.
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() || self.picker.is_some() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+
+        let settings = view.read(cx).settings.clone();
+        let restore = Some(view.read(cx).url_focus(cx));
+        let panel = cx.new(|cx| SettingsPanel::new(settings, restore, cx));
+
+        let subscription =
+            cx.subscribe_in(&panel, window, |workspace, _, event, window, cx| match event {
+                SettingsEvent::Dismissed => workspace.close_settings(window, cx),
+                // Cookies live in the engine, not in `RequestSettings`, so the panel can't
+                // do this itself.
+                SettingsEvent::ClearCookies => workspace.clear_cookies(&ClearCookies, window, cx),
+            });
+
+        let focus = panel.read(cx).focus_handle();
+        self.settings = Some(SettingsState {
+            panel,
+            _subscription: subscription,
+        });
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.settings.take() else { return };
+        // Same discipline as the picker: focus is inside a panel that's about to be dropped,
+        // and leaving it there kills the keymap silently.
+        if let Some(handle) = state.panel.read(cx).restore_focus() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Copy the panel's edits onto the active buffer.
+    ///
+    /// Written back on every change rather than on close, so dismissing with Esc keeps what
+    /// you changed — there is no OK/Cancel here, and a modal that silently discards edits on
+    /// Esc is worse than one that has no Esc.
+    fn commit_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.settings else { return };
+        let Some(view) = self.active() else { return };
+        let settings = state.panel.read(cx).settings().clone();
+        view.update(cx, |view, cx| {
+            view.settings = settings;
+            cx.notify();
+        });
+    }
+
+    fn setting_next(&mut self, _: &SettingNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.settings {
+            state.panel.update(cx, |panel, cx| panel.select(1, cx));
+        }
+    }
+
+    fn setting_prev(&mut self, _: &SettingPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.settings {
+            state.panel.update(cx, |panel, cx| panel.select(-1, cx));
+        }
+    }
+
+    fn setting_increase(&mut self, _: &SettingIncrease, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_setting(1, cx);
+    }
+
+    fn setting_decrease(&mut self, _: &SettingDecrease, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_setting(-1, cx);
+    }
+
+    fn adjust_setting(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let Some(state) = &self.settings else { return };
+        let changed = state.panel.update(cx, |panel, cx| panel.adjust(delta, cx));
+        if changed {
+            self.commit_settings(cx);
+        }
+    }
+
+    fn setting_confirm(&mut self, _: &SettingConfirm, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.settings else { return };
+        let changed = state.panel.update(cx, |panel, cx| panel.confirm(cx));
+        if changed {
+            self.commit_settings(cx);
+        }
+    }
+
+    fn settings_dismiss(&mut self, _: &SettingsDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_settings(window, cx);
+    }
+
+    /// Throw away every stored cookie.
+    ///
+    /// Reachable from the settings panel, the palette, and a keybinding, which is why it's
+    /// an action rather than a method the panel calls.
+    fn clear_cookies(&mut self, _: &ClearCookies, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(engine) = cx.engine() else {
+            self.set_status("The HTTP engine is not running", cx);
+            return;
+        };
+        engine.clear_cookies();
+        self.set_status("Cleared stored cookies", cx);
+    }
+
+    /// Whether the active request will store and replay cookies.
+    ///
+    /// Surfaced in the status bar because the jar is on by default and otherwise invisible,
+    /// which makes consecutive requests non-independent with nothing on screen saying so.
+    pub fn cookies_enabled(&self, cx: &App) -> bool {
+        self.active()
+            .map(|view| view.read(cx).settings.cookie_store)
+            .unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub fn settings_is_open(&self) -> bool {
+        self.settings.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn settings_rows(&self, cx: &App) -> Vec<String> {
+        self.settings
+            .as_ref()
+            .map(|state| state.panel.read(cx).rows_for_test())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn settings_selection(&self, cx: &App) -> usize {
+        self.settings
+            .as_ref()
+            .map(|state| state.panel.read(cx).selection())
+            .unwrap_or(0)
+    }
+
     /// The persistable state of every open buffer.
     ///
     /// Walks *all* views, not just the active one. Saving only `active()` was correct
@@ -749,6 +898,7 @@ impl Render for Workspace {
         let theme = cx.theme().clone();
         let focused_region = self.focused_region(window, cx);
         let status_message = self.status_message(cx);
+        let cookies = self.cookies_enabled(cx);
         let title = self
             .views
             .get(self.active_ix)
@@ -784,6 +934,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::open_request))
             .on_action(cx.listener(Self::open_palette))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::setting_next))
+            .on_action(cx.listener(Self::setting_prev))
+            .on_action(cx.listener(Self::setting_increase))
+            .on_action(cx.listener(Self::setting_decrease))
+            .on_action(cx.listener(Self::setting_confirm))
+            .on_action(cx.listener(Self::settings_dismiss))
+            .on_action(cx.listener(Self::clear_cookies))
             .on_action(cx.listener(Self::picker_next))
             .on_action(cx.listener(Self::picker_prev))
             .on_action(cx.listener(Self::picker_confirm))
@@ -817,9 +975,10 @@ impl Render for Workspace {
             .child(crate::chrome::titlebar(title, &theme, window))
             .children(tab_strip(tabs, &theme, cx))
             .children(self.active())
-            .child(status_bar(focused_region, status_message, &theme))
+            .child(status_bar(focused_region, status_message, cookies, &theme))
             // Above the panes, below the resize edges.
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
+            .children(self.settings.as_ref().map(|state| state.panel.clone()))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
     }
@@ -921,9 +1080,10 @@ fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
 fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
+    cookies: bool,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+P find · Ctrl+K commands · Ctrl+T tab · Ctrl+S save · Ctrl+Enter send";
+    const HINTS: &str = "Ctrl+P find · Ctrl+K commands · Ctrl+, settings · Ctrl+Enter send";
 
     div()
         .flex()
@@ -962,8 +1122,29 @@ fn status_bar(
         )
         .child(
             div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
                 .flex_none()
-                .text_color(theme.text_muted)
-                .child(HINTS.to_string()),
+                // The cookie jar is on by default and was otherwise invisible, which made
+                // consecutive requests silently non-independent — the exact thing that
+                // costs an hour of debugging a phantom auth bug. Shown only when it's on:
+                // a badge that's always there stops being read.
+                .children(cookies.then(|| {
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.bg_elevated)
+                        .text_color(theme.accent)
+                        .child("cookies on")
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.text_muted)
+                        .child(HINTS.to_string()),
+                ),
         )
 }

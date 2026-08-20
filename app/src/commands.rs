@@ -67,6 +67,9 @@ pub fn palette() -> Vec<Command> {
         // The response viewer.
         command("Fold all", FoldAll),
         command("Unfold all", UnfoldAll),
+        // Settings.
+        command("Request settings", OpenSettings),
+        command("Clear stored cookies", ClearCookies),
         // Application.
         command("Toggle theme", ToggleTheme),
         command("Quit", Quit),
@@ -87,6 +90,13 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::PickerDismiss", "only valid inside the picker"),
     // A palette that lists itself is noise; Ctrl+K is how you got here.
     ("zuno::OpenPalette", "this is the palette"),
+    // Only valid inside the settings panel, where they're already bound.
+    ("zuno::SettingNext", "only valid inside the settings panel"),
+    ("zuno::SettingPrev", "only valid inside the settings panel"),
+    ("zuno::SettingIncrease", "only valid inside the settings panel"),
+    ("zuno::SettingDecrease", "only valid inside the settings panel"),
+    ("zuno::SettingConfirm", "only valid inside the settings panel"),
+    ("zuno::SettingsDismiss", "only valid inside the settings panel"),
     // Tab/Shift-Tab move focus within a buffer. As a named command it reads as "go
     // somewhere" without saying where, which is worse than not offering it.
     ("zuno::FocusNext", "keystroke-only; no meaningful name"),

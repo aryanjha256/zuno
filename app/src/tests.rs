@@ -1752,3 +1752,210 @@ async fn choosing_a_buffer_leaves_focus_in_that_buffer(cx: &mut TestAppContext) 
     );
     assert_ne!(first_url, active.url, "sanity: the buffer really changed");
 }
+
+fn settings_rows(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext) -> Vec<String> {
+    window
+        .update(cx, |workspace, _, cx| workspace.settings_rows(cx))
+        .expect("window")
+}
+
+fn settings_open(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext) -> bool {
+    window
+        .update(cx, |workspace, _, _| workspace.settings_is_open())
+        .expect("window")
+}
+
+/// The value shown for a settings row, by label prefix.
+fn setting_value(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+    label: &str,
+) -> String {
+    settings_rows(window, cx)
+        .into_iter()
+        .find(|row| row.starts_with(label))
+        .map(|row| row.rsplit(" = ").next().unwrap_or_default().to_string())
+        .unwrap_or_else(|| panic!("no settings row starting with {label:?}"))
+}
+
+#[gpui::test]
+async fn ctrl_comma_shows_the_engine_settings_that_were_previously_invisible(
+    cx: &mut TestAppContext,
+) {
+    // §11's whole point: these are honoured on every request with no way to see them.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-,");
+    assert!(settings_open(&window, &mut cx));
+
+    let rows = settings_rows(&window, &mut cx).join("\n");
+    for expected in [
+        "Store and replay cookies = on",
+        "Verify TLS certificates = on",
+        "Follow redirects = on",
+        "Maximum redirect hops = 10",
+        "Accept compressed responses = on",
+        "Timeout = 30s",
+    ] {
+        assert!(rows.contains(expected), "missing {expected:?} in:\n{rows}");
+    }
+}
+
+#[gpui::test]
+async fn toggling_a_setting_reaches_the_spec_that_gets_sent(cx: &mut TestAppContext) {
+    // A panel that edits a copy nothing reads would look identical on screen and change
+    // nothing about the request, so assert against `spec(cx)` — what actually goes on the
+    // wire — rather than against the panel's own state.
+    let (window, view, mut cx) = boot(cx, None, None);
+    assert!(spec_of(&view, &mut cx).settings.cookie_store);
+
+    cx.simulate_keystrokes("ctrl-,");
+    // Cookies is the first row, so Enter toggles it without moving.
+    cx.simulate_keystrokes("enter");
+
+    assert!(
+        !spec_of(&view, &mut cx).settings.cookie_store,
+        "the toggle must reach the request that gets sent"
+    );
+    assert_eq!(setting_value(&window, &mut cx, "Store and replay cookies"), "off");
+}
+
+#[gpui::test]
+async fn an_edit_survives_dismissing_the_panel(cx: &mut TestAppContext) {
+    // There is no OK/Cancel here, so Esc must not silently discard what you changed.
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-, enter escape");
+    assert!(!settings_open(&window, &mut cx));
+    assert!(!spec_of(&view, &mut cx).settings.cookie_store);
+
+    // And focus has to come back, or the keymap is dead.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://after-settings.test");
+    assert_eq!(tabs_of(&window, &mut cx).1.url, "https://after-settings.test");
+}
+
+#[gpui::test]
+async fn arrows_step_the_numeric_settings_within_bounds(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-,");
+
+    // Down three times: cookies -> tls -> redirects -> max hops.
+    cx.simulate_keystrokes("down down down");
+    cx.simulate_keystrokes("right");
+    assert_eq!(setting_value(&window, &mut cx, "Maximum redirect hops"), "11");
+    cx.simulate_keystrokes("left left");
+    assert_eq!(setting_value(&window, &mut cx, "Maximum redirect hops"), "9");
+    assert_eq!(spec_of(&view, &mut cx).settings.max_redirects, 9);
+
+    // Timeout is two rows further down, and steps in 5s.
+    cx.simulate_keystrokes("down down");
+    cx.simulate_keystrokes("right");
+    assert_eq!(setting_value(&window, &mut cx, "Timeout"), "35s");
+
+    // Clamped, not wrapped or underflowed: 30 downward steps would go far below zero.
+    for _ in 0..30 {
+        cx.simulate_keystrokes("left");
+    }
+    assert_eq!(
+        setting_value(&window, &mut cx, "Timeout"),
+        "1s",
+        "the timeout must clamp above zero rather than reaching 0 or wrapping"
+    );
+}
+
+#[gpui::test]
+async fn the_selection_wraps_in_both_directions(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-,");
+
+    let selection = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, cx| workspace.settings_selection(cx))
+            .expect("window")
+    };
+
+    assert_eq!(selection(&mut cx), 0);
+    // Up from the first row must wrap rather than underflow a usize.
+    cx.simulate_keystrokes("up");
+    assert_eq!(selection(&mut cx), 6);
+    cx.simulate_keystrokes("down");
+    assert_eq!(selection(&mut cx), 0);
+}
+
+#[gpui::test]
+async fn the_status_bar_says_when_cookies_are_on(cx: &mut TestAppContext) {
+    // The indicator is the half that matters: the toggle says what *will* happen, the
+    // indicator says what *is* happening, and the jar being invisible is what costs an hour.
+    let (window, _, mut cx) = boot(cx, None, None);
+    let cookies_on = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, cx| workspace.cookies_enabled(cx))
+            .expect("window")
+    };
+
+    assert!(cookies_on(&mut cx), "on by default, matching the engine");
+
+    cx.simulate_keystrokes("ctrl-, enter escape");
+    assert!(!cookies_on(&mut cx), "the indicator must follow the setting");
+}
+
+#[gpui::test]
+async fn clearing_cookies_is_reachable_and_reports_back(cx: &mut TestAppContext) {
+    // The engine side is covered over a real socket in core/tests/engine.rs; this asserts
+    // the action is wired and confirms itself, since a silent action leaves you unsure
+    // whether you pressed it.
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-,");
+    // Clear cookies is the last row.
+    cx.simulate_keystrokes("up");
+    cx.simulate_keystrokes("enter");
+
+    assert_eq!(setting_value(&window, &mut cx, "Clear stored cookies now"), "cleared");
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    assert!(
+        status.is_some_and(|s| s.contains("Cleared stored cookies")),
+        "the action should report back"
+    );
+    // Clearing is not a settings change, so it must not have edited the request.
+    assert!(spec_of(&view, &mut cx).settings.cookie_store);
+}
+
+#[gpui::test]
+async fn settings_are_per_request_not_global(cx: &mut TestAppContext) {
+    // The scope decision, asserted. A global-defaults layer is the same scope-model problem
+    // environments has to solve, so this deliberately edits one buffer only.
+    let (window, first, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-, enter escape");
+    assert!(!spec_of(&first, &mut cx).settings.cookie_store);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let (_, fresh) = tabs_of(&window, &mut cx);
+    assert!(
+        fresh.settings.cookie_store,
+        "a new buffer must not inherit another buffer's settings"
+    );
+}
+
+#[gpui::test]
+async fn settings_survive_a_save_and_reopen(cx: &mut TestAppContext) {
+    // `RequestSettings` is part of `RequestSpec`, so it rides along in the collection file.
+    // Worth asserting: it's what makes "TLS off for this one request" durable.
+    let (session, root) = scratch_collection("settings-roundtrip");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/v1/insecure");
+    // Row 1 is Verify TLS.
+    cx.simulate_keystrokes("ctrl-, down enter escape");
+    cx.simulate_keystrokes("ctrl-s");
+
+    let bytes = std::fs::read(root.join("insecure.json")).expect("read");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    assert!(!saved.settings.verify_tls, "the setting must persist");
+    assert!(saved.settings.cookie_store, "and the others must be untouched");
+
+    remove_scratch(&mut cx, &session);
+    let _ = window;
+}

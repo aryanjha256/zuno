@@ -64,6 +64,7 @@ zuno/
         ├── collections.rs  ✅ where collections live (a global, for tests)
         ├── picker.rs        ✅ the modal picker: filter + ranked list
         ├── commands.rs      ✅ the command palette's curated action table
+        ├── settings_panel.rs ✅ per-request engine settings, as a modal
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
@@ -707,18 +708,33 @@ UI work, not engine work.
 
 | Capability | State |
 |---|---|
-| **Cookie jar** | **On by default.** `RequestSettings::cookie_store`, matching Postman and browsers. Nothing on screen says so, and it makes consecutive requests non-independent — the second carries the first's cookies. Wants an indicator or a toggle. |
-| Timeout (30s) | Applied per request; not editable |
-| Redirect following + max hops | Honoured; not editable |
-| TLS verification toggle | Honoured; not editable. curl import sets it from `-k` |
-| gzip / brotli / deflate / zstd | Negotiated; not editable |
+| ~~**Cookie jar**~~ | **Reachable.** Toggle plus a `cookies on` badge in the status bar, and `Engine::clear_cookies` — see below for why the toggle alone wasn't enough |
+| ~~Timeout (30s)~~ | **Reachable** in the settings panel, 1–600s |
+| ~~Redirect following + max hops~~ | **Reachable** in the settings panel |
+| ~~TLS verification toggle~~ | **Reachable** in the settings panel. curl import still sets it from `-k` |
+| ~~gzip / brotli / deflate / zstd~~ | **Reachable** in the settings panel |
 | Form and binary bodies | The engine sends both correctly; the UI can only author raw bodies |
 | Multipart bodies | Modeled, and curl import parses `-F` — but the engine returns `UnsupportedBody`. The one item here that is *not* just UI work |
 | Response history | 10 deep, newest first. Only the diff surfaces it; there's no way to browse back |
 | Custom HTTP methods | `Method::Other` sends anything; the UI only cycles the seven common verbs |
 
-A settings panel and a history browser would each expose several of these at once, which makes
-them unusually cheap for the value.
+`Ctrl+,` closed the first five. **Four remain**, and none of them is a settings toggle: form and
+binary body authoring, multipart (which also needs engine work), the response history browser, and
+custom HTTP methods.
+
+Two things the settings panel turned up that are worth knowing before touching either half:
+
+- **The cookie jar was never per-request.** `ClientKey` includes `cookie_store`, so every request
+  with the same client-level settings shares one `Client` and therefore one jar. Toggling cookies
+  off doesn't empty anything — it routes through a *different* cached client, and toggling back
+  returns the original jar intact. So a toggle on its own would have created the confusion it was
+  added to remove, and `Engine::clear_cookies` (drop the cached clients; the next request builds a
+  fresh jar) shipped with it. reqwest owns the store behind `cookie_store(true)` and exposes no way
+  to empty it, which is why eviction rather than clearing.
+- **Settings are per-request, and stay that way for now.** `RequestSettings` lives on `RequestSpec`,
+  so it already persists per collection file. A global-defaults layer needs a scope model
+  (global → environment → request) — the same one environments has to build in M3 — and doing it
+  twice would mean throwing one away.
 
 ---
 
