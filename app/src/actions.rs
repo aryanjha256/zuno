@@ -21,6 +21,7 @@ actions!(
         FocusPrev,
         // Navigation
         OpenRequest,
+        OpenPalette,
         PickerNext,
         PickerPrev,
         PickerConfirm,

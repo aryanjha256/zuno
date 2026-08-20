@@ -63,6 +63,7 @@ zuno/
         ├── session.rs      ✅ window-session envelope, versioned + migrating
         ├── collections.rs  ✅ where collections live (a global, for tests)
         ├── picker.rs        ✅ the modal picker: filter + ranked list
+        ├── commands.rs      ✅ the command palette's curated action table
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
@@ -820,10 +821,24 @@ Three decisions in `picker.rs` worth recording:
 Deliberately absent: **no highlighting of matched characters.** It needs match positions threaded
 out of the scorer and styled text runs, and the picker is useful without it.
 
-**Where `Ctrl+P` and `Ctrl+K` get their content.****Where `Ctrl+P` and `Ctrl+K` get their content.** These are the thesis features from `what.md`
-and neither exists. Note the dependency: `Ctrl+P` "find any request" is meaningless until
-collections exist, which is why curl import came first — it's how requests get *into* the app at
-all. A palette over one scratch request would be theatre.
+**Where `Ctrl+P` and `Ctrl+K` get their content — answered.** `Ctrl+P` lists open buffers then
+`collection::scan`; `Ctrl+K` lists `commands::palette()`. Both go through the one picker.
+
+The `Ctrl+K` half was mis-estimated for a while, and the correction is the useful part: a palette is
+*not* a loop over `cx.all_action_names()`. That returns namespaced strings for every registered
+action, including all the text-editing ones, with no human labels. `commands.rs` is a curated table
+of real action **values** — so a rename is a compile error, not a dead row — and a drift test
+requires every `zuno::` action to be either offered or excluded with a stated reason.
+
+Two ordering facts worth keeping, both verified against the vendored source rather than assumed:
+
+- `Window::dispatch_action` captures the focused id and then `cx.defer`s the dispatch. So a command
+  chosen in the modal resolves against the frame the modal was in, and close-then-dispatch is
+  indistinguishable from dispatch-then-close *for actions*.
+- It is **not** indistinguishable for `Buffer`/`File` targets, because `activate` focuses
+  synchronously — close afterwards and the focus restore clobbers the switch, leaving `active_ix`
+  and focus disagreeing so you type into the request you just left. That is why the picker closes
+  before acting, and `choosing_a_buffer_leaves_focus_in_that_buffer` is the guard.
 
 **The cookie jar's visibility** (new). It's on and invisible. Options: a status-bar
 indicator, a per-request toggle, or a jar viewer. Leaning toward an indicator plus a toggle in the

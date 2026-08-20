@@ -11,6 +11,7 @@ mod actions;
 mod body_view;
 mod chrome;
 mod collections;
+mod commands;
 mod engine;
 mod input;
 mod picker;
@@ -33,7 +34,8 @@ use gpui::{
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow,
+    OpenPalette, OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit,
+    RemoveRow,
     SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
@@ -181,6 +183,7 @@ fn register_keymap(cx: &mut App) {
         // global `escape` -> CancelRequest because it is registered after it. Move this
         // block above the Application section and Esc stops closing the picker.
         KeyBinding::new("ctrl-p", OpenRequest, None),
+        KeyBinding::new("ctrl-k", OpenPalette, None),
         KeyBinding::new("down", PickerNext, Some("Picker")),
         KeyBinding::new("up", PickerPrev, Some("Picker")),
         KeyBinding::new("enter", PickerConfirm, Some("Picker")),

@@ -19,7 +19,8 @@ use zuno_core::{RequestId, RequestSpec, collection};
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow,
+    OpenPalette, OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit,
+    RemoveRow,
     SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
@@ -258,31 +259,12 @@ impl Workspace {
             })
             .collect();
 
-        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
-        let picker = cx.new(|cx| picker::Picker::new(buffer_items, restore, cx));
-
-        // Dropping this subscription would make the picker unclosable, so it's held
-        // alongside the entity for exactly as long as the picker exists.
-        let subscription = cx.subscribe_in(&picker, window, |workspace, picker, event, window, cx| {
-            match event {
-                picker::PickerEvent::Dismissed => workspace.close_picker(window, cx),
-                picker::PickerEvent::Confirmed => {
-                    let chosen = picker.read(cx).chosen().cloned();
-                    workspace.close_picker(window, cx);
-                    if let Some(target) = chosen {
-                        workspace.choose(target, window, cx);
-                    }
-                }
-            }
-        });
-
-        let focus = picker.read(cx).focus_handle(cx);
-        self.picker = Some(PickerState {
-            picker: picker.clone(),
-            _subscription: subscription,
-        });
-        window.focus(&focus);
-        cx.notify();
+        let picker = self.show_picker(
+            buffer_items,
+            "No saved requests yet — press Ctrl+S to save the one you're editing",
+            window,
+            cx,
+        );
 
         // Fill in the saved requests as they arrive. The picker is already usable.
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
@@ -314,6 +296,79 @@ impl Workspace {
         }));
     }
 
+    /// Open the command palette: every verb in `commands::palette`, with its keybinding.
+    ///
+    /// The same picker as Ctrl+P, which is the whole point of principle 2 — a different
+    /// `Vec<Item>` and a different `Target` variant, no new interaction.
+    fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
+
+        let items = crate::commands::palette()
+            .into_iter()
+            .map(|command| picker::Item {
+                label: SharedString::from(command.label),
+                // The keybinding, so the palette teaches the shortcut rather than
+                // replacing it. Blank for commands that have none.
+                detail: SharedString::from(keybinding_hint(command.action.as_ref(), window)),
+                target: picker::Target::Action(command.action),
+            })
+            .collect();
+
+        // `palette()` is a non-empty literal, so an empty list means the filter matched
+        // nothing, never that there was nothing to show.
+        self.show_picker(items, "No commands", window, cx);
+    }
+
+    /// Put a picker on screen, focused, with the subscription that lets it close.
+    ///
+    /// Shared by Ctrl+P and Ctrl+K so there is exactly one place that gets focus and
+    /// teardown right.
+    fn show_picker(
+        &mut self,
+        items: Vec<picker::Item>,
+        empty_hint: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<picker::Picker> {
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let picker = cx.new(|cx| picker::Picker::new(items, empty_hint, restore, cx));
+
+        // Dropping this subscription would make the picker unclosable, so it's held
+        // alongside the entity for exactly as long as the picker exists.
+        let subscription =
+            cx.subscribe_in(&picker, window, |workspace, picker, event, window, cx| match event {
+                picker::PickerEvent::Dismissed => workspace.close_picker(window, cx),
+                picker::PickerEvent::Confirmed => {
+                    let chosen = picker.read(cx).chosen().cloned();
+                    // Closed *before* acting, and the order is load-bearing for
+                    // `Buffer`/`File`: `activate` focuses synchronously, so closing
+                    // afterwards would have `close_picker` restore focus to the *previous*
+                    // buffer, leaving `active_ix` and focus disagreeing — you'd type into
+                    // the request you just navigated away from.
+                    //
+                    // It makes no difference for `Action`: `Window::dispatch_action`
+                    // captures the focus id and then `cx.defer`s the dispatch, so a command
+                    // behaves identically either way. Verified, not assumed — see
+                    // `choosing_a_buffer_leaves_focus_in_that_buffer`.
+                    workspace.close_picker(window, cx);
+                    if let Some(target) = chosen {
+                        workspace.choose(target, window, cx);
+                    }
+                }
+            });
+
+        let focus = picker.read(cx).focus_handle(cx);
+        self.picker = Some(PickerState {
+            picker: picker.clone(),
+            _subscription: subscription,
+        });
+        window.focus(&focus);
+        cx.notify();
+        picker
+    }
+
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.picker.take() else { return };
         self.picker_scan = None;
@@ -332,6 +387,11 @@ impl Workspace {
     fn choose(&mut self, target: picker::Target, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             picker::Target::Buffer(ix) => self.activate(ix, window, cx),
+            picker::Target::Action(action) => {
+                // Dispatched rather than called directly, so a palette entry and its
+                // keybinding run the identical path — the convention in CLAUDE.md.
+                window.dispatch_action(action, cx);
+            }
             picker::Target::File(path) => {
                 // The file may have been deleted or broken since the scan; report rather
                 // than opening an empty buffer.
@@ -723,6 +783,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::open_request))
+            .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::picker_next))
             .on_action(cx.listener(Self::picker_prev))
             .on_action(cx.listener(Self::picker_confirm))
@@ -838,12 +899,31 @@ fn tab_strip(
     )
 }
 
+/// The first keybinding for an action, rendered like `ctrl-k`, or empty if it has none.
+///
+/// Read from the live keymap rather than a hardcoded string, so a rebinding can't leave the
+/// palette advertising a shortcut that no longer works.
+fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
+    window
+        .bindings_for_action(action)
+        .first()
+        .map(|binding| {
+            binding
+                .keystrokes()
+                .iter()
+                .map(|keystroke| keystroke.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
 fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+P find · Ctrl+T tab · Ctrl+S save · Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Enter send";
+    const HINTS: &str = "Ctrl+P find · Ctrl+K commands · Ctrl+T tab · Ctrl+S save · Ctrl+Enter send";
 
     div()
         .flex()

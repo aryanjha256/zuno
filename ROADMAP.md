@@ -20,12 +20,12 @@ light/dark themes, window chrome.
 Measured: **189 ms** cold start (release), **48 ms** to flatten 10 MB of JSON into 1.31 M rows
 off-thread, 60 fps scrolling on any response size.
 
-**M2 is nearly done.** Tabs, collections as one-file-per-request, and `Ctrl+P` over both buffers and
-saved requests. 241 tests across three layers, and a `.deb` on tagged releases.
+**M2 is complete.** Tabs as editor buffers, collections as one-file-per-request in git, `Ctrl+P`
+over buffers and saved requests, and `Ctrl+K` over every command. 249 tests across three layers,
+and a `.deb` on tagged releases.
 
-**One piece of the thesis is left: `Ctrl+K`.** The picker it needs already exists, so what remains
-is a curated action table rather than new machinery — see below for why that's more than a loop over
-`all_action_names()`.
+The navigation thesis from `what.md` is built. What's left is **reuse** — see M3 — and the honest
+next question is no longer "can you get around" but "can you stop retyping things".
 
 That gap *is* the roadmap. Everything below is about closing it.
 
@@ -57,9 +57,10 @@ These decide phase order, and they're the durable part of this document.
 
 ---
 
-## M2 — Navigation
+## M2 — Navigation — **complete**
 
-The thesis milestone. Concrete, because it's next.
+The thesis milestone. Kept in full rather than trimmed to a line: the *order* these landed in, and
+the two estimates that turned out wrong, are the durable part.
 
 **Tabs — done.** What makes the "20–100+ open requests" claim from `idea.md` true.
 
@@ -109,13 +110,16 @@ Choosing a file sets its `path`, so Ctrl+S afterwards overwrites instead of dupl
 This also closed the one-way door the collections slice left behind: Ctrl+S wrote files nothing
 could read back.
 
-**`Ctrl+K` — command palette.** The same picker over the action registry. Budget more than
-"`actions.rs` already lists the verbs" suggests: `actions!` generates *types*, not an iterable
-registry. The runtime list is `cx.all_action_names()` (with `cx.build_action` to dispatch by name),
-but it returns namespaced strings for *every* registered action — including the ~20
-`text_input::`/`editor::` ones that must not appear in a palette — and carries no human labels or
-keybinding hints. A curated label table is real work, not a lookup. `actions.rs` also isn't the
-single list: its own header points at `input::text_input` for the editing verbs.
+**`Ctrl+K` — done.** The same picker over `commands::palette()`, each row showing its keybinding
+read live from the keymap so a rebinding can't leave the palette advertising a dead shortcut.
+
+The estimate in an earlier version of this file was wrong, and it's worth recording why:
+"`actions.rs` already lists the verbs" treated a palette as a loop over `all_action_names()`. It
+isn't. That returns namespaced strings for *every* registered action — the twenty-odd
+`text_input::`/`editor::` ones included — with no labels. "Backspace" is a keystroke, not a command.
+So `commands.rs` is a curated table holding real action *values* rather than name strings, which
+makes renaming an action a compile error instead of a silently dead row, and a drift test requires
+every `zuno::` action to be either offered or explicitly excluded with a reason.
 
 > **Done when:** you can hold 50 requests open across collections, reach any of them by name
 > without touching the mouse, run any command from the palette, and nothing about it feels slower

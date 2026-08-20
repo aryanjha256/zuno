@@ -35,7 +35,6 @@ const ROW_HEIGHT: f32 = 26.;
 const VISIBLE_ROWS: f32 = 12.;
 
 /// What choosing a row does. Opaque to the picker itself.
-#[derive(Debug, Clone, PartialEq)]
 pub enum Target {
     /// Switch to an already-open buffer, by index into `Workspace::views`.
     ///
@@ -44,6 +43,20 @@ pub enum Target {
     Buffer(usize),
     /// Open a request from a collection file.
     File(PathBuf),
+    /// Dispatch an application action — the command palette.
+    Action(Box<dyn gpui::Action>),
+}
+
+// Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
+// answer to that. Deriving would require `Action: Clone`, which no trait object can be.
+impl Clone for Target {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Buffer(ix) => Self::Buffer(*ix),
+            Self::File(path) => Self::File(path.clone()),
+            Self::Action(action) => Self::Action(action.boxed_clone()),
+        }
+    }
 }
 
 pub struct Item {
@@ -70,11 +83,20 @@ pub struct Picker {
     /// The query the matches were computed for, so `render` can notice a keystroke landed
     /// in the input. The input owns its text, and it doesn't emit events yet.
     last_query: String,
+    /// Shown when there are no candidates at all, which means something different for a
+    /// request list (nothing saved yet) than for a command list (a bug).
+    empty_hint: &'static str,
 }
 
 impl Picker {
-    pub fn new(items: Vec<Item>, restore_focus: Option<FocusHandle>, cx: &mut Context<Self>) -> Self {
-        let filter = cx.new(|cx| TextInput::new(String::new(), "Search requests…", "Picker", cx));
+    pub fn new(
+        items: Vec<Item>,
+        placeholder: &'static str,
+        restore_focus: Option<FocusHandle>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let filter = cx.new(|cx| TextInput::new(String::new(), placeholder, "Picker", cx));
+        let empty_hint = placeholder;
 
         let mut picker = Self {
             filter,
@@ -84,6 +106,7 @@ impl Picker {
             scroll: UniformListScrollHandle::new(),
             restore_focus,
             last_query: String::new(),
+            empty_hint,
         };
         picker.refilter();
         picker
@@ -244,7 +267,7 @@ impl Render for Picker {
                             .child(self.filter.clone()),
                     )
                     .child(if count == 0 {
-                        empty_state(&self.last_query, &theme).into_any_element()
+                        empty_state(&self.last_query, self.empty_hint, &theme).into_any_element()
                     } else {
                         result_list(rows, selected, self.scroll.clone(), &theme, cx)
                             .into_any_element()
@@ -264,13 +287,13 @@ pub enum PickerEvent {
 
 impl gpui::EventEmitter<PickerEvent> for Picker {}
 
-fn empty_state(query: &str, theme: &Theme) -> impl IntoElement {
-    // Distinguishes "you filtered everything out" from "you have no saved requests",
+fn empty_state(query: &str, empty_hint: &str, theme: &Theme) -> impl IntoElement {
+    // Distinguishes "you filtered everything out" from "there was nothing to begin with",
     // because the fix for each is completely different.
     let message = if query.is_empty() {
-        "No saved requests yet — press Ctrl+S to save the one you're editing".to_string()
+        empty_hint.to_string()
     } else {
-        format!("No requests match “{query}”")
+        format!("Nothing matches “{query}”")
     };
 
     div()

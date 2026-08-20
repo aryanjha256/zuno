@@ -1629,3 +1629,126 @@ async fn a_second_ctrl_p_does_not_nest_a_modal(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("escape");
     assert!(!picker_is_open(&window, &mut cx), "one escape must close it");
 }
+
+#[gpui::test]
+async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-k");
+    assert!(picker_is_open(&window, &mut cx));
+
+    let rows = picker_rows(&window, &mut cx);
+    assert!(rows.len() > 10, "the palette should be populated: {}", rows.len());
+
+    // Read from the live keymap, not a hardcoded string — a rebinding must not leave the
+    // palette advertising a shortcut that no longer works.
+    let send = rows
+        .iter()
+        .find(|row| row.starts_with("Send request"))
+        .expect("Send request should be listed");
+    assert!(send.contains("ctrl-enter"), "missing its keybinding: {send:?}");
+
+    // Text-editing actions are keystrokes, not commands, and must never appear.
+    for row in &rows {
+        assert!(!row.contains("Backspace"), "{row:?}");
+        assert!(!row.contains("SelectLeft"), "{row:?}");
+    }
+}
+
+#[gpui::test]
+async fn a_palette_command_runs_the_same_path_as_its_keybinding(cx: &mut TestAppContext) {
+    // Dispatching rather than calling directly is what keeps a palette row and its
+    // shortcut from drifting apart.
+    let (window, view, mut cx) = boot(cx, None, None);
+    let before = spec_of(&view, &mut cx).headers.len();
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("add head");
+    cx.simulate_keystrokes("enter");
+
+    assert!(!picker_is_open(&window, &mut cx), "should close on confirm");
+
+    let after = spec_of(&view, &mut cx).headers.len();
+    assert_eq!(after, before + 1, "the command should have added a header");
+
+    // And focus must have landed in the new row, exactly as Ctrl+Shift+H does — proof the
+    // action dispatched from the request view rather than from inside the dying modal.
+    cx.simulate_input("X-From-Palette");
+    let added = spec_of(&view, &mut cx).headers.pop().expect("a header");
+    assert_eq!(added.name, "X-From-Palette");
+}
+
+#[gpui::test]
+async fn the_palette_filters_fuzzily(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-k");
+
+    cx.simulate_input("tgtm");
+    let rows = picker_rows(&window, &mut cx);
+    assert!(
+        rows.iter().any(|row| row.starts_with("Toggle theme")),
+        "initials should find it: {rows:?}"
+    );
+}
+
+#[gpui::test]
+async fn escape_closes_the_palette_too(cx: &mut TestAppContext) {
+    // The palette reuses the picker's key context, so this is really asserting that the
+    // one set of bindings serves both — principle 2 holding up in practice.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_keystrokes("escape");
+    assert!(!picker_is_open(&window, &mut cx));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://after-palette.test");
+    assert_eq!(tabs_of(&window, &mut cx).1.url, "https://after-palette.test");
+}
+
+#[gpui::test]
+async fn the_palette_can_open_a_tab_through_a_command(cx: &mut TestAppContext) {
+    // An end-to-end check that a dispatched action reaches a handler which mutates the
+    // workspace itself, not just the active buffer.
+    let (window, _, mut cx) = boot(cx, None, None);
+    assert_eq!(tabs_of(&window, &mut cx).0, 1);
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("new tab");
+    cx.simulate_keystrokes("enter");
+
+    assert_eq!(tabs_of(&window, &mut cx).0, 2, "the command should open a tab");
+}
+
+#[gpui::test]
+async fn choosing_a_buffer_leaves_focus_in_that_buffer(cx: &mut TestAppContext) {
+    // Ordering guard. `activate` focuses synchronously, so if the picker were closed
+    // *after* acting, `close_picker`'s focus restore would clobber the switch: `active_ix`
+    // would point at the chosen buffer while focus sat in the previous one, and typing
+    // would silently edit the wrong request.
+    //
+    // Note this does not apply to `Target::Action`: `Window::dispatch_action` captures the
+    // focus id and then `cx.defer`s, so a dispatched command behaves the same in either
+    // order. Buffers and files are the reason the order is fixed.
+    let (window, first, mut cx) = boot(cx, None, None);
+    let first_url = spec_of(&first, &mut cx).url;
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://second.test/widgets");
+
+    // Jump back to the original buffer through the picker. Filter on `graphql`, not on the
+    // sample's *name* ("List repositories") — labels derive from the URL, so the row reads
+    // as the last path segment of https://api.github.com/graphql.
+    cx.simulate_keystrokes("ctrl-p");
+    cx.simulate_input("graphql");
+    cx.simulate_keystrokes("enter");
+
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("https://typed-after-picking.test");
+
+    let (_, active) = tabs_of(&window, &mut cx);
+    assert_eq!(
+        active.url, "https://typed-after-picking.test",
+        "typing must land in the buffer that was picked"
+    );
+    assert_ne!(first_url, active.url, "sanity: the buffer really changed");
+}
