@@ -7,21 +7,23 @@
 //! `TextInput` nested two levels down. Handlers that need buffer state reach into the
 //! active `RequestView` through its entity.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, div, px,
+    Styled, Subscription, Task, Window, div, px,
 };
 use zuno_core::{RequestId, RequestSpec, collection};
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
+    OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow,
+    SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
+use crate::picker;
 use crate::request_view::{RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
@@ -35,6 +37,18 @@ pub struct Workspace {
     /// goes through `activate`, which is what keeps focus and `active_ix` from disagreeing.
     views: Vec<Entity<RequestView>>,
     active_ix: usize,
+    /// The picker, while it's open. `None` is the closed state, so a closed picker costs
+    /// nothing to render and cannot hold stale results.
+    picker: Option<PickerState>,
+    /// Holding the task is what keeps the collection scan alive; dropping it cancels.
+    picker_scan: Option<Task<()>>,
+}
+
+/// The picker plus the subscription that lets it be closed. Dropping either without the
+/// other would leave a modal nothing can dismiss, so they live and die together.
+struct PickerState {
+    picker: Entity<picker::Picker>,
+    _subscription: Subscription,
 }
 
 impl Workspace {
@@ -81,6 +95,8 @@ impl Workspace {
             _quit_subscription: quit_subscription,
             views,
             active_ix,
+            picker: None,
+            picker_scan: None,
         }
     }
 
@@ -93,6 +109,29 @@ impl Workspace {
     #[cfg(test)]
     pub fn tab_count(&self) -> usize {
         self.views.len()
+    }
+
+    #[cfg(test)]
+    pub fn picker_is_open(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    /// The picker's visible rows as `label — detail`, which is what a test can assert on
+    /// without reaching into rendered elements.
+    #[cfg(test)]
+    pub fn picker_rows(&self, cx: &App) -> Vec<String> {
+        self.picker
+            .as_ref()
+            .map(|state| state.picker.read(cx).visible_rows())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn picker_selection(&self, cx: &App) -> usize {
+        self.picker
+            .as_ref()
+            .map(|state| state.picker.read(cx).selection())
+            .unwrap_or(0)
     }
 
     /// Move focus into a buffer's URL bar and repaint.
@@ -179,6 +218,178 @@ impl Workspace {
         }
         let prev = (self.active_ix + self.views.len() - 1) % self.views.len();
         self.activate(prev, window, cx);
+    }
+
+    /// Open the request picker: every open buffer, then every saved request.
+    ///
+    /// Buffers come first because for the common case — a handful of tabs open — Ctrl+P is
+    /// a tab switcher, and that makes it useful from the first keystroke rather than only
+    /// once a collection has grown. A saved request already open as a buffer appears once,
+    /// as the buffer, so choosing it switches instead of opening a second copy of the same
+    /// file.
+    ///
+    /// The scan is file IO and JSON parsing, so it goes to the background executor
+    /// (invariant 3) and the picker opens immediately with the buffer rows. Scanning on
+    /// open rather than caching at startup is deliberate: a collection is a git directory,
+    /// so it changes underneath us whenever someone pulls or edits a file by hand.
+    fn open_request(&mut self, _: &OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
+        // A second Ctrl+P while it's open is a no-op, not a nested modal.
+        if self.picker.is_some() {
+            return;
+        }
+
+        let open_paths: Vec<Option<PathBuf>> = self
+            .views
+            .iter()
+            .map(|view| view.read(cx).path.clone())
+            .collect();
+
+        let buffer_items: Vec<picker::Item> = self
+            .views
+            .iter()
+            .enumerate()
+            .map(|(ix, view)| {
+                let view = view.read(cx);
+                picker::Item {
+                    label: view.label(cx),
+                    detail: SharedString::from(view.url.read(cx).text().to_string()),
+                    target: picker::Target::Buffer(ix),
+                }
+            })
+            .collect();
+
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let picker = cx.new(|cx| picker::Picker::new(buffer_items, restore, cx));
+
+        // Dropping this subscription would make the picker unclosable, so it's held
+        // alongside the entity for exactly as long as the picker exists.
+        let subscription = cx.subscribe_in(&picker, window, |workspace, picker, event, window, cx| {
+            match event {
+                picker::PickerEvent::Dismissed => workspace.close_picker(window, cx),
+                picker::PickerEvent::Confirmed => {
+                    let chosen = picker.read(cx).chosen().cloned();
+                    workspace.close_picker(window, cx);
+                    if let Some(target) = chosen {
+                        workspace.choose(target, window, cx);
+                    }
+                }
+            }
+        });
+
+        let focus = picker.read(cx).focus_handle(cx);
+        self.picker = Some(PickerState {
+            picker: picker.clone(),
+            _subscription: subscription,
+        });
+        window.focus(&focus);
+        cx.notify();
+
+        // Fill in the saved requests as they arrive. The picker is already usable.
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let scan = cx.background_executor().spawn(async move {
+            zuno_core::collection::scan(&root)
+                .into_iter()
+                .map(|entry| (entry.relative, entry.path, entry.spec.url))
+                .collect::<Vec<_>>()
+        });
+
+        self.picker_scan = Some(cx.spawn(async move |_this, cx| {
+            let found = scan.await;
+            let _ = picker.update(cx, |picker, cx| {
+                picker.extend(
+                    found
+                        .into_iter()
+                        // A request already open as a buffer is not listed twice.
+                        .filter(|(_, path, _)| !open_paths.contains(&Some(path.clone())))
+                        .map(|(relative, path, url)| picker::Item {
+                            label: SharedString::from(relative),
+                            detail: SharedString::from(url),
+                            target: picker::Target::File(path),
+                        }),
+                    cx,
+                );
+            });
+        }));
+    }
+
+    fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.picker.take() else { return };
+        self.picker_scan = None;
+
+        // Focus is currently inside the picker's filter input, which is about to be
+        // dropped. Leaving it there means no key context matches and the whole keymap goes
+        // dead with nothing on screen explaining why — the same failure as switching tabs
+        // without moving focus.
+        if let Some(handle) = state.picker.read(cx).restore_focus() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    /// Act on a picked row.
+    fn choose(&mut self, target: picker::Target, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            picker::Target::Buffer(ix) => self.activate(ix, window, cx),
+            picker::Target::File(path) => {
+                // The file may have been deleted or broken since the scan; report rather
+                // than opening an empty buffer.
+                let spec = match zuno_core::collection::read(&path) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        self.set_status(&format!("Could not open: {error}"), cx);
+                        return;
+                    }
+                };
+
+                // Stored ids are always 0 (see `collection`), so a live one is assigned
+                // here — the workspace is the only thing that knows which are taken.
+                let spec = RequestSpec {
+                    id: self.next_id(cx),
+                    ..spec
+                };
+                self.open(spec, window, cx);
+                // Remembering the file is what makes a later Ctrl+S overwrite it rather
+                // than derive a fresh name beside it.
+                if let Some(view) = self.active() {
+                    view.update(cx, |view, cx| {
+                        view.path = Some(path);
+                        cx.notify();
+                    });
+                }
+            }
+        }
+    }
+
+    fn picker_next(&mut self, _: &PickerNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.picker {
+            state.picker.update(cx, |picker, cx| picker.select(1, cx));
+        }
+    }
+
+    fn picker_prev(&mut self, _: &PickerPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.picker {
+            state.picker.update(cx, |picker, cx| picker.select(-1, cx));
+        }
+    }
+
+    fn picker_confirm(&mut self, _: &PickerConfirm, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.picker else { return };
+        // Nothing matched: swallow the keystroke rather than closing, so a typo doesn't
+        // dismiss the picker you were halfway through using.
+        if state.picker.read(cx).chosen().is_none() {
+            return;
+        }
+        // Emitted rather than handled inline so confirm-by-key and confirm-by-click run
+        // the exact same path through the subscription.
+        state
+            .picker
+            .update(cx, |_, cx| cx.emit(picker::PickerEvent::Confirmed));
+    }
+
+    fn picker_dismiss(&mut self, _: &PickerDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_picker(window, cx);
     }
 
     /// The persistable state of every open buffer.
@@ -511,6 +722,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_response))
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
+            .on_action(cx.listener(Self::open_request))
+            .on_action(cx.listener(Self::picker_next))
+            .on_action(cx.listener(Self::picker_prev))
+            .on_action(cx.listener(Self::picker_confirm))
+            .on_action(cx.listener(Self::picker_dismiss))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
@@ -541,6 +757,8 @@ impl Render for Workspace {
             .children(tab_strip(tabs, &theme, cx))
             .children(self.active())
             .child(status_bar(focused_region, status_message, &theme))
+            // Above the panes, below the resize edges.
+            .children(self.picker.as_ref().map(|state| state.picker.clone()))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
     }
@@ -625,7 +843,7 @@ fn status_bar(
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+T tab · Ctrl+Tab switch · Ctrl+S save · Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Enter send · Esc cancel";
+    const HINTS: &str = "Ctrl+P find · Ctrl+T tab · Ctrl+S save · Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Enter send";
 
     div()
         .flex()

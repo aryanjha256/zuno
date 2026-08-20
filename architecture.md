@@ -62,6 +62,7 @@ zuno/
         ├── chrome.rs       ✅ titlebar + window controls + resize edges (CSD)
         ├── session.rs      ✅ window-session envelope, versioned + migrating
         ├── collections.rs  ✅ where collections live (a global, for tests)
+        ├── picker.rs        ✅ the modal picker: filter + ranked list
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
@@ -797,13 +798,29 @@ Still deliberately **unanswered: what a *dirty* buffer means.** With no collecti
 saved baseline to be dirty against, so any meaning invented now would be rewritten when the
 collection format lands. Also absent by choice: tab reordering and renaming.
 
-**Reaching a saved request** (new). Collections are written but not readable from the UI: Ctrl+S
-saves, and nothing opens. That is deliberate — the opener is the picker (principle 2), not a
-one-off list — but it means a saved request is only reachable while its tab is open. `collection`
-has no `scan` yet for the same reason invariant 1 gives: it would have no caller until the picker
-exists. Folder authoring is also absent; nesting works if you `mkdir` by hand.
+**Reaching a saved request — answered.** `Ctrl+P` opens the picker over open buffers *and*
+`collection::scan`, and choosing a file opens it as a buffer with its `path` set, so the next
+Ctrl+S overwrites rather than duplicates. The one-way door — Ctrl+S writing files nothing could
+read — is closed.
 
-**Where `Ctrl+P` and `Ctrl+K` get their content.** These are the thesis features from `what.md`
+Three decisions in `picker.rs` worth recording:
+
+- **Concrete, not a `PickerDelegate` trait.** Principle 2 says build the picker once, but there is
+  one consumer today and invariant 1 says API waits for a caller. The picker owns `Vec<Item>` where
+  each carries a `Target` it never interprets, so `Ctrl+K` is a new variant rather than a rewrite.
+  The trait earns its complexity at the third consumer, if one wants different rendering.
+- **Modal, not `anchored()`.** A palette is centred over the window, so it's a full-size `absolute`
+  overlay. `anchored()` positions relative to a point and is what the method dropdown will want —
+  both exist in 0.2.2; this needed the simpler one.
+- **Scan on open, off-thread, results streamed in.** The picker opens instantly with the buffer rows
+  and gains saved requests when `scan` returns (invariant 3). Caching at startup was rejected: a
+  collection is a git directory, so it changes under us on every pull. `Picker::extend` re-ranks
+  against whatever has been typed meanwhile, because on a slow disk you can finish typing first.
+
+Deliberately absent: **no highlighting of matched characters.** It needs match positions threaded
+out of the scorer and styled text runs, and the picker is useful without it.
+
+**Where `Ctrl+P` and `Ctrl+K` get their content.****Where `Ctrl+P` and `Ctrl+K` get their content.** These are the thesis features from `what.md`
 and neither exists. Note the dependency: `Ctrl+P` "find any request" is meaningless until
 collections exist, which is why curl import came first — it's how requests get *into* the app at
 all. A palette over one scratch request would be theatre.

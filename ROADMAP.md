@@ -20,14 +20,12 @@ light/dark themes, window chrome.
 Measured: **189 ms** cold start (release), **48 ms** to flatten 10 MB of JSON into 1.31 M rows
 off-thread, 60 fps scrolling on any response size.
 
-**M2 is under way.** Tabs are done — buffers, a strip, a versioned session envelope that migrates
-every older format forward. Collections are done as a *format*: one request per file, git-diffable,
-written by Ctrl+S. 214 tests across three layers.
+**M2 is nearly done.** Tabs, collections as one-file-per-request, and `Ctrl+P` over both buffers and
+saved requests. 241 tests across three layers, and a `.deb` on tagged releases.
 
-**The navigation thesis is still the gap.** `what.md` named `Ctrl+P`, `Ctrl+K`, and fuzzy search
-across collections as the defining features, and none of them exist yet. That has a sharp
-consequence right now: requests can be *saved* to a collection but not *opened* from one, because
-the opener is the picker. Nothing else in the app is waiting on so much.
+**One piece of the thesis is left: `Ctrl+K`.** The picker it needs already exists, so what remains
+is a curated action table rather than new machinery — see below for why that's more than a loop over
+`all_action_names()`.
 
 That gap *is* the roadmap. Everything below is about closing it.
 
@@ -93,10 +91,23 @@ the picker's job by principle 2, so it waits rather than getting a throwaway lis
 saved request is only reachable while its tab is open — worth knowing, since it makes the picker
 the next thing that has to land. Folder authoring is also absent; `mkdir` works.
 
-**The picker primitive.** See principle 2. An overlay, a filter input, fuzzy scoring, keyboard
-selection, and a `Vec` of candidates it doesn't know the meaning of.
+**The picker primitive — done.** Principle 2's one build: `app/src/picker.rs` is a centred modal
+with a filter input, a fuzzy-ranked `uniform_list`, and a `Target` it hands back without
+interpreting. Deliberately *not* a `PickerDelegate` trait yet — one consumer, and invariant 1 says
+API waits for a caller; `Ctrl+K` is a new `Target` variant, not a rewrite.
 
-**`Ctrl+P` — find any request.** The picker over collections.
+Matching is hand-rolled in `core/src/fuzzy.rs` rather than taking `nucleo`: hundreds of requests and
+a couple of dozen actions is not a scale where a real matcher earns its complexity, and pure code in
+core unit-tests without a window. It's greedy, so it doesn't always find the tightest alignment —
+documented, and it never fails to match something a human would call a match.
+
+**`Ctrl+P` — done.** Open buffers first, then saved requests from `collection::scan`. Buffers first
+because for a handful of tabs it makes Ctrl+P a tab switcher, so it's useful from the first press
+rather than only once a collection has grown. A request already open is listed once, as the buffer.
+Choosing a file sets its `path`, so Ctrl+S afterwards overwrites instead of duplicating.
+
+This also closed the one-way door the collections slice left behind: Ctrl+S wrote files nothing
+could read back.
 
 **`Ctrl+K` — command palette.** The same picker over the action registry. Budget more than
 "`actions.rs` already lists the verbs" suggests: `actions!` generates *types*, not an iterable

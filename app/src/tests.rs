@@ -1421,3 +1421,211 @@ async fn a_url_that_looks_like_a_path_cannot_write_outside_the_collection(
 
     remove_scratch(&mut cx, &session);
 }
+
+/// The picker's currently-visible rows, top to bottom.
+fn picker_rows(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<String> {
+    window
+        .update(cx, |workspace, _, cx| workspace.picker_rows(cx))
+        .expect("window")
+}
+
+fn picker_is_open(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext) -> bool {
+    window
+        .update(cx, |workspace, _, _| workspace.picker_is_open())
+        .expect("window")
+}
+
+/// Save the active buffer to `url`'s derived name, in a collection.
+fn save_as(cx: &mut VisualTestContext, url: &str) {
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(url);
+    cx.simulate_keystrokes("ctrl-s");
+}
+
+#[gpui::test]
+async fn ctrl_p_lists_the_open_buffers(cx: &mut TestAppContext) {
+    // Ctrl+P earns its keystroke from the first press, before any collection exists.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://second.test/widgets");
+
+    cx.simulate_keystrokes("ctrl-p");
+    assert!(picker_is_open(&window, &mut cx));
+
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 2, "both buffers should be listed: {rows:?}");
+    assert!(rows.iter().any(|row| row.contains("widgets")), "{rows:?}");
+}
+
+#[gpui::test]
+async fn escape_closes_the_picker_rather_than_cancelling_a_request(cx: &mut TestAppContext) {
+    // Guards a keymap *ordering* rule, not just a binding. `binding_enabled` gives a
+    // context-less binding the maximum depth, so the global `escape` -> CancelRequest ties
+    // with `escape` -> PickerDismiss instead of losing to it, and the tie is broken by
+    // registration order. Move the picker block above the Application block in
+    // `register_keymap` and this test is what fails.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-p");
+    assert!(picker_is_open(&window, &mut cx));
+
+    cx.simulate_keystrokes("escape");
+    assert!(!picker_is_open(&window, &mut cx), "escape must dismiss");
+
+    // And focus has to come back, or every binding silently stops working.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://after-dismiss.test");
+    let (_, active) = tabs_of(&window, &mut cx);
+    assert_eq!(active.url, "https://after-dismiss.test", "focus was stranded");
+}
+
+#[gpui::test]
+async fn typing_filters_and_enter_opens_the_selection(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://a.test/invoices");
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://a.test/payments");
+
+    cx.simulate_keystrokes("ctrl-p");
+    cx.simulate_input("invo");
+
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 1, "the filter should narrow to one: {rows:?}");
+    assert!(rows[0].contains("invoices"), "{rows:?}");
+
+    cx.simulate_keystrokes("enter");
+    assert!(!picker_is_open(&window, &mut cx));
+
+    let (count, active) = tabs_of(&window, &mut cx);
+    assert_eq!(count, 3, "choosing an open buffer must not open a new one");
+    assert_eq!(active.url, "https://a.test/invoices");
+}
+
+#[gpui::test]
+async fn enter_with_no_match_does_nothing(cx: &mut TestAppContext) {
+    // A typo must not dismiss the picker you were halfway through using.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-p");
+    cx.simulate_input("zzzzz");
+
+    assert!(picker_rows(&window, &mut cx).is_empty());
+    cx.simulate_keystrokes("enter");
+    assert!(picker_is_open(&window, &mut cx), "should still be open");
+}
+
+#[gpui::test]
+async fn a_saved_request_can_be_reopened_from_the_picker(cx: &mut TestAppContext) {
+    // The hole this whole slice closes: before `scan`, Ctrl+S wrote files that nothing in
+    // the app could read back.
+    let (session, root) = scratch_collection("reopen");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    save_as(&mut cx, "https://api.test/v1/invoices");
+    // Close it, so the only way back is through the collection.
+    cx.simulate_keystrokes("ctrl-w");
+    assert_eq!(tabs_of(&window, &mut cx).0, 1);
+
+    cx.simulate_keystrokes("ctrl-p");
+    // The scan is off-thread, so the row arrives after the picker opens.
+    let rows = wait_for(&mut cx, "the scanned request", |cx| {
+        let rows = picker_rows(&window, cx);
+        rows.iter().any(|r| r.contains("invoices")).then_some(rows)
+    });
+    assert!(rows.iter().any(|r| r.contains("invoices.json")), "{rows:?}");
+
+    cx.simulate_input("invoices");
+    cx.simulate_keystrokes("enter");
+
+    let (count, active) = tabs_of(&window, &mut cx);
+    assert_eq!(count, 2, "the saved request should open in a new buffer");
+    assert_eq!(active.url, "https://api.test/v1/invoices");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn reopening_a_saved_request_remembers_its_file(cx: &mut TestAppContext) {
+    // Opening from a collection has to set `path`, or the next Ctrl+S derives a fresh name
+    // and writes `invoices-2.json` next to the original.
+    let (session, root) = scratch_collection("reopen-path");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    save_as(&mut cx, "https://api.test/v1/invoices");
+    cx.simulate_keystrokes("ctrl-w");
+
+    cx.simulate_keystrokes("ctrl-p");
+    wait_for(&mut cx, "the scanned request", |cx| {
+        picker_rows(&window, cx)
+            .iter()
+            .any(|r| r.contains("invoices"))
+            .then_some(())
+    });
+    cx.simulate_input("invoices");
+    cx.simulate_keystrokes("enter");
+
+    cx.simulate_keystrokes("ctrl-s");
+    assert_eq!(
+        collection_files(&root),
+        ["invoices.json"],
+        "a reopened request must save back over its own file"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn an_already_open_request_is_not_listed_twice(cx: &mut TestAppContext) {
+    // It's listed as the buffer, so choosing it switches instead of opening a second copy
+    // of the same file.
+    let (session, root) = scratch_collection("dedup");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    save_as(&mut cx, "https://api.test/v1/invoices");
+
+    cx.simulate_keystrokes("ctrl-p");
+    cx.run_until_parked();
+    // Give the scan a chance to add a duplicate row if it were going to.
+    let rows = picker_rows(&window, &mut cx);
+    let matching: Vec<&String> = rows.iter().filter(|r| r.contains("invoices")).collect();
+    assert_eq!(matching.len(), 1, "listed twice: {rows:?}");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn arrow_keys_move_the_selection_and_wrap(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://a.test/second");
+
+    cx.simulate_keystrokes("ctrl-p");
+    let selected = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, cx| workspace.picker_selection(cx))
+            .expect("window")
+    };
+
+    assert_eq!(selected(&mut cx), 0);
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected(&mut cx), 1);
+    // Wraps rather than dead-ending at the last row.
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected(&mut cx), 0);
+    cx.simulate_keystrokes("up");
+    assert_eq!(selected(&mut cx), 1, "up from the top must wrap to the end");
+}
+
+#[gpui::test]
+async fn a_second_ctrl_p_does_not_nest_a_modal(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-p");
+    cx.simulate_keystrokes("ctrl-p");
+    assert!(picker_is_open(&window, &mut cx));
+    cx.simulate_keystrokes("escape");
+    assert!(!picker_is_open(&window, &mut cx), "one escape must close it");
+}

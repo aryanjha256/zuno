@@ -13,6 +13,7 @@ mod chrome;
 mod collections;
 mod engine;
 mod input;
+mod picker;
 mod request_pane;
 mod request_view;
 mod response_pane;
@@ -32,7 +33,8 @@ use gpui::{
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
+    OpenRequest, PickerConfirm, PickerDismiss, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow,
+    SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -170,6 +172,19 @@ fn register_keymap(cx: &mut App) {
         // --- Application ---
         KeyBinding::new("ctrl-shift-t", ToggleTheme, None),
         KeyBinding::new("ctrl-q", Quit, None),
+        // --- The picker ---
+        //
+        // ORDER MATTERS HERE, and not for the reason you'd guess. `Keymap::binding_enabled`
+        // gives a context-less binding `depth = contexts.len()` — the *maximum* — so a
+        // global binding does not lose to a leaf-context one, it **ties**. The tiebreak is
+        // `ix_b.cmp(ix_a)`: later registration wins. So `escape` below only beats the
+        // global `escape` -> CancelRequest because it is registered after it. Move this
+        // block above the Application section and Esc stops closing the picker.
+        KeyBinding::new("ctrl-p", OpenRequest, None),
+        KeyBinding::new("down", PickerNext, Some("Picker")),
+        KeyBinding::new("up", PickerPrev, Some("Picker")),
+        KeyBinding::new("enter", PickerConfirm, Some("Picker")),
+        KeyBinding::new("escape", PickerDismiss, Some("Picker")),
         // --- Text editing, scoped to any focused TextInput ---
         KeyBinding::new("backspace", text_input::Backspace, Some("TextInput")),
         KeyBinding::new("delete", text_input::Delete, Some("TextInput")),

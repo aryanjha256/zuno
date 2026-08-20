@@ -11,6 +11,7 @@ pub mod collection;
 pub mod curl;
 pub mod diff;
 pub mod engine;
+pub mod fuzzy;
 pub mod json;
 pub mod lines;
 pub mod request;

@@ -49,6 +49,18 @@ pub enum CollectionError {
         #[source]
         source: io::Error,
     },
+    #[error("could not read {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{} is not a valid request: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("could not serialize the request: {0}")]
     Serialize(#[source] serde_json::Error),
     #[error("no free filename like {stem:?} in {}", root.display())]
@@ -137,6 +149,121 @@ pub fn allocate(root: &Path, label: &str) -> Result<PathBuf, CollectionError> {
     Err(CollectionError::NoFreeName {
         root: root.to_path_buf(),
         stem,
+    })
+}
+
+/// One request found on disk.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    /// Absolute path to the file, and the identity a buffer remembers.
+    pub path: PathBuf,
+    /// Path relative to the collection root, for display: `billing/invoices.json`.
+    pub relative: String,
+    pub spec: RequestSpec,
+}
+
+/// How deep to walk. Guards against a symlink cycle turning a scan into an infinite loop,
+/// and against a pathological tree; nobody nests request folders eight deep on purpose.
+const MAX_DEPTH: usize = 8;
+
+/// Read every request in the collection, depth-first, sorted by relative path.
+///
+/// **Never fails as a whole.** A single unparseable file must not hide an entire
+/// collection from the picker — a half-finished hand edit, or a merge conflict marker in
+/// one request, is exactly when you most need to reach the others. Unreadable entries are
+/// reported to stderr and skipped.
+///
+/// Does file IO and JSON parsing, so callers on the UI thread must push this to a
+/// background executor (CLAUDE.md invariant 3).
+pub fn scan(root: &Path) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    walk(root, root, 0, &mut entries);
+    // Sorted by the displayed string rather than by `path`, so the picker's order matches
+    // what a person reads.
+    entries.sort_by(|a, b| a.relative.cmp(&b.relative));
+    entries
+}
+
+fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
+    if depth > MAX_DEPTH {
+        eprintln!("[zuno] skipping {}: nested deeper than {MAX_DEPTH}", dir.display());
+        return;
+    }
+
+    // A missing root is normal — nothing has been saved yet — so it is not worth a
+    // message. Anything else is.
+    let listing = match std::fs::read_dir(dir) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!("[zuno] could not read {}: {error}", dir.display());
+            return;
+        }
+    };
+
+    for entry in listing.filter_map(Result::ok) {
+        let path = entry.path();
+
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // Skips `.git` above all: a git-diffable collection is expected to *be* a repo,
+        // and walking its objects would be thousands of files that are never requests.
+        if name.starts_with('.') {
+            continue;
+        }
+
+        let Ok(kind) = entry.file_type() else { continue };
+
+        // Recursing on `is_dir()` rather than filtering on `is_file()` is deliberate:
+        // `file_type` does not follow symlinks, so a symlinked directory reports as a
+        // symlink and is skipped (no cycles), while a symlink *to a request file* still
+        // gets read — which is a reasonable thing for someone to set up.
+        if kind.is_dir() {
+            walk(root, &path, depth + 1, out);
+            continue;
+        }
+
+        // `write` leaves a `.json.tmp` only if it dies between write and rename; ignore
+        // any that exist rather than reporting a parse failure for a half-written file.
+        if !name.ends_with(&format!(".{EXTENSION}")) {
+            continue;
+        }
+
+        match read(&path) {
+            Ok(spec) => out.push(Entry {
+                relative: relative_label(root, &path),
+                path,
+                spec,
+            }),
+            Err(error) => eprintln!("[zuno] skipping {}: {error}", path.display()),
+        }
+    }
+}
+
+/// The path as shown in the picker, always with `/` separators.
+fn relative_label(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Read one request file.
+///
+/// The stored `id` is always 0 (see the module docs); assigning a live one is the caller's
+/// job, since only it knows which ids are already open.
+pub fn read(path: &Path) -> Result<RequestSpec, CollectionError> {
+    let bytes = std::fs::read(path).map_err(|source| CollectionError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    serde_json::from_slice(&bytes).map_err(|source| CollectionError::Parse {
+        path: path.to_path_buf(),
+        source,
     })
 }
 
@@ -321,5 +448,127 @@ mod tests {
         assert!(path.exists());
 
         std::fs::remove_dir_all(root.parent().unwrap()).ok();
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zuno-scan-{}-{name}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    fn save(root: &Path, label: &str, url: &str) -> PathBuf {
+        let path = allocate(root, label).expect("allocate");
+        write(
+            &path,
+            &RequestSpec {
+                url: url.to_string(),
+                ..RequestSpec::sample()
+            },
+        )
+        .expect("write");
+        path
+    }
+
+    #[test]
+    fn a_missing_root_scans_to_nothing() {
+        // Normal on a first run: nothing has been saved yet. Must not be an error.
+        let root = std::env::temp_dir().join("zuno-scan-does-not-exist");
+        assert!(scan(&root).is_empty());
+    }
+
+    #[test]
+    fn requests_come_back_sorted_by_their_displayed_path() {
+        let root = scratch("sorted");
+        save(&root, "zebra", "https://a.test/zebra");
+        save(&root, "alpha", "https://a.test/alpha");
+
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        save(&root.join("billing"), "invoices", "https://a.test/invoices");
+
+        let found = scan(&root);
+        let labels: Vec<&str> = found.iter().map(|e| e.relative.as_str()).collect();
+        assert_eq!(labels, ["alpha.json", "billing/invoices.json", "zebra.json"]);
+
+        // The spec really is read back, not just the filename.
+        assert_eq!(found[0].spec.url, "https://a.test/alpha");
+        // And nested entries carry a usable absolute path.
+        assert_eq!(found[1].path, root.join("billing").join("invoices.json"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn one_corrupt_file_does_not_hide_the_rest() {
+        // The property that matters most: a half-finished hand edit or a merge conflict
+        // marker in one request is exactly when you need to reach the others.
+        let root = scratch("corrupt");
+        save(&root, "good", "https://a.test/good");
+        std::fs::write(root.join("broken.json"), b"{ not json").expect("write");
+        std::fs::write(root.join("wrong-shape.json"), br#"{"hello":1}"#).expect("write");
+
+        let found = scan(&root);
+        assert_eq!(found.len(), 1, "the good request must survive: {found:?}");
+        assert_eq!(found[0].relative, "good.json");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn dotfiles_and_non_json_are_ignored() {
+        let root = scratch("noise");
+        save(&root, "real", "https://a.test/real");
+
+        // A collection is expected to *be* a git repo; walking .git would be thousands of
+        // files that are never requests.
+        std::fs::create_dir_all(root.join(".git").join("objects")).expect("mkdir");
+        std::fs::write(root.join(".git").join("objects").join("x.json"), b"{}").expect("write");
+        std::fs::write(root.join("notes.md"), b"# notes").expect("write");
+        std::fs::write(root.join(".hidden.json"), b"{}").expect("write");
+        // A temp file left behind if `write` died between write and rename.
+        std::fs::write(root.join("leftover.json.tmp"), b"{}").expect("write");
+
+        let found = scan(&root);
+        let labels: Vec<&str> = found.iter().map(|e| e.relative.as_str()).collect();
+        assert_eq!(labels, ["real.json"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_written_request_is_found_again_with_its_url_intact() {
+        // The round trip the picker depends on, and the hole this closes: before `scan`,
+        // Ctrl+S wrote files nothing could read back.
+        let root = scratch("roundtrip");
+        let written = save(&root, "invoices", "https://api.test/v1/invoices?page=2");
+
+        let found = scan(&root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, written);
+        assert_eq!(found[0].spec.url, "https://api.test/v1/invoices?page=2");
+        assert_eq!(found[0].spec.headers, RequestSpec::sample().headers);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_symlinked_directory_cannot_cause_an_infinite_walk() {
+        let root = scratch("cycle");
+        save(&root, "real", "https://a.test/real");
+
+        // A loop back to the root. `file_type` doesn't follow symlinks, so the link is not
+        // a dir and never recursed into; MAX_DEPTH is the backstop if that ever changes.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&root, root.join("loop")).expect("symlink");
+
+        let found = scan(&root);
+        assert_eq!(found.len(), 1, "{found:?}");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

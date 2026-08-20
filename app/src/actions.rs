@@ -19,6 +19,12 @@ actions!(
         FocusResponse,
         FocusNext,
         FocusPrev,
+        // Navigation
+        OpenRequest,
+        PickerNext,
+        PickerPrev,
+        PickerConfirm,
+        PickerDismiss,
         // Buffers
         NewTab,
         CloseTab,

@@ -13,9 +13,9 @@ Three docs, three jobs. Read them in this order:
   building anything.
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
-Milestone 1 is complete: the request → response loop works end to end. The *navigation* thesis
-from `what.md` — `Ctrl+P`, `Ctrl+K`, collections, tabs — is entirely unbuilt, and that gap is the
-roadmap.
+Milestone 1 is complete: the request → response loop works end to end. M2 — the *navigation*
+thesis from `what.md` — is most of the way there: tabs, collections, and `Ctrl+P` are built.
+`Ctrl+K` is the piece left.
 
 ## Layout
 
@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 214 tests, ~4s
+cargo test --workspace                   # 241 tests, ~5s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -105,6 +105,7 @@ No `cx.background_spawn` in 0.2.2 | Use `cx.background_executor().spawn(fut)`. |
 `examples/input.rs` ships macOS `cmd-` bindings | Translate every one to `ctrl-`. It also has a latent `assert_eq!` panic when a placeholder is showing. |
 `TabStopNode` orders by tab_index path, **then** paint order | Leaving inputs at the default index 0 makes visual order the tab order for free. |
 `Context::on_app_quit` is the correct save hook | Not the Quit *action* — that misses window-manager close. `cx.on_window_closed` is also needed, since GPUI doesn't quit on last-window-close. |
+A context-less binding does **not** lose to a specific one — it *ties*, and **later registration wins** | `binding_enabled` returns `depth = contexts.len()` for a `None` context, which is the maximum; the tiebreak is `ix_b.cmp(ix_a)`. So `escape` in `Some("Picker")` only beats the global `escape` -> `CancelRequest` because it is registered after it in `register_keymap`. Reordering that list changes behaviour with no compile error. |
 
 ## Packaging
 
