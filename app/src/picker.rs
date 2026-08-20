@@ -49,6 +49,8 @@ pub enum Target {
     Action(Box<dyn gpui::Action>),
     /// Set the active request's method.
     Method(zuno_core::Method),
+    /// Select the active environment, or `None` for none.
+    Environment(Option<String>),
 }
 
 // Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
@@ -60,6 +62,7 @@ impl Clone for Target {
             Self::File(path) => Self::File(path.clone()),
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Method(method) => Self::Method(method.clone()),
+            Self::Environment(name) => Self::Environment(name.clone()),
         }
     }
 }

@@ -51,7 +51,10 @@ zuno/
 │       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
-│       └── curl.rs         ✅ curl command line -> RequestSpec
+│       ├── curl.rs         ✅ curl command line -> RequestSpec
+│       ├── collection.rs   ✅ one-request-per-file on-disk format
+│       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
+│       └── fuzzy.rs        ✅ subsequence scoring for the picker
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
     └── src/

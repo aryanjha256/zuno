@@ -20,7 +20,7 @@ use gpui::{
 };
 use zuno_core::{
     Body, Engine, EngineError, Event, Header, JobId, Method, QueryParam, RawKind, RequestId,
-    RequestSettings, RequestSpec, ResponseData, ResponseDiff,
+    RequestSettings, RequestSpec, Resolver, ResponseData, ResponseDiff,
 };
 
 use crate::body_view::BodyView;
@@ -286,13 +286,18 @@ impl RequestView {
     // ---- the send loop ------------------------------------------------------
 
     /// Submit the request as it currently appears on screen.
-    pub fn send(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) {
+    /// Send, substituting variables first.
+    ///
+    /// The resolver is applied to a *copy*: the buffer keeps its `{{placeholders}}`, which
+    /// is the entire point of having them. Anything the resolver doesn't know is left
+    /// verbatim, so `build.rs`'s existing check is what reports it — by name, before DNS.
+    pub fn send(&mut self, engine: &Arc<Engine>, resolver: &Resolver, cx: &mut Context<Self>) {
         // Hitting Send again must abandon the previous attempt immediately. Without
         // this, a rapid resend leaves the old socket draining and the new response can
         // land behind a stale one.
         self.cancel(engine, cx);
 
-        let spec = self.spec(cx);
+        let spec = resolver.apply(&self.spec(cx));
         let (job, events) = engine.send(spec);
 
         self.error = None;

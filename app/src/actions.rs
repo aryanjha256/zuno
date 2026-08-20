@@ -21,6 +21,7 @@ actions!(
         FocusPrev,
         // Navigation
         OpenRequest,
+        SwitchEnvironment,
         OpenPalette,
         PickerNext,
         PickerPrev,

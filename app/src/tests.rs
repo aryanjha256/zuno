@@ -1222,6 +1222,7 @@ async fn every_saved_buffer_is_restored_not_just_the_active_one(cx: &mut TestApp
             .map(crate::session::Tab::scratch)
             .collect(),
         1, // not 0, so ignoring `active` fails the test rather than passing by luck
+        None,
     );
     std::fs::write(&path, serde_json::to_vec(&session).expect("serialize")).expect("write");
 
@@ -2027,4 +2028,189 @@ async fn settings_survive_a_save_and_reopen(cx: &mut TestAppContext) {
 
     remove_scratch(&mut cx, &session);
     let _ = window;
+}
+
+/// Write an environment file into a collection's reserved `environments/` directory.
+fn write_env(root: &PathBuf, file: &str, json: &str) {
+    let dir = root.join("environments");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join(file), json).expect("write");
+}
+
+fn active_environment(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Option<String> {
+    window
+        .update(cx, |workspace, _, _| workspace.active_environment())
+        .expect("window")
+}
+
+#[gpui::test]
+async fn ctrl_e_lists_environments_with_none_always_offered(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-list");
+    write_env(&root, "dev.json", r#"{"baseUrl":"http://localhost:3000"}"#);
+    write_env(&root, "prod.json", r#"{"baseUrl":"https://api.example.com"}"#);
+    // Neither of these is selectable: globals is always-on, and a sidecar belongs to its
+    // environment rather than being one.
+    write_env(&root, "globals.json", r#"{"version":"v2"}"#);
+    write_env(&root, "dev.local.json", r#"{"token":"secret"}"#);
+
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e");
+
+    let rows = picker_rows(&window, &mut cx);
+    let labels: Vec<&str> = rows
+        .iter()
+        .map(|row| row.split(" — ").next().unwrap_or(""))
+        .collect();
+    assert_eq!(labels, ["None", "dev", "prod"], "{rows:?}");
+
+    // The secret's *value* must never be on screen; a count is what tells you it loaded.
+    let dev = rows.iter().find(|row| row.starts_with("dev")).expect("dev row");
+    assert!(dev.contains("secret"), "should say a secret exists: {dev:?}");
+    assert!(!rows.join("\n").contains("ghp_"), "no values on screen");
+    assert!(
+        !rows.join("\n").contains("http://localhost:3000"),
+        "not even non-secret values: {rows:?}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn a_variable_is_substituted_on_the_way_to_a_real_socket(cx: &mut TestAppContext) {
+    // The whole point, asserted against the bytes a server actually received rather than
+    // against the resolver in isolation.
+    let (session, root) = scratch_collection("env-send");
+    let url = serve_once(OK_JSON);
+    let host = url.trim_start_matches("http://").to_string();
+    write_env(&root, "dev.json", &format!(r#"{{"host":"{host}"}}"#));
+    write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+
+    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("dev"));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("http://{{host}}/v1/things");
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("Authorization");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("Bearer {{token}}");
+
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    // The stored request keeps its placeholders — otherwise saving would bake the
+    // environment into the file and the whole point is lost.
+    let spec = spec_of(&view, &mut cx);
+    assert_eq!(spec.url, "http://{{host}}/v1/things");
+    assert!(
+        spec.headers.iter().any(|h| h.value == "Bearer {{token}}"),
+        "the buffer must keep its placeholder: {:?}",
+        spec.headers
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn an_undefined_variable_is_reported_by_name_instead_of_being_sent(cx: &mut TestAppContext) {
+    // `Url::parse("https://{{baseUrl}}/x")` succeeds and reads the placeholder as a
+    // hostname, so without the check this is a pointless DNS lookup and a confusing error.
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://{{baseUrl}}/users");
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let error = wait_for(&mut cx, "the failure", |cx| {
+        cx.update(|_, cx| view.read(cx).error.clone())
+    });
+    assert!(
+        matches!(&error, EngineError::UnresolvedVariable { name, .. } if name == "baseUrl"),
+        "should name the variable: {error:?}"
+    );
+    assert!(error.is_local(), "nothing should have left the machine");
+}
+
+#[gpui::test]
+async fn the_selected_environment_survives_a_restart(cx: &mut TestAppContext) {
+    // The reason the session envelope went to v3.
+    let (session, root) = scratch_collection("env-restart");
+    write_env(&root, "staging.json", r#"{"baseUrl":"https://staging.test"}"#);
+
+    {
+        let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+        cx.simulate_keystrokes("ctrl-e");
+        cx.simulate_input("staging");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("staging"));
+    }
+
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    assert_eq!(
+        active_environment(&window, &mut cx).as_deref(),
+        Some("staging"),
+        "switching and closing must not forget the choice"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn selecting_none_turns_substitution_back_off(cx: &mut TestAppContext) {
+    // Otherwise there'd be no way out of an environment once you'd picked one.
+    let (session, root) = scratch_collection("env-none");
+    write_env(&root, "dev.json", r#"{"a":"1"}"#);
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("dev"));
+
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("none");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(active_environment(&window, &mut cx), None);
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn loading_an_environment_with_secrets_writes_the_gitignore_rule(cx: &mut TestAppContext) {
+    // Collections exist to be committed, so the first time a secret is in play the ignore
+    // rule has to already be there. Narrow on purpose: only when there's something to
+    // protect, and reported rather than done silently.
+    let (session, root) = scratch_collection("env-gitignore");
+    write_env(&root, "dev.json", r#"{"baseUrl":"http://localhost"}"#);
+    write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+
+    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    assert!(!root.join(".gitignore").exists(), "nothing written before a choice is made");
+
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+
+    // At switch, not at send: it's the earliest point secrets are known to be in play, and
+    // a send clears `status`, so a notice set during one would never be seen.
+    let ignore = std::fs::read_to_string(root.join(".gitignore")).expect("should exist");
+    assert!(ignore.contains("*.local.json"), "{ignore:?}");
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    assert!(
+        status.is_some_and(|s| s.contains(".gitignore")),
+        "touching the repo must be reported, not silent"
+    );
+
+    let _ = window;
+    remove_scratch(&mut cx, &session);
 }

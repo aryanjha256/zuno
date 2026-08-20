@@ -96,6 +96,21 @@ pub fn resolve_url(spec: &RequestSpec) -> Result<Url, EngineError> {
         .filter(|param| !param.name.trim().is_empty())
         .collect();
 
+    // Checked here rather than trusted: the URL and header checks predate query rows
+    // existing as a separate table, so an unsubstituted `{{var}}` in a parameter used to
+    // reach the wire literally — silently sending `search={{q}}` to a real server. Unlike a
+    // body, `{{` in a query value is a variable and nothing else, so this can be strict.
+    for param in &params {
+        if let Some(name) = find_unresolved_variable(&param.name)
+            .or_else(|| find_unresolved_variable(&param.value))
+        {
+            return Err(EngineError::UnresolvedVariable {
+                name,
+                location: format!("the query parameter {:?}", param.name.trim()),
+            });
+        }
+    }
+
     if !params.is_empty() {
         let mut pairs = url.query_pairs_mut();
         for param in params {
@@ -298,6 +313,23 @@ mod tests {
                 name: "baseUrl".to_string(),
                 location: "the URL".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn an_unresolved_query_variable_never_reaches_a_server() {
+        // The gap: URL and header checks existed, query rows had none, so `search={{q}}`
+        // was sent verbatim.
+        let mut spec = RequestSpec {
+            url: "https://api.test/search".to_string(),
+            ..RequestSpec::default()
+        };
+        spec.query = vec![QueryParam::new("search", "{{q}}")];
+
+        let error = resolve_url(&spec).expect_err("must refuse to send");
+        assert!(
+            matches!(&error, EngineError::UnresolvedVariable { name, .. } if name == "q"),
+            "{error:?}"
         );
     }
 

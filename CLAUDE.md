@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 264 tests, ~6s
+cargo test --workspace                   # 286 tests, ~7s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -69,7 +69,13 @@ Breaking any of these is a bug, not a tradeoff.
    is what lets `parse` tell an envelope apart from M1's bare `RequestSpec`. Default `tabs` and a
    legacy file parses as an envelope with zero tabs, silently discarding the user's request
    instead of migrating it. Change the shape by bumping `CURRENT_VERSION` and adding an arm to
-   `parse`'s version dispatch, with a test per migration — there are three now (bare spec, v1, v2).
+   `parse`'s version dispatch, with a test per migration — there are four now (bare spec, v1, v2,
+   v3). Each older version gets its own spelled-out struct rather than a defaulted field, so
+   "written by an older Zuno" can't be confused with "written by this one, with everything empty".
+10. **Environment secrets never touch the committed file.** `dev.json` is committed,
+    `dev.local.json` is gitignored and overrides it, and that split *is* the secret marking —
+    there's no per-variable flag to forget to set. Anything that writes environment values back to
+    disk must preserve the split, or the collection format starts leaking tokens by design.
 9. **Collection files never carry `RequestId`.** It's written as 0 and reassigned on open. A
    session-local handle in a committed file is diff churn and invented merge conflicts.
 

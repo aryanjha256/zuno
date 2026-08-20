@@ -220,6 +220,16 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
         // symlink and is skipped (no cycles), while a symlink *to a request file* still
         // gets read — which is a reasonable thing for someone to set up.
         if kind.is_dir() {
+            // `environments/` is reserved by the collection format — it holds variables,
+            // not requests. The skip is what makes that a *reservation* rather than a
+            // convention: without it the directory is walked, every file in it is parsed as
+            // a request, and each one is reported as unreadable on every single scan. The
+            // listing happens to come out the same, because an environment doesn't
+            // deserialize as a `RequestSpec` — but a file in there that did would be offered
+            // as a request, and the log would be noise either way.
+            if name == crate::environment::DIRECTORY {
+                continue;
+            }
             walk(root, &path, depth + 1, out);
             continue;
         }
@@ -552,6 +562,26 @@ mod scan_tests {
         assert_eq!(found[0].path, written);
         assert_eq!(found[0].spec.url, "https://api.test/v1/invoices?page=2");
         assert_eq!(found[0].spec.headers, RequestSpec::sample().headers);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_reserved_environments_directory_is_never_walked() {
+        // Uses a *valid* request file, which is what makes this discriminate: an
+        // environment wouldn't parse as a `RequestSpec` and so would be skipped anyway,
+        // leaving the assertion true whether or not the reservation is honoured.
+        let root = scratch("reserved");
+        save(&root, "real", "https://a.test/real");
+
+        let reserved = root.join(crate::environment::DIRECTORY);
+        std::fs::create_dir_all(&reserved).expect("mkdir");
+        let decoy = reserved.join("looks-like-a-request.json");
+        write(&decoy, &RequestSpec::sample()).expect("write");
+
+        let found = scan(&root);
+        let names: Vec<&str> = found.iter().map(|e| e.relative.as_str()).collect();
+        assert_eq!(names, ["real.json"], "the reserved directory must not be walked");
 
         std::fs::remove_dir_all(&root).ok();
     }

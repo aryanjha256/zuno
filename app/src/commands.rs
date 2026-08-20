@@ -48,6 +48,7 @@ pub fn palette() -> Vec<Command> {
         command("Import request from curl on the clipboard", ImportCurl),
         // Navigation.
         command("Find request", OpenRequest),
+        command("Switch environment", SwitchEnvironment),
         command("New tab", NewTab),
         command("Close tab", CloseTab),
         command("Next tab", NextTab),

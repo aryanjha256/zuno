@@ -14,7 +14,8 @@
 //! |---|---|---|
 //! | a bare `RequestSpec` | M1 | one scratch tab |
 //! | `{version: 1, active, tabs: [RequestSpec]}` | tabs, first slice | tabs with no collection path |
-//! | `{version: 2, active, tabs: [{spec, path}]}` | collections | current |
+//! | `{version: 2, active, tabs: [{spec, path}]}` | collections | tabs, no environment |
+//! | `{version: 3, …, environment}` | environments | current |
 //!
 //! Those migrations are the reason the version exists, and each one is covered by a test —
 //! there is no separate migration step to forget to run.
@@ -31,7 +32,7 @@ use zuno_core::RequestSpec;
 
 /// Bumped when the on-disk shape changes. A file claiming a *newer* version is refused
 /// rather than guessed at — see `parse`.
-const CURRENT_VERSION: u32 = 2;
+const CURRENT_VERSION: u32 = 3;
 
 /// One open buffer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -63,20 +64,27 @@ pub struct Session {
     version: u32,
     pub active: usize,
     pub tabs: Vec<Tab>,
+    /// The selected environment's name, or `None` for no environment.
+    ///
+    /// Window state rather than collection state: it's "what am I pointed at right now",
+    /// and two people sharing a collection through git should not fight over whose turn it
+    /// is to be pointed at prod.
+    pub environment: Option<String>,
 }
 
 impl Session {
-    pub fn new(tabs: Vec<Tab>, active: usize) -> Self {
+    pub fn new(tabs: Vec<Tab>, active: usize, environment: Option<String>) -> Self {
         Self {
             version: CURRENT_VERSION,
             active,
             tabs,
+            environment,
         }
     }
 
     /// The shape M1 persisted, expressed in the current format.
     pub fn single(spec: RequestSpec) -> Self {
-        Self::new(vec![Tab::scratch(spec)], 0)
+        Self::new(vec![Tab::scratch(spec)], 0, None)
     }
 }
 
@@ -96,6 +104,16 @@ struct VersionProbe {
 struct SessionV1 {
     active: usize,
     tabs: Vec<RequestSpec>,
+}
+
+/// `{version: 2, active, tabs: [{spec, path}]}` — before environments, so nothing was
+/// selected. Identical to v3 apart from the missing field, but spelled out rather than
+/// given a serde default: invariant 8 exists because a defaulted field turns "written by an
+/// older Zuno" into "written by this one, with everything empty".
+#[derive(Deserialize)]
+struct SessionV2 {
+    active: usize,
+    tabs: Vec<Tab>,
 }
 
 /// Where the session lives. `None` disables persistence entirely.
@@ -158,11 +176,20 @@ pub fn load(cx: &App) -> Option<Session> {
 fn parse(bytes: &[u8]) -> Result<Session, String> {
     let mut session = match serde_json::from_slice::<VersionProbe>(bytes) {
         Ok(probe) => match probe.version {
-            2 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            3 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            2 => {
+                let v2 =
+                    serde_json::from_slice::<SessionV2>(bytes).map_err(|error| error.to_string())?;
+                Session::new(v2.tabs, v2.active, None)
+            }
             1 => {
                 let v1 =
                     serde_json::from_slice::<SessionV1>(bytes).map_err(|error| error.to_string())?;
-                Session::new(v1.tabs.into_iter().map(Tab::scratch).collect(), v1.active)
+                Session::new(
+                    v1.tabs.into_iter().map(Tab::scratch).collect(),
+                    v1.active,
+                    None,
+                )
             }
             newer => {
                 return Err(format!(
@@ -259,6 +286,7 @@ mod tests {
                 Tab::scratch(named("third")),
             ],
             2,
+            Some("dev".to_string()),
         );
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
@@ -271,6 +299,11 @@ mod tests {
             back.tabs[1].path.as_deref(),
             Some(std::path::Path::new("/collections/second.json")),
             "a buffer's collection file must survive a restart"
+        );
+        assert_eq!(
+            back.environment.as_deref(),
+            Some("dev"),
+            "the selected environment must survive a restart"
         );
     }
 
@@ -311,7 +344,7 @@ mod tests {
     fn an_active_index_past_the_end_is_clamped_rather_than_panicking() {
         // A truncated or hand-edited file. Left alone, this indexes out of bounds at the
         // first render.
-        let session = Session::new(vec![Tab::scratch(named("only"))], 7);
+        let session = Session::new(vec![Tab::scratch(named("only"))], 7, None);
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
         let back = parse(&json).expect("parse");

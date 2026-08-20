@@ -135,10 +135,34 @@ The theme is *stop retyping things*. Started out of order on purpose: the settin
 because principle 3 outranked the listed sequence — it exposed five already-built capabilities for
 one modal, and the cookie jar was silently making consecutive requests non-independent.
 
-**Environments and variables.** The engine already *detects* unresolved `{{var}}` and refuses to
-send — so the failure path exists and substitution is the actual work. Needs a scope model
-(global → environment → request) and a decision about where secrets live, which is the first
-question in this milestone that isn't purely mechanical.
+**Environments and variables — done.** `Ctrl+E` selects one; `{{name}}` is substituted into the
+URL, query rows, headers, and raw bodies on the way to the socket, while the stored request keeps
+its placeholders. Two layers: `globals.json` always active, one selected environment on top.
+Request-level variables were considered and dropped — an editable table per request, for the layer
+least likely to be used.
+
+Four decisions worth keeping:
+
+- **Environments live in the collection**, in a reserved `environments/` directory, so they travel
+  with the requests they describe and are reviewable in a PR — the same argument as the collection
+  format itself.
+- **Secrets are a file split, not a flag.** `dev.json` is committed, `dev.local.json` is gitignored
+  and overrides it. The split *is* the marking, so there's no per-variable flag to forget. Zuno
+  writes the `.gitignore` rule itself, but only when a selected environment actually has secrets,
+  and it says so — the collection format exists to be committed, so "document it and hope" leaks
+  tokens by default.
+- **Substitution is single-pass and replaces only known names.** An unknown `{{foo}}` is left
+  verbatim: in a URL or header that trips the pre-existing `UnresolvedVariable` check by name
+  before DNS, and in a JSON body it passes straight through — which is why no escape syntax was
+  needed. No recursion, so cycles are impossible by construction rather than detected.
+- **Values are re-read per send, not cached at switch**, so editing `dev.json` in an editor takes
+  effect on the next request. The files are the interface, so they stay authoritative.
+
+*Deliberately absent:* no in-app environment editor. Environments are JSON files in your
+collection — the same bet the collection format makes; an editing UI is its own slice.
+
+A gap turned up on the way: `build.rs` validated the URL and headers but **not query rows**, so an
+unsubstituted `{{var}}` in a query parameter reached the wire literally. Fixed, with a test.
 
 **Auth helpers.** Mostly UI sugar over headers: Basic already works end to end (curl import
 proves it). Bearer is trivial. OAuth flows are a genuine project and should be scoped separately

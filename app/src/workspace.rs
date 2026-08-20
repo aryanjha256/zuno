@@ -14,15 +14,15 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Task, Window, div, px,
 };
-use zuno_core::{RequestId, RequestSpec, collection};
+use zuno_core::{Environment, RequestId, RequestSpec, Resolver, collection, environment};
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, ClearCookies, CloseTab, CycleBodyKind, FocusBody,
     FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
     OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm,
-    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ToggleRow,
-    ToggleTheme, UnfoldAll,
+    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, SwitchEnvironment,
+    ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
@@ -47,6 +47,12 @@ pub struct Workspace {
     picker_scan: Option<Task<()>>,
     /// The settings panel, while it's open.
     settings: Option<SettingsState>,
+    /// The selected environment's name, restored from the session.
+    ///
+    /// Only the *name* is held. The values are re-read from disk on every send, so editing
+    /// `dev.json` in another window takes effect on the next request rather than on the next
+    /// restart — the files are the interface, so they have to stay authoritative.
+    environment: Option<String>,
 }
 
 /// The settings panel and the subscription that lets it close, for the same reason
@@ -71,6 +77,7 @@ impl Workspace {
         let session = crate::session::load(cx)
             .unwrap_or_else(|| crate::session::Session::single(RequestSpec::sample()));
         let active_ix = session.active;
+        let environment = session.environment.clone();
         let views: Vec<_> = session
             .tabs
             .into_iter()
@@ -110,6 +117,7 @@ impl Workspace {
             picker: None,
             picker_scan: None,
             settings: None,
+            environment,
         }
     }
 
@@ -122,6 +130,11 @@ impl Workspace {
     #[cfg(test)]
     pub fn tab_count(&self) -> usize {
         self.views.len()
+    }
+
+    #[cfg(test)]
+    pub fn active_environment(&self) -> Option<String> {
+        self.environment.clone()
     }
 
     #[cfg(test)]
@@ -381,6 +394,121 @@ impl Workspace {
         picker
     }
 
+    /// Assemble the resolver for a send: globals underneath, the selected environment on
+    /// top.
+    ///
+    /// Deliberately free of side effects. An earlier version ensured the `.gitignore` rule
+    /// here, which meant a function running on *every send* wrote to the user's repository —
+    /// and the notice it set was then wiped by `RequestView::send`, which clears `status`.
+    /// Protecting the repo belongs at the moment of switching; see `choose`.
+    fn resolver(&self, cx: &App) -> Resolver {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return Resolver::default();
+        };
+
+        let globals = environment::load(&root, environment::GLOBALS).ok();
+        let active = self
+            .environment
+            .as_deref()
+            .and_then(|name| match environment::load(&root, name) {
+                Ok(env) => Some(env),
+                Err(error) => {
+                    eprintln!("[zuno] {error}");
+                    None
+                }
+            });
+
+        Resolver::new(globals.as_ref(), active.as_ref())
+    }
+
+    /// Make sure the collection ignores `*.local.json`, if the selected environment has any
+    /// secrets to protect.
+    ///
+    /// Done on *switch* rather than on send: it's the earliest moment we know secrets are in
+    /// play, it happens once instead of per request, and the status message survives — a send
+    /// clears `status`, so a notice set during one is never seen.
+    ///
+    /// Narrow on purpose. Zuno writing into a file it doesn't own is an intrusion, so it
+    /// happens only when there is something to protect and is always reported.
+    fn protect_secrets(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(name) = self.environment.clone() else {
+            return;
+        };
+
+        let has_secrets = environment::load(&root, &name)
+            .map(|env| !env.secret.is_empty())
+            .unwrap_or(false);
+        if !has_secrets {
+            return;
+        }
+
+        match environment::ensure_gitignored(&root) {
+            Ok(true) => self.set_status("Added *.local.json to the collection's .gitignore", cx),
+            Ok(false) => {}
+            Err(error) => eprintln!("[zuno] {error}"),
+        }
+    }
+
+    /// Pick the active environment. `None` is always offered, since "send it raw" is a
+    /// legitimate choice and otherwise there'd be no way back out.
+    fn switch_environment(
+        &mut self,
+        _: &SwitchEnvironment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.picker.is_some() || self.settings.is_some() {
+            return;
+        }
+
+        let root = crate::collections::root(cx).map(Path::to_path_buf);
+        let found: Vec<Environment> = root
+            .as_deref()
+            .map(environment::scan)
+            .unwrap_or_default();
+
+        let current = self.environment.clone();
+        let mut items = vec![picker::Item {
+            label: SharedString::from("None"),
+            detail: if current.is_none() {
+                SharedString::from("current — variables are left unresolved")
+            } else {
+                SharedString::from("send requests without substitution")
+            },
+            target: picker::Target::Environment(None),
+        }];
+
+        items.extend(found.into_iter().map(|env| {
+            let is_current = current.as_deref() == Some(env.name.as_str());
+            // Counts rather than values: a switcher is not a place to leak a token onto the
+            // screen, and the count is what tells you the file was actually found.
+            let secrets = env.secret.len();
+            let summary = match (env.values.len(), secrets) {
+                (n, 0) => format!("{n} variables"),
+                (n, s) => format!("{n} variables, {s} secret"),
+            };
+            picker::Item {
+                label: SharedString::from(env.name.clone()),
+                detail: SharedString::from(if is_current {
+                    format!("current — {summary}")
+                } else {
+                    summary
+                }),
+                target: picker::Target::Environment(Some(env.name)),
+            }
+        }));
+
+        self.show_picker(
+            items,
+            "No environments — add one to environments/ in your collection",
+            window,
+            cx,
+        );
+    }
+
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.picker.take() else { return };
         self.picker_scan = None;
@@ -403,6 +531,14 @@ impl Workspace {
                 // Dispatched rather than called directly, so a palette entry and its
                 // keybinding run the identical path — the convention in CLAUDE.md.
                 window.dispatch_action(action, cx);
+            }
+            picker::Target::Environment(name) => {
+                self.environment = name;
+                // Persisted immediately rather than at the next send: switching environment
+                // and then closing the window should not silently forget which one you chose.
+                crate::session::save(&self.session(cx), cx);
+                self.protect_secrets(cx);
+                cx.notify();
             }
             picker::Target::Method(method) => {
                 if let Some(view) = self.active() {
@@ -626,7 +762,7 @@ impl Workspace {
                 }
             })
             .collect();
-        crate::session::Session::new(tabs, self.active_ix)
+        crate::session::Session::new(tabs, self.active_ix, self.environment.clone())
     }
 
     /// `Window::focus` refreshes the whole window internally, so there's no
@@ -804,7 +940,12 @@ impl Workspace {
         // edits made since the last one. Every buffer is written, not just the one being
         // sent — the checkpoint is the window's state, not this request's.
         crate::session::save(&self.session(cx), cx);
-        view.update(cx, |view, cx| view.send(&engine, cx));
+
+        // Read from disk per send rather than cached at switch time, so editing an
+        // environment file takes effect on the next request. It's a couple of small files;
+        // if it ever shows up in a profile, cache it and invalidate on a file watch.
+        let resolver = self.resolver(cx);
+        view.update(cx, |view, cx| view.send(&engine, &resolver, cx));
     }
 
     /// Write the active buffer into the collection as a file of its own.
@@ -960,6 +1101,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::open_request))
+            .on_action(cx.listener(Self::switch_environment))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::setting_next))
@@ -1001,7 +1143,13 @@ impl Render for Workspace {
             .child(crate::chrome::titlebar(title, &theme, window))
             .children(tab_strip(tabs, &theme, cx))
             .children(self.active())
-            .child(status_bar(focused_region, status_message, cookies, &theme))
+            .child(status_bar(
+                focused_region,
+                status_message,
+                cookies,
+                self.environment.clone().map(SharedString::from),
+                &theme,
+            ))
             // Above the panes, below the resize edges.
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
@@ -1147,9 +1295,10 @@ fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     cookies: bool,
+    environment: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+P find · Ctrl+K commands · Ctrl+, settings · Ctrl+Enter send";
+    const HINTS: &str = "Ctrl+P find · Ctrl+K commands · Ctrl+E env · Ctrl+Enter send";
 
     div()
         .flex()
@@ -1197,6 +1346,19 @@ fn status_bar(
                 // consecutive requests silently non-independent — the exact thing that
                 // costs an hour of debugging a phantom auth bug. Shown only when it's on:
                 // a badge that's always there stops being read.
+                // Which environment a request will be sent against changes where it
+                // goes and what credentials it carries, so it belongs on screen rather than
+                // two keystrokes away. No badge at all means no substitution — a quieter
+                // way of saying it than a badge reading "None".
+                .children(environment.map(|name| {
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.bg_elevated)
+                        .text_color(theme.accent)
+                        .child(name)
+                }))
                 .children(cookies.then(|| {
                     div()
                         .flex_none()
