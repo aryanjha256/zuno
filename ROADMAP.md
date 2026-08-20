@@ -21,10 +21,10 @@ Measured: **189 ms** cold start (release), **48 ms** to flatten 10 MB of JSON in
 off-thread, 60 fps scrolling on any response size.
 
 **M2 is complete.** Tabs as editor buffers, collections as one-file-per-request in git, `Ctrl+P`
-over buffers and saved requests, and `Ctrl+K` over every command. 249 tests across three layers,
+over buffers and saved requests, and `Ctrl+K` over every command. 260 tests across three layers,
 and a `.deb` on tagged releases.
 
-The navigation thesis from `what.md` is built. What's left is **reuse** — see M3 — and the honest
+The navigation thesis is built. What's left is **reuse** — see M3 — and the honest
 next question is no longer "can you get around" but "can you stop retyping things".
 
 That gap *is* the roadmap. Everything below is about closing it.
@@ -45,10 +45,11 @@ These decide phase order, and they're the durable part of this document.
    written four times and feels different each time. **This is the highest-leverage piece of UI
    work remaining.**
 
-3. **Prefer work that exposes capability already built.** §11 of `architecture.md` lists nine
-   engine capabilities with no way to reach them — cookie jar, timeout, redirects, TLS toggle,
-   encodings, history. A settings panel and a history browser each surface several at once, which
-   makes them unusually cheap for the value.
+3. **Prefer work that exposes capability already built.** §11 of `architecture.md` tracks engine
+   capabilities that are honoured on every request with no way to reach them. `Ctrl+,` closed five
+   of the original nine in one modal, which is the ratio this principle is about. **Four remain**,
+   and none is a toggle: form and binary body authoring, multipart, the response history browser,
+   and custom HTTP methods.
 
 4. **Defer the expensive and isolated.** Syntax highlighting needs tree-sitter plus a highlight
    cache, touches nothing else, and improves nothing structural. It is the most expensive thing
@@ -62,7 +63,8 @@ These decide phase order, and they're the durable part of this document.
 The thesis milestone. Kept in full rather than trimmed to a line: the *order* these landed in, and
 the two estimates that turned out wrong, are the durable part.
 
-**Tabs — done.** What makes the "20–100+ open requests" claim from `idea.md` true.
+**Tabs — done.** What makes the original brief's "20–100+ open requests without the UI turning
+into chaos" true.
 
 Built in two slices, in that order for a reason. First the *session format*: a versioned envelope
 in `app/src/session.rs` that still reads M1's single-spec file, because persistence was the only
@@ -183,7 +185,7 @@ curl import parses `-F`, but the engine still returns `UnsupportedBody`.
 Reasons recorded so a future session can judge them, not commitments.
 
 - **Scripting** (pre-request / post-response). The largest single feature in the original
-  `idea.md` list, and the one most likely to define the product's ceiling. Needs a language and a
+  original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
 - **Request chaining** — extract a value from one response, feed it to the next. Arguably more
   valuable than general scripting and far smaller.
@@ -208,7 +210,7 @@ them would change what Zuno *is*.
 - **Mock servers, load testing, contract testing, API documentation.** Adjacent products.
   Postman's decline into a platform is the cautionary tale.
 - **A plugin ecosystem.** Not before the core loop is something people prefer.
-- **Beating Postman on feature count.** The bet is feel. `idea.md`: *"the first milestone
+- **Beating Postman on feature count.** The bet is feel. From the original brief: *"the first milestone
   shouldn't be build Postman"* — that stays true at every milestone.
 
 ---

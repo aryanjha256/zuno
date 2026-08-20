@@ -393,7 +393,7 @@ showing, because an empty input lays out placeholder text rather than content.
 
 **Explicitly deferred to M3+:** syntax highlighting (needs tree-sitter plus a highlight
 cache), autocomplete, multi-cursor, code folding in the *editor*, bracket matching. The
-"excellent request/code editor" in `idea.md` is a milestone of its own — treating it as a
+an "excellent request/code editor" is a milestone of its own — treating it as a
 sub-task of M1 is the most likely way this project stalls.
 
 **The rope was dropped, deliberately.** Two things decided it. `ropey`'s current release is
@@ -692,7 +692,7 @@ every line to know how far right the content goes.
 
 **Still deliberately absent:** tabs, collections, the `Ctrl+P` / `Ctrl+K` palettes, environments
 and variables, syntax highlighting, a method dropdown, a settings panel, and a history browser.
-The navigation thesis from `what.md` is entirely M2.
+The navigation thesis is entirely M2.
 
 **Deferred by design, and it's worth naming them so they stop feeling like omissions:**
 tabs/buffers, collections, the `Ctrl+P` / `Ctrl+K` palettes, environments and variables, auth
@@ -856,6 +856,25 @@ Two ordering facts worth keeping, both verified against the vendored source rath
   and focus disagreeing so you type into the request you just left. That is why the picker closes
   before acting, and `choosing_a_buffer_leaves_focus_in_that_buffer` is the guard.
 
+**Global settings defaults** (new, deferred deliberately). Nothing can change what a *new* request
+starts with: `new_tab` builds `RequestSpec::default()`, so `RequestSettings::default()` is hardcoded
+in Rust — 30s timeout, TLS verification on, cookies on, 10 hops. Work against a dev box with a
+self-signed certificate and you turn TLS verification off on every new request, forever.
+
+An earlier note here claimed this needed the same scope model as environments. That was too strong,
+and the correction matters because it changes the cost. **Two separable problems:**
+
+| | What it takes |
+|---|---|
+| *Defaults for new requests* — what a fresh buffer starts from | One `RequestSettings` in a config file (`~/.config/zuno/settings.json`), copied into new buffers. Reuses the `install`/`install_at` global pattern from `session.rs`, so test isolation comes free under invariant 6. No model change, no serde risk, independent of environments. |
+| *Inheritance* — "this request inherits TLS-off from the environment unless overridden" | Every field becomes `Option<T>` (`None` = inherit) or needs a parallel override mask, plus resolution at send. Real model change, hits invariant 7, touches every read site. |
+
+Only the second shares anything with environments. The first is cheap and could land any time; it's
+deferred because it wasn't asked for yet, not because it's blocked. Two sub-questions when it does:
+whether saving defaults is an explicit action (recommended — a panel that silently changes every
+*future* request is a nasty surprise) and whether the shipped values stay as they are (recommended —
+they match Postman and browsers, and the config file is the place to disagree).
+
 **The cookie jar's visibility** (new). It's on and invisible. Options: a status-bar
 indicator, a per-request toggle, or a jar viewer. Leaning toward an indicator plus a toggle in the
 settings panel that several other items in §11 also need — that section lists them.
@@ -870,7 +889,7 @@ read the response through a virtualized JSON viewer that handles 10MB at 60fps, 
 the previous run, and come back to it after a restart. Plus curl import, light/dark themes,
 window chrome, and 176 tests across three layers.
 
-**Not done, and it's the important half:** the *navigation* thesis. `what.md` named `Ctrl+P`,
+**Not done, and it's the important half:** the *navigation* thesis. The original brief named `Ctrl+P`,
 `Ctrl+K`, fuzzy search across collections, and request-tabs-as-editor-buffers as the defining
 features — the things that would make this Zed-like rather than Postman-like. None of them exist.
 There is one request, no tabs, no collections, no palette.

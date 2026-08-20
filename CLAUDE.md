@@ -1,7 +1,7 @@
 # Zuno — working notes for agents
 
-A native API client in Rust + GPUI. The thesis, from `what.md`: **Postman-level capability,
-Zed-level feel** — speed and keyboard navigation are requirements, not polish.
+A native API client in Rust + GPUI. The thesis: **Postman-level capability, Zed-level feel** —
+speed and keyboard navigation are requirements, not polish.
 
 Three docs, three jobs. Read them in this order:
 
@@ -14,7 +14,7 @@ Three docs, three jobs. Read them in this order:
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
 Milestone 1 is complete: the request → response loop works end to end. **M2 is complete too** —
-tabs, collections, `Ctrl+P`, and `Ctrl+K`. The navigation thesis from `what.md` is built; M3
+tabs, collections, `Ctrl+P`, and `Ctrl+K`. The navigation thesis is built; M3
 (environments and variables) is next.
 
 ## Layout
