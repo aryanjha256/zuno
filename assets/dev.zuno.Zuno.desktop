@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Zuno
+GenericName=API Client
+Comment=A ridiculously fast API client
+Exec=zuno
+Icon=dev.zuno.Zuno
+Terminal=false
+Categories=Development;WebDevelopment;
+Keywords=API;HTTP;HTTPS;REST;curl;request;client;
+# Must equal the `app_id` set in main.rs, or X11 can't tie the window to this entry.
+# On Wayland the *filename* does that job, which is why this file is named after the id
+# rather than after the binary.
+StartupWMClass=dev.zuno.Zuno
+StartupNotify=true

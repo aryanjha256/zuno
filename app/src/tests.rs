@@ -27,15 +27,21 @@ use crate::workspace::Workspace;
 fn open_workspace(cx: &mut TestAppContext) -> (gpui::Entity<RequestView>, VisualTestContext) {
     // Persistence must not touch the developer's real session file — the tests drive
     // SendRequest, and a send is a save point.
-    let (_, view, vcx) = boot(cx, None);
+    let (_, view, vcx) = boot(cx, None, None);
     (view, vcx)
 }
 
-/// `open_workspace`, but keeping the window handle and taking a session file, for the
-/// tests that care about restore. Most don't, which is why the common case hides both.
+/// `open_workspace`, but keeping the window handle and taking the two persistence paths,
+/// for the tests that care about restore or saving. Most don't, which is why the common
+/// case hides all three.
+///
+/// `None` for either disables that half. Both default to `None` in `open_workspace`
+/// because invariant 6 applies to collections exactly as it does to the session file: the
+/// suite must never write into the developer's own data.
 fn boot(
     cx: &mut TestAppContext,
     session: Option<PathBuf>,
+    collections: Option<PathBuf>,
 ) -> (
     gpui::WindowHandle<Workspace>,
     gpui::Entity<RequestView>,
@@ -46,6 +52,7 @@ fn boot(
         crate::register_keymap(cx);
         crate::engine::install(cx).expect("engine");
         crate::session::install_at(cx, session);
+        crate::collections::install_at(cx, collections);
     });
 
     let window = cx.add_window(|window, cx| Workspace::new(window, cx));
@@ -65,9 +72,24 @@ fn scratch_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Best-effort cleanup of a `scratch_dir`. Takes the whole directory, not just the file,
-/// so a failing test doesn't leave an empty one behind for every run.
-fn remove_scratch(session: &PathBuf) {
+/// Tear down a test's scratch directory.
+///
+/// **Persistence has to be switched off before deleting**, or the delete doesn't stick:
+/// dropping the app at the end of a test fires `on_app_quit`, which saves the session and
+/// recreates the directory that was just removed. Every scratch dir in `/tmp` came back with
+/// a `session.json` in it until this pointed the globals at `None` first.
+///
+/// That the hook fires on teardown at all is a small free proof it's wired to every exit
+/// path, which is what it was written for.
+///
+/// Takes the whole directory rather than the one file, so a failing test doesn't leave an
+/// empty one behind for every run.
+fn remove_scratch(cx: &mut VisualTestContext, session: &PathBuf) {
+    cx.update(|_, cx| {
+        crate::session::install_at(cx, None);
+        crate::collections::install_at(cx, None);
+    });
+
     if let Some(dir) = session.parent() {
         std::fs::remove_dir_all(dir).ok();
     }
@@ -862,7 +884,7 @@ fn put_on_clipboard(cx: &mut VisualTestContext, text: &str) {
 
 #[gpui::test]
 async fn a_curl_command_on_the_clipboard_becomes_the_request(cx: &mut TestAppContext) {
-    let (window, _, mut cx) = boot(cx, None);
+    let (window, _, mut cx) = boot(cx, None, None);
 
     put_on_clipboard(
         &mut cx,
@@ -955,7 +977,7 @@ fn tabs_of(
 
 #[gpui::test]
 async fn ctrl_t_opens_a_buffer_and_focus_follows_it(cx: &mut TestAppContext) {
-    let (window, first, mut cx) = boot(cx, None);
+    let (window, first, mut cx) = boot(cx, None, None);
 
     cx.simulate_keystrokes("ctrl-t");
     let (count, _) = tabs_of(&window, &mut cx);
@@ -981,7 +1003,7 @@ async fn ctrl_t_opens_a_buffer_and_focus_follows_it(cx: &mut TestAppContext) {
 async fn a_new_buffer_gets_a_distinct_id(cx: &mut TestAppContext) {
     // Duplicate ids would make the saved session ambiguous, and nothing allocates them —
     // `sample()` hardcodes 1 and `default()` 0.
-    let (window, first, mut cx) = boot(cx, None);
+    let (window, first, mut cx) = boot(cx, None, None);
     let original = spec_of(&first, &mut cx).id;
 
     cx.simulate_keystrokes("ctrl-t");
@@ -991,7 +1013,7 @@ async fn a_new_buffer_gets_a_distinct_id(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn ctrl_tab_cycles_buffers_and_wraps(cx: &mut TestAppContext) {
-    let (window, _, mut cx) = boot(cx, None);
+    let (window, _, mut cx) = boot(cx, None, None);
 
     // Three buffers, each identifiable by its URL.
     cx.simulate_keystrokes("ctrl-t");
@@ -1014,7 +1036,7 @@ async fn ctrl_tab_cycles_buffers_and_wraps(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn ctrl_w_closes_a_buffer_and_leaves_focus_usable(cx: &mut TestAppContext) {
-    let (window, _, mut cx) = boot(cx, None);
+    let (window, _, mut cx) = boot(cx, None, None);
 
     cx.simulate_keystrokes("ctrl-t");
     cx.simulate_input("https://second.test");
@@ -1041,7 +1063,7 @@ async fn closing_the_last_buffer_leaves_a_fresh_one(cx: &mut TestAppContext) {
     // An empty `views` makes `active()` return None, which every handler reads as "do
     // nothing" — a window that is still there and silently inert. Ctrl+W must not do that,
     // and must not quit either; that's Ctrl+Q's job.
-    let (window, _, mut cx) = boot(cx, None);
+    let (window, _, mut cx) = boot(cx, None, None);
 
     cx.simulate_keystrokes("ctrl-w");
 
@@ -1057,7 +1079,7 @@ async fn closing_the_last_buffer_leaves_a_fresh_one(cx: &mut TestAppContext) {
 async fn a_curl_import_opens_a_new_buffer_instead_of_replacing_one(cx: &mut TestAppContext) {
     // Replacing was only defensible while there was nowhere else to put the result: an
     // import over unsaved work destroyed it with no undo.
-    let (window, first, mut cx) = boot(cx, None);
+    let (window, first, mut cx) = boot(cx, None, None);
     let before = spec_of(&first, &mut cx);
 
     put_on_clipboard(&mut cx, "curl https://imported.test/widgets -H 'X-Key: abc'");
@@ -1077,7 +1099,7 @@ async fn a_curl_import_opens_a_new_buffer_instead_of_replacing_one(cx: &mut Test
 
 #[gpui::test]
 async fn a_tab_is_labelled_from_its_url_as_it_is_typed(cx: &mut TestAppContext) {
-    let (_, view, mut cx) = boot(cx, None);
+    let (_, view, mut cx) = boot(cx, None, None);
 
     cx.simulate_keystrokes("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v2/invoices");
@@ -1091,7 +1113,7 @@ async fn every_open_buffer_is_persisted_on_send(cx: &mut TestAppContext) {
     // The multi-buffer half of the save path, which could not be written before `NewTab`
     // existed — a send is a save point, so it checkpoints the whole window.
     let path = scratch_dir("multisave").join("session.json");
-    let (_, _, mut cx) = boot(cx, Some(path.clone()));
+    let (_, _, mut cx) = boot(cx, Some(path.clone()), None);
 
     cx.simulate_keystrokes("ctrl-t");
     cx.simulate_input("https://kept.test/two");
@@ -1107,16 +1129,16 @@ async fn every_open_buffer_is_persisted_on_send(cx: &mut TestAppContext) {
 
     assert_eq!(session.tabs.len(), 3, "every buffer, not just the one that sent");
     assert_eq!(session.active, 2, "and which one was in front");
-    assert_eq!(session.tabs[1].url, "https://kept.test/two");
-    assert_eq!(session.tabs[2].url, url);
+    assert_eq!(session.tabs[1].spec.url, "https://kept.test/two");
+    assert_eq!(session.tabs[2].spec.url, url);
 
     // Ids have to stay distinct through a round trip, or the file is ambiguous.
-    let mut ids: Vec<_> = session.tabs.iter().map(|tab| tab.id).collect();
+    let mut ids: Vec<_> = session.tabs.iter().map(|tab| tab.spec.id).collect();
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), 3, "saved buffers must have distinct ids");
 
-    remove_scratch(&path);
+    remove_scratch(&mut cx, &path);
 }
 
 #[gpui::test]
@@ -1126,12 +1148,15 @@ async fn every_saved_buffer_is_restored_not_just_the_active_one(cx: &mut TestApp
     // not in the parsing, which `session`'s own tests already cover.
     let path = scratch_dir("restore").join("session.json");
     let session = crate::session::Session::new(
-        vec![named("first"), named("second"), named("third")],
+        vec![named("first"), named("second"), named("third")]
+            .into_iter()
+            .map(crate::session::Tab::scratch)
+            .collect(),
         1, // not 0, so ignoring `active` fails the test rather than passing by luck
     );
     std::fs::write(&path, serde_json::to_vec(&session).expect("serialize")).expect("write");
 
-    let (window, view, mut cx) = boot(cx, Some(path.clone()));
+    let (window, view, mut cx) = boot(cx, Some(path.clone()), None);
 
     let tabs = window
         .update(&mut cx, |workspace, _, _| workspace.tab_count())
@@ -1143,7 +1168,7 @@ async fn every_saved_buffer_is_restored_not_just_the_active_one(cx: &mut TestApp
         "the buffer that was in front should be in front again"
     );
 
-    remove_scratch(&path);
+    remove_scratch(&mut cx, &path);
 }
 
 #[gpui::test]
@@ -1160,10 +1185,10 @@ async fn an_out_of_range_active_index_opens_a_window_instead_of_panicking(
     );
     std::fs::write(&path, json).expect("write");
 
-    let (_, view, mut cx) = boot(cx, Some(path.clone()));
+    let (_, view, mut cx) = boot(cx, Some(path.clone()), None);
     assert_eq!(spec_of(&view, &mut cx).name, "only");
 
-    remove_scratch(&path);
+    remove_scratch(&mut cx, &path);
 }
 
 #[gpui::test]
@@ -1175,7 +1200,7 @@ async fn a_session_written_by_m1_still_opens(cx: &mut TestAppContext) {
     let spec = named("saved by m1");
     std::fs::write(&path, serde_json::to_vec(&spec).expect("serialize")).expect("write");
 
-    let (window, view, mut cx) = boot(cx, Some(path.clone()));
+    let (window, view, mut cx) = boot(cx, Some(path.clone()), None);
 
     let tabs = window
         .update(&mut cx, |workspace, _, _| workspace.tab_count())
@@ -1183,7 +1208,7 @@ async fn a_session_written_by_m1_still_opens(cx: &mut TestAppContext) {
     assert_eq!(tabs, 1);
     assert_eq!(spec_of(&view, &mut cx).name, "saved by m1");
 
-    remove_scratch(&path);
+    remove_scratch(&mut cx, &path);
 }
 
 #[gpui::test]
@@ -1192,7 +1217,7 @@ async fn a_send_checkpoints_every_open_buffer(cx: &mut TestAppContext) {
     // With one buffer constructible today it can only prove the envelope reaches disk in
     // the new format; the multi-buffer assertion arrives with `NewTab`.
     let path = scratch_dir("checkpoint").join("session.json");
-    let (_, view, mut cx) = boot(cx, Some(path.clone()));
+    let (_, view, mut cx) = boot(cx, Some(path.clone()), None);
 
     let url = serve_once(OK_JSON);
     cx.simulate_keystrokes("ctrl-l ctrl-a");
@@ -1207,7 +1232,192 @@ async fn a_send_checkpoints_every_open_buffer(cx: &mut TestAppContext) {
         serde_json::from_slice(&written).expect("it should be an envelope, not a bare spec");
     assert_eq!(session.tabs.len(), 1);
     assert_eq!(session.active, 0);
-    assert_eq!(session.tabs[0].url, url);
+    assert_eq!(session.tabs[0].spec.url, url);
 
-    remove_scratch(&path);
+    remove_scratch(&mut cx, &path);
+}
+
+/// A collection root and a session file in the same scratch directory, so a test can
+/// restart the app against both.
+fn scratch_collection(name: &str) -> (PathBuf, PathBuf) {
+    let dir = scratch_dir(name);
+    (dir.join("session.json"), dir.join("collections"))
+}
+
+/// Every `.json` in a collection root, sorted, for asserting what a save actually wrote.
+fn collection_files(root: &PathBuf) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[gpui::test]
+async fn ctrl_s_writes_the_request_as_a_file_named_from_its_url(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("save");
+    let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/v1/invoices");
+    cx.simulate_keystrokes("ctrl-s");
+
+    assert_eq!(collection_files(&root), ["invoices.json"]);
+
+    // What landed on disk has to be the request as it appears on screen, not a stale copy.
+    let bytes = std::fs::read(root.join("invoices.json")).expect("read");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    assert_eq!(saved.url, "https://api.test/v1/invoices");
+
+    // The buffer now knows where it lives, which is what the next test depends on.
+    let path = cx.update(|_, cx| view.read(cx).path.clone());
+    assert_eq!(path, Some(root.join("invoices.json")));
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn saving_twice_overwrites_rather_than_making_a_second_file(cx: &mut TestAppContext) {
+    // The bug `RequestView::path` exists to prevent: a filename derived from the URL is
+    // not an identity, so without remembering the file, the second save finds
+    // `invoices.json` taken and writes `invoices-2.json`.
+    let (session, root) = scratch_collection("resave");
+    let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/v1/invoices");
+    cx.simulate_keystrokes("ctrl-s");
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/v1/invoices?page=2");
+    cx.simulate_keystrokes("ctrl-s");
+
+    assert_eq!(
+        collection_files(&root),
+        ["invoices.json"],
+        "a re-save must overwrite, not accumulate"
+    );
+
+    let bytes = std::fs::read(root.join("invoices.json")).expect("read");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    assert_eq!(saved.url, "https://api.test/v1/invoices?page=2", "and hold the edit");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn a_buffer_still_knows_its_file_after_a_restart(cx: &mut TestAppContext) {
+    // The reason the session envelope went to v2. Without persisting the path, Ctrl+S after
+    // a restart derives a fresh name and breeds `invoices-2.json` beside the original.
+    let (session, root) = scratch_collection("resave-restart");
+
+    {
+        let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.simulate_input("https://api.test/v1/invoices");
+        cx.simulate_keystrokes("ctrl-s");
+        // A send is the save point that writes the session envelope.
+        let served = serve_once(OK_JSON);
+        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.simulate_input(&served);
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+    }
+
+    assert_eq!(collection_files(&root), ["invoices.json"]);
+
+    // Reopen against the same session file, exactly as a restart would.
+    let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let restored = cx.update(|_, cx| view.read(cx).path.clone());
+    assert_eq!(
+        restored,
+        Some(root.join("invoices.json")),
+        "the collection file must survive a restart"
+    );
+
+    cx.simulate_keystrokes("ctrl-s");
+    assert_eq!(
+        collection_files(&root),
+        ["invoices.json"],
+        "saving after a restart must not create a duplicate"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn two_different_requests_with_the_same_label_both_survive(cx: &mut TestAppContext) {
+    // Same derived name, genuinely different requests. Overwriting here would lose one.
+    let (session, root) = scratch_collection("collide");
+    let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://one.test/posts");
+    cx.simulate_keystrokes("ctrl-s");
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://two.test/posts");
+    cx.simulate_keystrokes("ctrl-s");
+
+    assert_eq!(collection_files(&root), ["posts-2.json", "posts.json"]);
+
+    let first = std::fs::read(root.join("posts.json")).expect("read");
+    let first: RequestSpec = serde_json::from_slice(&first).expect("parse");
+    assert_eq!(first.url, "https://one.test/posts");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn a_save_with_no_collection_directory_reports_instead_of_failing_silently(
+    cx: &mut TestAppContext,
+) {
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-s");
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    assert!(
+        status.is_some_and(|s| s.contains("nothing was saved")),
+        "a save that cannot happen has to say so"
+    );
+}
+
+#[gpui::test]
+async fn a_url_that_looks_like_a_path_cannot_write_outside_the_collection(
+    cx: &mut TestAppContext,
+) {
+    // Containment is what this asserts, end to end: whatever you type, the write lands
+    // inside the root. Two independent layers hold it up — `label_for` only ever returns a
+    // single path segment or a host, and `slug` then strips separators — so this test
+    // deliberately cannot tell which one did the work, and passes if either does. The
+    // regression test for `slug` alone lives in `core/src/collection.rs`.
+    let (session, root) = scratch_collection("traversal");
+    let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://evil.test/../../../../tmp/zuno-escaped");
+    cx.simulate_keystrokes("ctrl-s");
+
+    let files = collection_files(&root);
+    assert_eq!(files.len(), 1, "exactly one file, inside the root: {files:?}");
+    assert!(
+        !std::path::Path::new("/tmp/zuno-escaped.json").exists(),
+        "a save escaped the collection root"
+    );
+
+    // The direct statement of the property, rather than inferring it from a listing: the
+    // file Zuno recorded is a direct child of the root and nothing above it.
+    let saved = cx
+        .update(|_, cx| view.read(cx).path.clone())
+        .expect("the buffer should know where it was saved");
+    assert_eq!(saved.parent(), Some(root.as_path()), "wrote outside the root: {saved:?}");
+    assert!(saved.starts_with(&root), "{saved:?}");
+
+    remove_scratch(&mut cx, &session);
 }

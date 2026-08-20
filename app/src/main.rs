@@ -10,6 +10,7 @@ mod timing;
 mod actions;
 mod body_view;
 mod chrome;
+mod collections;
 mod engine;
 mod input;
 mod request_pane;
@@ -31,7 +32,7 @@ use gpui::{
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    PrevTab, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
+    PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -75,6 +76,7 @@ fn main() {
             eprintln!("[zuno] could not start the HTTP engine: {error}");
         }
         session::install(cx);
+        collections::install(cx);
 
         // Without this, closing the last window leaves the process running with nothing
         // on screen — GPUI does not quit on last-window-close by default. Quitting here
@@ -161,6 +163,7 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
         // --- Request lifecycle ---
+        KeyBinding::new("ctrl-s", SaveRequest, None),
         KeyBinding::new("ctrl-enter", SendRequest, None),
         KeyBinding::new("enter", SendRequest, Some("UrlBar")),
         KeyBinding::new("escape", CancelRequest, None),

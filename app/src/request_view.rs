@@ -10,6 +10,7 @@
 //! Fields that aren't text (`method`, `body`, `settings`, row `enabled` flags) are
 //! plain state here, since nothing else owns them.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +87,12 @@ pub enum RowKind {
 pub struct RequestView {
     pub id: RequestId,
     pub name: String,
+    /// The collection file this buffer is backed by, or `None` for a scratch buffer.
+    ///
+    /// Set when a buffer is opened from a collection or saved into one. It exists because a
+    /// filename derived from the URL is *not* an identity: without remembering the file, a
+    /// second Ctrl+S would derive the same name, find it taken, and write `posts-2.json`.
+    pub path: Option<PathBuf>,
     pub method: Method,
     pub url: Entity<TextInput>,
     pub headers: Vec<KeyValueRow>,
@@ -116,6 +123,7 @@ impl RequestView {
         let mut view = Self {
             id: spec.id,
             name: String::new(),
+            path: None,
             method: Method::Get,
             url: cx.new(|cx| TextInput::new("", "", "UrlBar", cx)),
             headers: Vec::new(),

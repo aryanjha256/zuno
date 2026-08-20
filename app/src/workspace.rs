@@ -7,17 +7,19 @@
 //! `TextInput` nested two levels down. Handlers that need buffer state reach into the
 //! active `RequestView` through its entity.
 
+use std::path::Path;
+
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Window, div, px,
 };
-use zuno_core::{RequestId, RequestSpec};
+use zuno_core::{RequestId, RequestSpec, collection};
 
 use crate::actions::{
     AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
     FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    PrevTab, Quit, RemoveRow, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
+    PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::request_view::{RequestView, RowKind};
@@ -46,7 +48,15 @@ impl Workspace {
         let views: Vec<_> = session
             .tabs
             .into_iter()
-            .map(|spec| cx.new(|cx| RequestView::new(spec, cx)))
+            .map(|tab| {
+                cx.new(|cx| {
+                    let mut view = RequestView::new(tab.spec, cx);
+                    // Restoring this is what makes Ctrl+S after a restart overwrite the
+                    // request's own file instead of deriving a fresh name beside it.
+                    view.path = tab.path;
+                    view
+                })
+            })
             .collect();
 
         // Start focused on the URL bar of the buffer that was in front — the loop begins
@@ -180,7 +190,13 @@ impl Workspace {
         let tabs = self
             .views
             .iter()
-            .map(|view| view.read(cx).spec(cx))
+            .map(|view| {
+                let view = view.read(cx);
+                crate::session::Tab {
+                    spec: view.spec(cx),
+                    path: view.path.clone(),
+                }
+            })
             .collect();
         crate::session::Session::new(tabs, self.active_ix)
     }
@@ -344,6 +360,56 @@ impl Workspace {
         view.update(cx, |view, cx| view.send(&engine, cx));
     }
 
+    /// Write the active buffer into the collection as a file of its own.
+    ///
+    /// A buffer that already knows its file overwrites it; one that doesn't gets a name
+    /// derived from its URL. That split is the whole reason `RequestView::path` exists — a
+    /// derived name is not an identity, so without it a second Ctrl+S would find
+    /// `posts.json` taken and write `posts-2.json`.
+    ///
+    /// Synchronous, like `session::save`: it's a single small write, and a person who
+    /// pressed Ctrl+S wants to know it landed before they do anything else. If saving ever
+    /// grows to touch a whole tree it belongs on the background executor (invariant 3).
+    fn save_request(&mut self, _: &SaveRequest, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.set_status("No collection directory — nothing was saved", cx);
+            return;
+        };
+
+        let spec = view.read(cx).spec(cx);
+        let existing = view.read(cx).path.clone();
+
+        let path = match existing {
+            Some(path) => path,
+            None => {
+                let label = view.read(cx).label(cx);
+                match collection::allocate(&root, &label) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.set_status(&format!("Could not save: {error}"), cx);
+                        return;
+                    }
+                }
+            }
+        };
+
+        if let Err(error) = collection::write(&path, &spec) {
+            self.set_status(&format!("Could not save: {error}"), cx);
+            return;
+        }
+
+        // Report the path relative to the root: the absolute path is mostly the same
+        // prefix every time, and the part that identifies the request is the tail.
+        let shown = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
+        view.update(cx, |view, cx| {
+            view.path = Some(path);
+            cx.notify();
+        });
+        self.set_status(&format!("Saved to {shown}"), cx);
+    }
+
     /// `on_app_quit` does the saving, so this only has to ask the app to quit — one save
     /// path instead of one per exit route.
     fn quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
@@ -461,6 +527,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
             .size_full()
@@ -558,7 +625,7 @@ fn status_bar(
     message: Option<SharedString>,
     theme: &Theme,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+T tab · Ctrl+Tab switch · Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Shift+H header · Ctrl+Enter send · Esc cancel";
+    const HINTS: &str = "Ctrl+T tab · Ctrl+Tab switch · Ctrl+S save · Ctrl+Shift+V import curl · Ctrl+M method · Ctrl+Enter send · Esc cancel";
 
     div()
         .flex()

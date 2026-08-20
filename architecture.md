@@ -60,7 +60,8 @@ zuno/
         ├── engine.rs       ✅ the Engine as a global (one pool per process)
         ├── body_view.rs    ✅ body classification + fold state
         ├── chrome.rs       ✅ titlebar + window controls + resize edges (CSD)
-        ├── session.rs      ✅ scratch-request persistence (path is a global, for tests)
+        ├── session.rs      ✅ window-session envelope, versioned + migrating
+        ├── collections.rs  ✅ where collections live (a global, for tests)
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
@@ -724,21 +725,46 @@ them unusually cheap for the value.
 Deliberately **not** pre-answered. Each got cheaper to decide once the loop worked, and a
 confident guess written down now would mislead more than it helps.
 
-**Persistence format.** "Local-first" fits both SQLite and a git-diffable file tree
-(Bruno-style, one file per request). The recommendation stands: **file tree for collections**
-(git-diffable collections are a genuine differentiator and match the local-first
-philosophy) plus **ephemeral state kept separately** — history, response cache, window session.
+**Persistence format — decided.** "Local-first" fits both SQLite and a git-diffable file tree
+(Bruno-style, one file per request). Both halves are now settled, and they went different ways on
+purpose:
 
-*Half of this is now decided and shipped.* The window-session half lives in `app/src/session.rs`
-as a versioned JSON envelope (`Session { version, active, tabs }`) — deliberately in `app/`, not
-`core/`, because which buffers are open is window state, not part of the request model a future
-CLI would share. JSON rather than SQLite for now: it's one file, one write on quit, and nothing
-about the shape forecloses moving history and the response cache into SQLite later, which is where
-that dependency would actually pay for itself. **Still open: the collections format itself** — the
-file tree above is a recommendation, not yet a commitment.
+- **Collections: a directory of one-request-per-file JSON** (`core/src/collection.rs`). The reason
+  is git. A collection you can commit, review in a pull request, and merge is a genuine
+  differentiator, and that's only true if one request is one file with stable serialization —
+  pretty-printed, newline-terminated, and byte-identical when nothing changed, so an unrelated save
+  doesn't dirty the working tree. A single-file bundle or a SQLite database each turn "added a
+  header" into an unreadable diff. Rejected for that reason, not for weight.
+- **Window session: a versioned JSON envelope** in `app/src/session.rs` — which buffers are open,
+  which was in front, and which file each came from. Deliberately in `app/`, not `core/`: that is
+  window state, not part of the request model a future CLI shares. JSON rather than SQLite because
+  it is one file and one write; nothing forecloses moving history and the response cache into
+  SQLite later, which is where that dependency would start to pay for itself.
 
-The envelope reads M1's bare-`RequestSpec` file as a single tab, and that fallback *is* the
-migration path; see invariant 8 in `CLAUDE.md` for the constraint that keeps it working.
+Two consequences worth knowing before touching either:
+
+- **`RequestId` is written as 0 in collection files** and reassigned by `Workspace::next_id` on
+  open. It's a session-local handle, so persisting the live value would put churn in every diff and
+  manufacture merge conflicts over a number nothing reads across runs. Normalizing keeps the format
+  a plain `RequestSpec` — no parallel `StoredRequest` type to drift out of sync.
+- **Filenames are derived from the request, not from an id** — `posts.json`, not `7f3a.json`, since
+  the point is a readable directory. Derived names therefore collide, and a derived name is *not*
+  an identity: `collection::allocate` never overwrites, and `RequestView::path` remembers where a
+  buffer lives so a second Ctrl+S overwrites its own file instead of breeding `posts-2.json`. That
+  path is what the session envelope's v2 bump exists to persist.
+- **`slug` is a security boundary.** The label feeding it comes from a URL, so
+  `https://x.test/../../.ssh/config` would otherwise write outside the collection. Containment is
+  held up twice over — `label_for` yields only a single path segment or a host, and `slug` then
+  strips separators — and both layers are tested independently, because a test that passes when
+  either one works cannot tell you which is load-bearing.
+
+`serde_json` moved from a dev-dependency to a real dependency of `zuno-core` for this: the format
+lives in core precisely so a future CLI can read and write collections, which means core has to
+serialize rather than only model.
+
+Still open: **nothing about the format.** What's missing is *reach* — there is no way to open a
+saved request back into a buffer, which is the picker's job (principle 2), and no folder authoring
+beyond nesting a directory by hand. See §12's remaining entry.
 
 **Tabs — decided and built.** `Workspace` owns `Vec<Entity<RequestView>>` with an `active_ix`,
 restores every saved buffer, and persists all of them on quit and on send.
@@ -770,6 +796,12 @@ remains for genuine in-place replacement.
 Still deliberately **unanswered: what a *dirty* buffer means.** With no collections there is no
 saved baseline to be dirty against, so any meaning invented now would be rewritten when the
 collection format lands. Also absent by choice: tab reordering and renaming.
+
+**Reaching a saved request** (new). Collections are written but not readable from the UI: Ctrl+S
+saves, and nothing opens. That is deliberate — the opener is the picker (principle 2), not a
+one-off list — but it means a saved request is only reachable while its tab is open. `collection`
+has no `scan` yet for the same reason invariant 1 gives: it would have no caller until the picker
+exists. Folder authoring is also absent; nesting works if you `mkdir` by hand.
 
 **Where `Ctrl+P` and `Ctrl+K` get their content.** These are the thesis features from `what.md`
 and neither exists. Note the dependency: `Ctrl+P` "find any request" is meaningless until

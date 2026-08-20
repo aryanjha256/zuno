@@ -37,6 +37,7 @@ actions!(
         FoldAll,
         UnfoldAll,
         // Request lifecycle
+        SaveRequest,
         SendRequest,
         CancelRequest,
         // Application

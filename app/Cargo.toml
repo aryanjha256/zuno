@@ -2,6 +2,11 @@
 name = "zuno"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+authors.workspace = true
+readme = "../README.md"
 
 [dependencies]
 gpui.workspace = true
@@ -24,3 +29,52 @@ gpui = { workspace = true, features = ["test-support"] }
 [[bin]]
 name = "zuno"
 path = "src/main.rs"
+
+# --- Debian packaging -------------------------------------------------------------
+#
+# Build with `cargo deb -p zuno`. See CLAUDE.md "Packaging".
+[package.metadata.deb]
+maintainer = "Aryan Kumar <aryanajha256@gmail.com>"
+copyright = "2026 Aryan Kumar"
+# This inlines the full GPL-3 text into /usr/share/doc/zuno/copyright (~35KB). Debian
+# Policy §12.5 asks archive packages to reference /usr/share/common-licenses/GPL-3
+# instead, but we ship from GitHub, not the archive, and a self-contained copyright file
+# makes no assumption about that directory existing on the target.
+license-file = ["../LICENSE", "0"]
+section = "devel"
+priority = "optional"
+extended-description = """\
+Zuno is a keyboard-driven HTTP client for people who live in an API. It aims for \
+Postman-level capability with Zed-level feel: a virtualized response viewer that stays \
+at 60fps on multi-megabyte JSON, tabs as editor buffers, curl import, response diffing, \
+and collections stored as one file per request so they can live in git."""
+
+# `$auto` is what dpkg-shlibdeps found by scanning the binary. It is **not enough on its
+# own**, and this is the entry most likely to be wrong if someone "simplifies" it:
+#
+#   - libvulkan1 and libwayland-client0 are `dlopen`ed by gpui, not linked, so they never
+#     appear in `ldd` and shlibdeps cannot see them. Without these, the package installs
+#     cleanly and then the app dies at startup on a machine that happens to lack them.
+#   - mesa-vulkan-drivers is the ICD behind libvulkan1. The loader alone renders nothing.
+#     It's a Recommends rather than a Depends because a machine with a proprietary NVIDIA
+#     driver already has its own ICD and must not be forced to pull in Mesa.
+#
+# Versions are deliberately unconstrained: these package names are stable across every
+# release we target, which is what lets one .deb cover Ubuntu 22.04+ and Debian 12+.
+depends = "$auto, libvulkan1, libwayland-client0"
+recommends = "mesa-vulkan-drivers"
+
+assets = [
+    ["target/release/zuno", "usr/bin/", "755"],
+    ["../assets/dev.zuno.Zuno.desktop", "usr/share/applications/", "644"],
+    # Scalable only, no rasters. Every mainstream desktop reads SVG from hicolor, and
+    # generating PNGs would mean either committing artifacts that go stale the moment the
+    # source SVG changes, or adding a rasterizer to the build. Add sizes here if a
+    # specific desktop turns out to show a generic icon.
+    [
+        "../assets/icons/zuno.svg",
+        "usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg",
+        "644",
+    ],
+    ["../README.md", "usr/share/doc/zuno/README.md", "644"],
+]

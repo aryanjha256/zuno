@@ -1,0 +1,157 @@
+name: Release
+
+# Push a tag, get a .deb attached to a GitHub Release:
+#
+#   cargo set-version 0.2.0   # or edit [workspace.package] version by hand
+#   git commit -am "release 0.2.0" && git push
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# `workflow_dispatch` builds the same package without tagging or publishing anything, so
+# the pipeline can be exercised before committing to a version number.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the release and upload the asset
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  deb:
+    # NOT ubuntu-latest, and this is the whole reason one .deb can cover many distros.
+    #
+    # glibc is backward- but not forward-compatible, so a binary built here runs on any
+    # newer glibc but never an older one. Building on 22.04 makes dpkg-shlibdeps emit
+    # `libc6 (>= 2.35)`, which installs on Ubuntu 22.04+ and Debian 12+. Building on
+    # 24.04 would emit `libc6 (>= 2.39)` and silently drop both of those.
+    #
+    # If GitHub retires this runner image, don't "fix" it by moving to ubuntu-latest —
+    # that quietly narrows who can install the result. Use a container instead:
+    #   runs-on: ubuntu-latest
+    #   container: ubuntu:22.04
+    # and install rustup plus the apt list below inside it.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            desktop-file-utils
+
+      # The runner image ships a Rust toolchain, but it can lag behind what the workspace
+      # needs — edition 2024 wants 1.85+, resolver "3" wants 1.84+, cargo-deb wants 1.85.
+      - name: Use current stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version && cargo --version
+
+      # A tag that disagrees with Cargo.toml produces a .deb whose filename lies about
+      # its contents. Cheaper to fail here than to unpublish a release.
+      - name: Check the tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "zuno") | .version')
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      # A release build is the wrong place to discover a broken test. The branch workflow
+      # doesn't run on tag pushes, so this is not redundant.
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Validate the desktop entry
+        run: desktop-file-validate assets/dev.zuno.Zuno.desktop
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version 3.7.0
+
+      - name: Build the .deb
+        run: cargo deb -p zuno
+
+      # Printed into the log so a failed install can be diagnosed from the run alone,
+      # without anyone re-downloading and unpacking the artifact.
+      - name: Inspect the package
+        run: |
+          deb=$(ls target/debian/*.deb)
+          echo "path=$deb"
+          ls -lh "$deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          echo "DEB_PATH=$deb" >> "$GITHUB_ENV"
+
+      # The two dlopen'ed libraries cannot be detected by dpkg-shlibdeps, so they are
+      # declared by hand in app/Cargo.toml. If someone removes them the package still
+      # builds and installs, then dies at startup on a clean machine — so assert here
+      # rather than finding out from a bug report.
+      - name: Assert the runtime dependencies survived
+        run: |
+          depends=$(dpkg-deb --field "$DEB_PATH" Depends)
+          echo "$depends"
+          for lib in libvulkan1 libwayland-client0; do
+            case "$depends" in
+              *"$lib"*) echo "ok: $lib" ;;
+              *) echo "::error::$lib missing from Depends"; exit 1 ;;
+            esac
+          done
+          # Guards the runner choice above: a build on a newer image bumps this floor and
+          # locks out Ubuntu 22.04 and Debian 12 without any other visible symptom.
+          case "$depends" in
+            *"libc6 (>= 2.35)"*) echo "ok: glibc floor is 2.35" ;;
+            *) echo "::error::unexpected glibc floor — was this built on ubuntu-22.04?"; exit 1 ;;
+          esac
+
+      # Always uploaded, so a workflow_dispatch run is downloadable without a release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zuno-deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+      # Written to a file rather than piped: `--notes-file` and `--generate-notes` are
+      # mutually exclusive in gh, and a heredoc nested inside a YAML block scalar depends
+      # on the indentation surviving two levels of stripping.
+      - name: Write the release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          {
+            echo '### Install'
+            echo
+            echo '```bash'
+            echo 'sudo apt install ./zuno_*_amd64.deb'
+            echo '```'
+            echo
+            echo 'Requires Ubuntu 22.04+, Debian 12+, or a derivative, on x86-64.'
+            echo
+            echo 'Use `apt install ./file.deb` rather than `dpkg -i`, so the runtime'
+            echo 'dependencies are resolved for you.'
+            echo
+            echo 'Zuno renders through Vulkan. On a machine with no GPU driver present,'
+            echo 'install `mesa-vulkan-drivers` as well.'
+          } > release-notes.md
+          cat release-notes.md
+
+      # `gh` is preinstalled on the runner, so this needs no third-party action.
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" \
+            --title "Zuno $GITHUB_REF_NAME" \
+            --notes-file release-notes.md

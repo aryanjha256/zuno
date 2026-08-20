@@ -1,18 +1,23 @@
 //! Persisting the open buffers across restarts.
 //!
-//! Window session only — which requests were open and which was in front. Collections,
-//! environments, and the git-diffable file tree are still M2 (architecture.md §12); this
-//! file deliberately holds *ephemeral* state, and that split is the half of §12 being
-//! committed to here.
+//! Window session only — which requests were open, which was in front, and where each one
+//! came from. The collections themselves live in `zuno_core::collection` as one file per
+//! request; this file deliberately holds only the *ephemeral* half, and that split is the
+//! §12 persistence decision.
 //!
-//! **Why a versioned envelope rather than a bare `RequestSpec`.** M1 wrote one serialized
-//! spec, which cannot represent more than one open buffer. Tabs need a list plus an active
-//! index, so the format has to change — and a format change is precisely what broke every
-//! saved session when `cookie_store` was added (CLAUDE.md, "Lessons"). So the envelope
-//! carries a version from the start, and `load` falls back to reading a bare spec and
-//! adopting it as a single tab. That fallback *is* the migration: existing
-//! `~/.config/zuno/session.json` files keep working, and there's no separate migration
-//! step to forget to run.
+//! **Why a versioned envelope.** M1 wrote one bare serialized `RequestSpec`, which cannot
+//! represent more than one open buffer. A format change is precisely what broke every saved
+//! session when `cookie_store` was added (CLAUDE.md, "Lessons"), so the envelope carries a
+//! version and `load` migrates every older shape forward instead of discarding it:
+//!
+//! | On disk | Shipped in | Read as |
+//! |---|---|---|
+//! | a bare `RequestSpec` | M1 | one scratch tab |
+//! | `{version: 1, active, tabs: [RequestSpec]}` | tabs, first slice | tabs with no collection path |
+//! | `{version: 2, active, tabs: [{spec, path}]}` | collections | current |
+//!
+//! Those migrations are the reason the version exists, and each one is covered by a test —
+//! there is no separate migration step to forget to run.
 //!
 //! The destination is a **global rather than a hardcoded path** so tests can point it at
 //! a temp directory. Without that, running the suite would overwrite the developer's own
@@ -24,25 +29,44 @@ use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 use zuno_core::RequestSpec;
 
-/// Bumped when the on-disk shape changes incompatibly. A file claiming a *newer* version
-/// is refused rather than guessed at — see `load`.
-const CURRENT_VERSION: u32 = 1;
+/// Bumped when the on-disk shape changes. A file claiming a *newer* version is refused
+/// rather than guessed at — see `parse`.
+const CURRENT_VERSION: u32 = 2;
+
+/// One open buffer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Tab {
+    pub spec: RequestSpec,
+    /// The collection file this buffer was opened from or saved to, if any.
+    ///
+    /// Persisted so that Ctrl+S after a restart overwrites the request's own file instead
+    /// of deriving a fresh name and breeding `posts-2.json`, `posts-3.json`… A derived
+    /// filename is not an identity, so this is the only thing that ties a buffer to a file.
+    pub path: Option<PathBuf>,
+}
+
+impl Tab {
+    /// A buffer with no collection file behind it yet.
+    pub fn scratch(spec: RequestSpec) -> Self {
+        Self { spec, path: None }
+    }
+}
 
 /// Every open buffer, and which one was in front.
 ///
-/// Fields are **required, not `#[serde(default)]`**, and that's load-bearing: it's what
-/// lets `load` tell an envelope apart from M1's bare `RequestSpec`. Give `tabs` a default
-/// and a legacy file would parse as an envelope with zero tabs, silently discarding the
-/// user's request instead of migrating it.
+/// Fields are **required, not `#[serde(default)]`**, and that's load-bearing: a required
+/// `version` is what lets `parse` tell an envelope apart from M1's bare `RequestSpec`.
+/// Default `tabs` and a legacy file parses as an envelope with zero tabs, silently
+/// discarding the user's request instead of migrating it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     version: u32,
     pub active: usize,
-    pub tabs: Vec<RequestSpec>,
+    pub tabs: Vec<Tab>,
 }
 
 impl Session {
-    pub fn new(tabs: Vec<RequestSpec>, active: usize) -> Self {
+    pub fn new(tabs: Vec<Tab>, active: usize) -> Self {
         Self {
             version: CURRENT_VERSION,
             active,
@@ -50,13 +74,31 @@ impl Session {
         }
     }
 
-    /// The shape M1 persisted, expressed in the new format.
+    /// The shape M1 persisted, expressed in the current format.
     pub fn single(spec: RequestSpec) -> Self {
-        Self::new(vec![spec], 0)
+        Self::new(vec![Tab::scratch(spec)], 0)
     }
 }
 
-/// Where the scratch request lives. `None` disables persistence entirely.
+/// Just enough of any envelope to decide how to read the rest of it.
+///
+/// Dispatching on the declared version beats inferring the shape: the two happen to be
+/// distinguishable today, but that's luck, and a wrong guess silently loses a field rather
+/// than failing loudly.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u32,
+}
+
+/// `{version: 1, active, tabs: [RequestSpec]}` — tabs before collections existed, so no
+/// buffer had a file behind it.
+#[derive(Deserialize)]
+struct SessionV1 {
+    active: usize,
+    tabs: Vec<RequestSpec>,
+}
+
+/// Where the session lives. `None` disables persistence entirely.
 pub struct SessionFile(Option<PathBuf>);
 
 impl Global for SessionFile {}
@@ -111,31 +153,32 @@ pub fn load(cx: &App) -> Option<Session> {
     }
 }
 
-/// Split out from `load` so the format rules are testable without a `SessionFile` global
-/// or a real file on disk.
+/// Split out from `load` so the format and migration rules are testable without a
+/// `SessionFile` global or a real file on disk.
 fn parse(bytes: &[u8]) -> Result<Session, String> {
-    let mut session = match serde_json::from_slice::<Session>(bytes) {
-        Ok(session) => session,
-        // Not an envelope. Before giving up, try M1's format — one bare spec — and adopt
-        // it as a single tab. Discrimination is unambiguous in both directions because
-        // each type has required fields the other lacks.
+    let mut session = match serde_json::from_slice::<VersionProbe>(bytes) {
+        Ok(probe) => match probe.version {
+            2 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            1 => {
+                let v1 =
+                    serde_json::from_slice::<SessionV1>(bytes).map_err(|error| error.to_string())?;
+                Session::new(v1.tabs.into_iter().map(Tab::scratch).collect(), v1.active)
+            }
+            newer => {
+                return Err(format!(
+                    "written by a newer Zuno (format v{newer}, this build reads v{CURRENT_VERSION})"
+                ));
+            }
+        },
+        // No version at all. Before giving up, try M1's format — one bare spec — and adopt
+        // it as a single tab.
         Err(envelope_error) => match serde_json::from_slice::<RequestSpec>(bytes) {
-            Ok(spec) => return Ok(Session::single(spec)),
+            Ok(spec) => Session::single(spec),
             // Report the envelope's error, not the legacy one: for anything written by
-            // this version of Zuno, that's the message that describes the real problem.
+            // this version of Zuno, that's the message describing the real problem.
             Err(_) => return Err(envelope_error.to_string()),
         },
     };
-
-    // Checked *after* parsing rather than by probing the version first, because a future
-    // format is overwhelmingly likely to fail the parse anyway — and when it doesn't, this
-    // catches it. Either way nothing gets misread as v1.
-    if session.version > CURRENT_VERSION {
-        return Err(format!(
-            "written by a newer Zuno (format v{}, this build reads v{CURRENT_VERSION})",
-            session.version
-        ));
-    }
 
     // No tabs is not a usable session — it would open a window with nothing in it. Treat
     // it as absent so the caller falls back to the sample request.
@@ -206,34 +249,69 @@ mod tests {
 
     #[test]
     fn many_tabs_and_the_active_index_survive_a_round_trip() {
-        let session = Session::new(vec![named("first"), named("second"), named("third")], 2);
+        let session = Session::new(
+            vec![
+                Tab::scratch(named("first")),
+                Tab {
+                    spec: named("second"),
+                    path: Some(PathBuf::from("/collections/second.json")),
+                },
+                Tab::scratch(named("third")),
+            ],
+            2,
+        );
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
         let back = parse(&json).expect("parse");
         assert_eq!(back, session);
         assert_eq!(back.active, 2);
-        let names: Vec<&str> = back.tabs.iter().map(|tab| tab.name.as_str()).collect();
+        let names: Vec<&str> = back.tabs.iter().map(|tab| tab.spec.name.as_str()).collect();
         assert_eq!(names, ["first", "second", "third"]);
+        assert_eq!(
+            back.tabs[1].path.as_deref(),
+            Some(std::path::Path::new("/collections/second.json")),
+            "a buffer's collection file must survive a restart"
+        );
     }
 
     #[test]
     fn a_session_written_by_m1_opens_as_a_single_tab() {
         // The exact bytes M1 wrote: one bare spec, no envelope around it. This is the
-        // migration path, and it's the test that would have caught the `cookie_store`
+        // oldest migration path, and the test that would have caught the `cookie_store`
         // breakage described in CLAUDE.md.
         let spec = named("saved by m1");
         let legacy = serde_json::to_vec_pretty(&spec).expect("serialize");
 
         let session = parse(&legacy).expect("a bare spec must still load");
-        assert_eq!(session.tabs, vec![spec]);
+        assert_eq!(session.tabs, vec![Tab::scratch(spec)]);
         assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn a_v1_envelope_migrates_to_tabs_without_paths() {
+        // Written by the first tabs slice, before collections existed: `tabs` is a list of
+        // bare specs rather than of `{spec, path}`.
+        let json = format!(
+            r#"{{"version":1,"active":1,"tabs":[{},{}]}}"#,
+            serde_json::to_string(&named("one")).expect("serialize"),
+            serde_json::to_string(&named("two")).expect("serialize"),
+        );
+
+        let session = parse(json.as_bytes()).expect("a v1 envelope must still load");
+        assert_eq!(session.tabs.len(), 2, "both buffers must survive");
+        assert_eq!(session.active, 1, "and which one was in front");
+        assert_eq!(session.tabs[0].spec.name, "one");
+        assert!(
+            session.tabs.iter().all(|tab| tab.path.is_none()),
+            "no buffer had a collection file to remember"
+        );
     }
 
     #[test]
     fn an_active_index_past_the_end_is_clamped_rather_than_panicking() {
         // A truncated or hand-edited file. Left alone, this indexes out of bounds at the
         // first render.
-        let session = Session::new(vec![named("only")], 7);
+        let session = Session::new(vec![Tab::scratch(named("only"))], 7);
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
         let back = parse(&json).expect("parse");
@@ -244,15 +322,17 @@ mod tests {
     #[test]
     fn a_newer_format_is_refused_rather_than_misread() {
         // Better to reopen at the sample than to silently drop fields a future version
-        // added.
-        let json = br#"{"version":99,"active":0,"tabs":[]}"#;
-        assert!(parse(json).is_err());
+        // added. The message has to name the versions, since this is the one failure a
+        // person can act on — by upgrading.
+        let error = parse(br#"{"version":99,"active":0,"tabs":[]}"#).expect_err("must refuse");
+        assert!(error.contains("99"), "{error}");
+        assert!(error.contains("newer Zuno"), "{error}");
     }
 
     #[test]
     fn an_envelope_with_no_tabs_is_not_a_usable_session() {
-        let json = br#"{"version":1,"active":0,"tabs":[]}"#;
-        assert!(parse(json).is_err());
+        assert!(parse(br#"{"version":2,"active":0,"tabs":[]}"#).is_err());
+        assert!(parse(br#"{"version":1,"active":0,"tabs":[]}"#).is_err());
     }
 
     #[test]
@@ -260,5 +340,7 @@ mod tests {
         assert!(parse(b"not json at all").is_err());
         // A JSON object that is neither an envelope nor a spec must also fail cleanly.
         assert!(parse(br#"{"unexpected":true}"#).is_err());
+        // A well-formed envelope whose tabs are nonsense must fail rather than half-load.
+        assert!(parse(br#"{"version":2,"active":0,"tabs":[{"nope":1}]}"#).is_err());
     }
 }

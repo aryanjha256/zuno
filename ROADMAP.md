@@ -15,15 +15,19 @@ directional, and anything beyond that is a name and a reason.
 **Milestone 1 is complete: the request → response loop.** Author a request, send it over real
 HTTP with streaming progress and cancellation, read the response through a virtualized JSON
 viewer, diff it against the previous run, come back to it after a restart. Plus curl import,
-light/dark themes, window chrome, 176 tests across three layers.
+light/dark themes, window chrome.
 
 Measured: **189 ms** cold start (release), **48 ms** to flatten 10 MB of JSON into 1.31 M rows
 off-thread, 60 fps scrolling on any response size.
 
-**And the differentiator is unbuilt.** `what.md` named `Ctrl+P`, `Ctrl+K`, fuzzy search across
-collections, and request-tabs-as-editor-buffers as the defining features — the things that would
-make this Zed-like rather than Postman-like. None of them exist. There is one request, no tabs,
-no collections, no palette.
+**M2 is under way.** Tabs are done — buffers, a strip, a versioned session envelope that migrates
+every older format forward. Collections are done as a *format*: one request per file, git-diffable,
+written by Ctrl+S. 214 tests across three layers.
+
+**The navigation thesis is still the gap.** `what.md` named `Ctrl+P`, `Ctrl+K`, and fuzzy search
+across collections as the defining features, and none of them exist yet. That has a sharp
+consequence right now: requests can be *saved* to a collection but not *opened* from one, because
+the opener is the picker. Nothing else in the app is waiting on so much.
 
 That gap *is* the roadmap. Everything below is about closing it.
 
@@ -77,11 +81,17 @@ belongs to its creating entity, so a switch that only moves `active_ix` leaves t
 *Left over, deliberately:* no reordering, no rename (tab labels derive from the URL — see
 `label_for`), and `dirty` still unanswered until collections give it a baseline.
 
-**Collections.** The half of §12 still open — the window-session half is decided and shipped. The
-standing recommendation is a git-diffable file tree; decide it now, with the loop working, rather
-than inheriting the guess. `RequestSpec` has carried `Serialize`/`Deserialize` since M1.0 for this.
-Note *dirty* state is deliberately unanswered until this lands: there's no baseline to be dirty
-against without it.
+**Collections — the format is done.** §12's persistence decision is settled: a directory of
+one-request-per-file JSON (`core/src/collection.rs`), because a collection you can commit and
+review in a pull request is a real differentiator and that needs one file per request. Ctrl+S
+writes the active buffer; filenames derive from the URL, collisions get a suffix rather than
+overwriting, and `RequestView::path` — persisted through a v2 session envelope — is what makes a
+second save overwrite its own file instead of breeding `posts-2.json`.
+
+*What's missing is reach, not format:* **nothing opens a saved request back into a buffer.** That's
+the picker's job by principle 2, so it waits rather than getting a throwaway list UI. Until then a
+saved request is only reachable while its tab is open — worth knowing, since it makes the picker
+the next thing that has to land. Folder authoring is also absent; `mkdir` works.
 
 **The picker primitive.** See principle 2. An overlay, a filter input, fuzzy scoring, keyboard
 selection, and a `Vec` of candidates it doesn't know the meaning of.

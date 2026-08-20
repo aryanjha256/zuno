@@ -7,6 +7,7 @@
 //! Landed so far: the request and response models (M1.0), the HTTP engine (M1.2), the
 //! JSON outline and line index (M1.3), response diffing (M1.4).
 
+pub mod collection;
 pub mod curl;
 pub mod diff;
 pub mod engine;
@@ -15,6 +16,7 @@ pub mod lines;
 pub mod request;
 pub mod response;
 
+pub use collection::CollectionError;
 pub use curl::{CurlError, CurlImport};
 pub use diff::ResponseDiff;
 pub use engine::{Engine, EngineError, Event, JobId};

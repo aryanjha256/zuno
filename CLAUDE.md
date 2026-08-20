@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 197 tests, ~4s
+cargo test --workspace                   # 214 tests, ~4s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -39,6 +39,10 @@ cargo test -p zuno-core --test engine -- --ignored --nocapture
 
 # Perf floor for the response viewer. Release, or the numbers are meaningless.
 cargo test --release -p zuno-core --test json_perf -- --nocapture
+
+# Build the Debian package. Inspect before trusting it.
+cargo deb -p zuno
+dpkg-deb --info target/debian/*.deb && dpkg-deb --contents target/debian/*.deb
 ```
 
 Debug startup is ~4× slower than release; don't judge feel from a debug build.
@@ -55,15 +59,19 @@ Breaking any of these is a bug, not a tradeoff.
 4. **Response bodies are `Bytes`, never `String`.** Binary and invalid UTF-8 are normal.
 5. **Check the registry before writing a version string.** `cargo info <crate>`. Never write one
    from memory — see "Lessons" below.
-6. **Tests must never write to `~/.config/zuno`.** `session::install_at(cx, None)` in the test
-   harness. The suite drives `SendRequest`, and a send is a save point.
+6. **Tests must never write to the developer's own files.** `session::install_at(cx, None)` and
+   `collections::install_at(cx, None)` in the test harness — the suite drives `SendRequest` and
+   `SaveRequest`, and both are save points. `~/.config/zuno` holds the session,
+   `~/.local/share/zuno/collections` the requests.
 7. **New `RequestSettings` fields need serde defaults.** The container carries
    `#[serde(default)]`; keep it. `RequestSpec` stays strict on purpose.
-8. **`session::Session`'s fields stay required — no `#[serde(default)]`.** Required fields are
-   what let `parse` tell a v1 envelope apart from M1's bare `RequestSpec`. Default `tabs` and a
+8. **`session::Session`'s fields stay required — no `#[serde(default)]`.** A required `version`
+   is what lets `parse` tell an envelope apart from M1's bare `RequestSpec`. Default `tabs` and a
    legacy file parses as an envelope with zero tabs, silently discarding the user's request
-   instead of migrating it. Change the shape by bumping `CURRENT_VERSION` and adding a fallback,
-   the way the bare-spec path works.
+   instead of migrating it. Change the shape by bumping `CURRENT_VERSION` and adding an arm to
+   `parse`'s version dispatch, with a test per migration — there are three now (bare spec, v1, v2).
+9. **Collection files never carry `RequestId`.** It's written as 0 and reassigned on open. A
+   session-local handle in a committed file is diff churn and invented merge conflicts.
 
 ## GPUI 0.2.2 — verify, don't remember
 
@@ -97,6 +105,27 @@ No `cx.background_spawn` in 0.2.2 | Use `cx.background_executor().spawn(fut)`. |
 `examples/input.rs` ships macOS `cmd-` bindings | Translate every one to `ctrl-`. It also has a latent `assert_eq!` panic when a placeholder is showing. |
 `TabStopNode` orders by tab_index path, **then** paint order | Leaving inputs at the default index 0 makes visual order the tab order for free. |
 `Context::on_app_quit` is the correct save hook | Not the Quit *action* — that misses window-manager close. `cx.on_window_closed` is also needed, since GPUI doesn't quit on last-window-close. |
+
+## Packaging
+
+`.github/workflows/release.yml` on a `v*` tag → `.deb` on a GitHub Release.
+`workflow_dispatch` runs the same build without publishing. Four things here are
+counter-intuitive enough that the workflow asserts each one rather than trusting it:
+
+| Trap | Why |
+|---|---|
+**`libvulkan1` and `libwayland-client0` must be declared by hand** | gpui `dlopen`s both, so they never appear in `ldd` and `dpkg-shlibdeps` cannot see them. Omit them and the package installs cleanly, then dies at startup on a machine that happens to lack them. |
+**Build on `ubuntu-22.04`, never `ubuntu-latest`** | glibc is backward- but not forward-compatible. 22.04 yields `libc6 (>= 2.35)` — installs on Ubuntu 22.04+ and Debian 12+. 24.04 yields `>= 2.39` and silently locks both out. The workflow fails if the floor moves. |
+**The `.desktop` filename must equal the `app_id`** | `dev.zuno.Zuno.desktop`, matching `main.rs`. On Wayland the filename is the *only* link between window and icon; `StartupWMClass` covers X11. Rename either and the launcher shows a generic icon with no error anywhere. |
+**GPUI 0.2.2 has no window-icon API** | `set_app_id` exists, `set_icon` doesn't — and Wayland has no client-side icon protocol at all. So the icon is purely a packaging concern: an SVG in `hicolor/scalable/apps/`. Nothing in app code can set it. |
+
+`assets/icons/zuno.svg` is a **placeholder**; replacing that one file is the whole job, since
+the `.desktop` key and the cargo-deb asset entry both point at it by name. Only the scalable
+SVG is shipped — no PNG rasters — so there are no generated icon artifacts to go stale when
+the source changes.
+
+`mesa-vulkan-drivers` is a `Recommends`, not a `Depends`: a machine on the proprietary NVIDIA
+driver already has an ICD and must not be forced to pull in Mesa.
 
 ## Testing
 

@@ -16,6 +16,7 @@ tokio.workspace = true
 url.workspace = true
 async-channel.workspace = true
 futures-util.workspace = true
-
-[dev-dependencies]
+# Promoted from a dev-dependency when collections landed: the on-disk collection format
+# lives here rather than in `app` precisely so a future CLI can read and write it, and
+# that means the core has to serialize, not just model.
 serde_json.workspace = true
