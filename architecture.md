@@ -718,12 +718,18 @@ UI work, not engine work.
 | ~~gzip / brotli / deflate / zstd~~ | **Reachable** in the settings panel |
 | Form and binary bodies | The engine sends both correctly; the UI can only author raw bodies |
 | Multipart bodies | Modeled, and curl import parses `-F` — but the engine returns `UnsupportedBody`. The one item here that is *not* just UI work |
-| Response history | 10 deep, newest first. Only the diff surfaces it; there's no way to browse back |
+| ~~Response history~~ | **Reachable.** `Ctrl+H` lists every retained run; choosing one shows it and re-indexes its body. Until then the retention was *write-only* — nothing read it, not even the diff |
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 
-`Ctrl+,` closed the first five and the method picker closed a sixth. **Three remain**, and they
-are all authoring or browsing work rather than a toggle: form and binary body authoring, multipart
-(which also needs engine work), and the response history browser.
+`Ctrl+,` closed five, the method picker a sixth, and `Ctrl+H` a seventh. **Two remain**, both
+body-authoring work: form and binary bodies, and multipart — which is still the one item here that
+needs engine changes rather than UI, since `build.rs` returns `UnsupportedBody`.
+
+Worth recording about the history one, because it wasn't only a missing feature: `history` was
+written, truncated, and read by **nothing** — not even the diff, which is computed once when a
+response lands. Ten `ResponseData` per buffer were retained where nothing could reach them, and
+`Bytes` being refcounted means retaining pins the underlying buffers. So surfacing it was also what
+made the memory it was already costing worth paying.
 
 Two things the settings panel turned up that are worth knowing before touching either half:
 

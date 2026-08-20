@@ -51,6 +51,8 @@ pub enum Target {
     Method(zuno_core::Method),
     /// Select the active environment, or `None` for none.
     Environment(Option<String>),
+    /// Show a retained response: `0` is live, `1` the run before it.
+    Run(usize),
 }
 
 // Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
@@ -63,6 +65,7 @@ impl Clone for Target {
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Method(method) => Self::Method(method.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),
+            Self::Run(offset) => Self::Run(*offset),
         }
     }
 }

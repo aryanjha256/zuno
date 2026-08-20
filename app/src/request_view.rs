@@ -108,6 +108,13 @@ pub struct RequestView {
     pub diff: Option<ResponseDiff>,
     /// Previous responses, newest first, capped at `HISTORY_LIMIT`.
     pub history: Vec<ResponseData>,
+    /// Which run is on screen: `0` is the live response, `1` the run before it, and so on
+    /// into `history`.
+    ///
+    /// An index rather than a cloned `ResponseData`, so there is exactly one copy of each
+    /// run and `history` stays the only record of what happened. Reset to 0 whenever a new
+    /// response lands — you want to see what you just sent, not stay parked in the past.
+    viewing: usize,
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
@@ -134,6 +141,7 @@ impl RequestView {
             response: None,
             diff: None,
             history: Vec::new(),
+            viewing: 0,
             body_view: None,
             body_task: None,
             inflight: None,
@@ -204,12 +212,61 @@ impl RequestView {
         self.response = None;
         self.diff = None;
         self.history.clear();
+        self.viewing = 0;
         self.body_view = None;
         self.body_task = None;
         self.inflight = None;
         self.error = None;
         self.status = None;
 
+        cx.notify();
+    }
+
+    /// The response on screen: the live one, or a retained earlier run.
+    ///
+    /// Everything that renders or indexes a response goes through this rather than reading
+    /// `response` directly, which is what makes browsing history a change of one number.
+    pub fn displayed(&self) -> Option<&ResponseData> {
+        if self.viewing == 0 {
+            self.response.as_ref()
+        } else {
+            self.history.get(self.viewing - 1)
+        }
+    }
+
+    /// How many runs back the display is. `0` is live.
+    pub fn viewing(&self) -> usize {
+        self.viewing
+    }
+
+    /// Every run that can be shown, newest first, as `(offset, response)`.
+    ///
+    /// Offset 0 is the live response, so the list is "what happened", not "what happened
+    /// before now" — the current run belongs in it or the picker can't take you back.
+    pub fn runs(&self) -> Vec<(usize, &ResponseData)> {
+        self.response
+            .iter()
+            .map(|response| (0, response))
+            .chain(
+                self.history
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, response)| (ix + 1, response)),
+            )
+            .collect()
+    }
+
+    /// Show a retained run. Re-indexes the body, since the outline belongs to one response.
+    pub fn view_run(&mut self, offset: usize, cx: &mut Context<Self>) {
+        // Out of range would blank the pane with no way back; ignoring is the safer failure.
+        if offset != 0 && self.history.get(offset - 1).is_none() {
+            return;
+        }
+        if self.viewing == offset {
+            return;
+        }
+        self.viewing = offset;
+        self.index_body(false, cx);
         cx.notify();
     }
 
@@ -362,6 +419,9 @@ impl RequestView {
                 }
 
                 self.response = Some(*response);
+                // Back to live: a fresh response arriving while you're reading an old one
+                // must not leave you staring at the old one with no sign anything happened.
+                self.viewing = 0;
                 self.index_body(false, cx);
                 cx.notify();
                 false
@@ -436,7 +496,7 @@ impl RequestView {
     /// Note `background_executor().spawn` rather than `cx.background_spawn` — the latter
     /// doesn't exist in gpui 0.2.2.
     pub fn index_body(&mut self, force_parse: bool, cx: &mut Context<Self>) {
-        let Some(response) = &self.response else {
+        let Some(response) = self.displayed() else {
             self.body_view = None;
             self.body_task = None;
             return;

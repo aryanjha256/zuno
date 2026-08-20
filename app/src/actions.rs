@@ -22,6 +22,7 @@ actions!(
         // Navigation
         OpenRequest,
         SwitchEnvironment,
+        ShowHistory,
         OpenPalette,
         PickerNext,
         PickerPrev,

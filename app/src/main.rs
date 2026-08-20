@@ -37,8 +37,8 @@ use crate::actions::{
     FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenMethod,
     OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext, PickerPrev,
     PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm, SettingDecrease,
-    SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, SwitchEnvironment, ToggleRow,
-    ToggleTheme, UnfoldAll,
+    SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, SwitchEnvironment,
+    ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -188,6 +188,7 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-p", OpenRequest, None),
         KeyBinding::new("ctrl-k", OpenPalette, None),
         KeyBinding::new("ctrl-e", SwitchEnvironment, None),
+        KeyBinding::new("ctrl-h", ShowHistory, None),
         KeyBinding::new("down", PickerNext, Some("Picker")),
         KeyBinding::new("up", PickerPrev, Some("Picker")),
         KeyBinding::new("enter", PickerConfirm, Some("Picker")),

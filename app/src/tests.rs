@@ -2214,3 +2214,199 @@ async fn loading_an_environment_with_secrets_writes_the_gitignore_rule(cx: &mut 
     let _ = window;
     remove_scratch(&mut cx, &session);
 }
+
+/// A server that answers `count` times, with a different status each time, so runs are
+/// distinguishable in history.
+fn serve_sequence(statuses: &'static [(u16, &'static str)]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        for (code, body) in statuses {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let response = format!(
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// Send the active request and wait for a response whose status matches.
+fn send_and_wait(cx: &mut VisualTestContext, view: &gpui::Entity<RequestView>, status: u16) {
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(cx, "the response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+            .filter(|response| response.status == status)
+    });
+}
+
+fn viewing(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> usize {
+    cx.update(|_, cx| view.read(cx).viewing())
+}
+
+#[gpui::test]
+async fn ctrl_h_lists_every_retained_run_including_the_live_one(cx: &mut TestAppContext) {
+    // Ten runs per buffer were already retained and read by nothing. This is what makes the
+    // retention worth its memory.
+    let (window, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{\"a\":1}"), (500, "{\"b\":2}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 500);
+
+    cx.simulate_keystrokes("ctrl-h");
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 2, "the live run and the one before it: {rows:?}");
+    // The status is in the label because "which run was the 500?" is the question you open
+    // this to answer.
+    assert!(rows[0].starts_with("live · 500"), "{rows:?}");
+    assert!(rows[1].starts_with("1 send ago · 200"), "{rows:?}");
+    assert!(rows[0].contains("showing"), "the live row should be marked: {rows:?}");
+}
+
+#[gpui::test]
+async fn choosing_an_earlier_run_shows_it_and_reindexes_its_body(cx: &mut TestAppContext) {
+    // The two bodies deliberately differ in *row count*. An earlier version of this test
+    // asserted `row_count() > 0`, which was true whichever body had been indexed — so it
+    // passed even when the reindex was removed entirely. Row count is the cheapest
+    // observable that actually distinguishes one response's outline from another's.
+    let (window, view, mut cx) = boot(cx, None, None);
+    const OLDER: &str = r#"{"only":1}"#;
+    const NEWER: &str = r#"{"a":1,"b":2,"c":3,"d":4,"e":5}"#;
+    let url = serve_sequence(&[(200, OLDER), (201, NEWER)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 201);
+
+    let live_rows = wait_for(&mut cx, "the live body index", |cx| {
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().map(|body| body.row_count()))
+    });
+
+    cx.simulate_keystrokes("ctrl-h");
+    cx.simulate_keystrokes("down enter");
+
+    assert_eq!(viewing(&view, &mut cx), 1);
+    let shown = cx
+        .update(|_, cx| view.read(cx).displayed().cloned())
+        .expect("a displayed response");
+    assert_eq!(shown.status, 200, "the earlier run should be on screen");
+
+    // The outline belongs to one response, so switching has to rebuild it — otherwise the
+    // body pane shows the live response's rows under the older one's status line.
+    let older_rows = wait_for(&mut cx, "the earlier body to be reindexed", |cx| {
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().map(|body| body.row_count()))
+            .filter(|rows| *rows != live_rows)
+    });
+    assert!(
+        older_rows < live_rows,
+        "the smaller body should now be indexed: {older_rows} vs {live_rows}"
+    );
+
+    // The live response is untouched — history is a view, not a mutation.
+    let live = cx.update(|_, cx| view.read(cx).response.clone()).expect("live");
+    assert_eq!(live.status, 201);
+    let _ = window;
+}
+
+#[gpui::test]
+async fn sending_again_returns_the_view_to_live(cx: &mut TestAppContext) {
+    // A response arriving while you read an old one must not leave you parked in the past
+    // with no sign anything happened.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}"), (201, "{}"), (202, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 201);
+
+    cx.simulate_keystrokes("ctrl-h down enter");
+    assert_eq!(viewing(&view, &mut cx), 1);
+
+    send_and_wait(&mut cx, &view, 202);
+    assert_eq!(viewing(&view, &mut cx), 0, "a new response returns to live");
+}
+
+#[gpui::test]
+async fn history_is_capped_and_drops_the_oldest(cx: &mut TestAppContext) {
+    // HISTORY_LIMIT is the memory bound; a picker listing more than that would mean the cap
+    // stopped working.
+    let (window, view, mut cx) = boot(cx, None, None);
+    let statuses: &[(u16, &str)] = &[
+        (200, "{}"), (201, "{}"), (202, "{}"), (203, "{}"), (204, "{}"), (205, "{}"),
+        (206, "{}"), (207, "{}"), (208, "{}"), (209, "{}"), (210, "{}"), (211, "{}"),
+    ];
+    let url = serve_sequence(statuses);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    for (status, _) in statuses {
+        send_and_wait(&mut cx, &view, *status);
+    }
+
+    cx.simulate_keystrokes("ctrl-h");
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(
+        rows.len(),
+        crate::request_view::HISTORY_LIMIT + 1,
+        "the live run plus at most HISTORY_LIMIT retained: {}",
+        rows.len()
+    );
+    // The oldest is gone, not the newest.
+    assert!(rows[0].contains("211"), "{rows:?}");
+}
+
+#[gpui::test]
+async fn an_out_of_range_run_is_ignored_rather_than_blanking_the_pane(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_once(OK_JSON);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+
+    // Nothing in history yet, so offset 3 doesn't exist. Blanking the pane would leave no
+    // way back to the response that is there.
+    cx.update(|_, cx| view.update(cx, |view, cx| view.view_run(3, cx)));
+    assert_eq!(viewing(&view, &mut cx), 0);
+    assert!(
+        cx.update(|_, cx| view.read(cx).displayed().is_some()),
+        "the live response must still be on screen"
+    );
+}
+
+#[gpui::test]
+async fn history_does_not_survive_loading_a_different_request(cx: &mut TestAppContext) {
+    // `load` replaces what the buffer *is*, so retained responses belong to a request that
+    // is no longer there — showing them would attribute one request's responses to another.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}"), (201, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 201);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.load(RequestSpec::sample(), cx);
+        })
+    });
+
+    assert_eq!(viewing(&view, &mut cx), 0);
+    assert!(
+        cx.update(|_, cx| view.read(cx).runs().is_empty()),
+        "a replaced buffer has no runs to show"
+    );
+}

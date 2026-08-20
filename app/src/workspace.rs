@@ -21,8 +21,8 @@ use crate::actions::{
     FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
     OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm,
-    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, SwitchEnvironment,
-    ToggleRow, ToggleTheme, UnfoldAll,
+    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
+    SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
@@ -452,6 +452,50 @@ impl Workspace {
         }
     }
 
+    /// Browse the responses this buffer has already received.
+    ///
+    /// Ten runs per buffer were already retained and, until now, read by nothing at all —
+    /// not even the diff, which is computed once when a response lands. So this isn't only a
+    /// feature: it's what makes the retention worth its memory, since holding ten response
+    /// bodies per tab that nothing can reach is pure cost.
+    fn show_history(&mut self, _: &ShowHistory, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.settings.is_some() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+
+        let current = view.read(cx).viewing();
+        let items: Vec<picker::Item> = view
+            .read(cx)
+            .runs()
+            .into_iter()
+            .map(|(offset, response)| {
+                // The label carries the status, because "which run was the 500?" is the
+                // question you open this to answer.
+                let label = match offset {
+                    0 => format!("live · {} {}", response.status, response.status_text),
+                    1 => format!("1 send ago · {} {}", response.status, response.status_text),
+                    n => format!("{n} sends ago · {} {}", response.status, response.status_text),
+                };
+                let mut detail = format!(
+                    "{} · {:?}",
+                    format_bytes(response.size.decoded),
+                    response.timing.total
+                );
+                if offset == current {
+                    detail.push_str(" · showing");
+                }
+                picker::Item {
+                    label: SharedString::from(label),
+                    detail: SharedString::from(detail),
+                    target: picker::Target::Run(offset),
+                }
+            })
+            .collect();
+
+        self.show_picker(items, "Nothing sent yet from this request", window, cx);
+    }
+
     /// Pick the active environment. `None` is always offered, since "send it raw" is a
     /// legitimate choice and otherwise there'd be no way back out.
     fn switch_environment(
@@ -531,6 +575,11 @@ impl Workspace {
                 // Dispatched rather than called directly, so a palette entry and its
                 // keybinding run the identical path — the convention in CLAUDE.md.
                 window.dispatch_action(action, cx);
+            }
+            picker::Target::Run(offset) => {
+                if let Some(view) = self.active() {
+                    view.update(cx, |view, cx| view.view_run(offset, cx));
+                }
             }
             picker::Target::Environment(name) => {
                 self.environment = name;
@@ -1102,6 +1151,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::open_request))
             .on_action(cx.listener(Self::switch_environment))
+            .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::setting_next))
@@ -1230,6 +1280,18 @@ fn tab_strip(
                     .child(label)
             })),
     )
+}
+
+/// Bytes at human scale. The history picker shows sizes side by side, and `184320` next to
+/// `179` reads as noise where `180 KB` next to `179 B` reads as a difference.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    match bytes {
+        n if n >= MB => format!("{:.1} MB", n as f64 / MB as f64),
+        n if n >= KB => format!("{:.1} KB", n as f64 / KB as f64),
+        n => format!("{n} B"),
+    }
 }
 
 /// Offer the typed text as a custom HTTP verb, when it could be one.

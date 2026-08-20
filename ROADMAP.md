@@ -164,9 +164,21 @@ collection — the same bet the collection format makes; an editing UI is its ow
 A gap turned up on the way: `build.rs` validated the URL and headers but **not query rows**, so an
 unsubstituted `{{var}}` in a query parameter reached the wire literally. Fixed, with a test.
 
-**Auth helpers.** Mostly UI sugar over headers: Basic already works end to end (curl import
-proves it). Bearer is trivial. OAuth flows are a genuine project and should be scoped separately
-rather than smuggled in here.
+**Auth helpers — dropped, not deferred.** Recorded so nobody rebuilds it because the roadmap once
+said to. Environments made it redundant, and a dedicated auth tab would now be actively *worse*:
+
+- **Bearer and API keys** are `Authorization: Bearer {{token}}` with the token in `dev.local.json` —
+  per-environment and gitignored by construction. A Postman-style auth tab adds a mode with no new
+  capability, and it writes the credential into the *committed* request file, which is precisely the
+  leak the environment split exists to prevent.
+- **Basic** is the one genuine gap, and it points somewhere else. `core/src/curl.rs` has a tested
+  `base64`, so *importing* `-u user:pass` works; authoring it from scratch doesn't, because nothing
+  in the UI can encode. But the encoded value belongs in a `.local` file, not in a request header —
+  so the useful thing is "hand me the credential to paste", not an auth tab. ~30 lines as a palette
+  command over the picker's fallback row, whenever it's wanted.
+- **OAuth is not an auth helper.** Client-credentials flow is: send a token request, extract a value
+  from the response, use it in the next request. That's **request chaining** below, and it's the
+  motivating case for it.
 
 **Settings panel — done**, pulled forward ahead of environments. `Ctrl+,` surfaces the five §11
 capabilities that were honoured on every request with no way to see them: cookie jar, timeout,
@@ -187,7 +199,22 @@ Two things it turned out not to be:
 The status bar now carries a `cookies on` badge. That's the half that actually saves the hour: the
 toggle says what will happen, the badge says what *is* happening.
 
-**History browser.** Ten responses per request are already retained; only the diff surfaces them.
+**History browser — done.** `Ctrl+H` lists every retained run — live first, then "1 send ago" and
+back — with each row carrying its status, size and duration, because "which run was the 500?" is the
+question you open it to answer. Choosing one shows it and re-indexes its body off-thread.
+
+It closed the last non-body item in §11, and it was more than a feature: `history` was written and
+read by nothing at all, so ten response bodies per buffer were being retained where nothing could
+reach them. Surfacing it is what makes that memory worth spending.
+
+Three details that keep it from misleading:
+
+- The pane says **"Showing the run from N sends ago"** when you aren't on the live response.
+  Without it the pane is indistinguishable from the current run.
+- The **diff is hidden** while browsing, because it describes live-vs-previous and is simply wrong
+  next to an older run.
+- **Sending returns you to live.** A response arriving while you read an old one must not leave you
+  parked in the past with no sign anything happened.
 
 ---
 
@@ -225,7 +252,9 @@ Reasons recorded so a future session can judge them, not commitments.
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
 - **Request chaining** — extract a value from one response, feed it to the next. Arguably more
-  valuable than general scripting and far smaller.
+  valuable than general scripting and far smaller. **This is where OAuth lives**: a
+  client-credentials flow is exactly "POST for a token, then use it", and building it here rather
+  than as an auth feature means every other token-then-call API gets it too.
 - **Client certificates.** `RequestSettings` has room; reqwest supports it.
 - **Inline body diff.** The summary diff answers "did my change do anything?". A structural diff
   over `Row` spans is probably better than a text diff, now that the JSON outline exists.

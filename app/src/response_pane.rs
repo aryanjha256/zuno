@@ -59,10 +59,20 @@ pub fn render(
     if let Some(error) = &view.error {
         return pane.child(failure(error, theme));
     }
-    match &view.response {
+    match view.displayed() {
         Some(response) => pane
             .child(status_line(response, theme))
-            .children(view.diff.as_ref().map(|diff| diff_bar(diff, theme)))
+            // Says so when you're not looking at the live response. Without it the pane is
+            // indistinguishable from the current run, which is the one way this feature
+            // could actively mislead.
+            .children(historical_notice(view.viewing(), theme))
+            // The diff describes live-vs-previous, so it's meaningless — and wrong — beside
+            // an older run.
+            .children(
+                (view.viewing() == 0)
+                    .then(|| view.diff.as_ref().map(|diff| diff_bar(diff, theme)))
+                    .flatten(),
+            )
             .child(section_header("Headers", theme))
             .child(headers_table(&response.headers, theme))
             .child(body_header(view, theme, cx))
@@ -205,6 +215,31 @@ fn status_line(response: &ResponseData, theme: &Theme) -> Div {
             theme,
         ))
         .child(meta(size_label(response), theme))
+}
+
+/// A banner marking the pane as showing a retained run rather than the live one.
+fn historical_notice(viewing: usize, theme: &Theme) -> Option<Div> {
+    if viewing == 0 {
+        return None;
+    }
+    let label = if viewing == 1 {
+        "Showing the previous run".to_string()
+    } else {
+        format!("Showing the run from {viewing} sends ago")
+    };
+
+    Some(
+        div()
+            .flex_none()
+            .px_2()
+            .py_1()
+            .bg(theme.bg_elevated)
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.accent)
+            .child(format!("{label} · Ctrl+H to pick another · send to return to live")),
+    )
 }
 
 /// Wire size is only interesting when it differs from decoded — that difference is how
