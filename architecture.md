@@ -716,11 +716,11 @@ UI work, not engine work.
 | Form and binary bodies | The engine sends both correctly; the UI can only author raw bodies |
 | Multipart bodies | Modeled, and curl import parses `-F` — but the engine returns `UnsupportedBody`. The one item here that is *not* just UI work |
 | Response history | 10 deep, newest first. Only the diff surfaces it; there's no way to browse back |
-| Custom HTTP methods | `Method::Other` sends anything; the UI only cycles the seven common verbs |
+| ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 
-`Ctrl+,` closed the first five. **Four remain**, and none of them is a settings toggle: form and
-binary body authoring, multipart (which also needs engine work), the response history browser, and
-custom HTTP methods.
+`Ctrl+,` closed the first five and the method picker closed a sixth. **Three remain**, and they
+are all authoring or browsing work rather than a toggle: form and binary body authoring, multipart
+(which also needs engine work), and the response history browser.
 
 Two things the settings panel turned up that are worth knowing before touching either half:
 

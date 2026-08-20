@@ -214,20 +214,89 @@ async fn typed_text_reaches_the_derived_spec(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn method_cycles_in_both_directions(cx: &mut TestAppContext) {
-    let (view, mut cx) = open_workspace(cx);
+async fn ctrl_m_opens_the_method_picker_with_the_current_one_marked(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
 
-    // The sample request is a POST.
+    cx.simulate_keystrokes("ctrl-m");
+    assert!(picker_is_open(&window, &mut cx));
+
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 7, "the seven common verbs: {rows:?}");
+    // The sample request is a POST, and the list should say so rather than only offering
+    // choices.
+    assert!(
+        rows.iter().any(|row| row.starts_with("POST") && row.contains("current")),
+        "the active method should be marked: {rows:?}"
+    );
+}
+
+#[gpui::test]
+async fn choosing_a_method_sets_it_on_the_request(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
     assert_eq!(spec_of(&view, &mut cx).method, Method::Post);
 
     cx.simulate_keystrokes("ctrl-m");
-    assert_eq!(spec_of(&view, &mut cx).method, Method::Put);
+    cx.simulate_input("del");
+    cx.simulate_keystrokes("enter");
 
-    cx.simulate_keystrokes("ctrl-shift-m");
-    assert_eq!(spec_of(&view, &mut cx).method, Method::Post);
+    assert!(!picker_is_open(&window, &mut cx));
+    assert_eq!(spec_of(&view, &mut cx).method, Method::Delete);
+}
 
-    cx.simulate_keystrokes("ctrl-shift-m");
-    assert_eq!(spec_of(&view, &mut cx).method, Method::Get);
+#[gpui::test]
+async fn typing_an_unknown_verb_offers_it_as_a_custom_method(cx: &mut TestAppContext) {
+    // Closes the last of §11's non-body gaps. `Method::Other` was always sendable — core
+    // has tests for it — but nothing in the UI could produce one.
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-m");
+    cx.simulate_input("purge");
+
+    let rows = picker_rows(&window, &mut cx);
+    let derived = rows.last().expect("a derived row");
+    assert!(derived.contains("PURGE"), "should offer the typed verb: {rows:?}");
+    assert!(derived.contains("custom method"), "{derived:?}");
+
+    // The derived row is last, so this walks to it rather than assuming it's selected.
+    cx.simulate_keystrokes("up enter");
+    assert_eq!(
+        spec_of(&view, &mut cx).method,
+        Method::Other("PURGE".to_string()),
+        "and uppercase it, since nobody typing `purge` means a lowercase verb"
+    );
+    let _ = window;
+}
+
+#[gpui::test]
+async fn a_known_verb_typed_in_full_is_not_offered_twice(cx: &mut TestAppContext) {
+    // A second row would set `Other("GET")` rather than `Get` — the same request, but a
+    // different value everything downstream compares.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-m");
+    cx.simulate_input("get");
+
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 1, "exactly the real GET row: {rows:?}");
+    assert!(rows[0].starts_with("GET"), "{rows:?}");
+}
+
+#[gpui::test]
+async fn a_verb_that_could_not_be_sent_is_not_offered(cx: &mut TestAppContext) {
+    // The engine rejects anything outside RFC 9110's `tchar` with `InvalidMethod`. Offering
+    // a row that fails at send is worse than not offering it.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-m");
+    cx.simulate_input("foo bar");
+
+    let rows = picker_rows(&window, &mut cx);
+    assert!(rows.is_empty(), "should offer nothing at all: {rows:?}");
+
+    // A slash would land in the request line too.
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("GET/../x");
+    assert!(picker_rows(&window, &mut cx).is_empty());
 }
 
 #[gpui::test]

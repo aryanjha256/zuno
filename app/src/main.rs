@@ -33,12 +33,11 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
-    FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
-    PickerPrev, PrevTab, Quit, RemoveRow, SettingConfirm, SettingDecrease, SettingIncrease,
-    SettingNext, SettingPrev, SettingsDismiss,
-    SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
+    AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, FocusBody, FocusNext,
+    FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenMethod,
+    OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext, PickerPrev,
+    PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm, SettingDecrease,
+    SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -156,8 +155,9 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-tab", NextTab, None),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         // --- Request editing (global) ---
-        KeyBinding::new("ctrl-m", CycleMethod, None),
-        KeyBinding::new("ctrl-shift-m", CycleMethodBack, None),
+        // Opens the method picker. Was cycling until M4; a dropdown replaces it, so
+        // ctrl-shift-m is now free.
+        KeyBinding::new("ctrl-m", OpenMethod, None),
         KeyBinding::new("ctrl-shift-h", AddHeader, None),
         KeyBinding::new("ctrl-shift-y", AddQuery, None),
         KeyBinding::new("alt-t", ToggleRow, None),

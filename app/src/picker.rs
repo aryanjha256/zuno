@@ -12,10 +12,12 @@
 //! third consumer wants genuinely different rendering, *that* is when the trait earns its
 //! complexity.
 //!
-//! **Modal, not anchored.** `anchored()` positions a popover relative to a point, which is
-//! what the method dropdown will want. A command palette is centred over the whole window,
-//! so this is a full-size `absolute` overlay instead. Both live in gpui 0.2.2; this needed
-//! the simpler one.
+//! **Modal, not anchored.** This is a full-size `absolute` overlay with a centred child,
+//! not an `anchored()` popover. An earlier version of this note claimed the method dropdown
+//! "will want" anchoring; it didn't. Anchoring needs the triggering element's screen bounds,
+//! which is real plumbing, and in a keyboard-first app a centred picker is *better* — one
+//! idiom, reachable without the mouse, and no second selection implementation. `anchored()`
+//! is still there in gpui 0.2.2 if something ever genuinely needs to hang off a point.
 
 use std::path::PathBuf;
 
@@ -45,6 +47,8 @@ pub enum Target {
     File(PathBuf),
     /// Dispatch an application action — the command palette.
     Action(Box<dyn gpui::Action>),
+    /// Set the active request's method.
+    Method(zuno_core::Method),
 }
 
 // Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
@@ -55,6 +59,7 @@ impl Clone for Target {
             Self::Buffer(ix) => Self::Buffer(*ix),
             Self::File(path) => Self::File(path.clone()),
             Self::Action(action) => Self::Action(action.boxed_clone()),
+            Self::Method(method) => Self::Method(method.clone()),
         }
     }
 }
@@ -86,6 +91,19 @@ pub struct Picker {
     /// Shown when there are no candidates at all, which means something different for a
     /// request list (nothing saved yet) than for a command list (a bug).
     empty_hint: &'static str,
+    /// Turns the query itself into an extra candidate.
+    ///
+    /// Exists for custom HTTP verbs: typing `PURGE` should offer it even though no row
+    /// matches, which is what lets the method picker reach `Method::Other` and closes the
+    /// last of §11's non-body gaps. A plain `fn` pointer rather than a boxed closure —
+    /// nothing needs captured state, and it keeps `Picker` free of a type parameter.
+    fallback: Option<fn(&str) -> Option<Item>>,
+    /// The current query's derived candidate, if the fallback produced one.
+    ///
+    /// Held apart from `items` rather than appended to it: appending would mean truncating
+    /// on every re-rank and every `extend`, and one missed truncate leaves a stale synthetic
+    /// row in the list. Kept separate, it is structurally impossible for it to accumulate.
+    derived: Option<Item>,
 }
 
 impl Picker {
@@ -107,9 +125,17 @@ impl Picker {
             restore_focus,
             last_query: String::new(),
             empty_hint,
+            fallback: None,
+            derived: None,
         };
         picker.refilter();
         picker
+    }
+
+    /// Offer the query itself as a candidate when `build` yields one. See `fallback`.
+    pub fn set_fallback(&mut self, build: fn(&str) -> Option<Item>) {
+        self.fallback = Some(build);
+        self.refilter();
     }
 
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -129,15 +155,32 @@ impl Picker {
     fn refilter(&mut self) {
         let labels: Vec<&str> = self.items.iter().map(|item| item.label.as_ref()).collect();
         self.matches = zuno_core::fuzzy::rank(&self.last_query, labels);
+        // Deliberately not ranked among the real rows: it is the "or use what I typed"
+        // escape hatch, so it belongs last regardless of how it would score.
+        self.derived = self.fallback.and_then(|build| build(&self.last_query));
         self.selected = 0;
+    }
+
+    /// Rows on screen: the ranked matches, then the derived row if there is one.
+    fn visible_count(&self) -> usize {
+        self.matches.len() + usize::from(self.derived.is_some())
+    }
+
+    /// The item at a visible row, whether real or derived.
+    fn item_at(&self, visible: usize) -> Option<&Item> {
+        match self.matches.get(visible) {
+            Some(&ix) => self.items.get(ix),
+            // Past the end of the matches means it's the derived row.
+            None => self.derived.as_ref(),
+        }
     }
 
     /// Move the selection, wrapping, and keep it on screen.
     pub fn select(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.matches.is_empty() {
+        if self.visible_count() == 0 {
             return;
         }
-        let count = self.matches.len() as isize;
+        let count = self.visible_count() as isize;
         // `rem_euclid` so a negative step from row 0 wraps to the end rather than panicking
         // on an underflowing usize.
         self.selected = (self.selected as isize + delta).rem_euclid(count) as usize;
@@ -177,12 +220,9 @@ impl Picker {
     /// than reaching into rendered elements, and it's the same data `render` reads.
     #[cfg(test)]
     pub fn visible_rows(&self) -> Vec<String> {
-        self.matches
-            .iter()
-            .map(|&ix| {
-                let item = &self.items[ix];
-                format!("{} — {}", item.label, item.detail)
-            })
+        (0..self.visible_count())
+            .filter_map(|visible| self.item_at(visible))
+            .map(|item| format!("{} — {}", item.label, item.detail))
             .collect()
     }
 
@@ -194,8 +234,7 @@ impl Picker {
     /// The target under the selection, if any. `None` when nothing matched — pressing
     /// enter on an empty list must do nothing rather than pick something arbitrary.
     pub fn chosen(&self) -> Option<&Target> {
-        let ix = *self.matches.get(self.selected)?;
-        Some(&self.items.get(ix)?.target)
+        Some(&self.item_at(self.selected)?.target)
     }
 }
 
@@ -212,18 +251,13 @@ impl Render for Picker {
         }
 
         let theme = cx.theme().clone();
-        let count = self.matches.len();
+        let count = self.visible_count();
         let selected = self.selected;
 
-        // Rows are built from `matches` and `items` by index, so the closure borrows
-        // nothing from `self`.
-        let rows: Vec<(SharedString, SharedString)> = self
-            .matches
-            .iter()
-            .map(|&ix| {
-                let item = &self.items[ix];
-                (item.label.clone(), item.detail.clone())
-            })
+        // Owned clones, so the row closure borrows nothing from `self`.
+        let rows: Vec<(SharedString, SharedString)> = (0..count)
+            .filter_map(|visible| self.item_at(visible))
+            .map(|item| (item.label.clone(), item.detail.clone()))
             .collect();
 
         // Full-window scrim. Clicking it dismisses, which is the one mouse affordance a

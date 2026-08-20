@@ -47,9 +47,9 @@ These decide phase order, and they're the durable part of this document.
 
 3. **Prefer work that exposes capability already built.** §11 of `architecture.md` tracks engine
    capabilities that are honoured on every request with no way to reach them. `Ctrl+,` closed five
-   of the original nine in one modal, which is the ratio this principle is about. **Four remain**,
-   and none is a toggle: form and binary body authoring, multipart, the response history browser,
-   and custom HTTP methods.
+   of the original nine in one modal and the method picker closed a sixth as a side effect, which is
+   the ratio this principle is about. **Three remain**: form and binary body authoring, multipart,
+   and the response history browser.
 
 4. **Defer the expensive and isolated.** Syntax highlighting needs tree-sitter plus a highlight
    cache, touches nothing else, and improves nothing structural. It is the most expensive thing
@@ -173,7 +173,20 @@ toggle says what will happen, the badge says what *is* happening.
 (`SyntaxTheme`) were defined back in M1.0 so the palette wouldn't have to be invented under
 pressure.
 
-**Method dropdown**, replacing cycling — free once the picker exists.
+**Method dropdown — done**, pulled forward from M4 because it really was cheap once the picker
+existed. `Ctrl+M` opens the picker over the seven common verbs with the active one marked, replacing
+cycling (which needed seven presses to reach OPTIONS).
+
+Two things worth recording:
+
+- **It closed a §11 item nobody costed.** Because the picker has a filter input, typing an unknown
+  verb offers it as `Method::Other` — so custom HTTP methods went from "sendable but unreachable" to
+  reachable, for about twenty lines. Validated against RFC 9110's `tchar` set so a verb that the
+  engine would reject with `InvalidMethod` is never offered in the first place.
+- **"Free once the picker exists" was right, but a note in `picker.rs` was wrong.** That note said
+  the method dropdown would want `anchored()` positioning. It doesn't: anchoring needs the button's
+  screen bounds, and a centred picker is better here anyway — one interaction idiom, keyboard-first.
+  Corrected in place.
 
 **Form and multipart authoring.** Note multipart is the one item in §11 that isn't purely UI work:
 curl import parses `-F`, but the engine still returns `UnsupportedBody`.

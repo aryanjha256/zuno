@@ -57,8 +57,7 @@ pub fn palette() -> Vec<Command> {
         command("Add query parameter", AddQuery),
         command("Toggle focused row", ToggleRow),
         command("Remove focused row", RemoveRow),
-        command("Cycle method", CycleMethod),
-        command("Cycle method backwards", CycleMethodBack),
+        command("Change method", OpenMethod),
         command("Cycle body type", CycleBodyKind),
         // Moving around.
         command("Focus URL", FocusUrl),

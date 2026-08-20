@@ -17,12 +17,12 @@ use gpui::{
 use zuno_core::{RequestId, RequestSpec, collection};
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, CycleMethod, CycleMethodBack,
-    FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    ClearCookies, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
-    PickerPrev, PrevTab, Quit, RemoveRow, SettingConfirm, SettingDecrease, SettingIncrease,
-    SettingNext, SettingPrev, SettingsDismiss,
-    SaveRequest, SendRequest, ToggleRow, ToggleTheme, UnfoldAll,
+    AddHeader, AddQuery, CancelRequest, ClearCookies, CloseTab, CycleBodyKind, FocusBody,
+    FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
+    OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
+    PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm,
+    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ToggleRow,
+    ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
@@ -404,6 +404,14 @@ impl Workspace {
                 // keybinding run the identical path — the convention in CLAUDE.md.
                 window.dispatch_action(action, cx);
             }
+            picker::Target::Method(method) => {
+                if let Some(view) = self.active() {
+                    view.update(cx, |view, cx| {
+                        view.method = method;
+                        cx.notify();
+                    });
+                }
+            }
             picker::Target::File(path) => {
                 // The file may have been deleted or broken since the scan; report rather
                 // than opening an empty buffer.
@@ -656,16 +664,35 @@ impl Workspace {
         window.focus_prev();
     }
 
-    fn cycle_method(&mut self, _: &CycleMethod, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active() {
-            view.update(cx, |view, cx| view.cycle_method(true, cx));
+    /// Open the method picker.
+    ///
+    /// Replaces cycling, which needed seven presses to reach OPTIONS and gave no way at all
+    /// to reach `Method::Other`. Because the picker has a filter input, typing an unknown
+    /// verb offers it — closing the last of §11's non-body gaps (custom HTTP methods).
+    fn open_method(&mut self, _: &OpenMethod, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.settings.is_some() {
+            return;
         }
-    }
+        let Some(view) = self.active() else { return };
+        let current = view.read(cx).method.clone();
 
-    fn cycle_method_back(&mut self, _: &CycleMethodBack, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active() {
-            view.update(cx, |view, cx| view.cycle_method(false, cx));
-        }
+        let items = zuno_core::Method::common()
+            .into_iter()
+            .map(|method| picker::Item {
+                label: SharedString::from(method.as_str().to_string()),
+                // Marks where you are, so the list answers "what is it now?" as well as
+                // "what could it be?".
+                detail: if method == current {
+                    SharedString::from("current")
+                } else {
+                    SharedString::default()
+                },
+                target: picker::Target::Method(method),
+            })
+            .collect();
+
+        let picker = self.show_picker(items, "No methods", window, cx);
+        picker.update(cx, |picker, _| picker.set_fallback(custom_method_row));
     }
 
     fn add_header(&mut self, _: &AddHeader, window: &mut Window, cx: &mut Context<Self>) {
@@ -950,8 +977,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
-            .on_action(cx.listener(Self::cycle_method))
-            .on_action(cx.listener(Self::cycle_method_back))
+            .on_action(cx.listener(Self::open_method))
             .on_action(cx.listener(Self::add_header))
             .on_action(cx.listener(Self::add_query))
             .on_action(cx.listener(Self::toggle_row))
@@ -1056,6 +1082,46 @@ fn tab_strip(
                     .child(label)
             })),
     )
+}
+
+/// Offer the typed text as a custom HTTP verb, when it could be one.
+///
+/// `Method::Other` has always been sendable — `build_method` hands it to
+/// `http::Method::from_bytes`, and `core` has tests for it — but nothing in the UI could
+/// produce one. This is that path, and it's why the method picker is a filtered list rather
+/// than a fixed dropdown.
+///
+/// Returns `None` rather than offering a row that would fail: the engine rejects anything
+/// outside RFC 9110's `tchar` set with `InvalidMethod`, and offering `Use "foo bar"` only to
+/// fail at send is worse than not offering it.
+fn custom_method_row(query: &str) -> Option<picker::Item> {
+    let verb = query.trim();
+    if verb.is_empty() || !verb.bytes().all(is_tchar) {
+        return None;
+    }
+
+    // Case-sensitive on the wire, but conventionally uppercase, and nobody typing `purge`
+    // means a lowercase verb.
+    let verb = verb.to_ascii_uppercase();
+    // A known verb already has a row; a second would set `Other("GET")` instead of `Get`,
+    // which is the same request but a different value everything downstream compares.
+    if zuno_core::Method::common()
+        .iter()
+        .any(|known| known.as_str() == verb)
+    {
+        return None;
+    }
+
+    Some(picker::Item {
+        label: SharedString::from(format!("Use \"{verb}\"")),
+        detail: SharedString::from("custom method"),
+        target: picker::Target::Method(zuno_core::Method::Other(verb)),
+    })
+}
+
+/// RFC 9110's `tchar`: what an HTTP method token may contain.
+fn is_tchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
 /// The first keybinding for an action, rendered like `ctrl-k`, or empty if it has none.

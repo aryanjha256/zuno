@@ -129,19 +129,18 @@ fn toolbar(
         .bg(theme.bg_panel)
         .border_b_1()
         .border_color(theme.border)
-        .child(method_chip(view, theme, cx))
+        .child(method_chip(view, theme))
         .child(url_bar(view, theme, url_focused))
         .child(send_button(theme, view.is_sending(), cx))
 }
 
-/// Clicking cycles the method; right-click cycles back. A real dropdown needs an
-/// anchored popover, which isn't worth building before the send loop works —
-/// `Ctrl+M` / `Ctrl+Shift+M` do the same thing from the keyboard.
-fn method_chip(
-    view: &RequestView,
-    theme: &Theme,
-    cx: &mut gpui::Context<RequestView>,
-) -> impl IntoElement {
+/// Clicking opens the method picker, same as `Ctrl+M`.
+///
+/// It cycled until M4, and the note here used to say a real dropdown "needs an anchored
+/// popover". It doesn't: the picker is a centred modal, and reusing it means one selection
+/// interaction instead of two — plus a filter input, which is how a custom verb becomes
+/// reachable at all.
+fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
     div()
         .id("method-chip")
         .flex_none()
@@ -156,13 +155,14 @@ fn method_chip(
         .text_color(theme.method_color(&view.method))
         .cursor_pointer()
         .hover(|style| style.bg(theme.bg_hover))
+        // Dispatches rather than mutating the view directly, so the button and Ctrl+M run
+        // the same path — the convention in CLAUDE.md. Right-click used to cycle backwards;
+        // with a filtered list there is no "backwards" to go.
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|view, _: &MouseDownEvent, _, cx| view.cycle_method(true, cx)),
-        )
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(|view, _: &MouseDownEvent, _, cx| view.cycle_method(false, cx)),
+            |_: &MouseDownEvent, window, cx| {
+                window.dispatch_action(Box::new(crate::actions::OpenMethod), cx);
+            },
         )
         .child(view.method.as_str().to_string())
 }

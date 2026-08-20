@@ -485,18 +485,6 @@ impl RequestView {
 
     // ---- structural edits ---------------------------------------------------
 
-    pub fn cycle_method(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let methods = Method::common();
-        let current = methods.iter().position(|m| *m == self.method).unwrap_or(0);
-        let next = if forward {
-            (current + 1) % methods.len()
-        } else {
-            (current + methods.len() - 1) % methods.len()
-        };
-        self.method = methods[next].clone();
-        cx.notify();
-    }
-
     /// Append an empty row and move focus into its name cell — adding a row you
     /// then have to click into would defeat the point.
     pub fn add_row(&mut self, kind: RowKind, window: &mut Window, cx: &mut Context<Self>) {

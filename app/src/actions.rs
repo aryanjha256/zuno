@@ -32,8 +32,7 @@ actions!(
         NextTab,
         PrevTab,
         // Request editing
-        CycleMethod,
-        CycleMethodBack,
+        OpenMethod,
         AddHeader,
         AddQuery,
         ToggleRow,
