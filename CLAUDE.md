@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 314 tests, ~9s
+cargo test --workspace                   # 322 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -187,10 +187,11 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
 - Derive state rather than mirroring it. `RequestView` has no stored `RequestSpec` —
   `spec(cx)` assembles one from the inputs, so what's sent can't disagree with what's on screen.
   **The corollary bites:** anything the inputs can't represent is *destroyed* by the derivation.
-  That's how form, multipart, and binary bodies were silently emptied on load and then written over
-  on save. `RequestView::preserved_body` is the fix, and it's deliberately **disjoint** from the
-  editor rather than overlapping it — two fields that could each describe the same body would be the
-  mirroring this rule forbids.
+  That's how form, multipart, and binary bodies were once silently emptied on load and then written
+  over on save. The durable fix was giving every `Body` variant an editor, so `RequestView::load`
+  matches **exhaustively with no catch-all** — adding a variant is now a compile error until someone
+  decides how to edit it. An interim `preserved_body` field held the unknown instead; it's gone,
+  because a catch-all that quietly preserves is weaker than a match that refuses to build.
 - Actions, not direct calls, for anything a button and a keybinding share. A command palette row
   dispatches the action too, so palette and keystroke can't drift.
 - **Every new action needs a `commands::palette()` row or an `EXCLUDED` entry with a reason.** The

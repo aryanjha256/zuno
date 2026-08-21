@@ -33,8 +33,8 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddFormField, AddHeader, AddQuery, CancelRequest, ChooseBodyFile, CloseTab, CopyResponse,
-    FocusBody, FocusNext,
+    AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile, CloseTab,
+    CopyResponse, FocusBody, FocusNext,
     FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenBodyType,
     OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
@@ -169,6 +169,8 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-b", OpenBodyType, None),
         KeyBinding::new("ctrl-shift-f", AddFormField, None),
         KeyBinding::new("ctrl-shift-o", ChooseBodyFile, None),
+        // Free since the method picker replaced CycleMethodBack.
+        KeyBinding::new("ctrl-shift-m", AddMultipartField, None),
         // Paste-special: import a curl command from the clipboard.
         KeyBinding::new("ctrl-shift-v", ImportCurl, None),
         // --- Response viewer ---

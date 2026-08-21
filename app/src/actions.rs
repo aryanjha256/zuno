@@ -42,6 +42,7 @@ actions!(
         OpenBodyType,
         AddFormField,
         ChooseBodyFile,
+        AddMultipartField,
         ImportCurl,
         // Response viewer
         FoldAll,

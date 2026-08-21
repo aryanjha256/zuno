@@ -14,7 +14,7 @@ use gpui::{
 };
 
 use crate::actions::{CancelRequest, SendRequest};
-use crate::request_view::{BodyType, KeyValueRow, RequestView, RowKind};
+use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestView, RowKind};
 use crate::theme::Theme;
 
 pub fn render(
@@ -245,6 +245,7 @@ fn section_header(
         RowKind::Header => "add-header",
         RowKind::Query => "add-query",
         RowKind::Form => "add-form-field",
+        RowKind::Multipart => "add-part",
     };
 
     div()
@@ -294,30 +295,62 @@ fn rows_table(
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
     if rows.is_empty() {
-        return div()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .text_xs()
-            .text_color(theme.text_muted)
-            .child(match kind {
-                RowKind::Header => "No headers — Ctrl+Shift+H to add".to_string(),
-                RowKind::Query => "No query parameters — Ctrl+Shift+Y to add".to_string(),
-                RowKind::Form => "No fields — Ctrl+Shift+F to add".to_string(),
-            });
+        return empty_table(kind, theme);
     }
+
+    let prefix = match kind {
+        RowKind::Header => "hdr",
+        RowKind::Query => "qry",
+        RowKind::Form => "fld",
+        // Never reached: multipart goes through `multipart_table`, which labels each row by
+        // whether it is a file.
+        RowKind::Multipart => "prt",
+    };
 
     div().flex().flex_col().children(
         rows.iter()
             .enumerate()
-            .map(|(ix, row)| render_row(row, kind, ix, theme, cx)),
+            .map(|(ix, row)| render_row(row, kind, prefix, ix, theme, cx)),
     )
+}
+
+fn empty_table(kind: RowKind, theme: &Theme) -> Div {
+    div()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(match kind {
+            RowKind::Header => "No headers — Ctrl+Shift+H to add",
+            RowKind::Query => "No query parameters — Ctrl+Shift+Y to add",
+            RowKind::Form => "No fields — Ctrl+Shift+F to add",
+            RowKind::Multipart => "No parts — Ctrl+Shift+M to add, Ctrl+Shift+O to attach a file",
+        })
+}
+
+/// The multipart table. Separate from `rows_table` because the prefix is per *row* — a part
+/// is either text or a file, and that distinction is the whole point of the body type.
+fn multipart_table(
+    parts: &[MultipartRow],
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    if parts.is_empty() {
+        return empty_table(RowKind::Multipart, theme);
+    }
+
+    div().flex().flex_col().children(parts.iter().enumerate().map(|(ix, part)| {
+        let prefix = if part.is_file { "fil" } else { "txt" };
+        render_row(&part.row, RowKind::Multipart, prefix, ix, theme, cx)
+    }))
 }
 
 fn render_row(
     row: &KeyValueRow,
     kind: RowKind,
+    prefix: &'static str,
     ix: usize,
     theme: &Theme,
     cx: &mut gpui::Context<RequestView>,
@@ -331,12 +364,6 @@ fn render_row(
         theme.text
     } else {
         theme.text_muted
-    };
-
-    let prefix = match kind {
-        RowKind::Header => "hdr",
-        RowKind::Query => "qry",
-        RowKind::Form => "fld",
     };
 
     div()
@@ -427,16 +454,15 @@ fn body_region(
     // A form, multipart, or binary body can be *held* but not yet edited. Showing the empty
     // editor here would be a lie in the worst way: it looks like the request has no body,
     // and it's the state from which a save would overwrite the real one.
-    if let Some(summary) = view.preserved_body_summary() {
-        return region.child(preserved_body(summary, theme));
-    }
-
     match view.body_type {
         // A form body is a table, not text — the same widget as headers and query params,
         // because `FormField` has the same shape as `Header`.
         BodyType::Form => region
             .font_family(theme.mono.clone())
             .child(rows_table(&view.form, RowKind::Form, theme, cx)),
+        BodyType::Multipart => region
+            .font_family(theme.mono.clone())
+            .child(multipart_table(&view.multipart, theme, cx)),
         BodyType::Binary => region.child(binary_body(view, theme)),
         // Not the editor: its text is retained so switching back is lossless, but showing it
         // under a body type of "None" would imply it gets sent.
@@ -489,15 +515,3 @@ fn binary_body(view: &RequestView, theme: &Theme) -> impl IntoElement + use<> {
         }))
 }
 
-fn preserved_body(summary: String, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().text_color(theme.text).child(summary))
-        .child(
-            div()
-                .text_color(theme.text_muted)
-                .child("Kept as-is — editing this body type isn't built yet, and sending or saving preserves it."),
-        )
-}

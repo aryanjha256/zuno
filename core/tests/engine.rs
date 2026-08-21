@@ -10,7 +10,10 @@ use std::net::{TcpListener, TcpStream};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use zuno_core::{Body, Engine, EngineError, Event, Header, Method, RawKind, RequestSpec};
+use zuno_core::{
+    Body, Engine, EngineError, Event, Header, Method, MultipartField, MultipartValue, RawKind,
+    RequestSpec,
+};
 
 // ---------------------------------------------------------------------------
 // A minimal one-shot HTTP server
@@ -458,4 +461,74 @@ fn clearing_cookies_stops_them_being_replayed() {
         "the cookie survived a clear:\n{}",
         seen[1]
     );
+}
+
+#[test]
+fn a_multipart_body_goes_out_with_a_boundary_and_both_part_kinds() {
+    // The framing is what could silently be wrong: a boundary that doesn't match the header,
+    // a file part without a filename, a missing terminator. Asserted against the bytes a
+    // server actually received.
+    let dir = std::env::temp_dir().join(format!("zuno-mp-wire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file = dir.join("avatar.png");
+    std::fs::write(&file, b"PNGDATA").expect("write");
+
+    let engine = Engine::new().expect("engine");
+    let (base, server) = serve_once(OK_JSON);
+
+    let mut spec = spec_for(format!("{base}/upload"));
+    spec.method = Method::Post;
+    spec.body = Body::Multipart(vec![
+        MultipartField {
+            enabled: true,
+            name: "caption".into(),
+            value: MultipartValue::Text("hello".into()),
+        },
+        MultipartField {
+            enabled: true,
+            name: "avatar".into(),
+            value: MultipartValue::File(file.clone()),
+        },
+    ]);
+
+    let (_, events) = engine.send(spec);
+    let events = drain(&events);
+    assert!(
+        events.iter().any(|event| matches!(event, Event::Done { .. })),
+        "the multipart send did not complete: {events:?}"
+    );
+
+    let request = server.join().expect("server thread");
+    let lower = request.to_lowercase();
+
+    // The generated boundary has to appear in the header *and* delimit the parts, or no
+    // server can parse this.
+    let boundary = lower
+        .split("boundary=")
+        .nth(1)
+        .and_then(|rest| rest.split(['\r', '\n', ';']).next())
+        .map(str::to_string)
+        .expect("a boundary in the Content-Type");
+    assert!(!boundary.is_empty(), "empty boundary:\n{request}");
+    assert!(
+        lower.contains("content-type: multipart/form-data"),
+        "should declare multipart:\n{request}"
+    );
+    assert!(
+        request.matches(boundary.as_str()).count() >= 3,
+        "boundary should open both parts and close the body:\n{request}"
+    );
+
+    // A text part, and a file part carrying its filename.
+    assert!(
+        request.contains(r#"name="caption""#) && request.contains("hello"),
+        "the text part is missing:\n{request}"
+    );
+    assert!(
+        request.contains(r#"name="avatar""#) && request.contains(r#"filename="avatar.png""#),
+        "the file part should carry its filename:\n{request}"
+    );
+    assert!(request.contains("PNGDATA"), "the file's bytes are missing:\n{request}");
+
+    std::fs::remove_dir_all(&dir).ok();
 }

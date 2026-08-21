@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{TestAppContext, VisualTestContext};
-use zuno_core::{Body, EngineError, Method, RawKind, RequestSpec, ResponseData};
+use zuno_core::{Body, EngineError, Method, MultipartValue, RawKind, RequestSpec, ResponseData};
 
 use crate::body_view::BodyView;
 use crate::request_view::RequestView;
@@ -97,9 +97,9 @@ fn remove_scratch(cx: &mut VisualTestContext, session: &PathBuf) {
 
 /// The buffer currently in front.
 ///
-/// Needed whenever an action *opens* a buffer — curl import does, so the handle returned by
-/// `boot` is the previous buffer and reading it silently asserts against the wrong request.
-/// That has caught three tests now.
+/// Needed whenever an action *opens* a buffer — `ctrl-t`, curl import, and opening from the
+/// picker all do — so the handle returned by `boot` is the *previous* buffer, and reading it
+/// silently asserts against the wrong request. That has caught four tests now.
 fn active_view(
     window: &gpui::WindowHandle<Workspace>,
     cx: &mut VisualTestContext,
@@ -2605,9 +2605,10 @@ async fn a_multipart_body_survives_a_curl_import(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn saving_a_request_does_not_overwrite_a_body_it_cannot_edit(cx: &mut TestAppContext) {
-    // The step that made the loss permanent: the emptied editor was derived into `Empty`
-    // and written to the collection file.
+async fn saving_a_request_does_not_overwrite_an_imported_body(cx: &mut TestAppContext) {
+    // The step that made the old loss permanent: the emptied editor was derived into `Empty`
+    // and written to the collection file. Every body type is authorable now, so this guards
+    // the round trip rather than a read-only holding pen.
     let (session, root) = scratch_collection("preserve-save");
     let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
@@ -2652,14 +2653,10 @@ async fn an_imported_binary_body_arrives_editable(cx: &mut TestAppContext) {
     // The distinguishing assertion. `spec.body` and `body_label` both look right even when
     // the body is *held* rather than authorable, because `preserved_body` also round-trips —
     // this is the only observable that separates "editable" from "read-only".
-    assert!(
-        cx.update(|_, cx| imported.read(cx).preserved_body_summary()).is_none(),
-        "an authorable body must not be held read-only"
-    );
     assert_eq!(
         cx.update(|_, cx| imported.read(cx).body_type),
         crate::request_view::BodyType::Binary,
-        "and the body type must reflect it"
+        "an import must arrive as an editable body of the right type"
     );
     assert_eq!(
         cx.update(|_, cx| imported.read(cx).binary_path.clone()),
@@ -2674,8 +2671,9 @@ async fn a_raw_body_is_still_editable_and_not_preserved(cx: &mut TestAppContext)
     // set aside, or every request would become read-only.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    assert!(
-        cx.update(|_, cx| view.read(cx).preserved_body_summary()).is_none(),
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_type),
+        crate::request_view::BodyType::Raw,
         "the sample's raw body must stay editable"
     );
 
@@ -2686,14 +2684,18 @@ async fn a_raw_body_is_still_editable_and_not_preserved(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
-async fn an_empty_body_stays_editable(cx: &mut TestAppContext) {
-    // `Body::Empty` must not be preserved — typing into it is how you get a raw body.
-    let (_, view, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t"); // a fresh buffer starts empty
+async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
+    // Empty is a real body type, not an absence to be papered over: typing into the editor
+    // is how you get a raw body from here.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    // The *new* buffer, not the one `boot` returned — `ctrl-t` opens one.
+    let view = active_view(&window, &mut cx);
 
-    assert!(
-        cx.update(|_, cx| view.read(cx).preserved_body_summary()).is_none(),
-        "an empty body is not something to preserve"
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_type),
+        crate::request_view::BodyType::Empty,
+        "a fresh buffer starts with no body"
     );
 }
 
@@ -2800,9 +2802,10 @@ async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter");
 
     let reopened = active_view(&window, &mut cx);
-    assert!(
-        cx.update(|_, cx| reopened.read(cx).preserved_body_summary()).is_none(),
-        "a form body is authorable, so it must not be held read-only"
+    assert_eq!(
+        cx.update(|_, cx| reopened.read(cx).body_type),
+        crate::request_view::BodyType::Form,
+        "a reopened form must come back as an editable form"
     );
     cx.simulate_keystrokes("ctrl-shift-f");
     cx.simulate_input("extra");
@@ -2873,32 +2876,48 @@ async fn a_stale_content_type_header_is_reported_not_silently_obeyed(cx: &mut Te
 }
 
 #[gpui::test]
-async fn choosing_a_body_type_over_a_preserved_body_replaces_it(cx: &mut TestAppContext) {
-    // The preserved multipart body is held, not frozen — an explicit choice can drop it.
+async fn an_imported_multipart_body_arrives_editable(cx: &mut TestAppContext) {
+    // Multipart used to be *held* read-only, because nothing could author it. It's the last
+    // body type to become editable, which is what let `preserved_body` go entirely.
     let (window, _, mut cx) = boot(cx, None, None);
 
-    put_on_clipboard(&mut cx, "curl https://api.test/upload -F name=zuno");
+    put_on_clipboard(
+        &mut cx,
+        "curl https://api.test/upload -F caption=hello -F avatar=@/tmp/pic.png",
+    );
     cx.simulate_keystrokes("ctrl-shift-v");
     cx.run_until_parked();
 
     let imported = active_view(&window, &mut cx);
-    assert!(cx.update(|_, cx| imported.read(cx).preserved_body_summary()).is_some());
-
-    cx.simulate_keystrokes("ctrl-shift-b");
-    cx.simulate_input("json");
-    cx.simulate_keystrokes("enter");
-
-    assert!(
-        cx.update(|_, cx| imported.read(cx).preserved_body_summary()).is_none(),
-        "picking a type must release the preserved body"
+    assert_eq!(
+        cx.update(|_, cx| imported.read(cx).body_type),
+        crate::request_view::BodyType::Multipart
     );
-    assert_eq!(cx.update(|_, cx| imported.read(cx).body_label()), "JSON");
+    assert_eq!(cx.update(|_, cx| imported.read(cx).body_label()), "Multipart");
+
+    // Editable means the parts are real rows, and the file part is marked as one.
+    let (text_parts, file_parts) = cx.update(|_, cx| {
+        let view = imported.read(cx);
+        (
+            view.multipart.iter().filter(|part| !part.is_file).count(),
+            view.multipart.iter().filter(|part| part.is_file).count(),
+        )
+    });
+    assert_eq!((text_parts, file_parts), (1, 1), "one text part and one file part");
+
+    // And it still round-trips through the spec.
+    let Body::Multipart(fields) = &spec_of(&imported, &mut cx).body else {
+        panic!("expected multipart");
+    };
+    assert_eq!(fields.len(), 2);
+    assert!(matches!(&fields[1].value, MultipartValue::File(path) if path.ends_with("pic.png")));
 }
 
 #[gpui::test]
 async fn the_body_type_picker_offers_every_authorable_type(cx: &mut TestAppContext) {
-    // Cycling could only reach JSON/Text/XML/HTML, so form and binary were unreachable no
-    // matter how many times you pressed it.
+    // Cycling could only reach JSON/Text/XML/HTML, so form, binary and multipart were
+    // unreachable no matter how many times you pressed it. Every `Body` variant is now here,
+    // which is what let `preserved_body` go.
     let (window, _, mut cx) = boot(cx, None, None);
     cx.simulate_keystrokes("ctrl-shift-b");
 
@@ -2909,13 +2928,9 @@ async fn the_body_type_picker_offers_every_authorable_type(cx: &mut TestAppConte
         .collect();
     assert_eq!(
         labels,
-        ["None", "JSON", "Form", "Binary", "Text", "XML", "HTML"],
+        ["None", "JSON", "Form", "Binary", "Multipart", "Text", "XML", "HTML"],
         "{rows:?}"
     );
-    // Multipart still absent: nothing can author it yet, and offering a dead type is worse
-    // than omitting it.
-    assert!(!rows.iter().any(|row| row.contains("Multipart")), "{rows:?}");
-
     // The sample request is JSON, and the list should say which one you're on.
     let json = rows.iter().find(|row| row.starts_with("JSON")).expect("a JSON row");
     assert!(json.contains("current"), "{json:?}");
@@ -3048,9 +3063,10 @@ async fn a_binary_body_survives_a_save_and_reopen_as_editable(cx: &mut TestAppCo
     cx.simulate_keystrokes("enter");
 
     let reopened = active_view(&window, &mut cx);
-    assert!(
-        cx.update(|_, cx| reopened.read(cx).preserved_body_summary()).is_none(),
-        "binary is authorable, so it must not be held read-only"
+    assert_eq!(
+        cx.update(|_, cx| reopened.read(cx).body_type),
+        crate::request_view::BodyType::Binary,
+        "a reopened binary body must come back editable"
     );
     assert_eq!(
         cx.update(|_, cx| reopened.read(cx).binary_path.clone()),
@@ -3086,4 +3102,147 @@ async fn switching_from_binary_keeps_the_path_for_switching_back(cx: &mut TestAp
         Body::Binary(file),
         "the path should survive a round trip through another type"
     );
+}
+
+#[gpui::test]
+async fn ctrl_shift_m_adds_a_part_and_switches_the_body(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("caption");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("hello");
+
+    assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "Multipart");
+    let Body::Multipart(fields) = &spec_of(&view, &mut cx).body else {
+        panic!("expected multipart: {:?}", spec_of(&view, &mut cx).body);
+    };
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0].name, "caption");
+    // A new part is text until a file is attached.
+    assert_eq!(fields[0].value, MultipartValue::Text("hello".to_string()));
+}
+
+#[gpui::test]
+async fn attaching_a_file_turns_a_part_into_a_file_part(cx: &mut TestAppContext) {
+    // The dialog can't be driven headlessly, so this exercises everything downstream of the
+    // path arriving — which is where the text/file distinction is decided.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("avatar");
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("caption");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("hi");
+
+    let file = PathBuf::from("/tmp/zuno-avatar.png");
+    cx.update(|_, cx| view.update(cx, |view, cx| view.set_multipart_file(0, file.clone(), cx)));
+
+    let Body::Multipart(fields) = &spec_of(&view, &mut cx).body else {
+        panic!("expected multipart");
+    };
+    assert_eq!(fields[0].value, MultipartValue::File(file), "part 0 became a file");
+    assert_eq!(
+        fields[1].value,
+        MultipartValue::Text("hi".to_string()),
+        "and the other part is untouched"
+    );
+}
+
+#[gpui::test]
+async fn attaching_a_file_targets_the_focused_part_or_the_whole_body(cx: &mut TestAppContext) {
+    // One verb, two meanings, decided by focus. This asserts the decision itself, since the
+    // native dialog can't be opened in a test.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+
+    // No multipart body: the file would become the whole binary body.
+    assert_eq!(
+        cx.update(|window, cx| view.read(cx).focused_multipart_row(window, cx)),
+        None
+    );
+
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("first");
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("second");
+
+    // Focus is in the second part's name cell, so that's the one a file would attach to.
+    assert_eq!(
+        cx.update(|window, cx| view.read(cx).focused_multipart_row(window, cx)),
+        Some(1),
+        "the focused part is the target"
+    );
+}
+
+#[gpui::test]
+async fn a_disabled_part_is_left_out_but_kept(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("keep");
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("drop");
+    cx.simulate_keystrokes("alt-t");
+
+    let Body::Multipart(fields) = &spec_of(&view, &mut cx).body else {
+        panic!("expected multipart");
+    };
+    assert_eq!(fields.len(), 2, "the muted part must still exist");
+    assert!(!fields[1].enabled, "{fields:?}");
+    assert_eq!(fields[1].name, "drop", "with its text intact");
+}
+
+#[gpui::test]
+async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
+    // Including which parts are files — that distinction is the body type's whole point, and
+    // it's the part a round trip could quietly flatten.
+    let (session, root) = scratch_collection("multipart-roundtrip");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/v1/upload");
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("caption");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("hello");
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_input("avatar");
+
+    let view = active_view(&window, &mut cx);
+    let file = PathBuf::from("/tmp/zuno-pic.png");
+    cx.update(|_, cx| view.update(cx, |view, cx| view.set_multipart_file(1, file.clone(), cx)));
+    cx.simulate_keystrokes("ctrl-s");
+
+    let bytes = std::fs::read(root.join("upload.json")).expect("saved");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    let Body::Multipart(fields) = &saved.body else {
+        panic!("the multipart body was not persisted: {:?}", saved.body);
+    };
+    assert_eq!(fields[0].value, MultipartValue::Text("hello".to_string()));
+    assert_eq!(fields[1].value, MultipartValue::File(file.clone()));
+
+    // Reopen, and the file part must still be a file part rather than text holding a path.
+    cx.simulate_keystrokes("ctrl-w");
+    cx.simulate_keystrokes("ctrl-p");
+    wait_for(&mut cx, "the scanned request", |cx| {
+        picker_rows(&window, cx).iter().any(|r| r.contains("upload")).then_some(())
+    });
+    cx.simulate_input("upload");
+    cx.simulate_keystrokes("enter");
+
+    let reopened = active_view(&window, &mut cx);
+    let marks = cx.update(|_, cx| {
+        reopened
+            .read(cx)
+            .multipart
+            .iter()
+            .map(|part| part.is_file)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(marks, [false, true], "the text/file marks must survive");
+
+    remove_scratch(&mut cx, &session);
 }

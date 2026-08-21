@@ -19,8 +19,8 @@ use zuno_core::{
 };
 
 use crate::actions::{
-    AddFormField, AddHeader, AddQuery, CancelRequest, ChooseBodyFile, ClearCookies, CloseTab,
-    CopyResponse, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
+    AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
+    ClearCookies, CloseTab, CopyResponse, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
     OpenBodyType, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
@@ -949,11 +949,12 @@ impl Workspace {
         let Some(view) = self.active() else { return };
         let current = view.read(cx).body_label();
 
-        let choices: [(&str, BodyType, Option<RawKind>, &str); 7] = [
+        let choices: [(&str, BodyType, Option<RawKind>, &str); 8] = [
             ("None", BodyType::Empty, None, "send no body at all"),
             ("JSON", BodyType::Raw, Some(RawKind::Json), "application/json"),
             ("Form", BodyType::Form, None, "application/x-www-form-urlencoded"),
             ("Binary", BodyType::Binary, None, "the contents of a file"),
+            ("Multipart", BodyType::Multipart, None, "multipart/form-data"),
             ("Text", BodyType::Raw, Some(RawKind::Text), "text/plain"),
             ("XML", BodyType::Raw, Some(RawKind::Xml), "application/xml"),
             ("HTML", BodyType::Raw, Some(RawKind::Html), "text/html"),
@@ -982,10 +983,15 @@ impl Workspace {
     fn choose_body_file(
         &mut self,
         _: &ChooseBodyFile,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(view) = self.active() else { return };
+
+        // One verb, two meanings, decided by where focus is: with a multipart part focused it
+        // fills that part, otherwise it sets the whole binary body. Two separate actions for
+        // "pick a file" would be two keystrokes to remember for the same intent.
+        let part = view.read(cx).focused_multipart_row(window, cx);
 
         let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
@@ -1005,12 +1011,21 @@ impl Workspace {
             };
 
             let _ = workspace.update(cx, |workspace, cx| {
-                view.update(cx, |view, cx| view.set_binary_path(path.clone(), cx));
                 let shown = path
                     .file_name()
                     .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.display().to_string());
-                workspace.set_status(&format!("Sending {shown} as the body"), cx);
+
+                match part {
+                    Some(ix) => {
+                        view.update(cx, |view, cx| view.set_multipart_file(ix, path, cx));
+                        workspace.set_status(&format!("Attached {shown} to this part"), cx);
+                    }
+                    None => {
+                        view.update(cx, |view, cx| view.set_binary_path(path, cx));
+                        workspace.set_status(&format!("Sending {shown} as the body"), cx);
+                    }
+                }
             });
         }));
     }
@@ -1020,13 +1035,26 @@ impl Workspace {
 
         // Adding a field to a body that isn't a form would put a row somewhere invisible, so
         // switch first and say so — it's what the keystroke plainly means.
-        let needs_switch = view.read(cx).body_type != BodyType::Form
-            || view.read(cx).preserved_body.is_some();
-        if needs_switch {
+        if view.read(cx).body_type != BodyType::Form {
             view.update(cx, |view, cx| view.set_body_type(BodyType::Form, cx));
             self.set_status("Switched the body to a form", cx);
         }
         view.update(cx, |view, cx| view.add_row(RowKind::Form, window, cx));
+    }
+
+    fn add_multipart_field(
+        &mut self,
+        _: &AddMultipartField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+
+        if view.read(cx).body_type != BodyType::Multipart {
+            view.update(cx, |view, cx| view.set_body_type(BodyType::Multipart, cx));
+            self.set_status("Switched the body to multipart", cx);
+        }
+        view.update(cx, |view, cx| view.add_row(RowKind::Multipart, window, cx));
     }
 
     /// Open a request parsed from a curl command on the clipboard in a **new** buffer.
@@ -1280,6 +1308,7 @@ impl Workspace {
                 RowKind::Header => "header",
                 RowKind::Query => "query",
                 RowKind::Form => "form field",
+                RowKind::Multipart => "part",
             };
             return SharedString::from(format!("{label} row {}", ix + 1));
         }
@@ -1364,6 +1393,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_body_type))
             .on_action(cx.listener(Self::add_form_field))
             .on_action(cx.listener(Self::choose_body_file))
+            .on_action(cx.listener(Self::add_multipart_field))
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::fold_all))

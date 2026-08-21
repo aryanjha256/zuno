@@ -13,7 +13,7 @@ use http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Request, Url};
 
 use crate::engine::error::EngineError;
-use crate::request::{Body, Method, RequestSpec};
+use crate::request::{Body, Method, MultipartValue, RequestSpec};
 
 /// A body that has been reduced to bytes, plus the Content-Type it implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,23 @@ pub enum PreparedBody {
         /// Applied only if the request doesn't already carry a Content-Type.
         content_type: Option<&'static str>,
     },
+    /// Parts already read into memory, for `build` to hand to reqwest.
+    ///
+    /// Deliberately *not* a `reqwest::multipart::Form`: that type is neither `Debug`,
+    /// `Clone`, nor `PartialEq`, so holding one here would cost this enum its derives and
+    /// make multipart the only body that can't be asserted on in a unit test. Keeping the
+    /// parts as plain data means file reading (and `BodyFileUnreadable`) stays in
+    /// `build_body` with every other body, and reqwest stays confined to `build`.
+    Multipart(Vec<PreparedPart>),
+}
+
+/// One part of a multipart body, already reduced to bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedPart {
+    pub name: String,
+    /// `None` for a text field. A file part carries the name servers key off.
+    pub filename: Option<String>,
+    pub bytes: Vec<u8>,
 }
 
 /// Find the first unsubstituted `{{variable}}`, if any.
@@ -218,9 +235,49 @@ pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
             })
         }
 
-        // Needs reqwest's `multipart` feature plus streaming file parts. Explicitly
-        // unsupported beats silently sending the wrong thing.
-        Body::Multipart(_) => Err(EngineError::UnsupportedBody { kind: "multipart" }),
+        Body::Multipart(fields) => {
+            let mut parts = Vec::new();
+            for field in fields
+                .iter()
+                .filter(|field| field.enabled && !field.name.trim().is_empty())
+            {
+                let part = match &field.value {
+                    MultipartValue::Text(text) => PreparedPart {
+                        name: field.name.trim().to_string(),
+                        filename: None,
+                        bytes: text.clone().into_bytes(),
+                    },
+                    MultipartValue::File(path) => {
+                        // Read here rather than streamed, matching the binary body: the
+                        // whole file enters memory. Fine for the uploads an API client
+                        // sees; if that stops being true, `Part::stream` is the upgrade.
+                        let bytes =
+                            std::fs::read(path).map_err(|error| EngineError::BodyFileUnreadable {
+                                path: path.clone(),
+                                reason: error.to_string(),
+                            })?;
+                        PreparedPart {
+                            name: field.name.trim().to_string(),
+                            // Servers routinely key off the filename, and a part without
+                            // one reads as a text field to many frameworks.
+                            filename: Some(
+                                path.file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "file".to_string()),
+                            ),
+                            bytes,
+                        }
+                    }
+                };
+                parts.push(part);
+            }
+
+            // Same rule as a form body with no usable fields: nothing to send.
+            if parts.is_empty() {
+                return Ok(PreparedBody::None);
+            }
+            Ok(PreparedBody::Multipart(parts))
+        }
     }
 }
 
@@ -243,8 +300,24 @@ pub fn build(client: &Client, spec: &RequestSpec) -> Result<Request, EngineError
 
     let mut builder = client.request(method, url).headers(headers);
 
-    if let PreparedBody::Bytes { bytes, .. } = body {
-        builder = builder.body(bytes);
+    match body {
+        PreparedBody::Bytes { bytes, .. } => builder = builder.body(bytes),
+        PreparedBody::Multipart(parts) => {
+            let mut form = reqwest::multipart::Form::new();
+            for part in parts {
+                let mut piece = reqwest::multipart::Part::bytes(part.bytes);
+                if let Some(filename) = part.filename {
+                    piece = piece.file_name(filename);
+                }
+                form = form.part(part.name, piece);
+            }
+            // **Unlike every other body, an explicit Content-Type cannot win here.**
+            // `multipart` generates a boundary and writes the header itself, and a
+            // user-supplied `multipart/form-data` without that boundary is unparseable —
+            // so overriding it would produce a request no server can read.
+            builder = builder.multipart(form);
+        }
+        PreparedBody::None => {}
     }
     if let Some(timeout) = spec.settings.timeout {
         builder = builder.timeout(timeout);
@@ -258,7 +331,7 @@ pub fn build(client: &Client, spec: &RequestSpec) -> Result<Request, EngineError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::{FormField, Header, QueryParam, RawKind};
+    use crate::request::{FormField, Header, MultipartField, QueryParam, RawKind};
 
     fn spec_with_url(url: &str) -> RequestSpec {
         RequestSpec {
@@ -504,9 +577,77 @@ mod tests {
     fn multipart_is_explicitly_unsupported_rather_than_silently_wrong() {
         let mut spec = RequestSpec::default();
         spec.body = Body::Multipart(vec![]);
+        // Same rule as a form with no usable fields: nothing to send, rather than an empty
+        // multipart envelope with a boundary and no parts.
+        assert_eq!(build_body(&spec).unwrap(), PreparedBody::None);
+    }
+
+    #[test]
+    fn multipart_text_and_file_parts_are_both_prepared() {
+        let dir = std::env::temp_dir().join(format!("zuno-mp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("avatar.png");
+        std::fs::write(&file, b"PNGDATA").expect("write");
+
+        let mut spec = RequestSpec::default();
+        spec.body = Body::Multipart(vec![
+            MultipartField {
+                enabled: true,
+                name: "caption".into(),
+                value: MultipartValue::Text("hello".into()),
+            },
+            MultipartField {
+                enabled: true,
+                name: "avatar".into(),
+                value: MultipartValue::File(file.clone()),
+            },
+            // Disabled and blank-named parts are dropped, as in every other table.
+            MultipartField {
+                enabled: false,
+                name: "skipped".into(),
+                value: MultipartValue::Text("no".into()),
+            },
+            MultipartField {
+                enabled: true,
+                name: "   ".into(),
+                value: MultipartValue::Text("nameless".into()),
+            },
+        ]);
+
+        let PreparedBody::Multipart(parts) = build_body(&spec).unwrap() else {
+            panic!("expected multipart");
+        };
+        assert_eq!(parts.len(), 2, "{parts:?}");
+
+        assert_eq!(parts[0].name, "caption");
+        assert_eq!(parts[0].filename, None, "a text part has no filename");
+        assert_eq!(parts[0].bytes, b"hello");
+
+        assert_eq!(parts[1].name, "avatar");
         assert_eq!(
-            build_body(&spec),
-            Err(EngineError::UnsupportedBody { kind: "multipart" })
+            parts[1].filename.as_deref(),
+            Some("avatar.png"),
+            "a file part carries the name servers key off"
+        );
+        assert_eq!(parts[1].bytes, b"PNGDATA");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_multipart_file_is_reported_by_path() {
+        let missing = std::env::temp_dir().join("zuno-no-such-part.bin");
+        let mut spec = RequestSpec::default();
+        spec.body = Body::Multipart(vec![MultipartField {
+            enabled: true,
+            name: "avatar".into(),
+            value: MultipartValue::File(missing.clone()),
+        }]);
+
+        let error = build_body(&spec).expect_err("must refuse to send");
+        assert!(
+            matches!(&error, EngineError::BodyFileUnreadable { path, .. } if *path == missing),
+            "{error:?}"
         );
     }
 

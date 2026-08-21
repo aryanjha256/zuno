@@ -48,6 +48,9 @@ reqwest = { version = "0.13", default-features = false, features = [
     "zstd",
     "cookies",
     "http2",
+    # Multipart bodies. Enabled when multipart authoring landed; `build.rs` returns
+    # `UnsupportedBody` without it.
+    "multipart",
 ] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
 url = "2"
