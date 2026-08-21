@@ -12,15 +12,16 @@ use std::path::{Path, PathBuf};
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Task, Window, div, px,
+    ClipboardItem, Styled, Subscription, Task, Window, div, px,
 };
 use zuno_core::{Environment, RequestId, RequestSpec, Resolver, collection, environment};
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, ClearCookies, CloseTab, CycleBodyKind, FocusBody,
+    AddHeader, AddQuery, CancelRequest, ClearCookies, CloseTab, CopyResponse, CycleBodyKind,
+    FocusBody,
     FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
     OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
-    PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm,
+    PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
 };
@@ -47,6 +48,8 @@ pub struct Workspace {
     picker_scan: Option<Task<()>>,
     /// The settings panel, while it's open.
     settings: Option<SettingsState>,
+    /// Holding the task is what keeps a save-response dialog and its write alive.
+    response_save: Option<Task<()>>,
     /// The selected environment's name, restored from the session.
     ///
     /// Only the *name* is held. The values are re-read from disk on every send, so editing
@@ -117,6 +120,7 @@ impl Workspace {
             picker: None,
             picker_scan: None,
             settings: None,
+            response_save: None,
             environment,
         }
     }
@@ -971,6 +975,79 @@ impl Workspace {
         }
     }
 
+    /// Copy the displayed response body to the clipboard.
+    ///
+    /// **Raw bytes, exactly as the server sent them** — not the pretty-printed outline on
+    /// screen. What you paste into a test fixture or a bug report has to be what came back,
+    /// and reformatting it would quietly change the thing you're reporting.
+    ///
+    /// Text only. A response that isn't valid UTF-8 is a normal outcome here (invariant 4),
+    /// and the clipboard needs a `String`, so this points at `SaveResponse` instead of
+    /// silently copying mojibake.
+    fn copy_response(&mut self, _: &CopyResponse, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let Some(response) = view.read(cx).displayed().cloned() else {
+            self.set_status("No response to copy yet", cx);
+            return;
+        };
+
+        match response.body_as_str() {
+            Some(text) => {
+                let size = format_bytes(response.body.len() as u64);
+                cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                self.set_status(&format!("Copied {size} to the clipboard"), cx);
+            }
+            None => self.set_status(
+                "This response isn't text — use Ctrl+Shift+S to save it to a file",
+                cx,
+            ),
+        }
+    }
+
+    /// Write the displayed response body to a file the user picks.
+    ///
+    /// The counterpart to copying rather than a duplicate of it: this is how a binary or
+    /// multi-megabyte body gets out, neither of which the clipboard handles usefully.
+    fn save_response(&mut self, _: &SaveResponse, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let Some(response) = view.read(cx).displayed().cloned() else {
+            self.set_status("No response to save yet", cx);
+            return;
+        };
+
+        let suggested = suggested_filename(&view.read(cx).label(cx), response.content_type());
+        // `$HOME` rather than the collection root: a saved response is an artefact you're
+        // taking elsewhere, not part of the collection you'd commit.
+        let directory = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        let prompt = cx.prompt_for_new_path(&directory, Some(&suggested));
+        self.response_save = Some(cx.spawn(async move |workspace, cx| {
+            // Cancelled, or the platform couldn't open a picker at all.
+            let Ok(Ok(Some(path))) = prompt.await else {
+                return;
+            };
+
+            let body = response.body.clone();
+            let write = cx
+                .background_executor()
+                .spawn(async move { std::fs::write(&path, &body).map(|()| path) });
+
+            let outcome = write.await;
+            let _ = workspace.update(cx, |workspace, cx| match outcome {
+                Ok(path) => {
+                    let shown = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    workspace.set_status(&format!("Saved the response to {shown}"), cx);
+                }
+                Err(error) => workspace.set_status(&format!("Could not save: {error}"), cx),
+            });
+        }));
+    }
+
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         cx.global_mut::<Theme>().toggle();
         // A theme change repaints every window, not just this view.
@@ -1179,6 +1256,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
+            .on_action(cx.listener(Self::copy_response))
+            .on_action(cx.listener(Self::save_response))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
@@ -1280,6 +1359,31 @@ fn tab_strip(
                     .child(label)
             })),
     )
+}
+
+/// A filename to offer in the save dialog: the request's name plus an extension matching
+/// what came back.
+///
+/// Runs the label through `collection::slug` for the same reason saving a request does — the
+/// label derives from a URL, so `https://x.test/../../.ssh/config` must not become a path.
+pub fn suggested_filename(label: &str, content_type: Option<&str>) -> String {
+    // Match on the essence only: `application/json; charset=utf-8` is still JSON.
+    let base = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .unwrap_or("");
+
+    let extension = match base {
+        "application/json" | "text/json" => "json",
+        "application/xml" | "text/xml" => "xml",
+        "text/html" => "html",
+        "text/csv" => "csv",
+        other if other.starts_with("text/") => "txt",
+        // Anything else could be an image, a protobuf, a zip. `.bin` claims nothing.
+        _ => "bin",
+    };
+
+    format!("{}.{extension}", collection::slug(label))
 }
 
 /// Bytes at human scale. The history picker shows sizes side by side, and `184320` next to

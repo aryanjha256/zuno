@@ -65,6 +65,8 @@ pub fn palette() -> Vec<Command> {
         command("Focus body", FocusBody),
         command("Focus response", FocusResponse),
         // The response viewer.
+        command("Copy response body", CopyResponse),
+        command("Save response body to a file", SaveResponse),
         command("Show response history", ShowHistory),
         command("Fold all", FoldAll),
         command("Unfold all", UnfoldAll),

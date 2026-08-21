@@ -2410,3 +2410,134 @@ async fn history_does_not_survive_loading_a_different_request(cx: &mut TestAppCo
         "a replaced buffer has no runs to show"
     );
 }
+
+/// A response with an arbitrary content type and raw body bytes.
+fn serve_bytes(response: &'static [u8]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let _ = stream.write_all(response);
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
+    cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+}
+
+#[gpui::test]
+async fn ctrl_shift_c_copies_the_response_body_verbatim(cx: &mut TestAppContext) {
+    // Raw bytes, not the pretty-printed outline on screen: what you paste into a fixture or
+    // a bug report has to be what actually came back.
+    const BODY: &str = "{\"a\":1,\"b\":[2,3]}";
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_bytes(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"a\":1,\"b\":[2,3]}",
+    );
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+
+    cx.simulate_keystrokes("ctrl-shift-c");
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some(BODY),
+        "the clipboard must hold the bytes the server sent, unreformatted"
+    );
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    assert!(
+        status.is_some_and(|s| s.contains("Copied")),
+        "a copy that says nothing is indistinguishable from one that failed"
+    );
+}
+
+#[gpui::test]
+async fn copying_a_binary_response_points_at_saving_instead(cx: &mut TestAppContext) {
+    // Invariant 4: a body that isn't valid UTF-8 is normal, not an error. The clipboard
+    // needs a `String`, so the honest move is to name the alternative rather than copy
+    // mojibake.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_bytes(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\n\xff\xfe\xfd\xfc",
+    );
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+
+    cx.simulate_keystrokes("ctrl-shift-c");
+    let status = cx
+        .update(|_, cx| view.read(cx).status.clone())
+        .expect("a status");
+    assert!(status.contains("isn't text"), "{status:?}");
+    assert!(status.contains("save"), "must name the way out: {status:?}");
+}
+
+#[gpui::test]
+async fn copying_with_no_response_says_so(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-shift-c");
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    assert!(
+        status.is_some_and(|s| s.contains("No response")),
+        "a no-op keystroke should explain itself"
+    );
+}
+
+#[gpui::test]
+async fn copying_while_browsing_history_copies_the_run_on_screen(cx: &mut TestAppContext) {
+    // Egress reads `displayed()`, so it follows the history browser rather than always
+    // grabbing the live response — copying something other than what you're looking at
+    // would be the worst possible bug in this feature.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, r#"{"older":1}"#), (201, r#"{"newer":2}"#)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 201);
+
+    cx.simulate_keystrokes("ctrl-h down enter");
+    assert_eq!(viewing(&view, &mut cx), 1);
+
+    cx.simulate_keystrokes("ctrl-shift-c");
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some(r#"{"older":1}"#),
+        "must copy the run being shown, not the live one"
+    );
+}
+
+#[test]
+fn a_suggested_filename_is_safe_and_matches_the_content_type() {
+    use crate::workspace::suggested_filename;
+
+    assert_eq!(suggested_filename("invoices", Some("application/json")), "invoices.json");
+    // Parameters don't change the essence.
+    assert_eq!(
+        suggested_filename("invoices", Some("application/json; charset=utf-8")),
+        "invoices.json"
+    );
+    assert_eq!(suggested_filename("report", Some("text/csv")), "report.csv");
+    assert_eq!(suggested_filename("page", Some("text/html")), "page.html");
+    // An unknown or absent type claims nothing.
+    assert_eq!(suggested_filename("blob", Some("application/octet-stream")), "blob.bin");
+    assert_eq!(suggested_filename("blob", None), "blob.bin");
+    // Any `text/*` is readable.
+    assert_eq!(suggested_filename("notes", Some("text/plain")), "notes.txt");
+
+    // The label comes from a URL, so the same traversal guard as saving a request applies.
+    let escaped = suggested_filename("../../.ssh/config", Some("application/json"));
+    assert!(!escaped.contains('/'), "{escaped:?}");
+    assert!(!escaped.starts_with('.'), "{escaped:?}");
+}

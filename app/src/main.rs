@@ -33,10 +33,10 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, CloseTab, CycleBodyKind, FocusBody, FocusNext,
+    AddHeader, AddQuery, CancelRequest, CloseTab, CopyResponse, CycleBodyKind, FocusBody, FocusNext,
     FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenMethod,
     OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext, PickerPrev,
-    PrevTab, Quit, RemoveRow, SaveRequest, SendRequest, SettingConfirm, SettingDecrease,
+    PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm, SettingDecrease,
     SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, SwitchEnvironment,
     ToggleRow, ToggleTheme, UnfoldAll,
 };
@@ -169,6 +169,10 @@ fn register_keymap(cx: &mut App) {
         // --- Response viewer ---
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
+        // Getting the response back out. `ctrl-c` is taken by text-input copy, scoped to
+        // `TextInput`; these are global because the response pane has no input to type in.
+        KeyBinding::new("ctrl-shift-c", CopyResponse, None),
+        KeyBinding::new("ctrl-shift-s", SaveResponse, None),
         // --- Request lifecycle ---
         KeyBinding::new("ctrl-s", SaveRequest, None),
         KeyBinding::new("ctrl-enter", SendRequest, None),

@@ -716,14 +716,21 @@ UI work, not engine work.
 | ~~Redirect following + max hops~~ | **Reachable** in the settings panel |
 | ~~TLS verification toggle~~ | **Reachable** in the settings panel. curl import still sets it from `-k` |
 | ~~gzip / brotli / deflate / zstd~~ | **Reachable** in the settings panel |
-| Form and binary bodies | The engine sends both correctly; the UI can only author raw bodies |
+| Form bodies | **Reachable the awkward way.** The engine sends them, and the UI can't author one — but `build.rs` only fills in a derived Content-Type when no explicit header is set, so a raw body of `a=1&b=2` plus `Content-Type: application/x-www-form-urlencoded` goes out correctly today. A convenience gap, not a capability one |
+| Binary bodies | The engine sends them; the UI can't author one, and there is no workaround |
 | Multipart bodies | Modeled, and curl import parses `-F` — but the engine returns `UnsupportedBody`. The one item here that is *not* just UI work |
 | ~~Response history~~ | **Reachable.** `Ctrl+H` lists every retained run; choosing one shows it and re-indexes its body. Until then the retention was *write-only* — nothing read it, not even the diff |
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 
-`Ctrl+,` closed five, the method picker a sixth, and `Ctrl+H` a seventh. **Two remain**, both
-body-authoring work: form and binary bodies, and multipart — which is still the one item here that
-needs engine changes rather than UI, since `build.rs` returns `UnsupportedBody`.
+`Ctrl+,` closed five, the method picker a sixth, and `Ctrl+H` a seventh. What's left is
+body-authoring: **binary** and **multipart** have no workaround, and multipart is still the only item
+here needing engine changes rather than UI. **Form** is listed as reachable rather than missing,
+because an explicit `Content-Type` header already gets you there.
+
+A caution for whoever reads this section as a to-do list: it tracks *unreachable engine
+capabilities*, so by construction it cannot name a gap where the engine was never involved. The
+biggest hole found after this list was down to two — that nothing in the app can copy a response —
+appears nowhere in it. See ROADMAP's audit.
 
 Worth recording about the history one, because it wasn't only a missing feature: `history` was
 written, truncated, and read by **nothing** — not even the diff, which is computed once when a

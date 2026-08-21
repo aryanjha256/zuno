@@ -239,8 +239,60 @@ Two things worth recording:
   screen bounds, and a centred picker is better here anyway — one interaction idiom, keyboard-first.
   Corrected in place.
 
-**Form and multipart authoring.** Note multipart is the one item in §11 that isn't purely UI work:
-curl import parses `-F`, but the engine still returns `UnsupportedBody`.
+---
+
+## What's actually missing — an audit
+
+Taken after environments and history landed, when the remaining §11 items looked like the whole
+story. They weren't. Ordered by how much each one blocks *using Zuno for real REST work*, which is
+not the same as how much code each needs.
+
+**1. Response egress — done.** `Ctrl+Shift+C` copies the displayed body; `Ctrl+Shift+S` saves it to
+a file through the native picker. Both read `displayed()`, so they follow the history browser rather
+than always grabbing the live run.
+
+Three decisions worth keeping:
+
+- **Copy gives the raw bytes, not the pretty-printed outline on screen.** What you paste into a
+  fixture or a bug report has to be what came back; reformatting would quietly change the thing
+  you're reporting.
+- **Copy is text-only and says so.** A body that isn't valid UTF-8 is normal (invariant 4) and the
+  clipboard needs a `String`, so a binary response points at Save rather than copying mojibake.
+  That's *why* Save is a separate verb and not a duplicate of Copy — it's also how a multi-megabyte
+  body gets out.
+- **The suggested filename runs through `collection::slug`**, for the same reason saving a request
+  does: it derives from the URL, so `https://x.test/../../.ssh/config` must not become a path. The
+  extension comes from the content type, ignoring parameters, and defaults to `.bin` because an
+  unknown type shouldn't claim to be text.
+
+*Still missing from egress:* copying a single JSON row's value or its path. That needs a selected
+row in the response viewer, which doesn't exist — the pane has focus but no cursor — so it's row
+selection first, then copy. Worth doing alongside response search, which wants the same thing.
+
+**2. Multipart and binary bodies.** The real capability blocker — no workaround for either, and file
+upload is bread-and-butter REST. Multipart is the only remaining §11 item needing *engine* work
+(`build.rs` returns `UnsupportedBody`); binary the engine already sends. Form belongs in the same
+slice for the shared field-table UI, but note form is **not** blocked — see §11: an explicit
+`Content-Type` header beats the derived one, so `a=1&b=2` as a raw body already works.
+
+*De-risked:* `cx.prompt_for_paths` exists in gpui 0.2.2, so native file selection is available and
+neither of these needs hand-typed paths.
+
+**3. No search in a response.** The viewer holds 10 MB at 60 fps and folds, but there's no `Ctrl+F`
+— so at exactly the scale it was built for, finding a key means scrolling. Bigger than it looks: the
+viewer is virtualized over an outline, so search has to run over the source bytes off-thread and map
+hits back to rows. This is where the "huge JSON" claim gets tested.
+
+**4. Smaller, but real.**
+
+- **No copy-as-curl.** Import exists and export doesn't, which is asymmetric — and "here's the
+  repro" is a constant need.
+- **No delete or rename of a saved request** from inside the app. Mild, because files are the
+  interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
+- **No body prettify.** Paste minified JSON and you live with it.
+
+**Syntax highlighting stays last** regardless (principle 4): expensive, isolated, and it improves
+nothing structural — it would only flatter a screenshot.
 
 ---
 

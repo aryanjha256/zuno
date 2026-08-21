@@ -44,6 +44,8 @@ actions!(
         // Response viewer
         FoldAll,
         UnfoldAll,
+        CopyResponse,
+        SaveResponse,
         // Settings
         OpenSettings,
         SettingNext,
