@@ -7,6 +7,10 @@ Postman-level capability, Zed-level feel: a virtualized response viewer that hol
 multi-megabyte JSON, request tabs as editor buffers, curl import, response diffing, and
 collections stored as one file per request so they live in git like anything else you own.
 
+[![Rust](https://github.com/aryanjha256/zuno/actions/workflows/rust.yml/badge.svg)](https://github.com/aryanjha256/zuno/actions/workflows/rust.yml)
+
+[![Release](https://github.com/aryanjha256/zuno/actions/workflows/release.yml/badge.svg)](https://github.com/aryanjha256/zuno/actions/workflows/release.yml)
+
 ## Install
 
 Download the `.deb` from the [latest release](https://github.com/aryanjha256/zuno/releases/latest):
