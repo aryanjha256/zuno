@@ -718,14 +718,25 @@ UI work, not engine work.
 | ~~gzip / brotli / deflate / zstd~~ | **Reachable** in the settings panel |
 | ~~Form bodies~~ | **Reachable.** `Ctrl+Shift+B` picks the type, `Ctrl+Shift+F` adds a field, and the fields use the same table widget as headers and query rows |
 | ~~Binary bodies~~ | **Reachable.** `Ctrl+Shift+O` picks a file through the native dialog; only the path is held, and `build.rs` reads it at send |
-| Multipart bodies | Modeled, and curl import parses `-F` — but the engine returns `UnsupportedBody`. The one item here that is *not* just UI work |
+| ~~Multipart bodies~~ | **Reachable.** `Ctrl+Shift+M` adds a part, `Ctrl+Shift+O` attaches a file to the focused one. reqwest's `multipart` feature is enabled, and `build_body` reduces parts to bytes so `PreparedBody` keeps its derives |
 | ~~Response history~~ | **Reachable.** `Ctrl+H` lists every retained run; choosing one shows it and re-indexes its body. Until then the retention was *write-only* — nothing read it, not even the diff |
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 
-`Ctrl+,` closed five, the method picker a sixth, `Ctrl+H` a seventh, and body authoring took form
-and binary. **One remains: multipart** — and it's the only item here that ever needed engine work
-rather than UI, since `build.rs` returns `UnsupportedBody` and reqwest's `multipart` feature isn't
-enabled.
+**Nothing remains.** `Ctrl+,` closed five, the method picker a sixth, `Ctrl+H` a seventh, and body
+authoring took form, binary, and multipart — the last of which was the only item here that ever
+needed engine work rather than UI.
+
+The section stays as the record of *how* the gap opened: the engine was built ahead of the views,
+which is a reasonable order and a predictable debt. Two things it left behind are worth keeping in
+mind:
+
+- **`preserved_body` is gone.** Multipart was the last body type the UI couldn't author, so
+  `RequestView::load` now matches every `Body` variant exhaustively with no catch-all — adding a
+  variant is a compile error until someone decides how to edit it. The compiler forced the change:
+  once multipart was authorable the catch-all became unreachable and `-D warnings` rejected it.
+- **An explicit `Content-Type` cannot win for multipart**, unlike every other body. `multipart`
+  generates the boundary and writes the header itself, and a user-supplied `multipart/form-data`
+  without that boundary is unparseable. `conflicting_content_type` therefore reports nothing for it.
 
 A caution for whoever reads this section as a to-do list: it tracks *unreachable engine
 capabilities*, so by construction it cannot name a gap where the engine was never involved. The

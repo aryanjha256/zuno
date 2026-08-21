@@ -180,6 +180,36 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   row to sit on after pressing Enter. Both are commented.
 - **Write the test that's awkward to write.** The `tab_stop`, `{{baseUrl}}`, and line-index bugs
   were all found by tests that felt like a chore.
+- **A weak assertion reads exactly like a strong one.** Four times now a test has passed against
+  both the correct code *and* the broken version, because it asserted something true in both:
+  `row_count() > 0` after switching runs, "no environment appears in the request picker" (true
+  whether or not `scan` skips the directory), containment that two independent layers guaranteed,
+  and an accessor that reported "nothing held" for the very state it was meant to detect. The fix
+  is always the same — break it deliberately and watch the test fail. If it doesn't, the test is
+  decoration.
+- **Docs went stale twice while the code was right.** Both times a multi-file edit script aborted
+  on a failed anchor assertion, so files listed *after* the failure were silently skipped, and the
+  summary claimed work that hadn't happened. `git status` showed the untouched files both times.
+  Hence the checklist below.
+
+## Finishing a slice
+
+Not ceremony — each line here is something that has actually been missed, and the last two are why
+this list exists at all.
+
+1. `RUSTFLAGS="-D warnings" cargo test --workspace` — the count in **Commands** above is the current
+   total; update it.
+2. **Break it on purpose.** Revert the core behaviour by hand and confirm the intended test fails.
+   A test that passes both ways is decoration, and this has caught four of them.
+3. **Update the docs that the change invalidated**, then **grep for the new text to prove the edit
+   landed.** Prefer one edit per file over a batched script: a script that asserts its anchors
+   aborts on the first miss and silently skips everything after it, which is how §11 spent a slice
+   claiming multipart was unimplemented.
+4. `git status` before writing any summary. A doc you meant to change and didn't will be sitting
+   there unmodified.
+
+Which doc owns what: **ROADMAP** order and what's next; **architecture.md** design decisions and
+what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
 
 ## Conventions
 

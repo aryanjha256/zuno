@@ -2650,9 +2650,9 @@ async fn an_imported_binary_body_arrives_editable(cx: &mut TestAppContext) {
     assert_eq!(spec.body, Body::Binary(PathBuf::from("/tmp/payload.bin")));
 
     let imported = active_view(&window, &mut cx);
-    // The distinguishing assertion. `spec.body` and `body_label` both look right even when
-    // the body is *held* rather than authorable, because `preserved_body` also round-trips —
-    // this is the only observable that separates "editable" from "read-only".
+    // Asserts the *type*, not just the body: while non-raw bodies were held read-only in a
+    // since-removed `preserved_body` field, `spec.body` and `body_label` both looked correct
+    // either way, so only the body type distinguished "editable" from "held".
     assert_eq!(
         cx.update(|_, cx| imported.read(cx).body_type),
         crate::request_view::BodyType::Binary,

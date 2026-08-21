@@ -269,17 +269,14 @@ Three decisions worth keeping:
 row in the response viewer, which doesn't exist — the pane has focus but no cursor — so it's row
 selection first, then copy. Worth doing alongside response search, which wants the same thing.
 
-**2. Multipart and binary bodies.** The real capability blocker — no workaround for either, and file
-upload is bread-and-butter REST. Multipart is the only remaining §11 item needing *engine* work
-(`build.rs` returns `UnsupportedBody`); binary the engine already sends. Form belongs in the same
-slice for the shared field-table UI, but note form is **not** blocked — see §11: an explicit
-`Content-Type` header beats the derived one, so `a=1&b=2` as a raw body already works.
+**2. Body authoring — done** (2a–2d below). As found, this was the real capability blocker: no
+workaround for multipart or binary, and file upload is bread-and-butter REST. Multipart was the only
+part needing *engine* work — `UnsupportedBody` plus reqwest's `multipart` feature. Form turned out
+**not** to be blocked at all: an explicit `Content-Type` header beats the derived one, so `a=1&b=2`
+as a raw body already worked, which is why it ranked as convenience rather than capability.
 
-Also unenabled: reqwest's `multipart` feature. That's a dependency change on top of replacing
-`UnsupportedBody`.
-
-*De-risked:* `cx.prompt_for_paths` exists in gpui 0.2.2, so native file selection is available and
-neither of these needs hand-typed paths.
+`cx.prompt_for_paths` in gpui 0.2.2 de-risked the file selection, so neither binary nor multipart
+needed hand-typed paths.
 
 **2a. Non-raw bodies are no longer destroyed — done, and it was a bug rather than a gap.** `spec()`
 derives the body from the editor, the editor only holds raw text, so loading a request with a form
@@ -329,9 +326,28 @@ selection, because checking in the pane would mean a filesystem call on every fr
 The pane also says **"no Content-Type is sent unless you add the header"**, because `build.rs`
 deliberately guesses nothing for binary uploads — that's correct, and invisible otherwise.
 
-**2d. Last: multipart.** The only remaining §11 item, and the only one that ever needed engine work:
-`UnsupportedBody` plus reqwest's `multipart` feature. Its UI is the union of form's field table and
-binary's file picker, so doing it last makes it composition rather than invention.
+**2d. Multipart authoring — done, and §11 is now empty.** `Ctrl+Shift+M` adds a part;
+`Ctrl+Shift+O` attaches a file to the *focused* part, or sets the whole binary body when no part has
+focus — one verb, two meanings decided by where you are, rather than two keystrokes for the same
+intent. Doing it last paid off as predicted: the UI is form's field table plus binary's picker, so it
+was composition rather than invention.
+
+On the engine side, reqwest's `multipart` feature is enabled and `UnsupportedBody` is gone.
+`build_body` reduces parts to plain `PreparedPart` values rather than building a
+`reqwest::multipart::Form`: that type is neither `Debug`, `Clone`, nor `PartialEq`, so holding one in
+`PreparedBody` would have cost the enum its derives and made multipart the only body untestable in a
+unit test. Reqwest stays confined to `build`, and file reading stays beside every other body's.
+
+**Unlike every other body, an explicit `Content-Type` cannot win here** — `multipart` generates the
+boundary and writes the header itself, and a user-supplied `multipart/form-data` without that
+boundary is unparseable. Verified over a real socket: boundary in the header *and* delimiting the
+parts, a text part, and a file part carrying its filename (without which many frameworks read an
+upload as a plain text field).
+
+**And it let `preserved_body` go.** Every `Body` variant now has an editor, so `load` matches
+exhaustively with no catch-all: adding a variant is a compile error until someone decides how to edit
+it, which is stronger than silently holding the unknown. The compiler forced it — once multipart was
+authorable the catch-all became unreachable and `-D warnings` rejected it.
 
 **3. No search in a response.** The viewer holds 10 MB at 60 fps and folds, but there's no `Ctrl+F`
 — so at exactly the scale it was built for, finding a key means scrolling. Bigger than it looks: the
