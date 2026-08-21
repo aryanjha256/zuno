@@ -159,6 +159,13 @@ Two patterns worth reusing:
   returns while the consuming task is still awaiting its channel. Poll against a deadline.
 - **Real sockets over mocks** — `core/tests/engine.rs` spins a throwaway `TcpListener` and
   asserts on *the request text the server actually received*. ~60 lines, no test dependencies.
+- **A test server must send `Connection: close`, and must never wait forever.** Left keep-alive,
+  reqwest pools the socket, so a server that accepts once per response can block on a connection
+  the client decided to reuse instead. That hung a CI run for six hours before GitHub killed it,
+  and never reproduced locally — whether the client sees the server's FIN before sending again is a
+  race that only loses on a slow, loaded runner. `accept_before` bounds accept *and* read, so a
+  wrong assumption fails in seconds with a message. Both CI workflows now carry
+  `timeout-minutes` for the same reason.
 
 Three test layers, and bugs have been caught at each: pure units (`core/src/**/tests`),
 end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src/tests.rs`).

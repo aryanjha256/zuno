@@ -2259,6 +2259,11 @@ async fn loading_an_environment_with_secrets_writes_the_gitignore_rule(cx: &mut 
 
 /// A server that answers `count` times, with a different status each time, so runs are
 /// distinguishable in history.
+///
+/// Each response says `Connection: close`, so one request means one connection. Left
+/// keep-alive, reqwest may pool the socket and reuse it, and this server — which accepts
+/// once per response — waits for a connection that never arrives. See the note on
+/// `serve_twice_setting_a_cookie` in `core/tests/engine.rs`: that cost a six-hour CI run.
 fn serve_sequence(statuses: &'static [(u16, &'static str)]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2269,7 +2274,7 @@ fn serve_sequence(statuses: &'static [(u16, &'static str)]) -> String {
             let mut discard = [0u8; 4096];
             let _ = stream.read(&mut discard);
             let response = format!(
-                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());

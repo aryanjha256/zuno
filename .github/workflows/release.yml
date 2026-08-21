@@ -35,6 +35,9 @@ jobs:
     #   container: ubuntu:22.04
     # and install rustup plus the apt list below inside it.
     runs-on: ubuntu-22.04
+    # Same reasoning as the branch workflow: a hang here burned six hours of budget before
+    # GitHub cancelled it, on a job whose honest worst case is a cold release build.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +76,7 @@ jobs:
       # A release build is the wrong place to discover a broken test. The branch workflow
       # doesn't run on tag pushes, so this is not redundant.
       - name: Test
+        timeout-minutes: 10
         run: cargo test --workspace
 
       - name: Validate the desktop entry

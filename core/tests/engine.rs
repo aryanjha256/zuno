@@ -390,8 +390,19 @@ fn the_connection_pool_survives_a_resend() {
 
 /// A server that hands out a cookie on every response, and reports what it received.
 ///
-/// Two connections rather than one, because clearing the jar drops the client and so the
-/// pooled connection with it — the second request arrives on a fresh socket.
+/// **`Connection: close` is load-bearing, not politeness.** Without it the response is
+/// HTTP/1.1 keep-alive, so reqwest pools the socket and the second request *may* reuse it —
+/// leaving this server blocked in `accept` for a connection that never comes. That hung a CI
+/// run for six hours until GitHub killed it, and never reproduced locally, because whether
+/// the client notices the server's FIN before sending again is a race that only loses on a
+/// slow, loaded runner. Closing each connection makes one request mean one connection.
+///
+/// Note this makes the cookie assertion *stronger*: the replay now has to survive a new TCP
+/// connection rather than riding a single one.
+///
+/// Every wait is bounded for the same reason. A test that assumes a connection count the
+/// client doesn't promise should fail in seconds with a message, not hang until a scheduler
+/// gives up on it.
 fn serve_twice_setting_a_cookie() -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -399,13 +410,18 @@ fn serve_twice_setting_a_cookie() -> (String, JoinHandle<Vec<String>>) {
     let handle = std::thread::spawn(move || {
         let mut seen = Vec::new();
         for _ in 0..2 {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let Some(mut stream) = accept_before(&listener, SERVER_DEADLINE) else {
+                // Returning short makes the assertion fail with a useful message; panicking
+                // here would only surface as a poisoned `join`.
+                return seen;
+            };
             seen.push(read_request(&mut stream));
             let _ = stream.write_all(
                 b"HTTP/1.1 200 OK\r\n\
                   Content-Type: application/json\r\n\
                   Set-Cookie: session=abc123; Path=/\r\n\
                   Content-Length: 2\r\n\
+                  Connection: close\r\n\
                   \r\n\
                   {}",
             );
@@ -415,6 +431,41 @@ fn serve_twice_setting_a_cookie() -> (String, JoinHandle<Vec<String>>) {
     });
 
     (format!("http://{addr}"), handle)
+}
+
+/// How long a test server waits for something it expects. Generous enough for a loaded CI
+/// runner, short enough that a wrong assumption fails rather than hangs.
+const SERVER_DEADLINE: Duration = Duration::from_secs(20);
+
+/// `TcpListener::accept` with a deadline.
+///
+/// `std` has no timeout for accept, so this polls a non-blocking listener. The returned
+/// stream is put back into blocking mode, since `read_request` expects that.
+fn accept_before(listener: &TcpListener, within: Duration) -> Option<TcpStream> {
+    listener.set_nonblocking(true).expect("nonblocking");
+    let deadline = std::time::Instant::now() + within;
+
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break Some(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break None,
+        }
+    }?;
+
+    listener.set_nonblocking(false).expect("blocking");
+    stream.set_nonblocking(false).expect("blocking");
+    // Bounds the *other* unbounded wait: a connection the client opens and then abandons
+    // would otherwise block `read_request` forever.
+    stream
+        .set_read_timeout(Some(within))
+        .expect("read timeout");
+    Some(stream)
 }
 
 #[test]

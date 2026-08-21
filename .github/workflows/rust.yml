@@ -16,6 +16,10 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # A hung test used to run until GitHub's 6-hour ceiling killed the job. The whole
+    # workspace builds and tests in a couple of minutes cold, so anything past this is a
+    # hang, not slowness — and a hang should cost minutes of budget, not a whole afternoon.
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -32,4 +36,7 @@ jobs:
         run: cargo build --verbose
 
       - name: Run tests
+        # Its own, tighter limit: the step that hangs is nearly always this one, and a
+        # step-level timeout says *which* phase stalled rather than just "the job did".
+        timeout-minutes: 10
         run: cargo test --verbose
