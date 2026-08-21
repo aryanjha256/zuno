@@ -95,6 +95,22 @@ fn remove_scratch(cx: &mut VisualTestContext, session: &PathBuf) {
     }
 }
 
+/// The buffer currently in front.
+///
+/// Needed whenever an action *opens* a buffer — curl import does, so the handle returned by
+/// `boot` is the previous buffer and reading it silently asserts against the wrong request.
+/// That has caught three tests now.
+fn active_view(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> gpui::Entity<RequestView> {
+    window
+        .update(cx, |workspace, _, _| {
+            workspace.active().expect("an active buffer")
+        })
+        .expect("window")
+}
+
 fn spec_of(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> RequestSpec {
     cx.update(|_, cx| view.read(cx).spec(cx))
 }
@@ -139,6 +155,28 @@ fn serve_once(response: &'static str) -> String {
     });
 
     format!("http://{addr}")
+}
+
+/// Accept one connection, capture the raw request text, reply with `response`.
+///
+/// The app-level `serve_once` discards what it received; asserting on the bytes a server
+/// actually got is the only way to check an encoding rather than the intent behind it.
+fn serve_capturing(response: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let handle = std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else {
+            return String::new();
+        };
+        let mut buffer = vec![0u8; 8192];
+        let read = stream.read(&mut buffer).unwrap_or(0);
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        String::from_utf8_lossy(&buffer[..read]).to_string()
+    });
+
+    (format!("http://{addr}"), handle)
 }
 
 /// Accept a connection and never reply, so a request stays in flight.
@@ -837,7 +875,11 @@ async fn the_body_kind_cycles(cx: &mut TestAppContext) {
         Body::Raw { kind: RawKind::Json, .. }
     ));
 
+    // Ctrl+Shift+B used to cycle RawKind; it now opens the picker, so the sub-kind is
+    // chosen by name rather than reached by repetition.
     cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("text");
+    cx.simulate_keystrokes("enter");
     assert!(matches!(
         spec_of(&view, &mut cx).body,
         Body::Raw { kind: RawKind::Text, .. }
@@ -2540,4 +2582,508 @@ fn a_suggested_filename_is_safe_and_matches_the_content_type() {
     let escaped = suggested_filename("../../.ssh/config", Some("application/json"));
     assert!(!escaped.contains('/'), "{escaped:?}");
     assert!(!escaped.starts_with('.'), "{escaped:?}");
+}
+
+#[gpui::test]
+async fn a_multipart_body_survives_a_curl_import(cx: &mut TestAppContext) {
+    // The data loss this fixes, at its most reachable: curl import has parsed `-F` since
+    // M1, and `load` used to map anything non-raw to an empty editor.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    put_on_clipboard(
+        &mut cx,
+        "curl https://api.test/upload -F name=zuno -F file=@/tmp/payload.bin",
+    );
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+
+    let (_, spec) = tabs_of(&window, &mut cx);
+    let Body::Multipart(fields) = &spec.body else {
+        panic!("the multipart body was lost: {:?}", spec.body);
+    };
+    assert_eq!(fields.len(), 2, "{fields:?}");
+}
+
+#[gpui::test]
+async fn saving_a_request_does_not_overwrite_a_body_it_cannot_edit(cx: &mut TestAppContext) {
+    // The step that made the loss permanent: the emptied editor was derived into `Empty`
+    // and written to the collection file.
+    let (session, root) = scratch_collection("preserve-save");
+    let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    put_on_clipboard(&mut cx, "curl https://api.test/upload -F name=zuno");
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("ctrl-s");
+
+    let bytes = std::fs::read(root.join("upload.json")).expect("saved file");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    assert!(
+        matches!(&saved.body, Body::Multipart(fields) if fields.len() == 1),
+        "the saved file must keep the body: {:?}",
+        saved.body
+    );
+
+    // And it round-trips: reopening must not lose it either.
+    cx.simulate_keystrokes("ctrl-w");
+    let reopened = zuno_core::collection::read(&root.join("upload.json")).expect("read");
+    assert!(matches!(reopened.body, Body::Multipart(_)));
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn an_imported_binary_body_arrives_editable(cx: &mut TestAppContext) {
+    // Binary used to be *preserved* — held read-only because nothing could author it. Now
+    // that it's authorable, an import has to arrive as a chosen file rather than a blob.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    put_on_clipboard(
+        &mut cx,
+        "curl https://api.test/blob -X PUT --data-binary @/tmp/payload.bin",
+    );
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+
+    let (_, spec) = tabs_of(&window, &mut cx);
+    assert_eq!(spec.body, Body::Binary(PathBuf::from("/tmp/payload.bin")));
+
+    let imported = active_view(&window, &mut cx);
+    // The distinguishing assertion. `spec.body` and `body_label` both look right even when
+    // the body is *held* rather than authorable, because `preserved_body` also round-trips —
+    // this is the only observable that separates "editable" from "read-only".
+    assert!(
+        cx.update(|_, cx| imported.read(cx).preserved_body_summary()).is_none(),
+        "an authorable body must not be held read-only"
+    );
+    assert_eq!(
+        cx.update(|_, cx| imported.read(cx).body_type),
+        crate::request_view::BodyType::Binary,
+        "and the body type must reflect it"
+    );
+    assert_eq!(
+        cx.update(|_, cx| imported.read(cx).binary_path.clone()),
+        Some(PathBuf::from("/tmp/payload.bin"))
+    );
+    assert_eq!(cx.update(|_, cx| imported.read(cx).body_label()), "Binary");
+}
+
+#[gpui::test]
+async fn a_raw_body_is_still_editable_and_not_preserved(cx: &mut TestAppContext) {
+    // The guard against over-applying this: only variants the editor *can't* express get
+    // set aside, or every request would become read-only.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    assert!(
+        cx.update(|_, cx| view.read(cx).preserved_body_summary()).is_none(),
+        "the sample's raw body must stay editable"
+    );
+
+    clear_body(&mut cx);
+    cx.simulate_input("{\"typed\":true}");
+    let spec = spec_of(&view, &mut cx);
+    assert_eq!(spec.body.as_text(), Some("{\"typed\":true}"));
+}
+
+#[gpui::test]
+async fn an_empty_body_stays_editable(cx: &mut TestAppContext) {
+    // `Body::Empty` must not be preserved — typing into it is how you get a raw body.
+    let (_, view, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t"); // a fresh buffer starts empty
+
+    assert!(
+        cx.update(|_, cx| view.read(cx).preserved_body_summary()).is_none(),
+        "an empty body is not something to preserve"
+    );
+}
+
+
+
+#[gpui::test]
+async fn a_form_body_reaches_the_wire_urlencoded(cx: &mut TestAppContext) {
+    // Asserted against the bytes a server received, not against the spec — the encoding is
+    // the part that could silently be wrong.
+    let (window, _, mut cx) = boot(cx, None, None);
+    let (url, server) = serve_capturing(OK_JSON);
+
+    // A *fresh* buffer, because the sample ships `Content-Type: application/json` and an
+    // explicit header outranks the derived one — leaving it would send a urlencoded body
+    // labelled JSON. That precedence has its own test.
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+    assert!(
+        spec_of(&view, &mut cx).headers.is_empty(),
+        "a new buffer should start with no headers"
+    );
+    cx.simulate_input(&url);
+
+    // Ctrl+Shift+F switches to a form and adds a field in one go.
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("grant_type");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("client_credentials");
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("scope");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("read write");
+
+    assert_eq!(spec_of(&view, &mut cx).body.label(), "Form");
+
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    let request = server.join().expect("server thread");
+    assert!(
+        request.contains("grant_type=client_credentials&scope=read+write"),
+        "the form body should be urlencoded:\n{request}"
+    );
+    assert!(
+        request.to_lowercase().contains("content-type: application/x-www-form-urlencoded"),
+        "and carry the derived content type:\n{request}"
+    );
+}
+
+#[gpui::test]
+async fn a_disabled_form_field_is_left_out(cx: &mut TestAppContext) {
+    // Same contract as headers and query rows: muting a field must not lose what you typed.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("keep");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("yes");
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("drop");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("no");
+    // Focus is in the second row, so this mutes it.
+    cx.simulate_keystrokes("alt-t");
+
+    let spec = spec_of(&view, &mut cx);
+    let Body::Form(fields) = &spec.body else {
+        panic!("expected a form body: {:?}", spec.body);
+    };
+    assert_eq!(fields.len(), 2, "the muted row must still exist");
+    assert!(!fields[1].enabled, "and be marked disabled: {fields:?}");
+    assert_eq!(fields[1].value, "no", "with its text intact");
+}
+
+#[gpui::test]
+async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("form-roundtrip");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/token");
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("grant_type");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("password");
+    cx.simulate_keystrokes("ctrl-s");
+
+    let bytes = std::fs::read(root.join("token.json")).expect("saved");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    let Body::Form(fields) = &saved.body else {
+        panic!("the form body was not persisted: {:?}", saved.body);
+    };
+    assert_eq!(fields[0].name, "grant_type");
+
+    // And reopening gives back an *editable* form, not a preserved blob.
+    cx.simulate_keystrokes("ctrl-w");
+    cx.simulate_keystrokes("ctrl-p");
+    wait_for(&mut cx, "the scanned request", |cx| {
+        picker_rows(&window, cx).iter().any(|r| r.contains("token")).then_some(())
+    });
+    cx.simulate_input("token");
+    cx.simulate_keystrokes("enter");
+
+    let reopened = active_view(&window, &mut cx);
+    assert!(
+        cx.update(|_, cx| reopened.read(cx).preserved_body_summary()).is_none(),
+        "a form body is authorable, so it must not be held read-only"
+    );
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("extra");
+    let Body::Form(fields) = &spec_of(&reopened, &mut cx).body else {
+        panic!("expected a form body");
+    };
+    assert_eq!(fields.len(), 2, "the reopened form must be editable: {fields:?}");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn choosing_none_sends_no_body_and_switching_back_is_lossless(cx: &mut TestAppContext) {
+    // Two things at once, because they're the same decision. "None" has to mean *no body*
+    // even though the editor still holds text — falling through to the editor meant the
+    // setting looked applied and wasn't. And what you can still see is kept, so switching
+    // back restores it rather than silently emptying your work.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("field");
+    assert_eq!(spec_of(&view, &mut cx).body.label(), "Form");
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("none");
+    cx.simulate_keystrokes("enter");
+    assert!(
+        matches!(spec_of(&view, &mut cx).body, Body::Empty),
+        "None must send nothing, whatever the editors still hold: {:?}",
+        spec_of(&view, &mut cx).body
+    );
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("form");
+    cx.simulate_keystrokes("enter");
+    let Body::Form(fields) = &spec_of(&view, &mut cx).body else {
+        panic!("expected the form back");
+    };
+    assert_eq!(fields.len(), 1, "the form rows must survive a round trip: {fields:?}");
+    assert_eq!(fields[0].name, "field");
+}
+
+#[gpui::test]
+async fn a_stale_content_type_header_is_reported_not_silently_obeyed(cx: &mut TestAppContext) {
+    // The trap this closes: `build.rs` only derives a Content-Type when no explicit header is
+    // set, so the sample's `application/json` header outranks a form body — the request goes
+    // out urlencoded while declaring itself JSON, and the server misparses it.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("form");
+    cx.simulate_keystrokes("enter");
+
+    let status = cx
+        .update(|_, cx| view.read(cx).status.clone())
+        .expect("a status");
+    assert!(status.contains("Content-Type"), "{status:?}");
+    assert!(status.contains("x-www-form-urlencoded"), "should name what was expected: {status:?}");
+
+    // And no false alarm when they agree.
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("json");
+    cx.simulate_keystrokes("enter");
+    assert!(
+        cx.update(|_, cx| view.read(cx).conflicting_content_type(cx)).is_none(),
+        "application/json and a JSON body do not conflict"
+    );
+}
+
+#[gpui::test]
+async fn choosing_a_body_type_over_a_preserved_body_replaces_it(cx: &mut TestAppContext) {
+    // The preserved multipart body is held, not frozen — an explicit choice can drop it.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    put_on_clipboard(&mut cx, "curl https://api.test/upload -F name=zuno");
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+
+    let imported = active_view(&window, &mut cx);
+    assert!(cx.update(|_, cx| imported.read(cx).preserved_body_summary()).is_some());
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("json");
+    cx.simulate_keystrokes("enter");
+
+    assert!(
+        cx.update(|_, cx| imported.read(cx).preserved_body_summary()).is_none(),
+        "picking a type must release the preserved body"
+    );
+    assert_eq!(cx.update(|_, cx| imported.read(cx).body_label()), "JSON");
+}
+
+#[gpui::test]
+async fn the_body_type_picker_offers_every_authorable_type(cx: &mut TestAppContext) {
+    // Cycling could only reach JSON/Text/XML/HTML, so form and binary were unreachable no
+    // matter how many times you pressed it.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-shift-b");
+
+    let rows = picker_rows(&window, &mut cx);
+    let labels: Vec<&str> = rows
+        .iter()
+        .map(|row| row.split(" — ").next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        labels,
+        ["None", "JSON", "Form", "Binary", "Text", "XML", "HTML"],
+        "{rows:?}"
+    );
+    // Multipart still absent: nothing can author it yet, and offering a dead type is worse
+    // than omitting it.
+    assert!(!rows.iter().any(|row| row.contains("Multipart")), "{rows:?}");
+
+    // The sample request is JSON, and the list should say which one you're on.
+    let json = rows.iter().find(|row| row.starts_with("JSON")).expect("a JSON row");
+    assert!(json.contains("current"), "{json:?}");
+}
+
+#[gpui::test]
+async fn a_binary_body_with_no_file_chosen_sends_nothing(cx: &mut TestAppContext) {
+    // Incomplete, not malformed: `Binary("")` would be a request that can't succeed, and
+    // sending nothing is the honest reading of "no file chosen".
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("binary");
+    cx.simulate_keystrokes("enter");
+
+    assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "Binary");
+    assert!(
+        matches!(spec_of(&view, &mut cx).body, Body::Empty),
+        "{:?}",
+        spec_of(&view, &mut cx).body
+    );
+}
+
+#[gpui::test]
+async fn a_chosen_file_becomes_the_body_and_its_bytes_reach_the_wire(cx: &mut TestAppContext) {
+    // The engine reads the path at send, so this is the assertion that matters: the *file's
+    // contents* on the socket, not just a path in the spec.
+    let dir = scratch_dir("binary-body");
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"\x89PNG\r\n\x1a\n-not-really").expect("write");
+
+    let (window, _, mut cx) = boot(cx, None, None);
+    let (url, server) = serve_capturing(OK_JSON);
+
+    // A fresh buffer: the sample's `Content-Type: application/json` header would otherwise
+    // mislabel the upload, and `build.rs` sends no type of its own for binary.
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+    cx.simulate_input(&url);
+
+    // The dialog can't be driven headlessly, so set the path the way the dialog's callback
+    // does and assert everything downstream of it.
+    cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(file.clone(), cx)));
+    assert_eq!(
+        spec_of(&view, &mut cx).body,
+        Body::Binary(file.clone()),
+        "the path should become the body"
+    );
+
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    let request = server.join().expect("server thread");
+    assert!(
+        request.contains("-not-really"),
+        "the file's bytes should be the request body:\n{request}"
+    );
+    // Read the length rather than hardcoding it — the first version of this test asserted 22
+    // for a 19-byte file and would have "passed" for the wrong reason had it matched.
+    let expected = std::fs::metadata(&file).expect("metadata").len();
+    assert!(
+        request
+            .to_lowercase()
+            .contains(&format!("content-length: {expected}")),
+        "declared length should match the file ({expected} bytes):\n{request}"
+    );
+    // Deliberate: `build.rs` guesses no type for binary uploads.
+    assert!(
+        !request.to_lowercase().contains("content-type:"),
+        "no Content-Type should be invented:\n{request}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+async fn a_missing_body_file_is_reported_rather_than_sent_empty(cx: &mut TestAppContext) {
+    // The path is checked at send, not at selection — a file deleted between sends has to
+    // fail loudly rather than quietly posting nothing.
+    let (window, _, mut cx) = boot(cx, None, None);
+    let url = serve_once(OK_JSON);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+    cx.simulate_input(&url);
+
+    // No scratch directory: the whole point is a path that doesn't exist, so creating one
+    // would leave an empty directory behind for nothing.
+    let missing = std::env::temp_dir().join("zuno-no-such-body-file.bin");
+    assert!(!missing.exists(), "the test needs this to not exist");
+    cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(missing.clone(), cx)));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let error = wait_for(&mut cx, "the failure", |cx| {
+        cx.update(|_, cx| view.read(cx).error.clone())
+    });
+    assert!(
+        matches!(&error, EngineError::BodyFileUnreadable { .. }),
+        "{error:?}"
+    );
+    assert!(error.is_local(), "nothing should have left the machine");
+}
+
+#[gpui::test]
+async fn a_binary_body_survives_a_save_and_reopen_as_editable(cx: &mut TestAppContext) {
+    // Binary is authorable now, so it must come back as a chosen path rather than a
+    // read-only preserved blob.
+    let (session, root) = scratch_collection("binary-roundtrip");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/v1/upload");
+    let file = PathBuf::from("/tmp/zuno-example-payload.bin");
+    let view = active_view(&window, &mut cx);
+    cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(file.clone(), cx)));
+    cx.simulate_keystrokes("ctrl-s");
+
+    let bytes = std::fs::read(root.join("upload.json")).expect("saved");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    assert_eq!(saved.body, Body::Binary(file.clone()));
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.simulate_keystrokes("ctrl-p");
+    wait_for(&mut cx, "the scanned request", |cx| {
+        picker_rows(&window, cx).iter().any(|r| r.contains("upload")).then_some(())
+    });
+    cx.simulate_input("upload");
+    cx.simulate_keystrokes("enter");
+
+    let reopened = active_view(&window, &mut cx);
+    assert!(
+        cx.update(|_, cx| reopened.read(cx).preserved_body_summary()).is_none(),
+        "binary is authorable, so it must not be held read-only"
+    );
+    assert_eq!(
+        cx.update(|_, cx| reopened.read(cx).binary_path.clone()),
+        Some(file),
+        "the chosen file must come back"
+    );
+    assert_eq!(cx.update(|_, cx| reopened.read(cx).body_label()), "Binary");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn switching_from_binary_keeps_the_path_for_switching_back(cx: &mut TestAppContext) {
+    // Same rule as the editor's text and the form rows: what you can still see is kept, so
+    // a mistaken type change isn't destructive.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+
+    let file = PathBuf::from("/tmp/zuno-keepme.bin");
+    cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(file.clone(), cx)));
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("json");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "JSON");
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("binary");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(
+        spec_of(&view, &mut cx).body,
+        Body::Binary(file),
+        "the path should survive a round trip through another type"
+    );
 }

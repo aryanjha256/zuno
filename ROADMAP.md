@@ -275,8 +275,63 @@ upload is bread-and-butter REST. Multipart is the only remaining §11 item needi
 slice for the shared field-table UI, but note form is **not** blocked — see §11: an explicit
 `Content-Type` header beats the derived one, so `a=1&b=2` as a raw body already works.
 
+Also unenabled: reqwest's `multipart` feature. That's a dependency change on top of replacing
+`UnsupportedBody`.
+
 *De-risked:* `cx.prompt_for_paths` exists in gpui 0.2.2, so native file selection is available and
 neither of these needs hand-typed paths.
+
+**2a. Non-raw bodies are no longer destroyed — done, and it was a bug rather than a gap.** `spec()`
+derives the body from the editor, the editor only holds raw text, so loading a request with a form
+body produced an *empty* editor and the next Ctrl+S wrote that emptiness over the real body.
+Reachable since M1, because curl import has always parsed `-F` and `--data-binary @file` into
+exactly those variants. `RequestView::preserved_body` now holds what the editor can't express, the
+pane says what it's holding instead of showing a misleading empty editor, and `Ctrl+Shift+B` explains
+itself rather than being a dead keystroke.
+
+Two things this settles for the authoring work: **where** non-raw state lives (one field, disjoint
+from the editor), and that the round trip is already covered by tests — so form, binary, and
+multipart become "add an editor" rather than "add an editor and fix persistence at the same time".
+
+**2b. Form authoring — done.** `Ctrl+Shift+B` opens a body-type picker (None / JSON / Form / Text /
+XML / HTML), replacing the cycling that walked `RawKind` and so could never reach a form at all.
+`Ctrl+Shift+F` adds a field, switching the body to a form first if it isn't one — which is what the
+keystroke plainly means. Fields reuse `KeyValueRow`, so `enabled` toggling and row removal came free.
+
+Multipart and binary are deliberately **absent from the picker** until their editors exist: offering
+a type nothing can author is worse than not offering it.
+
+Two bugs surfaced while building it, both found by a test asserting on bytes a server actually
+received rather than on the spec:
+
+- **A stale `Content-Type` header silently outranked the body.** `build.rs` derives a Content-Type
+  only when no explicit header is set, so switching the sample request to a form sent a urlencoded
+  body *declaring itself JSON* — which a server rejects or misparses. Now reported at the moment the
+  type is chosen, naming both the header and what was expected. Reported rather than rewritten:
+  editing someone's headers behind their back is worse than telling them.
+- **Choosing "None" still sent the editor's text.** `body()` fell through to the editor for both
+  `Empty` and `Raw`, so the setting looked applied and wasn't. `Empty` is now unconditional, and the
+  pane shows "No body" instead of an editor whose contents don't get sent.
+
+Switching type turned out to be **lossless for anything still visible** — the editor's text and the
+form rows are both kept, so JSON → Form → JSON round-trips. Only `preserved_body` is dropped, because
+it can't be rendered or re-derived and holding it alongside a chosen type would be invisible state.
+
+**2c. Binary authoring — done.** `Ctrl+Shift+O` opens the native file dialog and switches the body
+type to match, the same "the keystroke plainly means this" shape as `Ctrl+Shift+F`. Clicking the path
+in the pane reopens the dialog, since there's nothing else in that region to click.
+
+**Only the path is held, never the bytes.** `build.rs` reads the file at the send boundary, so a file
+edited between sends goes out in its new state and a 2GB upload never enters this process's memory. A
+file that has since disappeared surfaces as `BodyFileUnreadable` — checked at send rather than at
+selection, because checking in the pane would mean a filesystem call on every frame.
+
+The pane also says **"no Content-Type is sent unless you add the header"**, because `build.rs`
+deliberately guesses nothing for binary uploads — that's correct, and invisible otherwise.
+
+**2d. Last: multipart.** The only remaining §11 item, and the only one that ever needed engine work:
+`UnsupportedBody` plus reqwest's `multipart` feature. Its UI is the union of form's field table and
+binary's file picker, so doing it last makes it composition rather than invention.
 
 **3. No search in a response.** The viewer holds 10 MB at 60 fps and folds, but there's no `Ctrl+F`
 — so at exactly the scale it was built for, finding a key means scrolling. Bigger than it looks: the

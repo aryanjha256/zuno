@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 297 tests, ~8s
+cargo test --workspace                   # 314 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -186,6 +186,11 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
 - Comments explain **why**, not what. If a decision has a rejected alternative, name it.
 - Derive state rather than mirroring it. `RequestView` has no stored `RequestSpec` —
   `spec(cx)` assembles one from the inputs, so what's sent can't disagree with what's on screen.
+  **The corollary bites:** anything the inputs can't represent is *destroyed* by the derivation.
+  That's how form, multipart, and binary bodies were silently emptied on load and then written over
+  on save. `RequestView::preserved_body` is the fix, and it's deliberately **disjoint** from the
+  editor rather than overlapping it — two fields that could each describe the same body would be the
+  mirroring this rule forbids.
 - Actions, not direct calls, for anything a button and a keybinding share. A command palette row
   dispatches the action too, so palette and keystroke can't drift.
 - **Every new action needs a `commands::palette()` row or an `EXCLUDED` entry with a reason.** The

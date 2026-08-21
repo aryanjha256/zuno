@@ -39,7 +39,9 @@ actions!(
         AddQuery,
         ToggleRow,
         RemoveRow,
-        CycleBodyKind,
+        OpenBodyType,
+        AddFormField,
+        ChooseBodyFile,
         ImportCurl,
         // Response viewer
         FoldAll,

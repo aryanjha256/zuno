@@ -14,21 +14,22 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
     ClipboardItem, Styled, Subscription, Task, Window, div, px,
 };
-use zuno_core::{Environment, RequestId, RequestSpec, Resolver, collection, environment};
+use zuno_core::{
+    Environment, RawKind, RequestId, RequestSpec, Resolver, collection, environment,
+};
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, ClearCookies, CloseTab, CopyResponse, CycleBodyKind,
-    FocusBody,
-    FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
-    PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
-    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
-    SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    AddFormField, AddHeader, AddQuery, CancelRequest, ChooseBodyFile, ClearCookies, CloseTab,
+    CopyResponse, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
+    OpenBodyType, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
+    PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
+    SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
+    ShowHistory, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
 use crate::settings_panel::{SettingsEvent, SettingsPanel};
-use crate::request_view::{RequestView, RowKind};
+use crate::request_view::{BodyType, RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
 pub struct Workspace {
@@ -50,6 +51,8 @@ pub struct Workspace {
     settings: Option<SettingsState>,
     /// Holding the task is what keeps a save-response dialog and its write alive.
     response_save: Option<Task<()>>,
+    /// Same, for the choose-a-body-file dialog.
+    body_file_prompt: Option<Task<()>>,
     /// The selected environment's name, restored from the session.
     ///
     /// Only the *name* is held. The values are re-read from disk on every send, so editing
@@ -121,6 +124,7 @@ impl Workspace {
             picker_scan: None,
             settings: None,
             response_save: None,
+            body_file_prompt: None,
             environment,
         }
     }
@@ -593,6 +597,25 @@ impl Workspace {
                 self.protect_secrets(cx);
                 cx.notify();
             }
+            picker::Target::BodyType(body_type, kind) => {
+                let Some(view) = self.active() else { return };
+                view.update(cx, |view, cx| {
+                    if let Some(kind) = kind {
+                        view.body_kind = kind;
+                    }
+                    view.set_body_type(body_type, cx);
+                });
+
+                // A stale `Content-Type` header outranks the body you just chose, so the
+                // request would go out urlencoded while claiming to be JSON. Say so at the
+                // moment the choice is made, which is the only moment it's surprising.
+                if let Some((declared, expected)) = view.read(cx).conflicting_content_type(cx) {
+                    self.set_status(
+                        &format!("Header Content-Type: {declared} overrides this — expected {expected}"),
+                        cx,
+                    );
+                }
+            }
             picker::Target::Method(method) => {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| {
@@ -914,10 +937,96 @@ impl Workspace {
         }
     }
 
-    fn cycle_body_kind(&mut self, _: &CycleBodyKind, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active() {
-            view.update(cx, |view, cx| view.cycle_body_kind(cx));
+    /// Pick the body type.
+    ///
+    /// Replaces cycling, which walked `RawKind` — JSON, Text, XML, HTML — and so could never
+    /// reach a form body at all. Multipart and binary are deliberately absent until their
+    /// editors exist: offering a type nothing can author is worse than not offering it.
+    fn open_body_type(&mut self, _: &OpenBodyType, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.settings.is_some() {
+            return;
         }
+        let Some(view) = self.active() else { return };
+        let current = view.read(cx).body_label();
+
+        let choices: [(&str, BodyType, Option<RawKind>, &str); 7] = [
+            ("None", BodyType::Empty, None, "send no body at all"),
+            ("JSON", BodyType::Raw, Some(RawKind::Json), "application/json"),
+            ("Form", BodyType::Form, None, "application/x-www-form-urlencoded"),
+            ("Binary", BodyType::Binary, None, "the contents of a file"),
+            ("Text", BodyType::Raw, Some(RawKind::Text), "text/plain"),
+            ("XML", BodyType::Raw, Some(RawKind::Xml), "application/xml"),
+            ("HTML", BodyType::Raw, Some(RawKind::Html), "text/html"),
+        ];
+
+        let items = choices
+            .into_iter()
+            .map(|(label, body_type, kind, hint)| picker::Item {
+                label: SharedString::from(label),
+                detail: SharedString::from(if current == label {
+                    format!("current · {hint}")
+                } else {
+                    hint.to_string()
+                }),
+                target: picker::Target::BodyType(body_type, kind),
+            })
+            .collect();
+
+        self.show_picker(items, "No body types", window, cx);
+    }
+
+    /// Pick the file a binary body sends, switching the body type to match.
+    ///
+    /// Same shape as `add_form_field`: the keystroke plainly means "send this file", so it
+    /// switches type rather than refusing because the body is currently something else.
+    fn choose_body_file(
+        &mut self,
+        _: &ChooseBodyFile,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            // One body, one file. Multipart is where several belong.
+            multiple: false,
+            prompt: Some("Send as body".into()),
+        });
+
+        self.body_file_prompt = Some(cx.spawn(async move |workspace, cx| {
+            // Cancelled, or the platform couldn't open a picker at all.
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+
+            let _ = workspace.update(cx, |workspace, cx| {
+                view.update(cx, |view, cx| view.set_binary_path(path.clone(), cx));
+                let shown = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| path.display().to_string());
+                workspace.set_status(&format!("Sending {shown} as the body"), cx);
+            });
+        }));
+    }
+
+    fn add_form_field(&mut self, _: &AddFormField, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        // Adding a field to a body that isn't a form would put a row somewhere invisible, so
+        // switch first and say so — it's what the keystroke plainly means.
+        let needs_switch = view.read(cx).body_type != BodyType::Form
+            || view.read(cx).preserved_body.is_some();
+        if needs_switch {
+            view.update(cx, |view, cx| view.set_body_type(BodyType::Form, cx));
+            self.set_status("Switched the body to a form", cx);
+        }
+        view.update(cx, |view, cx| view.add_row(RowKind::Form, window, cx));
     }
 
     /// Open a request parsed from a curl command on the clipboard in a **new** buffer.
@@ -1170,6 +1279,7 @@ impl Workspace {
             let label = match kind {
                 RowKind::Header => "header",
                 RowKind::Query => "query",
+                RowKind::Form => "form field",
             };
             return SharedString::from(format!("{label} row {}", ix + 1));
         }
@@ -1251,7 +1361,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_query))
             .on_action(cx.listener(Self::toggle_row))
             .on_action(cx.listener(Self::remove_row))
-            .on_action(cx.listener(Self::cycle_body_kind))
+            .on_action(cx.listener(Self::open_body_type))
+            .on_action(cx.listener(Self::add_form_field))
+            .on_action(cx.listener(Self::choose_body_file))
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::fold_all))

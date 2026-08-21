@@ -59,7 +59,9 @@ pub fn palette() -> Vec<Command> {
         command("Toggle focused row", ToggleRow),
         command("Remove focused row", RemoveRow),
         command("Change method", OpenMethod),
-        command("Cycle body type", CycleBodyKind),
+        command("Change body type", OpenBodyType),
+        command("Add form field", AddFormField),
+        command("Choose a file to send as the body", ChooseBodyFile),
         // Moving around.
         command("Focus URL", FocusUrl),
         command("Focus body", FocusBody),

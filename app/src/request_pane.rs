@@ -14,7 +14,7 @@ use gpui::{
 };
 
 use crate::actions::{CancelRequest, SendRequest};
-use crate::request_view::{KeyValueRow, RequestView, RowKind};
+use crate::request_view::{BodyType, KeyValueRow, RequestView, RowKind};
 use crate::theme::Theme;
 
 pub fn render(
@@ -63,7 +63,7 @@ pub fn render(
         ))
         .child(rows_table(&view.query, RowKind::Query, theme, cx))
         .child(body_header(view, body_lines, theme, cx))
-        .child(body_region(view, theme, body_focused))
+        .child(body_region(view, theme, body_focused, cx))
 }
 
 /// The Body header, with a clickable body-kind chip (`Ctrl+Shift+B` does the same).
@@ -244,6 +244,7 @@ fn section_header(
     let add_id: &'static str = match kind {
         RowKind::Header => "add-header",
         RowKind::Query => "add-query",
+        RowKind::Form => "add-form-field",
     };
 
     div()
@@ -303,6 +304,7 @@ fn rows_table(
             .child(match kind {
                 RowKind::Header => "No headers — Ctrl+Shift+H to add".to_string(),
                 RowKind::Query => "No query parameters — Ctrl+Shift+Y to add".to_string(),
+                RowKind::Form => "No fields — Ctrl+Shift+F to add".to_string(),
             });
     }
 
@@ -334,6 +336,7 @@ fn render_row(
     let prefix = match kind {
         RowKind::Header => "hdr",
         RowKind::Query => "qry",
+        RowKind::Form => "fld",
     };
 
     div()
@@ -402,8 +405,13 @@ fn render_row(
 
 /// The editor entity renders itself; this only supplies the frame, the focus ring, and
 /// the inherited text style it shapes with.
-fn body_region(view: &RequestView, theme: &Theme, focused: bool) -> impl IntoElement {
-    div()
+fn body_region(
+    view: &RequestView,
+    theme: &Theme,
+    focused: bool,
+    cx: &mut gpui::Context<RequestView>,
+) -> impl IntoElement + use<> {
+    let region = div()
         .flex_1()
         .min_h(px(0.))
         .m_2()
@@ -414,6 +422,82 @@ fn body_region(view: &RequestView, theme: &Theme, focused: bool) -> impl IntoEle
         .border_color(theme.focus_border(focused))
         .font_family(theme.mono.clone())
         .text_xs()
-        .text_color(theme.text)
-        .child(view.body_editor.clone())
+        .text_color(theme.text);
+
+    // A form, multipart, or binary body can be *held* but not yet edited. Showing the empty
+    // editor here would be a lie in the worst way: it looks like the request has no body,
+    // and it's the state from which a save would overwrite the real one.
+    if let Some(summary) = view.preserved_body_summary() {
+        return region.child(preserved_body(summary, theme));
+    }
+
+    match view.body_type {
+        // A form body is a table, not text — the same widget as headers and query params,
+        // because `FormField` has the same shape as `Header`.
+        BodyType::Form => region
+            .font_family(theme.mono.clone())
+            .child(rows_table(&view.form, RowKind::Form, theme, cx)),
+        BodyType::Binary => region.child(binary_body(view, theme)),
+        // Not the editor: its text is retained so switching back is lossless, but showing it
+        // under a body type of "None" would imply it gets sent.
+        BodyType::Empty => region.child(
+            div()
+                .text_color(theme.text_muted)
+                .child("No body — Ctrl+Shift+B to pick a type"),
+        ),
+        BodyType::Raw => region.child(view.body_editor.clone()),
+    }
+}
+
+/// The chosen file, or a prompt to pick one.
+///
+/// Clicking anywhere here reopens the picker, so the path doubles as the control — there's
+/// nothing else in this region to click.
+fn binary_body(view: &RequestView, theme: &Theme) -> impl IntoElement + use<> {
+    let chosen = view.binary_path.clone();
+
+    let headline = match &chosen {
+        Some(path) => path.display().to_string(),
+        None => "No file chosen — Ctrl+Shift+O to pick one".to_string(),
+    };
+
+    div()
+        .id("binary-body")
+        .flex()
+        .flex_col()
+        .gap_1()
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(crate::actions::ChooseBodyFile), cx);
+        })
+        .child(
+            div()
+                .text_color(if chosen.is_some() {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .child(headline),
+        )
+        // `build.rs` sends no Content-Type for a binary body on purpose, so the request has
+        // none at all unless a header supplies one. Servers routinely reject that, and it's
+        // invisible otherwise.
+        .children(chosen.map(|_| {
+            div()
+                .text_color(theme.text_muted)
+                .child("Read at send · no Content-Type is sent unless you add the header")
+        }))
+}
+
+fn preserved_body(summary: String, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_color(theme.text).child(summary))
+        .child(
+            div()
+                .text_color(theme.text_muted)
+                .child("Kept as-is — editing this body type isn't built yet, and sending or saving preserves it."),
+        )
 }

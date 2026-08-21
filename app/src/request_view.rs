@@ -19,9 +19,22 @@ use gpui::{
     SharedString, Styled, Task, Window, div, px,
 };
 use zuno_core::{
-    Body, Engine, EngineError, Event, Header, JobId, Method, QueryParam, RawKind, RequestId,
-    RequestSettings, RequestSpec, Resolver, ResponseData, ResponseDiff,
+    Body, Engine, EngineError, Event, FormField, Header, JobId, Method, MultipartValue, QueryParam,
+    RawKind, RequestId, RequestSettings, RequestSpec, Resolver, ResponseData, ResponseDiff,
 };
+
+/// Which body a request sends, among the kinds the UI can author.
+///
+/// Multipart is absent on purpose: it's held in `preserved_body` until its editor exists, and
+/// offering a type nothing can edit would be worse than not offering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyType {
+    Empty,
+    Raw,
+    Form,
+    /// The contents of a file, sent as-is.
+    Binary,
+}
 
 use crate::body_view::BodyView;
 use crate::input::{Editor, TextInput};
@@ -82,6 +95,8 @@ impl KeyValueRow {
 pub enum RowKind {
     Header,
     Query,
+    /// A field of an `application/x-www-form-urlencoded` body.
+    Form,
 }
 
 pub struct RequestView {
@@ -100,7 +115,37 @@ pub struct RequestView {
     /// The editor owns the body text, exactly as the inputs own theirs — `spec()` reads
     /// through to it rather than mirroring into a field.
     pub body_editor: Entity<Editor>,
+    /// Which body this request sends. `Raw` is further qualified by `body_kind`.
+    ///
+    /// Stored rather than inferred: a `Form` body with no fields yet and an `Empty` body are
+    /// different intentions that look identical in the data, so nothing else records the
+    /// choice. Ignored while `preserved_body` is set — see there.
+    pub body_type: BodyType,
     pub body_kind: RawKind,
+    /// Fields of a form body. Same widget as the header and query tables, since
+    /// `FormField` has the same shape as `Header`.
+    pub form: Vec<KeyValueRow>,
+    /// The file a binary body sends.
+    ///
+    /// Only the path is held — the bytes are read at the send boundary by `build.rs`, so a
+    /// file edited between sends goes out in its new state, and a 2GB upload never sits in
+    /// this process's memory. A missing file surfaces as `BodyFileUnreadable` rather than
+    /// being checked here, which would mean a filesystem call on every frame.
+    pub binary_path: Option<PathBuf>,
+    /// A body the UI cannot author yet — form, multipart, or binary — kept verbatim.
+    ///
+    /// **This exists to stop silent data loss, not as a feature.** `spec()` derives the body
+    /// from the editor, and the editor can only represent raw text; so before this, loading
+    /// a request with a form body produced an *empty* editor, and the next `Ctrl+S` wrote
+    /// that emptiness over the real body. Reachable today, because curl import parses `-F`
+    /// and `--data-binary @file` into exactly these variants.
+    ///
+    /// Deliberately **disjoint** from the editor rather than overlapping it: the editor
+    /// stays the only source of truth for raw bodies, and this holds only what the editor
+    /// cannot express. Two fields that could each describe the same body would be the
+    /// mirroring this codebase avoids everywhere else. `Body::Empty` is *not* kept here —
+    /// an empty body is editable, and typing into it should produce a raw one.
+    pub preserved_body: Option<Body>,
     pub settings: RequestSettings,
 
     pub response: Option<ResponseData>,
@@ -136,7 +181,11 @@ impl RequestView {
             headers: Vec::new(),
             query: Vec::new(),
             body_editor: cx.new(|cx| Editor::new("", "Request body…", cx)),
+            body_type: BodyType::Empty,
             body_kind: RawKind::Json,
+            form: Vec::new(),
+            binary_path: None,
+            preserved_body: None,
             settings: RequestSettings::default(),
             response: None,
             diff: None,
@@ -190,11 +239,35 @@ impl RequestView {
             })
             .collect();
 
-        // The model still supports form, multipart, and binary bodies; the UI only
-        // authors raw ones so far, so anything else opens as an empty raw body.
-        let (body_text, body_kind) = match &spec.body {
-            Body::Raw { text, kind } => (text.clone(), *kind),
-            _ => (String::new(), RawKind::Json),
+        // Anything the editor and the form table can't represent is set aside rather than
+        // dropped. Losing it here is invisible until a save writes the loss to disk.
+        let (body_text, body_kind, body_type, preserved) = match &spec.body {
+            Body::Raw { text, kind } => (text.clone(), *kind, BodyType::Raw, None),
+            // Empty stays editable: typing into it is how you get a raw body.
+            Body::Empty => (String::new(), RawKind::Json, BodyType::Empty, None),
+            Body::Form(_) => (String::new(), RawKind::Json, BodyType::Form, None),
+            Body::Binary(_) => (String::new(), RawKind::Json, BodyType::Binary, None),
+            other => (
+                String::new(),
+                RawKind::Json,
+                BodyType::Empty,
+                Some(other.clone()),
+            ),
+        };
+
+        let binary_path = match &spec.body {
+            Body::Binary(path) => Some(path.clone()),
+            _ => None,
+        };
+
+        let form = match &spec.body {
+            Body::Form(fields) => fields
+                .iter()
+                .map(|field| {
+                    KeyValueRow::new(field.enabled, &field.name, &field.value, "FormCell", cx)
+                })
+                .collect(),
+            _ => Vec::new(),
         };
         let body_editor = cx.new(|cx| Editor::new(body_text, "Request body…", cx));
 
@@ -206,6 +279,10 @@ impl RequestView {
         self.query = query;
         self.body_editor = body_editor;
         self.body_kind = body_kind;
+        self.body_type = body_type;
+        self.form = form;
+        self.binary_path = binary_path;
+        self.preserved_body = preserved;
         self.settings = spec.settings;
 
         // A different request has no relationship to the last one's response.
@@ -314,15 +391,59 @@ impl RequestView {
     /// A blank editor means no body at all, not an empty raw one — sending
     /// `Content-Type: application/json` with zero bytes confuses servers.
     fn body(&self, cx: &App) -> Body {
-        let text = self.body_editor.read(cx).text();
-        if text.trim().is_empty() {
-            Body::Empty
-        } else {
-            Body::Raw {
-                text: text.to_string(),
-                kind: self.body_kind,
+        // A preserved body wins, because while one is held the editor is not shown — so
+        // deriving from it would return `Empty` and destroy what was loaded.
+        if let Some(body) = &self.preserved_body {
+            return body.clone();
+        }
+
+        match self.body_type {
+            BodyType::Form => Body::Form(
+                self.form
+                    .iter()
+                    .map(|row| FormField {
+                        enabled: row.enabled,
+                        name: row.name.read(cx).text().to_string(),
+                        value: row.value.read(cx).text().to_string(),
+                    })
+                    .collect(),
+            ),
+            // No file chosen yet is `Empty`, not a broken `Binary("")` — the request is
+            // incomplete, not malformed, and sending nothing is the honest reading.
+            BodyType::Binary => match &self.binary_path {
+                Some(path) => Body::Binary(path.clone()),
+                None => Body::Empty,
+            },
+            // Unconditional: "None" means no body even though the editor may still hold
+            // text. Falling through to the editor here meant picking None sent the previous
+            // body anyway — the setting looked applied and wasn't.
+            BodyType::Empty => Body::Empty,
+            BodyType::Raw => {
+                let text = self.body_editor.read(cx).text();
+                // An empty raw body is `Empty`, not `Raw("")`: it keeps a blank editor from
+                // sending a Content-Type for content that isn't there.
+                if text.trim().is_empty() {
+                    Body::Empty
+                } else {
+                    Body::Raw {
+                        text: text.to_string(),
+                        kind: self.body_kind,
+                    }
+                }
             }
         }
+    }
+
+    /// Choose the body type.
+    ///
+    /// Only `preserved_body` is dropped — it can't be rendered or re-derived, so holding it
+    /// alongside a chosen type would be invisible state. The editor's text and the form rows
+    /// are *kept*, so switching JSON → Form → JSON is lossless and only changes what gets
+    /// sent. That asymmetry is deliberate: what you can still see is safe to keep.
+    pub fn set_body_type(&mut self, body_type: BodyType, cx: &mut Context<Self>) {
+        self.body_type = body_type;
+        self.preserved_body = None;
+        cx.notify();
     }
 
     pub fn url_focus(&self, cx: &App) -> FocusHandle {
@@ -564,6 +685,11 @@ impl RequestView {
                 self.query.push(row);
                 self.query.last()
             }
+            RowKind::Form => {
+                let row = KeyValueRow::new(true, "", "", "FormCell", cx);
+                self.form.push(row);
+                self.form.last()
+            }
         };
 
         if let Some(row) = row {
@@ -583,20 +709,29 @@ impl RequestView {
         {
             return Some((RowKind::Header, ix));
         }
-        self.query
+        if let Some(ix) = self.query.iter().position(|row| row.is_focused(window, cx)) {
+            return Some((RowKind::Query, ix));
+        }
+        self.form
             .iter()
             .position(|row| row.is_focused(window, cx))
-            .map(|ix| (RowKind::Query, ix))
+            .map(|ix| (RowKind::Form, ix))
+    }
+
+    /// The rows a `RowKind` refers to. One place to add a variant rather than five.
+    fn rows_mut(&mut self, kind: RowKind) -> &mut Vec<KeyValueRow> {
+        match kind {
+            RowKind::Header => &mut self.headers,
+            RowKind::Query => &mut self.query,
+            RowKind::Form => &mut self.form,
+        }
     }
 
     pub fn toggle_focused_row(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
         let Some((kind, ix)) = self.focused_row(window, cx) else {
             return false;
         };
-        let rows = match kind {
-            RowKind::Header => &mut self.headers,
-            RowKind::Query => &mut self.query,
-        };
+        let rows = self.rows_mut(kind);
         rows[ix].enabled = !rows[ix].enabled;
         cx.notify();
         true
@@ -606,23 +741,13 @@ impl RequestView {
         let Some((kind, ix)) = self.focused_row(window, cx) else {
             return false;
         };
-        match kind {
-            RowKind::Header => {
-                self.headers.remove(ix);
-            }
-            RowKind::Query => {
-                self.query.remove(ix);
-            }
-        }
+        self.rows_mut(kind).remove(ix);
         cx.notify();
         true
     }
 
     pub fn toggle_row_at(&mut self, kind: RowKind, ix: usize, cx: &mut Context<Self>) {
-        let rows = match kind {
-            RowKind::Header => &mut self.headers,
-            RowKind::Query => &mut self.query,
-        };
+        let rows = self.rows_mut(kind);
         if let Some(row) = rows.get_mut(ix) {
             row.enabled = !row.enabled;
             cx.notify();
@@ -630,10 +755,7 @@ impl RequestView {
     }
 
     pub fn remove_row_at(&mut self, kind: RowKind, ix: usize, cx: &mut Context<Self>) {
-        let rows = match kind {
-            RowKind::Header => &mut self.headers,
-            RowKind::Query => &mut self.query,
-        };
+        let rows = self.rows_mut(kind);
         if ix < rows.len() {
             rows.remove(ix);
             cx.notify();
@@ -641,7 +763,86 @@ impl RequestView {
     }
 
     pub fn body_label(&self) -> SharedString {
-        SharedString::from(self.body_kind.label())
+        if let Some(body) = &self.preserved_body {
+            return SharedString::from(body.label());
+        }
+        match self.body_type {
+            BodyType::Form => SharedString::from("Form"),
+            BodyType::Binary => SharedString::from("Binary"),
+            BodyType::Empty | BodyType::Raw => SharedString::from(self.body_kind.label()),
+        }
+    }
+
+    /// Point a binary body at a file, switching the body type to match.
+    pub fn set_binary_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.binary_path = Some(path);
+        self.set_body_type(BodyType::Binary, cx);
+    }
+
+    /// An explicit `Content-Type` header that disagrees with the body being sent, if there
+    /// is one.
+    ///
+    /// `build.rs` only fills in a derived Content-Type when no explicit header is set, so a
+    /// stale header silently wins: switch a request from JSON to Form and the body is
+    /// urlencoded while declaring itself JSON. That's a request lying about itself, and the
+    /// server rejects or misparses it. Reported rather than rewritten — editing someone's
+    /// headers behind their back is worse than telling them.
+    pub fn conflicting_content_type(&self, cx: &App) -> Option<(String, &'static str)> {
+        let expected = match self.body(cx) {
+            Body::Raw { kind, .. } => kind.content_type(),
+            Body::Form(_) => "application/x-www-form-urlencoded",
+            // Nothing to disagree with. `build.rs` deliberately sends no Content-Type for
+            // a binary body — the user is expected to set one — so there is nothing for a
+            // header to contradict.
+            Body::Empty | Body::Multipart(_) | Body::Binary(_) => return None,
+        };
+
+        let declared = self
+            .headers
+            .iter()
+            .filter(|row| row.enabled)
+            .find(|row| row.name.read(cx).text().trim().eq_ignore_ascii_case("content-type"))?
+            .value
+            .read(cx)
+            .text()
+            .to_string();
+
+        // Compare the essence only: `application/json; charset=utf-8` agrees with JSON.
+        let essence = declared.split(';').next().unwrap_or("").trim();
+        if essence.eq_ignore_ascii_case(expected) {
+            return None;
+        }
+        Some((declared, expected))
+    }
+
+    /// A one-line description of a body the UI can't edit yet, for the pane to show in
+    /// place of the editor.
+    ///
+    /// Counts rather than contents: a multipart field can be a file path or a secret, and
+    /// the point here is to prove nothing was lost, not to display it.
+    pub fn preserved_body_summary(&self) -> Option<String> {
+        let body = self.preserved_body.as_ref()?;
+        let detail = match body {
+            Body::Form(fields) => format!("{} fields", fields.len()),
+            Body::Multipart(fields) => {
+                let files = fields
+                    .iter()
+                    .filter(|field| matches!(field.value, MultipartValue::File(_)))
+                    .count();
+                match files {
+                    0 => format!("{} fields", fields.len()),
+                    n => format!("{} fields, {n} from files", fields.len()),
+                }
+            }
+            // Binary is authorable now, so `load` never puts one here. Described anyway
+            // rather than reported as nothing: an accessor that says "nothing is held" while
+            // something *is* held can't be used to check the invariant, and returning `None`
+            // here silently defeated a test asserting exactly that.
+            Body::Binary(path) => path.display().to_string(),
+            // Genuinely never preserved: both are authorable and representable.
+            Body::Raw { .. } | Body::Empty => return None,
+        };
+        Some(format!("{} · {detail}", body.label()))
     }
 
 }

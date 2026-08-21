@@ -33,12 +33,13 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddHeader, AddQuery, CancelRequest, CloseTab, CopyResponse, CycleBodyKind, FocusBody, FocusNext,
-    FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenMethod,
-    OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext, PickerPrev,
-    PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm, SettingDecrease,
-    SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, SwitchEnvironment,
-    ToggleRow, ToggleTheme, UnfoldAll,
+    AddFormField, AddHeader, AddQuery, CancelRequest, ChooseBodyFile, CloseTab, CopyResponse,
+    FocusBody, FocusNext,
+    FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenBodyType,
+    OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
+    PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
+    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
+    SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -163,7 +164,11 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-y", AddQuery, None),
         KeyBinding::new("alt-t", ToggleRow, None),
         KeyBinding::new("ctrl-shift-k", RemoveRow, None),
-        KeyBinding::new("ctrl-shift-b", CycleBodyKind, None),
+        // Opens the body-type picker. Was cycling `RawKind` only, which could never reach a
+        // form body.
+        KeyBinding::new("ctrl-shift-b", OpenBodyType, None),
+        KeyBinding::new("ctrl-shift-f", AddFormField, None),
+        KeyBinding::new("ctrl-shift-o", ChooseBodyFile, None),
         // Paste-special: import a curl command from the clipboard.
         KeyBinding::new("ctrl-shift-v", ImportCurl, None),
         // --- Response viewer ---

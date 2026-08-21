@@ -53,6 +53,8 @@ pub enum Target {
     Environment(Option<String>),
     /// Show a retained response: `0` is live, `1` the run before it.
     Run(usize),
+    /// Set the request's body type, and its raw sub-kind when it has one.
+    BodyType(crate::request_view::BodyType, Option<zuno_core::RawKind>),
 }
 
 // Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
@@ -66,6 +68,7 @@ impl Clone for Target {
             Self::Method(method) => Self::Method(method.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),
             Self::Run(offset) => Self::Run(*offset),
+            Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),
         }
     }
 }
