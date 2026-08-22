@@ -308,6 +308,13 @@ keystroke plainly means. Fields reuse `KeyValueRow`, so `enabled` toggling and r
 Multipart and binary are deliberately **absent from the picker** until their editors exist: offering
 a type nothing can author is worse than not offering it.
 
+> **"Replacing the cycling" was only half true until an audit caught it.** The *keystroke* moved to
+> the picker; the body-kind **chip in the pane kept cycling `RawKind`** by calling the view directly.
+> So the click and the keybinding were different verbs — which is what "actions, not direct calls" is
+> there to prevent — and on a Form, Binary, or Multipart body the chip mutated `body_kind` under a
+> label that couldn't show it, making a real control look dead. The chip now dispatches
+> `OpenBodyType`, `cycle_body_kind` is gone, and a test clicks the chip rather than trusting it.
+
 Two bugs surfaced while building it, both found by a test asserting on bytes a server actually
 received rather than on the spec:
 

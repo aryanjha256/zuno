@@ -865,7 +865,7 @@ async fn a_blank_body_sends_nothing_at_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_body_kind_cycles(cx: &mut TestAppContext) {
+async fn the_body_sub_kind_is_chosen_by_name(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     clear_body(&mut cx);
@@ -2795,6 +2795,39 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
 }
 
 
+
+#[gpui::test]
+async fn clicking_the_body_chip_opens_the_type_picker(cx: &mut TestAppContext) {
+    // The chip used to cycle `RawKind` in place, so it could never reach Form, Binary or
+    // Multipart — and on those three it mutated hidden state while the label stayed put, which
+    // looked like a dead control. A real click, because the bug was *in* the click path: only
+    // dispatching the action makes the chip and Ctrl+Shift+B the same verb.
+    let (window, view, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let chip = cx
+        .debug_bounds("body-kind-chip")
+        .expect("the body-kind chip should be painted");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+
+    assert!(
+        picker_is_open(&window, &mut cx),
+        "the chip must open the body-type picker"
+    );
+    let rows = picker_rows(&window, &mut cx);
+    assert!(
+        rows.iter().any(|row| row.starts_with("Multipart")),
+        "and it must be the picker that reaches every type: {rows:?}"
+    );
+
+    // The discriminating half: cycling would have moved the sample's JSON body to Text on this
+    // very click. Opening a picker changes nothing until something is chosen.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_kind),
+        RawKind::Json,
+        "clicking must not mutate the body kind in place"
+    );
+}
 
 #[gpui::test]
 async fn a_body_less_request_says_none_rather_than_a_retained_sub_kind(cx: &mut TestAppContext) {

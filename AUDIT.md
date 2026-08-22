@@ -24,8 +24,8 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings are fixed, each with a test that was confirmed to fail against
-the old code before the fix landed. Findings 4–21 are open.
+**Status.** The three High findings and #4 are fixed, each with a test that was confirmed to fail
+against the old code before the fix landed. Findings 5–21 are open.
 
 ---
 
@@ -155,6 +155,13 @@ own `None` row label, so the `current` marker starts working with no other chang
 ## Medium
 
 ### 4. The body-kind chip bypasses the action system and still cycles
+
+> **Fixed.** The chip dispatches `OpenBodyType`, matching the method chip beside it;
+> `cycle_body_kind` is deleted (it had one caller, which is now gone); the comment says what the
+> chip actually does. Guarded by `clicking_the_body_chip_opens_the_type_picker`, which drives a real
+> click via gpui's `debug_selector`/`simulate_click` — the bug was *in* the click path, so nothing
+> short of clicking tests it. It also asserts `body_kind` is unchanged, which is the half that
+> distinguishes "opened a picker" from "cycled in place".
 
 [app/src/request_pane.rs:105-111](app/src/request_pane.rs#L105-L111)
 
@@ -525,16 +532,16 @@ Not a general complaint — these are the specific untested paths:
 | Untested | Finding |
 |---|---|
 | `body_label()` on a fresh (`Empty`) buffer, and the picker's `current` marker for it | #3 |
-| The body-kind chip's click path — `cycle_body_kind` has one caller and zero tests | #4 |
+| ~~The body-kind chip's click path — `cycle_body_kind` has one caller and zero tests~~ — fixed with #4 | #4 |
 | `Tab` while any modal is open | #5 |
 | `Ctrl+P` / `Ctrl+K` while the settings panel is open (`a_second_ctrl_p_does_not_nest_a_modal` covers only picker-over-picker) | #6 |
 | Whether closing a tab cancels its in-flight job | #2 |
 | Variable substitution into a form or multipart body | #1 |
 | An imported curl command *without* `-L` / `--compressed` | #12 |
 
-Also: `the_body_kind_cycles` ([tests.rs:868](app/src/tests.rs#L868)) no longer tests cycling — its
-body drives the picker, and its own comment says so. Rename it; the name is the last thing claiming
-the cycling path is covered.
+Also: `the_body_kind_cycles` no longer tested cycling — its body drives the picker, and its own
+comment said so, leaving the *name* as the last thing claiming the cycling path was covered.
+Renamed to `the_body_sub_kind_is_chosen_by_name` alongside #4.
 
 ### 21. `folding_a_huge_document_is_cheap` can't fail for the reason it exists
 

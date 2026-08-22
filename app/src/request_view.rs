@@ -519,13 +519,6 @@ impl RequestView {
         self.body_editor.read(cx).focus_handle(cx)
     }
 
-    pub fn cycle_body_kind(&mut self, cx: &mut Context<Self>) {
-        const KINDS: [RawKind; 4] = [RawKind::Json, RawKind::Text, RawKind::Xml, RawKind::Html];
-        let current = KINDS.iter().position(|k| *k == self.body_kind).unwrap_or(0);
-        self.body_kind = KINDS[(current + 1) % KINDS.len()];
-        cx.notify();
-    }
-
     // ---- the send loop ------------------------------------------------------
 
     /// Submit the request as it currently appears on screen.
