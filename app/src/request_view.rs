@@ -74,6 +74,14 @@ pub struct InFlight {
     pub total: Option<usize>,
     /// Holding the task is what keeps the event loop alive; dropping it stops
     /// consumption. Never read — that's the whole contract.
+    ///
+    /// **It drops itself, and that only works because the terminal event also ends the loop.**
+    /// `apply`'s `Done` and `Failed` arms set `inflight = None`, which drops this field — the task
+    /// currently executing that very closure. The remaining statements in the arm still run,
+    /// because a `Task` dropped while running is cancelled only after the current poll returns, and
+    /// by then the consuming future has already `break`ed and completed. Make a terminal event
+    /// return `true` instead, or add work after the `while` loop in `send`, and that work silently
+    /// never happens: the future would go back to awaiting a channel nothing will poll again.
     _task: Task<()>,
 }
 

@@ -209,6 +209,21 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   on a failed anchor assertion, so files listed *after* the failure were silently skipped, and the
   summary claimed work that hadn't happened. `git status` showed the untouched files both times.
   Hence the checklist below.
+- **And then the code went stale while the comments were right — five times, found in one audit.**
+  The opposite failure, and the harder one: `chrome.rs` explained why the window controls call
+  `stop_propagation` and never called it, so closing the window also asked the compositor to drag
+  it; the body chip's comment said `Ctrl+Shift+B` "does the same" while the chip still cycled
+  `RawKind`; `SizeInfo` documented a compression ratio that reqwest makes unknowable; the in-flight
+  pane advertised `Ctrl+C` because an M1 design sketch had said to wire it; `settings_panel` cited a
+  `tab_stop(false)` call that was never there — and *that* default is why Tab used to escape the
+  modal.
+
+  The pattern is worth naming, because good docs cause it. A confident comment gets trusted and
+  stops being checked, so the code drifts underneath it and every reader inherits the claim. All
+  five were found by reading the vendored `gpui`/`reqwest`/`tower-http` source instead of the
+  sentence describing it. **"Verify, don't remember" applies to our own comments, not just to
+  recalled GPUI APIs** — and when a comment explains why a call is load-bearing, that is precisely
+  the moment to check the call is there.
 
 ## Finishing a slice
 
