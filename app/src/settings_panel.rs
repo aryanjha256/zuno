@@ -128,9 +128,11 @@ impl SettingsPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
-            // Its own handle rather than a text input's: every control here is a key press,
-            // so there's nothing to type into. `tab_stop(false)` because Tab is not how you
-            // move within a modal — up/down is.
+            // Its own handle rather than a text input's: every control here is a key press, so
+            // there's nothing to type into. Left at gpui's default of `tab_stop: false` — Tab is
+            // not how you move within a modal, up/down is. (This comment used to claim a
+            // `tab_stop(false)` call that was never here. The default is *why* Tab used to escape
+            // the panel entirely; `Workspace::modal_open` is what stops it now.)
             focus_handle: cx.focus_handle(),
             settings,
             selected: 0,

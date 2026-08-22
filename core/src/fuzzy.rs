@@ -42,20 +42,33 @@ const TRAILING: i32 = -1;
 /// Case-insensitive. An empty query matches everything at 0, which is what makes a picker
 /// list its whole set before you type.
 pub fn score(query: &str, candidate: &str) -> Option<i32> {
-    if query.is_empty() {
+    score_against(&query.chars().collect::<Vec<_>>(), candidate)
+}
+
+/// `score`, with the query already split into characters.
+///
+/// Split out so `rank` can collect the query **once** for a whole ranking pass instead of once per
+/// candidate — it is the same string every time, and a picker re-ranks its entire list on every
+/// keystroke.
+///
+/// The empty-query rule lives here rather than in `score` so both entry points share it. That
+/// matters more than it looks: falling through to the loop below with no needles scores `-trailing`,
+/// which would sort an unfiltered list by length and quietly discard the order the caller
+/// assembled.
+fn score_against(needles: &[char], candidate: &str) -> Option<i32> {
+    if needles.is_empty() {
         return Some(0);
     }
 
     // Collected once rather than repeatedly indexing a &str: matching walks with
     // lookbehind, which char_indices makes awkward, and these are short strings.
     let haystack: Vec<char> = candidate.chars().collect();
-    let needles: Vec<char> = query.chars().collect();
 
     let mut total = 0;
     let mut at = 0;
     let mut previous_match: Option<usize> = None;
 
-    for &needle in &needles {
+    for &needle in needles {
         let found = haystack[at..]
             .iter()
             .position(|candidate_char| eq_ignore_case(*candidate_char, needle))
@@ -126,10 +139,15 @@ fn is_boundary(haystack: &[char], index: usize) -> bool {
 /// sorts its candidates meaningfully (open buffers before files, then by path), and an
 /// unstable sort here would scramble that for equal scores.
 pub fn rank(query: &str, candidates: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<usize> {
+    // Collected once for the pass, not once per candidate.
+    let needles: Vec<char> = query.chars().collect();
+
     let mut scored: Vec<(usize, i32)> = candidates
         .into_iter()
         .enumerate()
-        .filter_map(|(ix, candidate)| score(query, candidate.as_ref()).map(|score| (ix, score)))
+        .filter_map(|(ix, candidate)| {
+            score_against(&needles, candidate.as_ref()).map(|score| (ix, score))
+        })
         .collect();
 
     scored.sort_by(|(ix_a, score_a), (ix_b, score_b)| score_b.cmp(score_a).then(ix_a.cmp(ix_b)));
@@ -161,6 +179,18 @@ mod tests {
         // What makes the picker show the full list before you type.
         assert_eq!(score("", "anything"), Some(0));
         assert_eq!(ranked("", &["a", "b", "c"]), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_empty_query_keeps_the_callers_order_regardless_of_length() {
+        // The picker lists its whole set before you type, in the order the caller assembled it —
+        // open buffers before saved files, environments in scan order. Letting an empty query fall
+        // through to the scoring loop would give every candidate `-trailing`, sorting the list by
+        // length and silently throwing that order away. Guards the shortcut in `score_against`.
+        assert_eq!(
+            ranked("", &["a-very-long-name", "b", "medium-name"]),
+            ["a-very-long-name", "b", "medium-name"]
+        );
     }
 
     #[test]

@@ -24,8 +24,10 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings and #4–#21 are fixed, each with a test that was confirmed to
-fail against the old code before the fix landed. Open: the cleanup list.
+**Status.** All 21 findings and all five cleanup items are fixed. Each behavioural fix has a test
+that was confirmed to fail against the old code before the fix landed; where a property wasn't
+test-observable (thread placement, a deleted variant, a stale doc claim) that is stated explicitly
+rather than papered over with an assertion that looks strong and proves nothing.
 
 ---
 
@@ -734,6 +736,15 @@ orders of magnitude below `unfolded`, not merely within 2×.
 ## Cleanup
 
 Small, verified, low-risk. Grouped because none of them individually justifies a section.
+**All five are done**; each entry records what happened.
+
+> **4 turned out not to be cosmetic.** Hoisting the query collection out of the per-candidate path
+> meant `score`'s empty-query shortcut had to move too — and without it the general loop scores an
+> empty query as `-trailing`, which sorts an unfiltered picker *by label length* and throws away the
+> order the caller assembled (buffers before files, environments in scan order). Caught by a test
+> written for the hazard rather than by review:
+> `an_empty_query_keeps_the_callers_order_regardless_of_length` fails with
+> `["b", "medium-name", "a-very-long-name"]` when the shortcut is removed.
 
 1. **Stale `#[allow(dead_code)]`.** [theme.rs:70-73](app/src/theme.rs#L70-L73) and
    [:80](app/src/theme.rs#L80) suppress dead-code warnings on `Theme::syntax` / `SyntaxTheme` with
