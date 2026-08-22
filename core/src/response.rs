@@ -43,11 +43,24 @@ pub struct Timing {
     pub total: Duration,
 }
 
-/// Wire size and decoded size are both interesting — the ratio is how you spot
-/// whether compression actually happened.
+/// How big the response was, as far as can be known.
+///
+/// **`declared` is an `Option` for the same reason `Timing`'s connection stages are:** the number
+/// often isn't available, and pretending otherwise makes the display lie. It is the server's
+/// `Content-Length`, which is absent *exactly when it would have been most interesting* — reqwest
+/// 0.13 delegates decompression to `tower-http`, and that removes `Content-Encoding` and
+/// `Content-Length` together whenever it decodes a body, so a compressed response arrives with no
+/// declaration at all.
+///
+/// The consequence is worth stating plainly, because an earlier version of this doc claimed the
+/// opposite: **the compression ratio cannot be shown.** Recovering the wire size needs a client
+/// lower-level than reqwest. Where the two numbers *can* differ is a `HEAD` or `304` — a length
+/// declared with no body behind it, which is informative but is not compression.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SizeInfo {
-    pub wire: u64,
+    /// The server's `Content-Length`, when it sent one and it survived decoding.
+    pub declared: Option<u64>,
+    /// Bytes actually received, after any decompression. Always known.
     pub decoded: u64,
 }
 
@@ -135,7 +148,10 @@ impl ResponseData {
                 ttfb: Duration::from_millis(126),
                 total: Duration::from_millis(142),
             },
-            size: SizeInfo { wire: 96, decoded },
+            size: SizeInfo {
+                declared: Some(96),
+                decoded,
+            },
         }
     }
 }

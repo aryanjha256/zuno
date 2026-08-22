@@ -189,7 +189,10 @@ pub async fn execute(
                 total,
             },
             size: SizeInfo {
-                wire: declared_length.unwrap_or(decoded),
+                // Straight through rather than defaulted to `decoded`: a missing declaration is
+                // information, and collapsing it made `declared == decoded` indistinguishable
+                // from "the server never said".
+                declared: declared_length,
                 decoded,
             },
         }),
@@ -212,9 +215,11 @@ fn collect_headers(headers: &http::HeaderMap) -> Vec<Header> {
             value: value
                 .to_str()
                 .map(str::to_string)
-                // Non-UTF-8 header values are legal on the wire; show them rather
-                // than dropping the header.
-                .unwrap_or_else(|_| format!("{:?}", value.as_bytes())),
+                // Non-UTF-8 header values are legal on the wire, so show them rather than dropping
+                // the header — but *lossily decoded*, not debug-printed. The common real case is a
+                // latin-1 filename in `Content-Disposition`, where `caf\u{fffd}.txt` is readable
+                // and `[99, 97, 102, 233, 46, 116, 120, 116]` is not.
+                .unwrap_or_else(|_| String::from_utf8_lossy(value.as_bytes()).into_owned()),
         })
         .collect();
 

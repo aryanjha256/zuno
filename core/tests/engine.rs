@@ -326,6 +326,136 @@ fn cancel_abandons_a_request_mid_flight() {
     );
 }
 
+/// gzip of `"zuno " * 40` — **28 bytes on the wire for 200 decoded**, so the ratio is one a person
+/// would want to see, which is the whole reason this limitation is worth pinning.
+///
+/// A literal rather than a compression dependency: `zuno-core` has no other reason to take one, and
+/// the bytes are deterministic (`mtime` zeroed) so they can be checked in. Deliberately a
+/// *compressible* payload — the first version of this test gzipped a 27-byte string, which came out
+/// 47 bytes because gzip's header and trailer outweigh a tiny payload, and the test caught the
+/// mistaken assumption rather than the other way round.
+const GZIPPED_BODY: &[u8] = &[
+    0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xab, 0x2a, 0xcd, 0xcb, 0x57, 0xa8,
+    0x1a, 0xfa, 0x04, 0x00, 0xe7, 0x23, 0x01, 0x42, 0xc8, 0x00, 0x00, 0x00,
+];
+
+/// What `GZIPPED_BODY` decodes to.
+const GZIPPED_PLAIN_LEN: u64 = 200;
+
+#[test]
+fn a_non_utf8_header_value_is_readable_rather_than_a_byte_dump() {
+    // Header values may carry `obs-text` (0x80-0xFF), and a latin-1 filename in
+    // `Content-Disposition` is the case that actually turns up. These used to render through
+    // `format!("{:?}", bytes)` — a decimal array — so the one piece of information in the header
+    // was unreadable.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = read_request(&mut stream);
+            // 0xe9 is `é` in latin-1 and invalid UTF-8 on its own.
+            let mut response = b"HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Disposition: attachment; filename=\"caf"
+                .to_vec();
+            response.push(0xe9);
+            response.extend_from_slice(
+                b".txt\"\r\n\
+                  Content-Length: 2\r\n\
+                  Connection: close\r\n\
+                  \r\n\
+                  ok",
+            );
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+        }
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_, events) = engine.send(spec_for(format!("http://{addr}/download")));
+    let events = drain(&events);
+
+    let Some(Event::Done { response, .. }) = events.iter().find(|event| event.is_terminal()) else {
+        panic!("expected a completed response, got {events:?}");
+    };
+
+    let disposition = response
+        .header("content-disposition")
+        .expect("the header must survive, not be dropped");
+    assert!(
+        disposition.contains("caf\u{fffd}.txt"),
+        "the undecodable byte should become U+FFFD and leave the rest readable: {disposition:?}"
+    );
+    assert!(
+        !disposition.contains('['),
+        "a debug byte array is not a header value: {disposition:?}"
+    );
+}
+
+#[test]
+fn a_compressed_response_is_decoded_and_reports_no_declared_length() {
+    // **This test exists to pin a dependency's behaviour that our own docs rest on.** reqwest 0.13
+    // delegates decompression to `tower-http`, which removes `Content-Encoding` *and*
+    // `Content-Length` when it decodes — so `content_length()` comes back `None` and the wire size
+    // is unrecoverable, which is why `SizeInfo::declared` is an `Option` and why the response pane
+    // cannot show a compression ratio.
+    //
+    // If a future reqwest keeps those headers, this test fails — and that failure is the signal
+    // that the ratio has become showable, rather than a regression.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = read_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Encoding: gzip\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\
+                 \r\n",
+                GZIPPED_BODY.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(GZIPPED_BODY);
+            let _ = stream.flush();
+        }
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_, events) = engine.send(spec_for(format!("http://{addr}/gzipped")));
+    let events = drain(&events);
+
+    let Some(Event::Done { response, .. }) = events.iter().find(|event| event.is_terminal()) else {
+        panic!("expected a completed response, got {events:?}");
+    };
+
+    // Decompression really happened: the decoded body is the plain text, longer than the wire bytes.
+    assert_eq!(
+        response.body_as_str(),
+        Some("zuno ".repeat(40).as_str()),
+        "the body should arrive decompressed"
+    );
+    assert_eq!(response.size.decoded, GZIPPED_PLAIN_LEN);
+    assert!(
+        response.size.decoded > GZIPPED_BODY.len() as u64 * 5,
+        "the payload really was compressed, so a ratio would have been worth showing"
+    );
+
+    // And the declaration is gone, which is the whole point.
+    assert_eq!(
+        response.size.declared, None,
+        "Content-Length does not survive decompression, so the wire size is unknowable here"
+    );
+    assert!(
+        response.header("content-encoding").is_none(),
+        "Content-Encoding is stripped alongside it: {:?}",
+        response.headers
+    );
+}
+
 #[test]
 fn a_declared_length_over_the_limit_is_refused_before_the_body_transfers() {
     // The cheap half of the cap: a server that *claims* more than Zuno will hold is refused as

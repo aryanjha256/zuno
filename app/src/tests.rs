@@ -543,6 +543,40 @@ async fn escape_cancels_an_in_flight_request(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn the_in_flight_hint_names_a_key_that_actually_cancels(cx: &mut TestAppContext) {
+    // The pane used to say "Ctrl+C or Escape to cancel", and `ctrl-c` has only ever been bound to
+    // `text_input::Copy` — so half that sentence told people to press a key that does nothing to a
+    // request. The hint is read from the keymap now, and this test presses whatever it names rather
+    // than what a human thought it said.
+    let base = serve_never();
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    type_url(&mut cx, &format!("{base}/slow"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the request to start", |cx| {
+        cx.update(|_, cx| view.read(cx).is_sending().then_some(()))
+    });
+
+    let advertised = window
+        .update(&mut cx, |_, window, _| {
+            crate::workspace::keybinding_hint(&crate::actions::CancelRequest, window)
+        })
+        .expect("window");
+    assert!(
+        !advertised.is_empty(),
+        "the pane has to be able to name a key at all"
+    );
+
+    cx.simulate_keystrokes(&advertised);
+    cx.run_until_parked();
+
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_sending()),
+        "the keystroke the pane advertises ({advertised:?}) must actually cancel the request"
+    );
+}
+
+#[gpui::test]
 async fn resending_replaces_the_previous_response(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
@@ -1082,6 +1116,47 @@ async fn an_unparseable_clipboard_reports_instead_of_wrecking_the_request(
     assert!(
         status.is_some_and(|s| s.contains("Could not import")),
         "the failure should be reported"
+    );
+}
+
+#[gpui::test]
+async fn a_composed_replacement_leaves_a_copyable_selection(cx: &mut TestAppContext) {
+    // Driven through `EntityInputHandler` directly, because that is the surface an IME talks to and
+    // there is no way to reach it with keystrokes. The case that matters is replacing a *non-empty*
+    // range mid-composition: with both ends of the new selection offset by `range.start` it lands
+    // on the inserted text, while offsetting the end by `range.end` overshoots past the end of the
+    // content — and `copy` then slices with it and panics. At an insertion point the two are
+    // identical, which is why this went unnoticed.
+    use gpui::EntityInputHandler;
+
+    let (view, mut cx) = open_workspace(cx);
+    type_url(&mut cx, "abcdef");
+    let url = cx.update(|_, cx| view.read(cx).url.clone());
+
+    // Replace "bcd" with "XY" and mark it, selecting the inserted text as an IME would.
+    cx.update(|window, cx| {
+        url.update(cx, |input, cx| {
+            input.replace_and_mark_text_in_range(Some(1..4), "XY", Some(0..2), window, cx)
+        })
+    });
+    assert_eq!(spec_of(&view, &mut cx).url, "aXYef");
+
+    let selection = cx
+        .update(|window, cx| {
+            url.update(cx, |input, cx| input.selected_text_range(false, window, cx))
+        })
+        .expect("a selection");
+    assert_eq!(
+        selection.range, 1..3,
+        "the selection must cover the inserted text, not run past the end of the content"
+    );
+
+    // The real consequence: an out-of-range selection is a panic waiting for the next copy.
+    cx.simulate_keystrokes("ctrl-c");
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some("XY"),
+        "copying the composed selection must yield exactly the inserted text"
     );
 }
 

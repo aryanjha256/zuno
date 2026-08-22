@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::request::{
-    Body, Header, Method, MultipartField, MultipartValue, RawKind, RequestSpec,
+    Body, Header, Method, MultipartField, MultipartValue, RawKind, RequestSettings, RequestSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -77,7 +77,26 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
     let mut ignored: Vec<String> = Vec::new();
     let mut explicit_content_type = false;
     let mut as_get = false;
-    let mut spec = RequestSpec::default();
+    // **Start from curl's defaults, not Zuno's**, for the two settings that change what goes on
+    // the wire. curl does not follow redirects without `-L` and sends no `Accept-Encoding`
+    // without `--compressed`; Zuno has both on. Starting from Zuno's defaults made both flags
+    // no-ops *and* made their absence unrepresentable, so `curl https://x/redirects` imported as
+    // a request that follows the redirect and reports the destination's 200 instead of the 302 you
+    // were looking at — principle 2 at the top of this file, broken.
+    //
+    // The line is drawn at *wire-observable* behaviour. `timeout` stays at Zuno's 30s even though
+    // curl waits forever, because that one is a local guard rather than something the server can
+    // tell apart, and "no timeout by default" is a worse default than a wrong one. `max_redirects`
+    // likewise stays at Zuno's 10 rather than curl's 50: it only applies once `-L` is present, and
+    // the settings panel can change it.
+    let mut spec = RequestSpec {
+        settings: RequestSettings {
+            follow_redirects: false,
+            accept_encodings: false,
+            ..RequestSettings::default()
+        },
+        ..RequestSpec::default()
+    };
 
     while let Some(token) = tokens.next() {
         // A bare `-` is curl's stdin marker; nothing to import from it.
@@ -686,6 +705,32 @@ mod tests {
     }
 
     #[test]
+    fn absent_flags_keep_curls_behaviour_rather_than_zunos() {
+        // The bug, and the weak assertion that hid it. `RequestSettings::default()` has redirect
+        // following and Accept-Encoding **on**; curl has both off. So `-L` and `--compressed` were
+        // no-ops, and — the part that actually changed requests — their *absence* did nothing.
+        // `settings_flags_are_applied` asserted `follow_redirects` after `-L`, which was true by
+        // default, so it passed with the `-L` arm deleted from `parse` entirely.
+        let spec = import("curl https://x.test/a").spec;
+        assert!(
+            !spec.settings.follow_redirects,
+            "curl does not follow redirects without -L"
+        );
+        assert!(
+            !spec.settings.accept_encodings,
+            "curl sends no Accept-Encoding without --compressed"
+        );
+
+        // `-k` was always faithful, because there the polarity happened to line up: both verify by
+        // default, so the flag only ever had to turn something off.
+        assert!(spec.settings.verify_tls);
+
+        // Deliberately *not* faithful, and the reason is in `parse`: a local guard rather than
+        // anything the server can distinguish.
+        assert_eq!(spec.settings.timeout, RequestSettings::default().timeout);
+    }
+
+    #[test]
     fn settings_flags_are_applied() {
         let spec = import("curl -k -L --max-time 5 https://x.test/a").spec;
         assert!(!spec.settings.verify_tls);
@@ -726,6 +771,9 @@ mod tests {
     fn output_flags_are_silently_dropped_because_they_mean_nothing_here() {
         let import = import("curl -s -v -i --compressed https://x.test/a");
         assert!(import.ignored.is_empty(), "{:?}", import.ignored);
+        // `--compressed` is in that list because it parses, not because it does nothing —
+        // asserting only `ignored.is_empty()` would pass whether or not it took effect.
+        assert!(import.spec.settings.accept_encodings, "--compressed should turn encodings on");
     }
 
     #[test]

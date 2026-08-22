@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 337 tests, ~9s
+cargo test --workspace                   # 345 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -194,13 +194,17 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   row to sit on after pressing Enter. Both are commented.
 - **Write the test that's awkward to write.** The `tab_stop`, `{{baseUrl}}`, and line-index bugs
   were all found by tests that felt like a chore.
-- **A weak assertion reads exactly like a strong one.** Four times now a test has passed against
+- **A weak assertion reads exactly like a strong one.** Five times now a test has passed against
   both the correct code *and* the broken version, because it asserted something true in both:
   `row_count() > 0` after switching runs, "no environment appears in the request picker" (true
   whether or not `scan` skips the directory), containment that two independent layers guaranteed,
-  and an accessor that reported "nothing held" for the very state it was meant to detect. The fix
-  is always the same — break it deliberately and watch the test fail. If it doesn't, the test is
-  decoration.
+  an accessor that reported "nothing held" for the very state it was meant to detect, and
+  `assert!(spec.settings.follow_redirects)` after importing `curl -L` — true by default, so it held
+  with the `-L` arm deleted from the parser entirely. The fix is always the same — break it
+  deliberately and watch the test fail. If it doesn't, the test is decoration.
+  **The fifth one is worth a second look**, because the weak assertion was hiding a real bug rather
+  than merely failing to catch one: the default that made it vacuous was itself the defect, so
+  fixing the *code* turned the existing test load-bearing without touching it.
 - **Docs went stale twice while the code was right.** Both times a multi-file edit script aborted
   on a failed anchor assertion, so files listed *after* the failure were silently skipped, and the
   summary claimed work that hadn't happened. `git status` showed the untouched files both times.

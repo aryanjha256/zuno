@@ -77,6 +77,13 @@ pub struct Item {
     /// What the filter matches against, and the row's main text.
     pub label: SharedString,
     /// Dimmed trailing context — a URL, or a relative path.
+    ///
+    /// **Not matched against.** `refilter` ranks `label` alone, so a buffer row displays a URL you
+    /// cannot search by: `Ctrl+P` finds a request by `posts`, not by `api.github.com`. Deliberate
+    /// for now — the label is what a person is reaching for, and scoring both would let a long URL
+    /// outrank a name that matches exactly — but worth knowing, because the row visibly shows text
+    /// the filter ignores. Doing it properly needs per-field weights so a detail hit can never beat
+    /// a label hit, which is more machinery than the current scale asks for.
     pub detail: SharedString,
     pub target: Target,
 }

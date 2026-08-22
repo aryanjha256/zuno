@@ -24,7 +24,12 @@ pub enum EngineError {
     /// `https://{{baseUrl}}/users` — it reads the placeholder as a hostname. Without
     /// this check the user gets "could not connect to {{baseurl}}" after a pointless
     /// DNS lookup, instead of being told what's actually wrong.
-    #[error("{{{{{name}}}}} is not defined (in {location}) — environments arrive in M2")]
+    // Deliberately free of keystrokes. Naming `Ctrl+E` here would put a keybinding in `core`,
+    // which cannot see the keymap and so cannot know if it has been rebound — the same class of
+    // stale claim this message used to make about milestones.
+    #[error(
+        "{{{{{name}}}}} is not defined (in {location}) — add it to an environment, or select one that defines it"
+    )]
     UnresolvedVariable { name: String, location: String },
 
     #[error("{scheme}:// is not an HTTP scheme — use http or https")]
@@ -41,9 +46,6 @@ pub enum EngineError {
 
     #[error("could not read the body file {path}: {reason}")]
     BodyFileUnreadable { path: PathBuf, reason: String },
-
-    #[error("{kind} bodies are not supported yet")]
-    UnsupportedBody { kind: &'static str },
 
     /// Could not turn a valid-looking spec into a request. Distinct from a network
     /// failure: nothing left the machine.
@@ -139,7 +141,6 @@ impl EngineError {
                 | EngineError::InvalidHeaderName { .. }
                 | EngineError::InvalidHeaderValue { .. }
                 | EngineError::BodyFileUnreadable { .. }
-                | EngineError::UnsupportedBody { .. }
                 | EngineError::Build { .. }
         )
     }
@@ -180,6 +181,21 @@ mod tests {
             }
             .is_local()
         );
+    }
+
+    #[test]
+    fn an_unresolved_variable_reads_back_as_a_placeholder() {
+        // The braces are four levels of escaping in the format string, which is easy to get wrong
+        // while editing the copy around them — and `{baseUrl}` instead of `{{baseUrl}}` would name
+        // something the user never typed. This message used to end "environments arrive in M2",
+        // which is the other way copy goes wrong: it aged.
+        let error = EngineError::UnresolvedVariable {
+            name: "baseUrl".into(),
+            location: "the URL".into(),
+        };
+        let message = error.to_string();
+        assert!(message.contains("{{baseUrl}}"), "{message}");
+        assert!(message.contains("the URL"), "{message}");
     }
 
     #[test]

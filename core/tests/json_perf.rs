@@ -10,6 +10,10 @@
 //! The bounds are deliberately loose (these run in a debug build, roughly 10-20x slower
 //! than release). They exist to catch an accidental O(n²) or a per-row allocation
 //! creeping in, not to certify a specific speed.
+//!
+//! Loose is not the same as unfailable, though. The fold assertion below used to compare the two
+//! `visible_rows` calls within a factor of two — and since both are O(rows), nothing could ever
+//! breach it. A bound that cannot fail measures nothing; it just reads like it does.
 
 use std::time::{Duration, Instant};
 
@@ -90,9 +94,16 @@ fn folding_a_huge_document_is_cheap() {
         unfolded < Duration::from_millis(500),
         "rebuilding the visible index took {unfolded:?}"
     );
+    // **Was `collapsed < unfolded * 2`, which could not fail for the reason the test exists.**
+    // Both calls are O(rows), so a factor of two separated nothing: a `visible_rows` rewritten to
+    // walk every row and filter would sit comfortably inside it. The property actually worth
+    // holding is that folding *short-circuits* — an open folded row jumps `subtree_len` forward
+    // instead of stepping — so collapsing the root should cost a couple of iterations against
+    // 1.3M. Measured at ~900x in release (6.7ms vs 7.3us); 20x leaves room for a debug build and
+    // a loaded machine while still failing outright if the skip is ever lost.
     assert!(
-        collapsed < unfolded.max(Duration::from_millis(1)) * 2,
-        "a fold that hides everything should not cost more than not folding"
+        collapsed * 20 < unfolded,
+        "folding the root should skip the walk, not repeat it: {collapsed:?} vs {unfolded:?}"
     );
 }
 

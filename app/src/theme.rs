@@ -65,19 +65,18 @@ pub struct Theme {
     pub status_client_error: Hsla,
     pub status_server_error: Hsla,
 
-    /// Unread until the JSON viewer lands in M1.3. Grouped into its own struct so
-    /// the forward declaration is explicit and the dead-code allowance stays
-    /// scoped to exactly these colors — deciding the whole palette in one sitting
-    /// beats letting it drift across three milestones.
-    #[allow(dead_code)]
+    /// Token colors for the response viewer, read by `response_pane::json_row`.
+    ///
+    /// Grouped into its own struct because the whole palette was decided in one sitting in M1.0,
+    /// before anything read it — the `#[allow(dead_code)]` that scoped the forward declaration is
+    /// gone now that M1.3 shipped and every field is used.
     pub syntax: SyntaxTheme,
 
     /// Resolved at startup from what the OS actually has installed.
     pub mono: SharedString,
 }
 
-/// Token colors for the response viewer (M1.3).
-#[allow(dead_code)]
+/// Token colors for the response viewer.
 #[derive(Debug, Clone)]
 pub struct SyntaxTheme {
     pub key: Hsla,
