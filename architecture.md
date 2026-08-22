@@ -178,7 +178,7 @@ pub struct ResponseData {
     pub headers: Vec<Header>,      // ordered, exactly as received
     pub body: Bytes,               // raw wire bytes, post-decompression
     pub timing: Timing,
-    pub size: SizeInfo,            // wire vs decoded — both are interesting
+    pub size: SizeInfo,            // declared (Option) vs decoded — see the limitation below
 }
 
 pub struct Timing {
@@ -193,7 +193,7 @@ pub struct Timing {
 `body: Bytes` is load-bearing. It makes the body cheap to clone into a background task, and
 it's what lets the JSON viewer hold *byte spans* instead of copied strings (§6).
 
-**Two limitations found while implementing M1.2**, both inherited from reqwest:
+**Three limitations found in the response model**, all inherited from reqwest:
 
 - **Response header order is not wire order.** `http::HeaderMap`'s iteration order across
   different names is an implementation detail. Duplicates of the *same* name do stay in
@@ -202,6 +202,16 @@ it's what lets the JSON viewer hold *byte spans* instead of copied strings (§6)
 - **`Timing.dns` / `connect` / `tls` stay `None`.** reqwest exposes no per-stage connection
   timings; getting them needs a custom hyper connector. `ttfb` and `total` are real. This is
   exactly why those three were typed as `Option` from the start rather than `Duration`.
+- **The wire size is unknowable, so the compression ratio cannot be shown.** This section used to
+  claim the opposite — that "wire vs decoded" is how you spot whether compression happened. It
+  isn't. reqwest 0.13 delegates decompression to `tower-http`, which removes `Content-Encoding` and
+  `Content-Length` *together* the moment it decodes a body, so the declaration is absent exactly
+  when it would have been interesting. `SizeInfo::declared` is therefore an `Option` — the same
+  admission the `Timing` fields above make, for the same reason — and it holds the server's claim
+  rather than a measurement. Where the two numbers can differ is a `HEAD` or `304`: a length
+  declared with no body behind it. Pinned by
+  `a_compressed_response_is_decoded_and_reports_no_declared_length`, so a future reqwest that keeps
+  those headers shows up as a test failure rather than as a silent chance missed.
 
 ---
 
@@ -271,8 +281,14 @@ fn send(&mut self, _: &Send, _window: &mut Window, cx: &mut Context<Self>) {
 
 **Cancellation has two halves,** and both are needed: dropping the `Task` stops the UI from
 consuming events, but the socket keeps draining until you also call `engine.cancel(id)`.
-Wire `Ctrl+C` / a re-`Send` to do both — an in-flight request must be abandoned the instant
+Wire a cancel key and a re-`Send` to do both — an in-flight request must be abandoned the instant
 you hit send again, or rapid resend feels laggy for reasons the user can't see.
+
+> This sketch originally said `Ctrl+C`, and it shipped as `Escape` — `ctrl-c` belongs to
+> `text_input::Copy` and a global binding would fight it. The stale sentence outlived the decision
+> and turned into a user-facing one: the in-flight pane read "Ctrl+C or Escape to cancel" for
+> several milestones. The hint is now read from the keymap via `workspace::keybinding_hint`, the
+> same way the command palette gets its shortcuts, so it cannot name a key that isn't bound.
 
 **API note:** gpui 0.2.2 has **no `cx.background_spawn`** (that's newer Zed-main API). Use
 `cx.background_executor().spawn(fut)`. Anything CPU-bound — JSON parse, flatten, pretty-print,
@@ -405,7 +421,8 @@ M1 plan, in cost order:
 | `Editor` (multi-line) ✅ | Request body only | Same input handler; **no rope** — see below; soft-wrap off |
 | Response body | — | Read-only rows; **no editor at all** |
 
-**Five deliberate changes from the upstream example**, made while adapting it in M1.1:
+**Six deliberate changes from the upstream example**, five made while adapting it in M1.1 and one
+found later by audit:
 theme-driven colors instead of hardcoded literals; text style *inherited* from the parent div
 (which is what lets one `TextInput` serve both the URL bar and the tiny table cells);
 a caller-supplied key context identifier (see §10's note on leaf-only predicate matching);
@@ -413,6 +430,13 @@ newline sanitization moved into `replace_text_in_range` so it covers the IME and
 not just paste; and `character_index_for_point` returning `None` instead of asserting — the
 example's `assert_eq!(last_layout.text, self.content)` panics whenever the placeholder is
 showing, because an empty input lays out placeholder text rather than content.
+
+The sixth: **the composed-selection offset adds `range.start` to both ends**, where the example adds
+`range.end` to the end. That overshoots by the width of whatever was replaced, so an IME replacing a
+non-empty range leaves a selection running past the end of the content — which `copy` and `cut` then
+slice with, and panic. Invisible while `range.start == range.end`, which is every ordinary
+insertion, and that is why it survived being copied in. `editor.rs` had it right all along; the two
+had silently disagreed since M1.4.
 
 **Explicitly deferred to M3+:** syntax highlighting (needs tree-sitter plus a highlight
 cache), autocomplete, multi-cursor, code folding in the *editor*, bracket matching. The

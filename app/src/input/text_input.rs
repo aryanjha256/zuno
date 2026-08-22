@@ -18,6 +18,9 @@
 //! 5. **`character_index_for_point` no longer asserts.** The example's
 //!    `assert_eq!(last_layout.text, self.content)` panics whenever the placeholder is
 //!    showing, because an empty input lays out placeholder text instead of content.
+//! 6. **The composed-selection offset uses `range.start` for both ends.** The example adds
+//!    `range.end` to the end, which overshoots by the width of whatever was replaced — invisible
+//!    at an insertion point, a panic in `copy` once a non-empty range is replaced mid-composition.
 //!
 //! Keybindings live in `main.rs` under the `TextInput` context — including the
 //! `ctrl-` translations, since the upstream example ships macOS `cmd-` bindings that
@@ -424,10 +427,17 @@ impl EntityInputHandler for TextInput {
         } else {
             Some(range.start..range.start + new_text.len())
         };
+        // **Both ends shift by `range.start`.** `new_selected_range_utf16` is relative to the text
+        // just inserted, so the old range's *end* has nothing to do with it — and adding it
+        // produced a selection longer than the content whenever the replaced range was non-empty,
+        // which `copy` and `cut` then slice with and panic on. Harmless only while
+        // `range.start == range.end`, which is the ordinary insertion-point case and why this sat
+        // unnoticed. `editor.rs` already had it right; this is a sixth deliberate divergence from
+        // gpui's `examples/input.rs`, which is where the `range.end` came from.
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| {
                 let cursor = range.start + new_text.len();
                 cursor..cursor

@@ -152,7 +152,7 @@ mod tests {
                 total: Duration::from_millis(total_ms),
             },
             size: SizeInfo {
-                wire: body.len() as u64,
+                declared: Some(body.len() as u64),
                 decoded: body.len() as u64,
             },
         }

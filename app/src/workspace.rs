@@ -1636,9 +1636,12 @@ fn is_tchar(byte: u8) -> bool {
 
 /// The first keybinding for an action, rendered like `ctrl-k`, or empty if it has none.
 ///
-/// Read from the live keymap rather than a hardcoded string, so a rebinding can't leave the
-/// palette advertising a shortcut that no longer works.
-fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
+/// Read from the live keymap rather than a hardcoded string, so a rebinding can't leave a piece of
+/// UI copy advertising a shortcut that no longer works. Shared with `response_pane`'s in-flight
+/// hint, which said "Ctrl+C or Escape to cancel" for a while — `ctrl-c` has only ever been bound to
+/// `text_input::Copy`, so half of that sentence was telling people to press a key that does
+/// nothing to a request.
+pub fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
     window
         .bindings_for_action(action)
         .first()

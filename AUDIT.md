@@ -24,9 +24,8 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings, #4–#10, #12 and #19 are fixed, each with a test that was
-confirmed to fail against the old code before the fix landed. Open: #11, #13–#18, #20, #21, and the
-cleanup list.
+**Status.** The three High findings and #4–#21 are fixed, each with a test that was confirmed to
+fail against the old code before the fix landed. Open: the cleanup list.
 
 ---
 
@@ -410,6 +409,23 @@ silent truncation is a trust bug.
 
 ### 11. `SizeInfo.wire` can never show what the docs say it shows
 
+> **Fixed, and the audit's reasoning was verified rather than assumed before doing so.** reqwest
+> 0.13 delegates decompression to `tower_http::decompression`, whose response future calls
+> `entry.remove()` on `Content-Encoding` and `headers.remove(CONTENT_LENGTH)` — but *only* when it
+> actually decodes. So the wire size really is unrecoverable, and the audit's conclusion stands.
+>
+> Rather than documenting around it, the type now tells the truth: `wire: u64` became
+> `declared: Option<u64>`, holding the server's claim rather than a measurement, and dropping the
+> `unwrap_or(decoded)` that made "the server said nothing" indistinguishable from "the server said
+> exactly what arrived". That is the same admission `Timing`'s connection stages already make. The
+> label reads "N received · M declared" and only when they disagree.
+>
+> Guarded by `a_compressed_response_is_decoded_and_reports_no_declared_length`, which exists to pin
+> a *dependency's* behaviour our docs now rest on: if a future reqwest preserves those headers, the
+> test fails and the ratio has become showable. The gzip payload is a checked-in literal — and the
+> first version of it gzipped a 27-byte string into 47 bytes, so the test caught my own wrong
+> assumption about compression before it reached the assertion it was meant to support.
+
 [core/src/engine/run.rs:131-134](core/src/engine/run.rs#L131-L134) — `wire:
 declared_length.unwrap_or(decoded)`, where `declared_length` is `Response::content_length()`.
 
@@ -479,6 +495,15 @@ for why the current tests don't catch this.
 
 ### 13. `EngineError::UnresolvedVariable` still says environments are coming in M2
 
+> **Fixed.** Now "add it to an environment, or select one that defines it". Deliberately names no
+> keystroke: `core` cannot see the keymap, so a `Ctrl+E` in that string would be the same kind of
+> claim that can quietly stop being true.
+>
+> Guarded by `an_unresolved_variable_reads_back_as_a_placeholder`, which checks the message reads
+> back `{{baseUrl}}` — four levels of brace escaping sit in that format string and `{baseUrl}` would
+> name something the user never typed. The staleness itself isn't test-catchable; no assertion knows
+> that a milestone has passed.
+
 [core/src/engine/error.rs:27](core/src/engine/error.rs#L27)
 
 ```rust
@@ -493,6 +518,22 @@ select one"`.
 
 ### 14. The in-flight pane advertises a keystroke that isn't bound
 
+> **Fixed structurally rather than textually.** `in_flight` takes the keystroke as a parameter and
+> `render` reads it from the live keymap through `workspace::keybinding_hint` — the helper the
+> command palette already uses for the same reason. There is no longer a string to go stale, and if
+> nothing is bound the pane says "waiting for the first byte" rather than inventing an instruction.
+>
+> Guarded by `the_in_flight_hint_names_a_key_that_actually_cancels`, which reads whatever the pane
+> would advertise and *presses it*, then asserts the request was abandoned. Verified by removing the
+> `escape` binding: the test fails.
+>
+> **Honest limit:** the test drives the keymap and the helper, not the pane's rendered text, so it
+> would not catch someone hardcoding the string again. What prevents that is that there is no string
+> at the call site to hardcode — a structural guard, not a tested one.
+>
+> architecture.md §4's sketch, which said "Wire `Ctrl+C`", is corrected in place: that sentence is
+> the likely origin of the wrong hint.
+
 [app/src/response_pane.rs:101](app/src/response_pane.rs#L101) — `"Ctrl+C or Escape to cancel"`.
 
 `ctrl-c` is bound only to `text_input::Copy` under the `TextInput` context; nothing binds it to
@@ -505,6 +546,11 @@ field must copy — so the string should change.
 
 ### 15. `EngineError::UnsupportedBody` is dead
 
+> **Fixed.** Variant and its `is_local` arm deleted; `grep` confirms no references remain and the
+> workspace compiles clean under `-D warnings`. No test — there is nothing to assert about a variant
+> that no longer exists, and the compiler is the guard. ROADMAP's claim that it "is gone" is now
+> true rather than aspirational.
+
 Declared at [error.rs:45-46](core/src/engine/error.rs#L45-L46), matched in `is_local` at
 [:127](core/src/engine/error.rs#L127), constructed nowhere (verified by grep). `ROADMAP.md` states
 "`UnsupportedBody` is gone" — it isn't. Invariant 1: *"Don't leave speculative API behind 'for
@@ -514,6 +560,12 @@ later' — delete it and re-add when there's a caller."*
 not a reuse of this one.)
 
 ### 16. `label_from_url` mistakes a path segment containing `:` for the authority
+
+> **Fixed.** A colon is authority evidence only in the *first* segment, established without
+> allocating by taking `next()` and then `next_back()` — `None` from the second call means there was
+> only one segment. Guarded by `a_path_segment_may_contain_a_colon`, which covers both directions:
+> `/v1/files:batchUpdate` and `/v1/models/x:predict` keep their verb, while `localhost:8080` alone
+> is still a host and port.
 
 [core/src/request.rs:328-333](core/src/request.rs#L328-L333)
 
@@ -536,6 +588,17 @@ path had no `/`). The segment is already known to be the last one, so the check 
 `path.split('/').filter(non-empty).count() == 1`.
 
 ### 17. IME selection mapping is inconsistent between the two editors, and `text_input`'s looks wrong
+
+> **Fixed.** `text_input` now offsets both ends by `range.start`, matching `editor.rs`. Recorded as a
+> sixth deliberate divergence from `examples/input.rs` in both the module header and
+> architecture.md §7.
+>
+> Guarded by `a_composed_replacement_leaves_a_copyable_selection`, driven through
+> `EntityInputHandler` directly because that is the surface an IME talks to and no keystroke reaches
+> it. It replaces a *non-empty* range, which is the only case where the two forms differ, then
+> copies — because the real consequence is not a wrong highlight but a panic: with the bug the stored
+> selection is `1..6` over five bytes of content, and `copy` slices with it. Reverting gives
+> `1..5` against an expected `1..3`.
 
 [app/src/input/text_input.rs:427-434](app/src/input/text_input.rs#L427-L434)
 
@@ -561,6 +624,13 @@ the corrected copy, so the codebase already contains the fix.
 upstream example — that list is already in the module header and this would be a sixth entry.
 
 ### 18. Non-UTF-8 header values render as a Rust debug array
+
+> **Fixed.** `String::from_utf8_lossy` instead of `format!("{:?}", bytes)`, so an undecodable byte
+> becomes U+FFFD and the rest of the value stays readable.
+>
+> Guarded by `a_non_utf8_header_value_is_readable_rather_than_a_byte_dump`, which serves a latin-1
+> filename in `Content-Disposition` — the case that actually turns up. Reverting renders
+> `[97, 116, 116, 97, 99, 104, ...]`, which is the finding in one line.
 
 [core/src/engine/run.rs:157](core/src/engine/run.rs#L157) —
 `.unwrap_or_else(|_| format!("{:?}", value.as_bytes()))`
@@ -633,6 +703,16 @@ comment said so, leaving the *name* as the last thing claiming the cycling path 
 Renamed to `the_body_sub_kind_is_chosen_by_name` alongside #4.
 
 ### 21. `folding_a_huge_document_is_cheap` can't fail for the reason it exists
+
+> **Fixed, and the old bound's uselessness was demonstrated rather than argued.** The assertion is
+> now `collapsed * 20 < unfolded`, holding the property that actually matters: folding an open row
+> *skips* `subtree_len` forward rather than stepping through it.
+>
+> To prove the new bound earns its place, `visible_rows` was rewritten to produce **identical
+> output** with no short-circuit — visiting all 1.3M rows. That gives `collapsed` 6.61ms against
+> `unfolded` 19.87ms: the old `collapsed < unfolded * 2` **passes** that (6.61 < 39.7), the new one
+> fails it. So the old assertion could not have caught a real regression, which is exactly what the
+> finding claimed. Measured ~4000x in a debug build when correct, so 20x is a wide margin.
 
 [core/tests/json_perf.rs:93-96](core/tests/json_perf.rs#L93-L96)
 

@@ -315,17 +315,25 @@ pub fn label_for<'a>(url: &'a str, name: &'a str) -> &'a str {
 
 /// The last meaningful piece of a URL — its final path segment, or the host when there
 /// isn't one. Empty when nothing usable is there.
+///
+/// **A colon only means `host:port` in the *first* segment.** Treating it as authority evidence
+/// anywhere made every Google-style `:verb` endpoint — `/v1/files:batchUpdate`,
+/// `/v1/models/x:predict`, and everything gRPC transcoding produces — label as the bare host, so
+/// each one showed the same tab title and derived the same filename as the last.
 fn label_from_url(url: &str) -> &str {
     let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let path = without_scheme.split(['?', '#']).next().unwrap_or("");
 
-    let segment = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .next_back()
-        .unwrap_or("");
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let first = segments.next().unwrap_or("");
+    // `next_back` after `next` yields the last of what *remains*, so `None` means `first` was the
+    // only segment — which is the one case where a colon really is a port.
+    let (segment, only_segment) = match segments.next_back() {
+        Some(last) => (last, false),
+        None => (first, true),
+    };
 
-    if segment.is_empty() || segment.contains(':') {
+    if segment.is_empty() || (only_segment && segment.contains(':')) {
         // Bare host, or host:port — the segment found was the authority, not a path.
         without_scheme.split(['/', '?', '#']).next().unwrap_or("")
     } else {
@@ -344,6 +352,21 @@ mod tests {
         assert_eq!(label_for("https://api.example.com/v1/users/", ""), "users");
         // Query and fragment are not part of the name.
         assert_eq!(label_for("https://api.example.com/posts?page=2#top", ""), "posts");
+    }
+
+    #[test]
+    fn a_path_segment_may_contain_a_colon() {
+        // Google-style REST and gRPC transcoding use `:verb` throughout. Reading the colon as
+        // host:port labelled all of them as the host, so every such endpoint on one host shared a
+        // tab title and derived the same collection filename.
+        assert_eq!(
+            label_for("https://api.test/v1/files:batchUpdate", ""),
+            "files:batchUpdate"
+        );
+        assert_eq!(label_for("https://api.test/v1/models/x:predict", ""), "x:predict");
+        // Still a port when it is the only segment there is.
+        assert_eq!(label_for("http://localhost:8080", ""), "localhost:8080");
+        assert_eq!(label_for("localhost:3000/health", ""), "health");
     }
 
     #[test]

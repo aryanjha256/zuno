@@ -21,6 +21,7 @@ use zuno_core::{
     ScalarKind, StatusClass,
 };
 
+use crate::actions::CancelRequest;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView};
 use crate::theme::Theme;
@@ -54,7 +55,10 @@ pub fn render(
     // Order matters: an in-flight request outranks the previous response, and an error
     // outranks a stale success.
     if let Some(inflight) = &view.inflight {
-        return pane.child(in_flight(inflight, theme));
+        // Read from the keymap rather than written into the copy, so the hint cannot outlive the
+        // binding it names — the same reason the command palette does it.
+        let cancel = crate::workspace::keybinding_hint(&CancelRequest, window);
+        return pane.child(in_flight(inflight, &cancel, theme));
     }
     if let Some(error) = &view.error {
         return pane.child(failure(error, theme));
@@ -85,7 +89,8 @@ pub fn render(
 // In flight
 // ---------------------------------------------------------------------------
 
-fn in_flight(inflight: &InFlight, theme: &Theme) -> Div {
+/// `cancel` is the keystroke currently bound to `CancelRequest`, or empty if nothing is.
+fn in_flight(inflight: &InFlight, cancel: &str, theme: &Theme) -> Div {
     let headline = match &inflight.status {
         // Status known already — the response head arrived, the body is still coming.
         Some((status, text)) => SharedString::from(format!("{status} {text}")),
@@ -98,7 +103,10 @@ fn in_flight(inflight: &InFlight, theme: &Theme) -> Div {
         .unwrap_or(theme.text_muted);
 
     let progress = match (inflight.received, inflight.total) {
-        (0, _) => SharedString::from("Ctrl+C or Escape to cancel"),
+        // Nothing has arrived yet, so the only useful thing to say is how to give up. If the action
+        // is unbound there is no instruction to give, and inventing one would be the original bug.
+        (0, _) if cancel.is_empty() => SharedString::from("waiting for the first byte"),
+        (0, _) => SharedString::from(format!("{cancel} to cancel")),
         (received, Some(total)) => SharedString::from(format!(
             "{} of {} ({:.0}%)",
             format_bytes(received as u64),
@@ -242,18 +250,21 @@ fn historical_notice(viewing: usize, theme: &Theme) -> Option<Div> {
     )
 }
 
-/// Wire size is only interesting when it differs from decoded — that difference is how
-/// you see compression happened. reqwest drops Content-Length once it decompresses, in
-/// which case there is nothing to compare.
+/// What arrived, and the server's declared length when it disagrees.
+///
+/// **Not a compression indicator, though it reads like one.** The declaration is `Content-Length`,
+/// and `tower-http` removes that header along with `Content-Encoding` whenever it decompresses — so
+/// on a compressed response there is nothing to compare and the ratio can never be shown. See
+/// `SizeInfo`. What does reach the second arm is a `HEAD` or `304`: a length declared with no body
+/// behind it, worth showing precisely because it is surprising.
 fn size_label(response: &ResponseData) -> String {
-    if response.size.wire == response.size.decoded {
-        format_bytes(response.size.decoded)
-    } else {
-        format!(
-            "{} on the wire · {} decoded",
-            format_bytes(response.size.wire),
-            format_bytes(response.size.decoded)
-        )
+    match response.size.declared {
+        Some(declared) if declared != response.size.decoded => format!(
+            "{} received · {} declared",
+            format_bytes(response.size.decoded),
+            format_bytes(declared)
+        ),
+        _ => format_bytes(response.size.decoded),
     }
 }
 
