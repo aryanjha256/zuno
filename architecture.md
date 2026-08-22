@@ -681,6 +681,20 @@ continuations. 35 tests.
 > Zuno would infer `text/plain` from the raw-body kind and the imported request would behave
 > differently from the command it came from.
 
+> **The same trap in the other direction, found later by audit.** Import started from
+> `RequestSpec::default()`, whose `follow_redirects` and `accept_encodings` are both **on**, while
+> curl's are both off. So `-L` and `--compressed` were no-ops — and, worse, their *absence* was
+> unrepresentable: `curl https://x/redirects-to-login` imported as a request that follows the
+> redirect and reports the login page's 200 instead of the 302 you were investigating. The imported
+> spec now starts from curl's defaults for those two.
+>
+> The line is drawn at **wire-observable** behaviour. `timeout` keeps Zuno's 30s even though curl
+> waits forever, because that is a local guard rather than something a server can tell apart, and
+> "no timeout by default" is a worse default than a slightly wrong one; `max_redirects` keeps Zuno's
+> 10 rather than curl's 50, since it only applies once `-L` is present. `-k` was always faithful
+> because there the polarity lined up: both verify by default, so the flag only ever turned
+> something off.
+
 > **And one where faithful was wrong.** curl treats any bare word as a hostname, so
 > `curl this is garbage` parses with `url = "this"`. Faithful, and useless as an import —
 > pasting arbitrary text would quietly build a nonsense request. Import now requires either the

@@ -24,8 +24,9 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings and #4–#10 are fixed, each with a test that was confirmed to fail
-against the old code before the fix landed. Findings 11–21 are open.
+**Status.** The three High findings, #4–#10, #12 and #19 are fixed, each with a test that was
+confirmed to fail against the old code before the fix landed. Open: #11, #13–#18, #20, #21, and the
+cleanup list.
 
 ---
 
@@ -436,6 +437,15 @@ before decompression, which means a custom decoder — a much larger change than
 
 ### 12. Imported curl requests silently follow redirects and accept compression
 
+> **Fixed.** The imported spec now starts from *curl's* defaults for the two wire-observable
+> settings — `follow_redirects: false`, `accept_encodings: false` — so the flags turn them on and,
+> more importantly, their absence means what curl means by it. `timeout` and `max_redirects`
+> deliberately keep Zuno's values; the reasoning (local guard vs. wire-observable) is in `parse`
+> and in architecture.md's M1.5 notes.
+>
+> Guarded by `absent_flags_keep_curls_behaviour_rather_than_zunos`, and see #19 — this fix is what
+> made the *existing* test able to fail.
+
 [core/src/curl.rs:180-181](core/src/curl.rs#L180-L181)
 
 ```rust
@@ -570,6 +580,16 @@ The suite is strong — three layers, real keystrokes, real sockets, and asserti
 actually received. Two specific problems.
 
 ### 19. `settings_flags_are_applied` is a weak assertion of the exact kind CLAUDE.md documents
+
+> **Fixed, and instructively.** The assertion was vacuous *because of the bug in #12* — the default
+> it asserted was the defect. So fixing the code turned the existing test load-bearing without
+> touching it: with `-L` deleted from the parser, `settings_flags_are_applied` now fails, where
+> before the same deletion left it green. Verified both ways.
+>
+> `output_flags_are_silently_dropped_because_they_mean_nothing_here` also gained an assertion that
+> `--compressed` took effect, since `ignored.is_empty()` alone passed whether or not it did.
+> Recorded as the fifth instance in CLAUDE.md's weak-assertion lesson, with the note that this one
+> was hiding a bug rather than merely failing to catch one.
 
 [core/src/curl.rs:689-694](core/src/curl.rs#L689-L694)
 
