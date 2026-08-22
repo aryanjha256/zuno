@@ -24,11 +24,20 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
+**Status.** The three High findings are fixed, each with a test that was confirmed to fail against
+the old code before the fix landed. Findings 4–21 are open.
+
 ---
 
 ## High
 
 ### 1. Variables are never substituted into form or multipart bodies
+
+> **Fixed.** `apply`'s body match is now exhaustive with no catch-all, so a new `Body` variant fails
+> the build until someone decides whether a variable belongs in it. Guarded by
+> `apply_substitutes_form_field_values`, `apply_substitutes_a_form_field_name`,
+> `apply_substitutes_multipart_text_parts_but_never_file_paths`, and — over a real socket —
+> `a_variable_in_a_form_field_reaches_the_socket_substituted`.
 
 `Resolver::apply` substitutes the URL, query names/values, header names/values, and `Body::Raw`
 text — and then stops. `Body::Form` and `Body::Multipart` field values pass through untouched.
@@ -68,6 +77,10 @@ unsubstituted — that reasoning is already right and already tested
 
 ### 2. Closing a tab abandons the UI side of a request but not the socket
 
+> **Fixed.** `close_tab` now cancels through the engine before removing the view. Guarded by
+> `closing_a_buffer_cancels_its_in_flight_request`, which holds an `Entity` handle so the buffer
+> outlives its removal and its `inflight` state can still be read.
+
 `close_tab` drops the `RequestView`, which drops `InFlight` and with it the consuming `Task`. It
 never calls `Engine::cancel`.
 
@@ -102,6 +115,13 @@ place. Worth also considering it for `RequestView::load`, which resets `inflight
 ---
 
 ### 3. A request with no body advertises "JSON"
+
+> **Fixed.** `BodyType::Empty` now reports "None", which also makes the picker's `current` marker
+> correct because it compares against that string. Guarded by
+> `a_body_less_request_says_none_rather_than_a_retained_sub_kind` and
+> `the_body_type_picker_marks_none_as_current_on_a_fresh_buffer` — the latter deliberately on a
+> fresh buffer, since the pre-existing picker test boots the sample request whose raw JSON body made
+> the old label accidentally correct.
 
 `body_label` folds `Empty` in with `Raw` and returns the raw sub-kind for both:
 

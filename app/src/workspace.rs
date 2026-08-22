@@ -223,6 +223,16 @@ impl Workspace {
             return;
         }
 
+        // Cancellation has two halves, and dropping the buffer is only one of them. Dropping
+        // its task stops the UI *consuming* events; the socket keeps draining into a buffer
+        // nothing will ever read, for up to the request's timeout. `Escape` does both — so
+        // must this, and only the workspace holds the engine to do it with.
+        if let (Some(view), Some(engine)) = (self.active(), cx.engine()) {
+            view.update(cx, |view, cx| {
+                view.cancel(&engine, cx);
+            });
+        }
+
         self.views.remove(self.active_ix);
 
         if self.views.is_empty() {

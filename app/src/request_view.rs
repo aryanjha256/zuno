@@ -861,12 +861,21 @@ impl RequestView {
         }
     }
 
+    /// How the body type reads on screen, and what `open_body_type` compares against to mark
+    /// the current row.
+    ///
+    /// **`Empty` reports "None", not the retained raw sub-kind.** Folding the two together
+    /// meant a body-less request advertised "JSON" on the pane's chip while the pane beside it
+    /// read "No body" — and since the picker marks its current row by comparing this string
+    /// against the row labels, it marked *JSON* as current on every fresh buffer and could
+    /// never mark None. The string has to stay equal to the picker's own "None" label.
     pub fn body_label(&self) -> SharedString {
         match self.body_type {
+            BodyType::Empty => SharedString::from("None"),
             BodyType::Form => SharedString::from("Form"),
             BodyType::Binary => SharedString::from("Binary"),
             BodyType::Multipart => SharedString::from("Multipart"),
-            BodyType::Empty | BodyType::Raw => SharedString::from(self.body_kind.label()),
+            BodyType::Raw => SharedString::from(self.body_kind.label()),
         }
     }
 

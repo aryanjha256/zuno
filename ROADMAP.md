@@ -136,8 +136,9 @@ because principle 3 outranked the listed sequence — it exposed five already-bu
 one modal, and the cookie jar was silently making consecutive requests non-independent.
 
 **Environments and variables — done.** `Ctrl+E` selects one; `{{name}}` is substituted into the
-URL, query rows, headers, and raw bodies on the way to the socket, while the stored request keeps
-its placeholders. Two layers: `globals.json` always active, one selected environment on top.
+URL, query rows, headers, and every body a variable can appear in — raw text, form field names and
+values, and multipart text parts — on the way to the socket, while the stored request keeps its
+placeholders. Two layers: `globals.json` always active, one selected environment on top.
 Request-level variables were considered and dropped — an editable table per request, for the layer
 least likely to be used.
 
@@ -163,6 +164,15 @@ collection — the same bet the collection format makes; an editing UI is its ow
 
 A gap turned up on the way: `build.rs` validated the URL and headers but **not query rows**, so an
 unsubstituted `{{var}}` in a query parameter reached the wire literally. Fixed, with a test.
+
+**The same gap, found again by audit, in bodies.** `Resolver::apply` substituted `Body::Raw` and
+nothing else, so once form and multipart became authorable (2b and 2d below) their field values went
+out verbatim. Worse than the query-row case: `build.rs` deliberately never scans a body for `{{…}}`
+because `{{` is legal in JSON, so there was no error either — and a client-credentials token
+request, the motivating case for request chaining, is a *form* body, so it sent the literal string
+`{{secret}}`. `apply`'s body match is now exhaustive with no catch-all, the same discipline
+`RequestView::load` already uses: a new `Body` variant fails the build until someone decides whether
+a variable belongs in it.
 
 **Auth helpers — dropped, not deferred.** Recorded so nobody rebuilds it because the roadmap once
 said to. Environments made it redundant, and a dedicated auth tab would now be actively *worse*:

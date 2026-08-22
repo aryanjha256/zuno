@@ -1170,6 +1170,39 @@ async fn ctrl_w_closes_a_buffer_and_leaves_focus_usable(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+async fn closing_a_buffer_cancels_its_in_flight_request(cx: &mut TestAppContext) {
+    // Dropping the buffer drops the task that consumes events, which *looks* like
+    // cancellation and isn't: the socket keeps draining into a buffer nothing will read until
+    // the timeout. `Engine::cancel` is the half that stops it.
+    //
+    // Observable because this test holds an `Entity` handle, so the buffer outlives its
+    // removal from `views` and can still be read. Without the cancel, `inflight` is still
+    // `Some` in it.
+    let base = serve_never();
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let doomed = active_view(&window, &mut cx);
+    cx.simulate_input(&format!("{base}/slow"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    // Confirm it really is in flight, so this tests cancellation and not a race with
+    // submission.
+    wait_for(&mut cx, "the request to start", |cx| {
+        cx.update(|_, cx| doomed.read(cx).is_sending().then_some(()))
+    });
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+
+    assert_eq!(tabs_of(&window, &mut cx).0, 1, "the buffer should be gone");
+    assert!(
+        !cx.update(|_, cx| doomed.read(cx).is_sending()),
+        "closing a tab must abandon its request, not just stop listening to it"
+    );
+}
+
+#[gpui::test]
 async fn closing_the_last_buffer_leaves_a_fresh_one(cx: &mut TestAppContext) {
     // An empty `views` makes `active()` return None, which every handler reads as "do
     // nothing" — a window that is still there and silently inert. Ctrl+W must not do that,
@@ -2163,6 +2196,63 @@ async fn a_variable_is_substituted_on_the_way_to_a_real_socket(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn a_variable_in_a_form_field_reaches_the_socket_substituted(cx: &mut TestAppContext) {
+    // Asserted against the bytes a server actually received, because that is the only place
+    // this bug was visible: `apply` substituted raw bodies only, and `build.rs` deliberately
+    // never scans a body for `{{…}}`, so an unresolved secret was sent verbatim with no error
+    // anywhere. A client-credentials token request is exactly this shape.
+    let (session, root) = scratch_collection("env-form-send");
+    write_env(&root, "dev.json", r#"{"id":"zuno-cli"}"#);
+    write_env(&root, "dev.local.json", r#"{"secret":"s3cret"}"#);
+
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let (url, server) = serve_capturing(OK_JSON);
+
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+
+    // A fresh buffer: the sample ships `Content-Type: application/json`, and an explicit
+    // header outranks the form's derived type.
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+    cx.simulate_input(&url);
+
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("client_id");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("{{id}}");
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("client_secret");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("{{secret}}");
+
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    let request = server.join().expect("server thread");
+    assert!(
+        request.contains("client_id=zuno-cli&client_secret=s3cret"),
+        "form values should be substituted on the way out:\n{request}"
+    );
+    assert!(
+        !request.contains("%7B%7B") && !request.contains("{{"),
+        "no placeholder may reach the server, encoded or not:\n{request}"
+    );
+
+    // And the buffer keeps its placeholders, or a later Ctrl+S would write the secret into a
+    // committed collection file.
+    let Body::Form(fields) = &spec_of(&view, &mut cx).body else {
+        panic!("expected a form body");
+    };
+    assert_eq!(fields[1].value, "{{secret}}");
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
 async fn an_undefined_variable_is_reported_by_name_instead_of_being_sent(cx: &mut TestAppContext) {
     // `Url::parse("https://{{baseUrl}}/x")` succeeds and reads the placeholder as a
     // hostname, so without the check this is a pointless DNS lookup and a confusing error.
@@ -2705,6 +2795,46 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
 }
 
 
+
+#[gpui::test]
+async fn a_body_less_request_says_none_rather_than_a_retained_sub_kind(cx: &mut TestAppContext) {
+    // `body_label` folded `Empty` in with `Raw` and returned `body_kind`, which defaults to
+    // Json — so a fresh buffer's chip read "JSON" next to a pane reading "No body".
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_type),
+        crate::request_view::BodyType::Empty
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_label()),
+        "None",
+        "a request that sends no body must not advertise a content type"
+    );
+}
+
+#[gpui::test]
+async fn the_body_type_picker_marks_none_as_current_on_a_fresh_buffer(cx: &mut TestAppContext) {
+    // The consequence that made the mislabel more than cosmetic: the picker marks its current
+    // row by comparing `body_label()` against the row labels, so it marked JSON as current on
+    // a buffer with no body and could never mark None. Deliberately on a *fresh* buffer — the
+    // existing coverage boots the sample request, whose raw JSON body makes the old label
+    // accidentally correct.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_keystrokes("ctrl-shift-b");
+
+    let rows = picker_rows(&window, &mut cx);
+    let none = rows.iter().find(|row| row.starts_with("None")).expect("a None row");
+    assert!(none.contains("current"), "{rows:?}");
+    let json = rows.iter().find(|row| row.starts_with("JSON")).expect("a JSON row");
+    assert!(
+        !json.contains("current"),
+        "JSON must not claim to be the current body: {rows:?}"
+    );
+}
 
 #[gpui::test]
 async fn a_form_body_reaches_the_wire_urlencoded(cx: &mut TestAppContext) {
