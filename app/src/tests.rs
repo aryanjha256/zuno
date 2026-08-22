@@ -958,6 +958,42 @@ async fn an_identical_resend_reports_no_change(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn the_diff_describes_the_two_most_recent_runs(cx: &mut TestAppContext) {
+    // The diff is computed off-thread now, so it arrives a frame or two after the response and
+    // has to describe the *right* pair when it does. Three runs rather than two: with only two,
+    // "diffed against the previous run" and "diffed against the first run" are the same
+    // assertion, so a wrong baseline would pass.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, r#"{"a":1}"#), (201, r#"{"b":2}"#), (202, r#"{"c":3}"#)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 201);
+    send_and_wait(&mut cx, &view, 202);
+
+    // `apply` clears `diff` when the response lands, so anything found here is the new one
+    // rather than a leftover from the run before.
+    let diff = wait_for(&mut cx, "the diff for the newest run", |cx| {
+        cx.update(|_, cx| view.read(cx).diff.clone())
+    });
+
+    assert_eq!(
+        diff.status,
+        Some((201, 202)),
+        "the baseline must be the run this one replaced, not an older one"
+    );
+    assert!(diff.body_changed);
+
+    // And the retired run is the one it was compared against.
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.history[0].status, 201);
+        assert_eq!(view.response.as_ref().expect("live").status, 202);
+    });
+}
+
+#[gpui::test]
 async fn a_failure_clears_the_diff_but_keeps_the_baseline(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 

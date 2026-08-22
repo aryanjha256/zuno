@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 334 tests, ~9s
+cargo test --workspace                   # 335 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -54,8 +54,14 @@ Breaking any of these is a bug, not a tradeoff.
 1. **Zero warnings.** CI sets `RUSTFLAGS: -D warnings`. Don't leave speculative API behind
    "for later" — delete it and re-add when there's a caller.
 2. **`zuno-core` never imports GPUI.**
-3. **Nothing parses or formats on the UI thread.** Body indexing, JSON flattening, and UTF-8
-   validation go to `cx.background_executor()`. Only a finished index crosses back.
+3. **Nothing parses or formats on the UI thread.** Body indexing, JSON flattening, UTF-8
+   validation, the response diff, and the session write all go to `cx.background_executor()`; only
+   a finished result crosses back. **The two that don't look like parsing are the two that were
+   missed:** `ResponseDiff::between` compares both bodies byte-for-byte *and* counts the newlines
+   in each, and `session::save` serializes every open buffer's `RequestSpec`, bodies included.
+   Assembling the input often does need the UI thread, because only it can read entities — but
+   that part has to be a clone, not a format. Blocking is allowed only where the write must land
+   before the next thing happens, and only two places qualify: the quit hook and Ctrl+S.
 4. **Response bodies are `Bytes`, never `String`.** Binary and invalid UTF-8 are normal.
 5. **Check the registry before writing a version string.** `cargo info <crate>`. Never write one
    from memory — see "Lessons" below.

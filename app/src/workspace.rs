@@ -51,6 +51,8 @@ pub struct Workspace {
     settings: Option<SettingsState>,
     /// Holding the task is what keeps a save-response dialog and its write alive.
     response_save: Option<Task<()>>,
+    /// Same, for the checkpoint write a send kicks off.
+    session_save: Option<Task<()>>,
     /// Same, for the choose-a-body-file dialog.
     body_file_prompt: Option<Task<()>>,
     /// The selected environment's name, restored from the session.
@@ -108,6 +110,10 @@ impl Workspace {
         // with the window manager's button lost every edit made since the last send —
         // `session::save` was only reachable from the Send and Quit actions.
         let quit_subscription = cx.on_app_quit(|workspace, cx| {
+            // Drop any in-flight background checkpoint before writing. Otherwise a write queued
+            // by a send moments ago could land *after* this one and put older state back on
+            // disk; dropping the task cancels it.
+            workspace.session_save = None;
             crate::session::save(&workspace.session(cx), cx);
             // The hook wants a future; there is nothing to await, since the write is
             // synchronous and must finish before the process goes away.
@@ -124,6 +130,7 @@ impl Workspace {
             picker_scan: None,
             settings: None,
             response_save: None,
+            session_save: None,
             body_file_prompt: None,
             environment,
         }
@@ -1245,7 +1252,11 @@ impl Workspace {
         // A send is a natural checkpoint: persist here so a crash costs at most the
         // edits made since the last one. Every buffer is written, not just the one being
         // sent — the checkpoint is the window's state, not this request's.
-        crate::session::save(&self.session(cx), cx);
+        //
+        // Assembled here and written off-thread. Reading the buffers needs the UI thread, but
+        // serializing every open request and blocking on the write does not, and this is the
+        // path §8 budgets at 5ms.
+        self.session_save = Some(crate::session::save_in_background(self.session(cx), cx));
 
         // Read from disk per send rather than cached at switch time, so editing an
         // environment file takes effect on the next request. It's a couple of small files;

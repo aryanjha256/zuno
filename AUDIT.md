@@ -20,12 +20,12 @@ The findings cluster in three places, and the pattern is worth naming:
 2. **Features added late didn't revisit earlier assumptions.** Body authoring became complete in M3
    but variable substitution (#1) and `body_label` (#3) still assume raw-only bodies.
 3. **Invariant 3 ("nothing parses or formats on the UI thread") is enforced for the response index
-   and nowhere else** — the diff (#10) and the session write (#11) both do real work in the frame.
+   and nowhere else** — the diff (#8) and the session write (#9) both do real work in the frame.
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings and #4–#7 are fixed, each with a test that was confirmed to fail
-against the old code before the fix landed. Findings 8–21 are open.
+**Status.** The three High findings and #4–#9 are fixed, each with a test that was confirmed to fail
+against the old code before the fix landed. Findings 10–21 are open.
 
 ---
 
@@ -301,6 +301,18 @@ unnoticed while being wrong.
 
 ### 8. `ResponseDiff::between` runs on the UI thread
 
+> **Fixed.** `RequestView::diff_against` computes it on the background executor and hands back only
+> the finished `ResponseDiff`, so `diff` is `None` for a frame or two after a response lands — the
+> same deal the body index has always had, and `response_pane` already renders a missing diff as no
+> diff bar. The task is held in a `diff_task` field so assigning a new one cancels a superseded
+> diff, matching `body_task`.
+>
+> Guarded by the three pre-existing diff tests, which now exercise the async path and **time out**
+> if the result never lands (verified by dropping the task: they fail in 10s with "timed out waiting
+> for a diff"), plus a new `the_diff_describes_the_two_most_recent_runs`. That one uses *three* runs
+> on purpose — with two, "diffed against the previous run" and "diffed against the first run" are
+> the same assertion.
+
 Every other piece of response handling is pushed to the background executor with a comment citing
 invariant 3. The diff isn't: it runs inline in `apply`'s `Event::Done` arm.
 
@@ -318,6 +330,19 @@ there and keep the header/status comparison inline. The first is cleaner and mak
 uniform.
 
 ### 9. Every send synchronously serializes and writes every open buffer
+
+> **Fixed.** `session::save_in_background` serializes and writes on the background executor;
+> `session::save` is kept for the two places that must block. Assembling the `Session` still happens
+> on the UI thread — only it can read the buffers — which is why the new function takes an owned
+> `Session` rather than a reference: the UI-thread part is a clone, not a format.
+>
+> The quit hook now drops any pending background write **before** writing synchronously, or a
+> checkpoint queued by a send moments earlier could land after it and put older state back on disk.
+>
+> Guarded by the two pre-existing persistence tests, which fail with "No such file or directory"
+> if the write task is dropped rather than held (verified). No bespoke test for the quit ordering:
+> `on_app_quit` fires at test teardown, so asserting after it isn't reachable from a test — the
+> ordering is enforced by the code and stated in the comment instead.
 
 [app/src/workspace.rs:1205](app/src/workspace.rs#L1205)
 

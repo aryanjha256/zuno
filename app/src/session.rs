@@ -26,7 +26,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, Global};
+use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
 use zuno_core::RequestSpec;
 
@@ -222,12 +222,46 @@ fn parse(bytes: &[u8]) -> Result<Session, String> {
     Ok(session)
 }
 
-/// Write the open buffers. Best-effort: a failure is reported but never fatal.
+/// Write the open buffers, blocking until it lands. Best-effort: a failure is reported but
+/// never fatal.
+///
+/// Use this only where the write genuinely has to finish before the next thing happens — the
+/// quit hook, where the process is about to go away, and explicit user actions small enough that
+/// a person wants to know they landed. A *send* is neither; see `save_in_background`.
 pub fn save(session: &Session, cx: &App) {
     let Some(path) = path(cx) else {
         return;
     };
+    write_to(&path, session);
+}
 
+/// Write the open buffers on a background thread, returning the task.
+///
+/// **The caller must hold the task**: dropping it cancels the write.
+///
+/// Serializing every open buffer is real work — `Session` carries a full `RequestSpec` per tab,
+/// bodies included, so fifty tabs is megabytes through `to_vec_pretty` — and then the write
+/// blocks. A send is the wrong moment for it: architecture.md §8 budgets 5ms from the Send
+/// keypress to bytes on the wire, and this used to sit inside that budget along with a
+/// `create_dir_all`.
+///
+/// Assembling the `Session` still has to happen on the UI thread, because only it can read the
+/// buffers — but that part is a clone, not a format, which is why this takes an owned `Session`
+/// rather than a `&`.
+pub fn save_in_background(session: Session, cx: &App) -> Task<()> {
+    let Some(path) = path(cx) else {
+        return Task::ready(());
+    };
+    cx.background_executor()
+        .spawn(async move { write_to(&path, &session) })
+}
+
+/// Serialize and write, reporting failures without propagating them.
+///
+/// In place rather than write-to-temp-and-rename, unlike `collection::write`, and the difference
+/// is deliberate: a truncated session costs you the tab layout, while a truncated collection file
+/// costs a request you may have intended to keep.
+fn write_to(path: &std::path::Path, session: &Session) {
     if let Some(parent) = path.parent()
         && let Err(error) = std::fs::create_dir_all(parent)
     {
@@ -237,7 +271,7 @@ pub fn save(session: &Session, cx: &App) {
 
     match serde_json::to_vec_pretty(session) {
         Ok(bytes) => {
-            if let Err(error) = std::fs::write(&path, bytes) {
+            if let Err(error) = std::fs::write(path, bytes) {
                 eprintln!("[zuno] could not save session: {error}");
             }
         }

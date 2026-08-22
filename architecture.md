@@ -20,7 +20,11 @@ Four rules that decide most of the design. When a later decision is ambiguous, t
    (see §2), not by discipline.
 2. **Nothing parses or formats on the UI thread.** A 50MB response body is parsed,
    flattened, and measured on a background executor. Only a finished, indexable
-   structure crosses back to the renderer.
+   structure crosses back to the renderer. *Two things that don't look like parsing but are, both
+   inline until an audit found them:* the response diff compares both bodies byte-for-byte and
+   counts the newlines in each, and the session write serializes every open buffer. Assembling
+   either one's input can need the UI thread — only it can read entities — but that part has to be
+   a clone rather than a format, which is why `save_in_background` takes an owned `Session`.
 3. **Bytes in, bytes stored.** Response bodies are `Bytes`, never `String`. Decoding to
    text is a lazy, display-time concern. Binary responses and invalid UTF-8 are normal, not edge cases.
 4. **Latency is a spec, not a vibe.** §8 gives numbers. If they aren't asserted, "fast" drifts.

@@ -178,6 +178,9 @@ pub struct RequestView {
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
+    /// Holding the diff task is what keeps it alive, and replacing it is what makes a
+    /// superseded diff harmless — see `diff_against`.
+    diff_task: Option<Task<()>>,
     pub inflight: Option<InFlight>,
     pub error: Option<EngineError>,
     pub status: Option<SharedString>,
@@ -208,6 +211,7 @@ impl RequestView {
             viewing: 0,
             body_view: None,
             body_task: None,
+            diff_task: None,
             inflight: None,
             error: None,
             status: None,
@@ -321,6 +325,7 @@ impl RequestView {
         self.viewing = 0;
         self.body_view = None;
         self.body_task = None;
+        self.diff_task = None;
         self.inflight = None;
         self.error = None;
         self.status = None;
@@ -587,20 +592,26 @@ impl RequestView {
                 );
                 self.inflight = None;
 
-                // Diff against the run this one replaces, then retire it to history.
+                // The run this one replaces is the diff baseline, and then becomes history.
                 let previous = self.response.take();
-                self.diff = previous
-                    .as_ref()
-                    .map(|previous| ResponseDiff::between(previous, &response));
-                if let Some(previous) = previous {
-                    self.history.insert(0, previous);
-                    self.history.truncate(HISTORY_LIMIT);
-                }
+                // Cleared rather than left stale: it described a comparison that no longer holds,
+                // and the replacement arrives from a background task a frame or two later.
+                self.diff = None;
+                // Cloned before the move, and cheap for it: `Bytes` is refcounted, so this copies
+                // a status line and a header list, not a body.
+                let current = (*response).clone();
 
                 self.response = Some(*response);
                 // Back to live: a fresh response arriving while you're reading an old one
                 // must not leave you staring at the old one with no sign anything happened.
                 self.viewing = 0;
+
+                if let Some(previous) = previous {
+                    self.diff_against(previous.clone(), current, cx);
+                    self.history.insert(0, previous);
+                    self.history.truncate(HISTORY_LIMIT);
+                }
+
                 self.index_body(false, cx);
                 cx.notify();
                 false
@@ -662,6 +673,40 @@ impl RequestView {
 
     pub fn is_sending(&self) -> bool {
         self.inflight.is_some()
+    }
+
+    /// Compare this response with the one it replaced, **on a background thread**.
+    ///
+    /// `ResponseDiff::between` compares both bodies byte-for-byte and counts the newlines in each,
+    /// so on two 10MB responses it is tens of megabytes of scanning — and it was doing it in the
+    /// same frame that then has to lay the pane out and repaint it, three lines above an
+    /// `index_body` call that goes off-thread for exactly this reason. Invariant 3 applies to a
+    /// diff as much as to an index; this was the last piece of response handling still inline.
+    ///
+    /// The consequence is that `diff` is `None` for a frame or two after a response lands, which
+    /// is the same deal the body index has always had, and `response_pane` already renders a
+    /// missing diff as simply no diff bar.
+    ///
+    /// Holding the task in a field is what makes a superseded diff harmless: assigning a new one
+    /// drops the old, and dropping a `Task` cancels it, so a late result can never land on top of
+    /// a newer response.
+    fn diff_against(
+        &mut self,
+        previous: ResponseData,
+        current: ResponseData,
+        cx: &mut Context<Self>,
+    ) {
+        let compute = cx
+            .background_executor()
+            .spawn(async move { ResponseDiff::between(&previous, &current) });
+
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            let diff = compute.await;
+            let _ = this.update(cx, |this, cx| {
+                this.diff = Some(diff);
+                cx.notify();
+            });
+        }));
     }
 
     // ---- body indexing ------------------------------------------------------
