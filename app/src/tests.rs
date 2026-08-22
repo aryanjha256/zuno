@@ -1776,6 +1776,80 @@ async fn a_second_ctrl_p_does_not_nest_a_modal(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn tab_does_not_move_focus_out_of_the_picker(cx: &mut TestAppContext) {
+    // The panes behind a modal are still painted, so their inputs are still tab stops and
+    // `focus_next` walks straight past the scrim into them.
+    //
+    // `picker_is_open` cannot detect this on its own — the bug leaves the picker on screen and
+    // merely strands it — so the only proof is where the keystrokes afterwards land.
+    let (window, view, mut cx) = boot(cx, None, None);
+    let url_before = spec_of(&view, &mut cx).url;
+
+    cx.simulate_keystrokes("ctrl-p");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("zzzz");
+
+    assert!(picker_is_open(&window, &mut cx));
+    assert!(
+        picker_rows(&window, &mut cx).is_empty(),
+        "typing after Tab must still reach the picker's filter"
+    );
+    assert_eq!(
+        spec_of(&view, &mut cx).url,
+        url_before,
+        "Tab must not put focus in the buffer behind the modal"
+    );
+}
+
+#[gpui::test]
+async fn tab_does_not_strand_the_settings_panel(cx: &mut TestAppContext) {
+    // The harm, stated as the user meets it: once focus leaves the panel its leaf key context
+    // stops matching, so `escape` resolves to the *global* CancelRequest and the panel becomes
+    // closable only with the mouse. Every binding it owns dies at once and nothing on screen
+    // says why.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-,");
+    assert!(settings_open(&window, &mut cx));
+
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("escape");
+
+    assert!(
+        !settings_open(&window, &mut cx),
+        "Escape must still dismiss the panel after Tab"
+    );
+}
+
+#[gpui::test]
+async fn a_picker_cannot_open_over_the_settings_panel(cx: &mut TestAppContext) {
+    // Four of the six openers guarded on both modals and these two guarded on only the picker,
+    // so they stacked. Closing the picker then restored focus to the buffer *behind* the panel,
+    // stranding it exactly as Tab did — one defect, two routes in.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-,");
+
+    cx.simulate_keystrokes("ctrl-p");
+    assert!(
+        !picker_is_open(&window, &mut cx),
+        "Ctrl+P must not stack a picker over the panel"
+    );
+    cx.simulate_keystrokes("ctrl-k");
+    assert!(
+        !picker_is_open(&window, &mut cx),
+        "Ctrl+K must not stack a picker over the panel"
+    );
+    assert!(
+        settings_open(&window, &mut cx),
+        "and the panel itself must be untouched"
+    );
+
+    // Still dismissable from the keyboard, which is what stacking took away.
+    cx.simulate_keystrokes("escape");
+    assert!(!settings_open(&window, &mut cx));
+}
+
+#[gpui::test]
 async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 

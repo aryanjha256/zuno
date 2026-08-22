@@ -24,8 +24,8 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings and #4 are fixed, each with a test that was confirmed to fail
-against the old code before the fix landed. Findings 5–21 are open.
+**Status.** The three High findings and #4–#6 are fixed, each with a test that was confirmed to fail
+against the old code before the fix landed. Findings 7–21 are open.
 
 ---
 
@@ -197,6 +197,17 @@ picker already reaches every raw kind by name.
 
 ### 5. Tab moves focus out of an open modal and kills the keymap
 
+> **Fixed together with #6**, since they are one defect — focus leaving a modal that stays on screen
+> — reached two ways. `Workspace::modal_open` is now the single predicate, consulted by
+> `FocusNext`/`FocusPrev` and by all seven openers. Guarded by
+> `tab_does_not_move_focus_out_of_the_picker` (which asserts on where keystrokes *land*, because
+> `picker_is_open` stays true in the broken case) and `tab_does_not_strand_the_settings_panel`
+> (which asserts Escape still works, the harm as the user meets it).
+>
+> The guard sits on the handler rather than on the key binding: GPUI matches only the leaf context,
+> so "not inside a modal" would have to be restated for every modal that ever exists. Recorded in
+> architecture.md §12 with the rejected alternative.
+
 `FocusNext`/`FocusPrev` are bound with **no context**:
 
 [app/src/main.rs:149-150](app/src/main.rs#L149-L150)
@@ -226,6 +237,10 @@ self.settings.is_some()`, or scope both bindings away from the modal contexts. T
 cheaper and matches how every other handler guards.
 
 ### 6. `Ctrl+P` and `Ctrl+K` stack a second modal over the settings panel
+
+> **Fixed with #5.** All seven openers now go through `modal_open`, so the drift that produced this
+> can't recur in a new opener. Guarded by `a_picker_cannot_open_over_the_settings_panel`, which also
+> asserts the panel is still dismissable afterwards.
 
 Four of the six modal openers guard on both modals; two guard on only one.
 
@@ -533,8 +548,8 @@ Not a general complaint — these are the specific untested paths:
 |---|---|
 | `body_label()` on a fresh (`Empty`) buffer, and the picker's `current` marker for it | #3 |
 | ~~The body-kind chip's click path — `cycle_body_kind` has one caller and zero tests~~ — fixed with #4 | #4 |
-| `Tab` while any modal is open | #5 |
-| `Ctrl+P` / `Ctrl+K` while the settings panel is open (`a_second_ctrl_p_does_not_nest_a_modal` covers only picker-over-picker) | #6 |
+| ~~`Tab` while any modal is open~~ — fixed with #5 | #5 |
+| ~~`Ctrl+P` / `Ctrl+K` while the settings panel is open~~ — fixed with #6 (`a_second_ctrl_p_does_not_nest_a_modal` covered only picker-over-picker) | #6 |
 | Whether closing a tab cancels its in-flight job | #2 |
 | Variable substitution into a form or multipart body | #1 |
 | An imported curl command *without* `-L` / `--compressed` | #12 |

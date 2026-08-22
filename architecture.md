@@ -861,6 +861,20 @@ Three decisions in `picker.rs` worth recording:
   collection is a git directory, so it changes under us on every pull. `Picker::extend` re-ranks
   against whatever has been typed meanwhile, because on a slow disk you can finish typing first.
 
+A fourth, added after an audit found it missing: **a modal owns the keyboard exclusively, and that
+is enforced by a guard rather than by key contexts.** `Workspace::modal_open` is consulted by every
+opener *and* by `FocusNext`/`FocusPrev`. Two things forced it. The openers had drifted — four checked
+both modals, `Ctrl+P` and `Ctrl+K` checked only the picker, so a picker could stack over the settings
+panel and closing it restored focus to the buffer behind, leaving the panel stranded. And `Tab` did
+the same thing directly: the panes behind a modal are still painted, so their inputs are still tab
+stops and `focus_next` walks past the scrim into them.
+
+*Rejected: scoping the `tab` binding with a context predicate.* GPUI matches only the **leaf**
+context, so "not inside a modal" cannot be written once — it has to be restated for every modal
+context that ever exists, and the failure mode when someone forgets is a dead keymap with nothing on
+screen explaining it. A guard on the handler is one place and cannot be forgotten by a *new* modal,
+only by a new focus-moving action.
+
 Deliberately absent: **no highlighting of matched characters.** It needs match positions threaded
 out of the scorer and styled text runs, and the picker is useful without it.
 

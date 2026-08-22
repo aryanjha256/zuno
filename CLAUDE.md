@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 330 tests, ~9s
+cargo test --workspace                   # 333 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -236,6 +236,13 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   is the thing a palette exists to prevent.
 - Every action handler lives on `Workspace`, because dispatch travels up the focus tree and
   `Workspace` is always on it.
+- **Anything that opens a modal, or moves focus, asks `Workspace::modal_open` first.** Written out
+  at each site it drifts: `open_request` and `open_palette` checked only `picker` while four other
+  openers checked both, so `Ctrl+P` over the settings panel stacked two modals. And because the
+  panes behind a modal are still painted, their `TextInput`s are still tab stops — so `Tab` walked
+  focus past the scrim, the modal's leaf key context stopped matching, and every binding it owned
+  including `Escape` silently died. Both are the same bug: focus left the modal while the modal
+  stayed on screen.
 - **Anything that changes which buffer is active goes through `Workspace::activate`.** A
   `FocusHandle` belongs to the entity that created it, so switching `active_ix` without moving
   focus leaves it inside the old view — and after a close, inside a dropped one, where no key
