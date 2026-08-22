@@ -20,7 +20,11 @@ Four rules that decide most of the design. When a later decision is ambiguous, t
    (see §2), not by discipline.
 2. **Nothing parses or formats on the UI thread.** A 50MB response body is parsed,
    flattened, and measured on a background executor. Only a finished, indexable
-   structure crosses back to the renderer.
+   structure crosses back to the renderer. *Two things that don't look like parsing but are, both
+   inline until an audit found them:* the response diff compares both bodies byte-for-byte and
+   counts the newlines in each, and the session write serializes every open buffer. Assembling
+   either one's input can need the UI thread — only it can read entities — but that part has to be
+   a clone rather than a format, which is why `save_in_background` takes an owned `Session`.
 3. **Bytes in, bytes stored.** Response bodies are `Bytes`, never `String`. Decoding to
    text is a lazy, display-time concern. Binary responses and invalid UTF-8 are normal, not edge cases.
 4. **Latency is a spec, not a vibe.** §8 gives numbers. If they aren't asserted, "fast" drifts.
@@ -363,6 +367,22 @@ Structural errors *are* rejected, since flattening them would produce nonsense.
 "parse as JSON anyway" affordance. Pretty-printing a 200MB body is a bad idea at any speed.
 Whatever the cap is, *say so in the UI* — a silently truncated response reads as a wrong
 response, and that's a trust bug, not a perf one.
+
+**Two caps, answering different questions — and only one of them existed for a long time.** The one
+above is a *display* cap (`body_view::MAX_AUTO_PARSE`, 10MB): past it the body is shown as raw text
+with a button, and every byte is still held. It says nothing about whether the body should have been
+held at all, and nothing did — `run.rs` collected the stream into an unbounded `Vec<u8>`, so a URL
+pointing at a release artifact instead of an API endpoint buffered the lot, with `HISTORY_LIMIT`
+retaining up to eleven of them per buffer. `run::MAX_BODY_BYTES` (100MB) is the *transfer* cap.
+
+Unlike the display cap it **fails rather than degrading**, which is the opposite of `MAX_DISPLAY_LINE`
+and deliberate: a truncated body is not the response, so `SaveResponse` would write a corrupt file
+from it and the viewer would report a parse error at the cut. Being told the transfer was refused
+beats both. It is checked twice — against a declared `Content-Length` before any body moves, which
+is the cheap half, and again while streaming, because a declared length is a claim and a chunked
+response makes none. The limit is a *parameter* of `run::execute` rather than a constant read inside
+it, so the streaming guard can be tested with a 64KB limit instead of pushing 100MB through a
+socket.
 
 **The viewer is read-only.** This is what makes M1 tractable: rendered rows plus
 selection-for-copy, no editing, no cursor, no IME. All the editor complexity is confined to
@@ -860,6 +880,20 @@ Three decisions in `picker.rs` worth recording:
   and gains saved requests when `scan` returns (invariant 3). Caching at startup was rejected: a
   collection is a git directory, so it changes under us on every pull. `Picker::extend` re-ranks
   against whatever has been typed meanwhile, because on a slow disk you can finish typing first.
+
+A fourth, added after an audit found it missing: **a modal owns the keyboard exclusively, and that
+is enforced by a guard rather than by key contexts.** `Workspace::modal_open` is consulted by every
+opener *and* by `FocusNext`/`FocusPrev`. Two things forced it. The openers had drifted — four checked
+both modals, `Ctrl+P` and `Ctrl+K` checked only the picker, so a picker could stack over the settings
+panel and closing it restored focus to the buffer behind, leaving the panel stranded. And `Tab` did
+the same thing directly: the panes behind a modal are still painted, so their inputs are still tab
+stops and `focus_next` walks past the scrim into them.
+
+*Rejected: scoping the `tab` binding with a context predicate.* GPUI matches only the **leaf**
+context, so "not inside a modal" cannot be written once — it has to be restated for every modal
+context that ever exists, and the failure mode when someone forgets is a dead keymap with nothing on
+screen explaining it. A guard on the handler is one place and cannot be forgotten by a *new* modal,
+only by a new focus-moving action.
 
 Deliberately absent: **no highlighting of matched characters.** It needs match positions threaded
 out of the scorer and styled text runs, and the picker is useful without it.

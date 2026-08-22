@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{Body, RequestSpec};
+use crate::{Body, FormField, MultipartField, MultipartValue, RequestSpec};
 
 /// The reserved directory name inside a collection. Skipped by `collection::scan`.
 pub const DIRECTORY: &str = "environments";
@@ -153,31 +153,71 @@ impl Resolver {
     /// The stored request keeps its `{{placeholders}}` — that's the point of having them —
     /// so this is deliberately a new value rather than an in-place edit.
     ///
-    /// Covers the URL, query names and values, header names and values, and raw body text.
+    /// Covers the URL, query names and values, header names and values, and every body a
+    /// variable can appear in.
+    ///
     /// Query rows matter here: `build.rs` validates the URL and headers but *not* query
     /// rows, so before this a `{{var}}` in a query parameter reached the wire literally.
+    /// Form and multipart fields had the same hole for the same reason, and it was worse:
+    /// `build.rs` deliberately never scans bodies for `{{…}}` (`{{` is legal in JSON), so
+    /// there was no error either — an unresolved `client_secret={{secret}}` was simply sent.
     pub fn apply(&self, spec: &RequestSpec) -> RequestSpec {
         let mut resolved = spec.clone();
         resolved.url = self.resolve(&spec.url).into_owned();
 
         for param in &mut resolved.query {
-            param.name = self.resolve(&param.name.clone()).into_owned();
-            param.value = self.resolve(&param.value.clone()).into_owned();
+            let name = self.resolve(&param.name).into_owned();
+            let value = self.resolve(&param.value).into_owned();
+            param.name = name;
+            param.value = value;
         }
         for header in &mut resolved.headers {
-            header.name = self.resolve(&header.name.clone()).into_owned();
-            header.value = self.resolve(&header.value.clone()).into_owned();
+            let name = self.resolve(&header.name).into_owned();
+            let value = self.resolve(&header.value).into_owned();
+            header.name = name;
+            header.value = value;
         }
 
-        // Only raw bodies. Form and multipart field values would want this too once the UI
-        // can author them; `Binary` is a path, and substituting into it would let a variable
-        // choose which file gets uploaded.
-        if let Body::Raw { text, kind } = &resolved.body {
-            resolved.body = Body::Raw {
+        // Exhaustive with no catch-all, for the reason `RequestView::load` is: a new `Body`
+        // variant must fail the build until someone decides whether a variable belongs in it.
+        // A catch-all here is what left form and multipart silently unsubstituted once they
+        // became authorable.
+        resolved.body = match &spec.body {
+            Body::Empty => Body::Empty,
+            Body::Raw { text, kind } => Body::Raw {
                 text: self.resolve(text).into_owned(),
                 kind: *kind,
-            };
-        }
+            },
+            Body::Form(fields) => Body::Form(
+                fields
+                    .iter()
+                    .map(|field| FormField {
+                        enabled: field.enabled,
+                        name: self.resolve(&field.name).into_owned(),
+                        value: self.resolve(&field.value).into_owned(),
+                    })
+                    .collect(),
+            ),
+            Body::Multipart(fields) => Body::Multipart(
+                fields
+                    .iter()
+                    .map(|field| MultipartField {
+                        enabled: field.enabled,
+                        name: self.resolve(&field.name).into_owned(),
+                        value: match &field.value {
+                            MultipartValue::Text(text) => {
+                                MultipartValue::Text(self.resolve(text).into_owned())
+                            }
+                            // Left alone for the same reason as `Binary` below.
+                            MultipartValue::File(path) => MultipartValue::File(path.clone()),
+                        },
+                    })
+                    .collect(),
+            ),
+            // A path, not text: substituting into it would let a variable choose which file
+            // gets uploaded.
+            Body::Binary(path) => Body::Binary(path.clone()),
+        };
 
         resolved
     }
@@ -427,6 +467,104 @@ mod tests {
 
         // The stored request must be untouched, or saving would bake the environment in.
         assert_eq!(spec.url, "https://{{host}}/v1");
+    }
+
+    #[test]
+    fn apply_substitutes_form_field_values() {
+        // The motivating case, and the one that was silently broken: a client-credentials
+        // token request is a *form* body, so the secret from `dev.local.json` was sent as the
+        // literal string `{{secret}}`. `build.rs` never scans bodies for `{{…}}`, so there was
+        // no error either — just a request that failed at the server for no visible reason.
+        let resolver = Resolver::new(
+            None,
+            Some(&env("dev", &[("id", "zuno-cli"), ("secret", "s3cret")])),
+        );
+
+        let spec = RequestSpec {
+            body: Body::Form(vec![
+                FormField {
+                    enabled: true,
+                    name: "grant_type".into(),
+                    value: "client_credentials".into(),
+                },
+                FormField {
+                    enabled: true,
+                    name: "client_id".into(),
+                    value: "{{id}}".into(),
+                },
+                FormField {
+                    enabled: true,
+                    name: "client_secret".into(),
+                    value: "{{secret}}".into(),
+                },
+            ]),
+            ..RequestSpec::default()
+        };
+
+        let Body::Form(fields) = resolver.apply(&spec).body else {
+            panic!("expected a form body");
+        };
+        assert_eq!(fields[1].value, "zuno-cli");
+        assert_eq!(fields[2].value, "s3cret");
+        assert_eq!(fields[0].value, "client_credentials", "untouched values stay put");
+
+        // The stored request keeps its placeholders, or saving would bake the secret into a
+        // committed collection file — the exact leak the `.local` split exists to prevent.
+        let Body::Form(stored) = &spec.body else { unreachable!() };
+        assert_eq!(stored[2].value, "{{secret}}");
+    }
+
+    #[test]
+    fn apply_substitutes_a_form_field_name() {
+        // Names as well as values, matching how query and header rows are handled.
+        let resolver = Resolver::new(None, Some(&env("dev", &[("key", "api_key")])));
+        let spec = RequestSpec {
+            body: Body::Form(vec![FormField {
+                enabled: true,
+                name: "{{key}}".into(),
+                value: "x".into(),
+            }]),
+            ..RequestSpec::default()
+        };
+
+        let Body::Form(fields) = resolver.apply(&spec).body else {
+            panic!("expected a form body");
+        };
+        assert_eq!(fields[0].name, "api_key");
+    }
+
+    #[test]
+    fn apply_substitutes_multipart_text_parts_but_never_file_paths() {
+        let resolver = Resolver::new(
+            None,
+            Some(&env("dev", &[("caption", "hello"), ("p", "/etc/passwd")])),
+        );
+
+        let spec = RequestSpec {
+            body: Body::Multipart(vec![
+                MultipartField {
+                    enabled: true,
+                    name: "caption".into(),
+                    value: MultipartValue::Text("{{caption}}".into()),
+                },
+                MultipartField {
+                    enabled: true,
+                    name: "avatar".into(),
+                    value: MultipartValue::File(PathBuf::from("{{p}}")),
+                },
+            ]),
+            ..RequestSpec::default()
+        };
+
+        let Body::Multipart(fields) = resolver.apply(&spec).body else {
+            panic!("expected a multipart body");
+        };
+        assert_eq!(fields[0].value, MultipartValue::Text("hello".to_string()));
+        assert_eq!(
+            fields[1].value,
+            MultipartValue::File(PathBuf::from("{{p}}")),
+            "a variable choosing which file gets uploaded is not a feature"
+        );
     }
 
     #[test]

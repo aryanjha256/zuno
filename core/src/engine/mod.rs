@@ -207,7 +207,16 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
             match command {
                 Command::Send { job, spec, events } => match clients.get(&spec.settings) {
                     Ok(client) => {
-                        jobs.insert(job, tokio::spawn(run::execute(job, client, *spec, events)));
+                        jobs.insert(
+                            job,
+                            tokio::spawn(run::execute(
+                                job,
+                                client,
+                                *spec,
+                                events,
+                                run::MAX_BODY_BYTES,
+                            )),
+                        );
                     }
                     Err(error) => {
                         let _ = events.try_send(Event::Failed { job, error });

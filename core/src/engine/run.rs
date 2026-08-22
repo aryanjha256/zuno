@@ -27,7 +27,36 @@ const MAX_PREALLOC: usize = 8 * 1024 * 1024;
 /// emitting per-chunk would flood the channel with events that get coalesced anyway.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(33);
 
-pub async fn execute(job: JobId, client: Client, spec: RequestSpec, events: Sender<Event>) {
+/// Largest response body Zuno will buffer, and the value `Engine` runs with.
+///
+/// **A memory limit on the transfer, not on the display.** `body_view::MAX_AUTO_PARSE` is the
+/// display one, and it declines to *index* 10MB+ while still showing the bytes. This one is about
+/// holding the bytes at all: the stream was collected into an unbounded `Vec<u8>`, so a mistyped
+/// URL pointing at a release artifact instead of an API endpoint buffered the whole thing, and
+/// `HISTORY_LIMIT` retained up to eleven of them per buffer.
+///
+/// **Fails rather than truncating**, unlike `MAX_DISPLAY_LINE`, which truncates for display while
+/// keeping every byte. A truncated body is not the response: `SaveResponse` would write a corrupt
+/// file from it and the JSON viewer would report a parse error at the cut. Being told the transfer
+/// was refused is more useful than either.
+///
+/// 100MB is a policy guess — ten times the parse cap, far past any JSON an API returns on purpose,
+/// and far below the point where buffering it hurts. If a legitimate download ever needs more, this
+/// belongs in `RequestSettings` rather than as a larger constant.
+pub const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+
+/// Run one request.
+///
+/// `max_body_bytes` is a parameter rather than a constant read inside, so a test can drive the
+/// streaming guard with a small limit instead of pushing 100MB through a socket. `Engine` always
+/// passes `MAX_BODY_BYTES`.
+pub async fn execute(
+    job: JobId,
+    client: Client,
+    spec: RequestSpec,
+    events: Sender<Event>,
+    max_body_bytes: usize,
+) {
     let started = Instant::now();
     let timeout = spec.settings.timeout;
 
@@ -75,6 +104,24 @@ pub async fn execute(job: JobId, client: Client, spec: RequestSpec, events: Send
         ttfb,
     });
 
+    // Refuse before transferring anything, when the server declares more than we will hold.
+    // The streaming check below is the real guard — a declared length is a claim, and a chunked
+    // response makes none — but this saves pulling down bytes that are going to be rejected.
+    // Emitted after `Head` on purpose: the status line and the `Content-Length` header are worth
+    // seeing, and they are what make the failure make sense.
+    if let Some(declared) = declared_length
+        && declared > max_body_bytes as u64
+    {
+        emit(Event::Failed {
+            job,
+            error: EngineError::BodyTooLarge {
+                limit: max_body_bytes,
+                size: declared as usize,
+            },
+        });
+        return;
+    }
+
     let mut buffer: Vec<u8> = Vec::with_capacity(
         declared_length
             .map(|len| len.min(MAX_PREALLOC as u64) as usize)
@@ -88,6 +135,19 @@ pub async fn execute(job: JobId, client: Client, spec: RequestSpec, events: Send
         match chunk {
             Ok(chunk) => {
                 buffer.extend_from_slice(&chunk);
+                // Checked after appending rather than before, so the limit is a ceiling on what we
+                // hold and not on what we accept: one chunk of overshoot is bounded and cheap,
+                // while a pre-check would need the chunk size to reason about.
+                if buffer.len() > max_body_bytes {
+                    emit(Event::Failed {
+                        job,
+                        error: EngineError::BodyTooLarge {
+                            limit: max_body_bytes,
+                            size: buffer.len(),
+                        },
+                    });
+                    return;
+                }
                 if last_progress.elapsed() >= PROGRESS_INTERVAL {
                     last_progress = Instant::now();
                     emit(Event::Progress {
@@ -170,5 +230,96 @@ fn http_version(version: reqwest::Version) -> HttpVersion {
         reqwest::Version::HTTP_2 => HttpVersion::Http2,
         reqwest::Version::HTTP_3 => HttpVersion::Http3,
         _ => HttpVersion::Http11,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve a response with **no `Content-Length`** — framed by closing the connection — carrying
+    /// roughly `bytes` bytes of body.
+    ///
+    /// The missing length is what makes this exercise the *streaming* guard: with a declared length
+    /// the pre-check would fire first and the loop would never run.
+    fn serve_unbounded_body(bytes: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut discard = [0u8; 1024];
+                let _ = stream.read(&mut discard);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/octet-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                );
+                let chunk = vec![b'x'; 8 * 1024];
+                let mut sent = 0;
+                while sent < bytes {
+                    // The client hangs up the moment it gives up, so a write error here is the
+                    // expected end of this thread rather than a problem.
+                    if stream.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    sent += chunk.len();
+                }
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_streamed_body_past_the_limit_fails_instead_of_buffering_without_bound() {
+        // Driven with a 64KB limit rather than the real 100MB, which is the whole reason
+        // `max_body_bytes` is a parameter: the guard is what needs testing, not the policy number.
+        const LIMIT: usize = 64 * 1024;
+
+        let base = serve_unbounded_body(LIMIT * 4);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let (sender, events) = async_channel::unbounded();
+        let spec = RequestSpec {
+            url: format!("{base}/big"),
+            ..RequestSpec::default()
+        };
+
+        runtime.block_on(execute(JobId(1), Client::new(), spec, sender, LIMIT));
+
+        let collected: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let failure = collected
+            .iter()
+            .find_map(|event| match event {
+                Event::Failed { error, .. } => Some(error),
+                _ => None,
+            })
+            .expect("a Failed event");
+
+        assert!(
+            matches!(
+                failure,
+                EngineError::BodyTooLarge { limit, size } if *limit == LIMIT && *size > LIMIT
+            ),
+            "{failure:?}"
+        );
+        // The overshoot is bounded by one chunk, not by however much the server had left to send.
+        // Without the guard this collects the lot, which is the failure being prevented.
+        assert!(
+            matches!(failure, EngineError::BodyTooLarge { size, .. } if *size < LIMIT * 4),
+            "should have stopped near the limit, not read the whole body: {failure:?}"
+        );
+        assert!(
+            !collected.iter().any(|e| matches!(e, Event::Done { .. })),
+            "a refused body must not also report success"
+        );
     }
 }

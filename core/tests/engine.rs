@@ -326,6 +326,58 @@ fn cancel_abandons_a_request_mid_flight() {
     );
 }
 
+#[test]
+fn a_declared_length_over_the_limit_is_refused_before_the_body_transfers() {
+    // The cheap half of the cap: a server that *claims* more than Zuno will hold is refused as
+    // soon as the head arrives, without pulling the body down. The body is deliberately never
+    // sent — if the check failed to fire, this would sit waiting for bytes that never come and
+    // fail on the 3s timeout from `spec_for` rather than hanging.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 1024];
+            let _ = stream.read(&mut discard);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/octet-stream\r\n\
+                  Content-Length: 209715200\r\n\
+                  \r\n",
+            );
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_, events) = engine.send(spec_for(format!("http://{addr}/artifact")));
+    let events = drain(&events);
+
+    let failure = events
+        .iter()
+        .find_map(|event| match event {
+            Event::Failed { error, .. } => Some(error),
+            _ => None,
+        })
+        .expect("a Failed event");
+
+    assert!(
+        matches!(failure, EngineError::BodyTooLarge { .. }),
+        "expected BodyTooLarge, got {failure:?}"
+    );
+    assert!(
+        !failure.is_local(),
+        "the request went out and the server answered, so a retry is not free"
+    );
+    // Emitted after `Head`, which is what makes the failure legible: you can see the 200 and the
+    // Content-Length that caused it.
+    assert!(
+        events.iter().any(|event| matches!(event, Event::Head { .. })),
+        "the head should still have been reported: {events:?}"
+    );
+}
+
 /// Localhost tests never exercise DNS, rustls, ALPN, or content decoding. This one
 /// does — and is `#[ignore]`d so CI never depends on the internet.
 ///

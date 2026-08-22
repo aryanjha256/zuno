@@ -62,17 +62,21 @@ pub fn render(
             cx,
         ))
         .child(rows_table(&view.query, RowKind::Query, theme, cx))
-        .child(body_header(view, body_lines, theme, cx))
+        .child(body_header(view, body_lines, theme))
         .child(body_region(view, theme, body_focused, cx))
 }
 
-/// The Body header, with a clickable body-kind chip (`Ctrl+Shift+B` does the same).
-fn body_header(
-    view: &RequestView,
-    lines: usize,
-    theme: &Theme,
-    cx: &mut gpui::Context<RequestView>,
-) -> Div {
+/// The Body header, with a chip that opens the body-type picker — the same action
+/// `Ctrl+Shift+B` dispatches.
+///
+/// **It used to cycle `RawKind` in place**, which was wrong three ways. It could never reach
+/// Form, Binary, or Multipart — the picker exists precisely because cycling couldn't. When the
+/// body *was* one of those three, the label read "Form"/"Binary"/"Multipart" while the click
+/// mutated `body_kind` underneath it, so clicking appeared to do nothing and silently changed
+/// what a later switch back to Raw would produce. And it called into the view directly rather
+/// than dispatching, which is the thing the "actions, not direct calls" convention exists to
+/// prevent: the chip and the keybinding could drift, and had.
+fn body_header(view: &RequestView, lines: usize, theme: &Theme) -> Div {
     div()
         .flex()
         .flex_row()
@@ -97,17 +101,18 @@ fn body_header(
                 .child(
                     div()
                         .id("body-kind")
+                        // A no-op outside test builds (gpui cfg-gates the body away); it's what
+                        // lets a test click this chip rather than only assert about the action
+                        // it dispatches.
+                        .debug_selector(|| "body-kind-chip".to_string())
                         .px_1()
                         .rounded_sm()
                         .text_color(theme.accent)
                         .cursor_pointer()
                         .hover(|style| style.bg(theme.bg_hover))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|view, _: &MouseDownEvent, _, cx| {
-                                view.cycle_body_kind(cx)
-                            }),
-                        )
+                        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+                            window.dispatch_action(Box::new(crate::actions::OpenBodyType), cx);
+                        })
                         .child(view.body_label()),
                 ),
         )

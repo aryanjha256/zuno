@@ -51,6 +51,8 @@ pub struct Workspace {
     settings: Option<SettingsState>,
     /// Holding the task is what keeps a save-response dialog and its write alive.
     response_save: Option<Task<()>>,
+    /// Same, for the checkpoint write a send kicks off.
+    session_save: Option<Task<()>>,
     /// Same, for the choose-a-body-file dialog.
     body_file_prompt: Option<Task<()>>,
     /// The selected environment's name, restored from the session.
@@ -108,6 +110,10 @@ impl Workspace {
         // with the window manager's button lost every edit made since the last send —
         // `session::save` was only reachable from the Send and Quit actions.
         let quit_subscription = cx.on_app_quit(|workspace, cx| {
+            // Drop any in-flight background checkpoint before writing. Otherwise a write queued
+            // by a send moments ago could land *after* this one and put older state back on
+            // disk; dropping the task cancels it.
+            workspace.session_save = None;
             crate::session::save(&workspace.session(cx), cx);
             // The hook wants a future; there is nothing to await, since the write is
             // synchronous and must finish before the process goes away.
@@ -124,6 +130,7 @@ impl Workspace {
             picker_scan: None,
             settings: None,
             response_save: None,
+            session_save: None,
             body_file_prompt: None,
             environment,
         }
@@ -131,6 +138,19 @@ impl Workspace {
 
     pub fn active(&self) -> Option<Entity<RequestView>> {
         self.views.get(self.active_ix).cloned()
+    }
+
+    /// Whether a modal currently owns the keyboard.
+    ///
+    /// One predicate rather than the same two checks spelled out at seven call sites, because
+    /// spelling them out is how they drift: `open_request` and `open_palette` each shipped
+    /// testing only `picker`, so `Ctrl+P` over the settings panel stacked a second modal — and
+    /// closing the picker then restored focus to the buffer *behind* the panel, stranding it on
+    /// screen with a key context that no longer matched anything.
+    ///
+    /// Everything that opens a modal, and everything that moves focus, has to consult this.
+    fn modal_open(&self) -> bool {
+        self.picker.is_some() || self.settings.is_some()
     }
 
     /// How many buffers are open. The strip renders from `render`'s own collected list, so
@@ -223,6 +243,16 @@ impl Workspace {
             return;
         }
 
+        // Cancellation has two halves, and dropping the buffer is only one of them. Dropping
+        // its task stops the UI *consuming* events; the socket keeps draining into a buffer
+        // nothing will ever read, for up to the request's timeout. `Escape` does both — so
+        // must this, and only the workspace holds the engine to do it with.
+        if let (Some(view), Some(engine)) = (self.active(), cx.engine()) {
+            view.update(cx, |view, cx| {
+                view.cancel(&engine, cx);
+            });
+        }
+
         self.views.remove(self.active_ix);
 
         if self.views.is_empty() {
@@ -267,8 +297,8 @@ impl Workspace {
     /// open rather than caching at startup is deliberate: a collection is a git directory,
     /// so it changes underneath us whenever someone pulls or edits a file by hand.
     fn open_request(&mut self, _: &OpenRequest, window: &mut Window, cx: &mut Context<Self>) {
-        // A second Ctrl+P while it's open is a no-op, not a nested modal.
-        if self.picker.is_some() {
+        // A second Ctrl+P while any modal is open is a no-op, not a nested modal.
+        if self.modal_open() {
             return;
         }
 
@@ -334,7 +364,7 @@ impl Workspace {
     /// The same picker as Ctrl+P, which is the whole point of principle 2 — a different
     /// `Vec<Item>` and a different `Target` variant, no new interaction.
     fn open_palette(&mut self, _: &OpenPalette, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.is_some() {
+        if self.modal_open() {
             return;
         }
 
@@ -467,7 +497,7 @@ impl Workspace {
     /// feature: it's what makes the retention worth its memory, since holding ten response
     /// bodies per tab that nothing can reach is pure cost.
     fn show_history(&mut self, _: &ShowHistory, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.is_some() || self.settings.is_some() {
+        if self.modal_open() {
             return;
         }
         let Some(view) = self.active() else { return };
@@ -512,7 +542,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.picker.is_some() || self.settings.is_some() {
+        if self.modal_open() {
             return;
         }
 
@@ -686,7 +716,7 @@ impl Workspace {
 
     /// Open the settings panel over the active buffer's `RequestSettings`.
     fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() || self.picker.is_some() {
+        if self.modal_open() {
             return;
         }
         let Some(view) = self.active() else { return };
@@ -868,11 +898,31 @@ impl Workspace {
         self.focus_region(window, cx, |view, _| view.response_focus.clone());
     }
 
+    /// Tab and Shift+Tab move focus *within* a buffer, so they must do nothing while a modal
+    /// owns the keyboard.
+    ///
+    /// **Why a guard and not a key context.** The bindings are global, and the panes behind a
+    /// modal are still painted — so their `TextInput`s are still tab stops (`TextInput::new`
+    /// sets `tab_stop(true)`) and `focus_next` walks straight past the scrim into them. The
+    /// modal's leaf key context then stops matching, which silently kills every binding it
+    /// owns: up/down to move, Enter to confirm, and Escape to dismiss. What's left is a modal
+    /// on screen that only the mouse can close. Scoping the binding instead would mean encoding
+    /// "not in a modal" as a context predicate, and GPUI matches only the *leaf* context, so
+    /// that has to be restated for every modal that ever exists.
+    ///
+    /// A modal moves its own selection with up/down, so there is nothing for Tab to do inside
+    /// one and swallowing it costs nothing.
     fn focus_next(&mut self, _: &FocusNext, window: &mut Window, _: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
         window.focus_next();
     }
 
     fn focus_prev(&mut self, _: &FocusPrev, window: &mut Window, _: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
         window.focus_prev();
     }
 
@@ -882,7 +932,7 @@ impl Workspace {
     /// to reach `Method::Other`. Because the picker has a filter input, typing an unknown
     /// verb offers it — closing the last of §11's non-body gaps (custom HTTP methods).
     fn open_method(&mut self, _: &OpenMethod, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.is_some() || self.settings.is_some() {
+        if self.modal_open() {
             return;
         }
         let Some(view) = self.active() else { return };
@@ -943,7 +993,7 @@ impl Workspace {
     /// reach a form body at all. Multipart and binary are deliberately absent until their
     /// editors exist: offering a type nothing can author is worse than not offering it.
     fn open_body_type(&mut self, _: &OpenBodyType, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.is_some() || self.settings.is_some() {
+        if self.modal_open() {
             return;
         }
         let Some(view) = self.active() else { return };
@@ -1202,7 +1252,11 @@ impl Workspace {
         // A send is a natural checkpoint: persist here so a crash costs at most the
         // edits made since the last one. Every buffer is written, not just the one being
         // sent — the checkpoint is the window's state, not this request's.
-        crate::session::save(&self.session(cx), cx);
+        //
+        // Assembled here and written off-thread. Reading the buffers needs the UI thread, but
+        // serializing every open request and blocking on the write does not, and this is the
+        // path §8 budgets at 5ms.
+        self.session_save = Some(crate::session::save_in_background(self.session(cx), cx));
 
         // Read from disk per send rather than cached at switch time, so editing an
         // environment file takes effect on the next request. It's a couple of small files;

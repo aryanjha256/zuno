@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 322 tests, ~9s
+cargo test --workspace                   # 337 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -54,8 +54,14 @@ Breaking any of these is a bug, not a tradeoff.
 1. **Zero warnings.** CI sets `RUSTFLAGS: -D warnings`. Don't leave speculative API behind
    "for later" — delete it and re-add when there's a caller.
 2. **`zuno-core` never imports GPUI.**
-3. **Nothing parses or formats on the UI thread.** Body indexing, JSON flattening, and UTF-8
-   validation go to `cx.background_executor()`. Only a finished index crosses back.
+3. **Nothing parses or formats on the UI thread.** Body indexing, JSON flattening, UTF-8
+   validation, the response diff, and the session write all go to `cx.background_executor()`; only
+   a finished result crosses back. **The two that don't look like parsing are the two that were
+   missed:** `ResponseDiff::between` compares both bodies byte-for-byte *and* counts the newlines
+   in each, and `session::save` serializes every open buffer's `RequestSpec`, bodies included.
+   Assembling the input often does need the UI thread, because only it can read entities — but
+   that part has to be a clone, not a format. Blocking is allowed only where the write must land
+   before the next thing happens, and only two places qualify: the quit hook and Ctrl+S.
 4. **Response bodies are `Bytes`, never `String`.** Binary and invalid UTF-8 are normal.
 5. **Check the registry before writing a version string.** `cargo info <crate>`. Never write one
    from memory — see "Lessons" below.
@@ -114,6 +120,7 @@ No `cx.background_spawn` in 0.2.2 | Use `cx.background_executor().spawn(fut)`. |
 `impl Trait` returns capture **every** in-scope lifetime under edition 2024 | A render helper taking `cx: &mut Context<_>` and returning `impl IntoElement` borrows `cx` for the element's life — fine for one, but collecting several into a `Vec` is several simultaneous mutable borrows. Add `+ use<>` when nothing in the element actually needs the borrow (`cx.listener` returns an *owned* closure). See `settings_panel::setting_row`. |
 `Window::dispatch_action` **defers** — it captures the focus id, then `cx.defer`s the dispatch | So an action dispatched from a modal still resolves against the frame the modal was in. It also means closing-then-dispatching and dispatching-then-closing behave identically for actions. Focus order *does* matter for anything that calls `window.focus` synchronously, like `activate`. |
 A context-less binding does **not** lose to a specific one — it *ties*, and **later registration wins** | `binding_enabled` returns `depth = contexts.len()` for a `None` context, which is the maximum; the tiebreak is `ix_b.cmp(ix_a)`. So `escape` in `Some("Picker")` only beats the global `escape` -> `CancelRequest` because it is registered after it in `register_keymap`. Reordering that list changes behaviour with no compile error. |
+`on_mouse_down` is a **Bubble**-phase listener, so an **ancestor's** handler runs too | Overlapping *siblings* are resolved by hit-testing — the one painted later occludes the rest, which is why `chrome.rs` emits the resize corners last. **Ancestor/descendant is not**: a click inside a child is inside the parent's hitbox as well, so both fire, child first. A clickable nested in a clickable therefore needs `cx.stop_propagation()`. The window controls sit inside the drag-to-move titlebar and went without it for a while — so closing the window also asked the compositor to start dragging it. `platform/test/window.rs`'s `start_window_move` is `unimplemented!()`, which is what makes this testable at all. |
 
 ## Packaging
 
@@ -236,6 +243,13 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   is the thing a palette exists to prevent.
 - Every action handler lives on `Workspace`, because dispatch travels up the focus tree and
   `Workspace` is always on it.
+- **Anything that opens a modal, or moves focus, asks `Workspace::modal_open` first.** Written out
+  at each site it drifts: `open_request` and `open_palette` checked only `picker` while four other
+  openers checked both, so `Ctrl+P` over the settings panel stacked two modals. And because the
+  panes behind a modal are still painted, their `TextInput`s are still tab stops — so `Tab` walked
+  focus past the scrim, the modal's leaf key context stopped matching, and every binding it owned
+  including `Escape` silently died. Both are the same bug: focus left the modal while the modal
+  stayed on screen.
 - **Anything that changes which buffer is active goes through `Workspace::activate`.** A
   `FocusHandle` belongs to the entity that created it, so switching `active_ix` without moving
   focus leaves it inside the old view — and after a close, inside a dropped one, where no key

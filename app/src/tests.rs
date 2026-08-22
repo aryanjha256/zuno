@@ -865,7 +865,7 @@ async fn a_blank_body_sends_nothing_at_all(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn the_body_kind_cycles(cx: &mut TestAppContext) {
+async fn the_body_sub_kind_is_chosen_by_name(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     clear_body(&mut cx);
@@ -955,6 +955,42 @@ async fn an_identical_resend_reports_no_change(cx: &mut TestAppContext) {
         cx.update(|_, cx| view.read(cx).diff.clone())
     });
     assert!(diff.is_quiet(), "expected a quiet diff, got {diff:?}");
+}
+
+#[gpui::test]
+async fn the_diff_describes_the_two_most_recent_runs(cx: &mut TestAppContext) {
+    // The diff is computed off-thread now, so it arrives a frame or two after the response and
+    // has to describe the *right* pair when it does. Three runs rather than two: with only two,
+    // "diffed against the previous run" and "diffed against the first run" are the same
+    // assertion, so a wrong baseline would pass.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, r#"{"a":1}"#), (201, r#"{"b":2}"#), (202, r#"{"c":3}"#)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 201);
+    send_and_wait(&mut cx, &view, 202);
+
+    // `apply` clears `diff` when the response lands, so anything found here is the new one
+    // rather than a leftover from the run before.
+    let diff = wait_for(&mut cx, "the diff for the newest run", |cx| {
+        cx.update(|_, cx| view.read(cx).diff.clone())
+    });
+
+    assert_eq!(
+        diff.status,
+        Some((201, 202)),
+        "the baseline must be the run this one replaced, not an older one"
+    );
+    assert!(diff.body_changed);
+
+    // And the retired run is the one it was compared against.
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert_eq!(view.history[0].status, 201);
+        assert_eq!(view.response.as_ref().expect("live").status, 202);
+    });
 }
 
 #[gpui::test]
@@ -1166,6 +1202,39 @@ async fn ctrl_w_closes_a_buffer_and_leaves_focus_usable(cx: &mut TestAppContext)
         after.url.contains("/extra"),
         "typing after a close must reach the surviving buffer, got {:?}",
         after.url
+    );
+}
+
+#[gpui::test]
+async fn closing_a_buffer_cancels_its_in_flight_request(cx: &mut TestAppContext) {
+    // Dropping the buffer drops the task that consumes events, which *looks* like
+    // cancellation and isn't: the socket keeps draining into a buffer nothing will read until
+    // the timeout. `Engine::cancel` is the half that stops it.
+    //
+    // Observable because this test holds an `Entity` handle, so the buffer outlives its
+    // removal from `views` and can still be read. Without the cancel, `inflight` is still
+    // `Some` in it.
+    let base = serve_never();
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let doomed = active_view(&window, &mut cx);
+    cx.simulate_input(&format!("{base}/slow"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    // Confirm it really is in flight, so this tests cancellation and not a race with
+    // submission.
+    wait_for(&mut cx, "the request to start", |cx| {
+        cx.update(|_, cx| doomed.read(cx).is_sending().then_some(()))
+    });
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+
+    assert_eq!(tabs_of(&window, &mut cx).0, 1, "the buffer should be gone");
+    assert!(
+        !cx.update(|_, cx| doomed.read(cx).is_sending()),
+        "closing a tab must abandon its request, not just stop listening to it"
     );
 }
 
@@ -1743,6 +1812,80 @@ async fn a_second_ctrl_p_does_not_nest_a_modal(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn tab_does_not_move_focus_out_of_the_picker(cx: &mut TestAppContext) {
+    // The panes behind a modal are still painted, so their inputs are still tab stops and
+    // `focus_next` walks straight past the scrim into them.
+    //
+    // `picker_is_open` cannot detect this on its own — the bug leaves the picker on screen and
+    // merely strands it — so the only proof is where the keystrokes afterwards land.
+    let (window, view, mut cx) = boot(cx, None, None);
+    let url_before = spec_of(&view, &mut cx).url;
+
+    cx.simulate_keystrokes("ctrl-p");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("zzzz");
+
+    assert!(picker_is_open(&window, &mut cx));
+    assert!(
+        picker_rows(&window, &mut cx).is_empty(),
+        "typing after Tab must still reach the picker's filter"
+    );
+    assert_eq!(
+        spec_of(&view, &mut cx).url,
+        url_before,
+        "Tab must not put focus in the buffer behind the modal"
+    );
+}
+
+#[gpui::test]
+async fn tab_does_not_strand_the_settings_panel(cx: &mut TestAppContext) {
+    // The harm, stated as the user meets it: once focus leaves the panel its leaf key context
+    // stops matching, so `escape` resolves to the *global* CancelRequest and the panel becomes
+    // closable only with the mouse. Every binding it owns dies at once and nothing on screen
+    // says why.
+    let (window, _, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-,");
+    assert!(settings_open(&window, &mut cx));
+
+    cx.simulate_keystrokes("tab");
+    cx.simulate_keystrokes("escape");
+
+    assert!(
+        !settings_open(&window, &mut cx),
+        "Escape must still dismiss the panel after Tab"
+    );
+}
+
+#[gpui::test]
+async fn a_picker_cannot_open_over_the_settings_panel(cx: &mut TestAppContext) {
+    // Four of the six openers guarded on both modals and these two guarded on only the picker,
+    // so they stacked. Closing the picker then restored focus to the buffer *behind* the panel,
+    // stranding it exactly as Tab did — one defect, two routes in.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-,");
+
+    cx.simulate_keystrokes("ctrl-p");
+    assert!(
+        !picker_is_open(&window, &mut cx),
+        "Ctrl+P must not stack a picker over the panel"
+    );
+    cx.simulate_keystrokes("ctrl-k");
+    assert!(
+        !picker_is_open(&window, &mut cx),
+        "Ctrl+K must not stack a picker over the panel"
+    );
+    assert!(
+        settings_open(&window, &mut cx),
+        "and the panel itself must be untouched"
+    );
+
+    // Still dismissable from the keyboard, which is what stacking took away.
+    cx.simulate_keystrokes("escape");
+    assert!(!settings_open(&window, &mut cx));
+}
+
+#[gpui::test]
 async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
@@ -2158,6 +2301,63 @@ async fn a_variable_is_substituted_on_the_way_to_a_real_socket(cx: &mut TestAppC
         "the buffer must keep its placeholder: {:?}",
         spec.headers
     );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn a_variable_in_a_form_field_reaches_the_socket_substituted(cx: &mut TestAppContext) {
+    // Asserted against the bytes a server actually received, because that is the only place
+    // this bug was visible: `apply` substituted raw bodies only, and `build.rs` deliberately
+    // never scans a body for `{{…}}`, so an unresolved secret was sent verbatim with no error
+    // anywhere. A client-credentials token request is exactly this shape.
+    let (session, root) = scratch_collection("env-form-send");
+    write_env(&root, "dev.json", r#"{"id":"zuno-cli"}"#);
+    write_env(&root, "dev.local.json", r#"{"secret":"s3cret"}"#);
+
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let (url, server) = serve_capturing(OK_JSON);
+
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+
+    // A fresh buffer: the sample ships `Content-Type: application/json`, and an explicit
+    // header outranks the form's derived type.
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+    cx.simulate_input(&url);
+
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("client_id");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("{{id}}");
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_input("client_secret");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("{{secret}}");
+
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the response", |cx| {
+        cx.update(|_, cx| view.read(cx).response.clone())
+    });
+
+    let request = server.join().expect("server thread");
+    assert!(
+        request.contains("client_id=zuno-cli&client_secret=s3cret"),
+        "form values should be substituted on the way out:\n{request}"
+    );
+    assert!(
+        !request.contains("%7B%7B") && !request.contains("{{"),
+        "no placeholder may reach the server, encoded or not:\n{request}"
+    );
+
+    // And the buffer keeps its placeholders, or a later Ctrl+S would write the secret into a
+    // committed collection file.
+    let Body::Form(fields) = &spec_of(&view, &mut cx).body else {
+        panic!("expected a form body");
+    };
+    assert_eq!(fields[1].value, "{{secret}}");
 
     remove_scratch(&mut cx, &session);
 }
@@ -2705,6 +2905,117 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
 }
 
 
+
+#[gpui::test]
+async fn clicking_a_window_control_does_not_also_start_a_window_drag(cx: &mut TestAppContext) {
+    // The whole titlebar is a drag handle, and `on_mouse_down` registers a *Bubble*-phase
+    // listener — GPUI runs every bubble listener whose hitbox was hit, in reverse paint order,
+    // until one clears `propagate_event`. So without `stop_propagation` on the button, the
+    // button acts and *then* its ancestor titlebar calls `start_window_move`: the compositor
+    // starts dragging a window the user was trying to close.
+    //
+    // What makes this observable at all is that the test platform's `start_window_move` is
+    // `unimplemented!()`, so reaching the titlebar's handler panics and fails this test.
+    // Minimize and maximize can't stand in here — their own platform calls are
+    // `unimplemented!()` too, so they'd panic either way — which is why this clicks close,
+    // whose action is a plain flag on the window.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let close = cx
+        .debug_bounds("close")
+        .expect("the close button should be painted");
+    // A bare mouse-*down*, not `simulate_click`: `on_mouse_down` fires on the down event, and
+    // this particular button removes the window, so the paired mouse-up would land on a window
+    // that no longer exists and panic inside gpui's own test context.
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: close.center(),
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+
+    // And the button's own action still has to run: stopping propagation must not cost the
+    // click its effect, which is the plausible way to "fix" this wrongly.
+    assert!(
+        window.update(&mut cx, |_, _, _| ()).is_err(),
+        "the close button should have closed the window"
+    );
+}
+
+#[gpui::test]
+async fn clicking_the_body_chip_opens_the_type_picker(cx: &mut TestAppContext) {
+    // The chip used to cycle `RawKind` in place, so it could never reach Form, Binary or
+    // Multipart — and on those three it mutated hidden state while the label stayed put, which
+    // looked like a dead control. A real click, because the bug was *in* the click path: only
+    // dispatching the action makes the chip and Ctrl+Shift+B the same verb.
+    let (window, view, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let chip = cx
+        .debug_bounds("body-kind-chip")
+        .expect("the body-kind chip should be painted");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+
+    assert!(
+        picker_is_open(&window, &mut cx),
+        "the chip must open the body-type picker"
+    );
+    let rows = picker_rows(&window, &mut cx);
+    assert!(
+        rows.iter().any(|row| row.starts_with("Multipart")),
+        "and it must be the picker that reaches every type: {rows:?}"
+    );
+
+    // The discriminating half: cycling would have moved the sample's JSON body to Text on this
+    // very click. Opening a picker changes nothing until something is chosen.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_kind),
+        RawKind::Json,
+        "clicking must not mutate the body kind in place"
+    );
+}
+
+#[gpui::test]
+async fn a_body_less_request_says_none_rather_than_a_retained_sub_kind(cx: &mut TestAppContext) {
+    // `body_label` folded `Empty` in with `Raw` and returned `body_kind`, which defaults to
+    // Json — so a fresh buffer's chip read "JSON" next to a pane reading "No body".
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    let view = active_view(&window, &mut cx);
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_type),
+        crate::request_view::BodyType::Empty
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_label()),
+        "None",
+        "a request that sends no body must not advertise a content type"
+    );
+}
+
+#[gpui::test]
+async fn the_body_type_picker_marks_none_as_current_on_a_fresh_buffer(cx: &mut TestAppContext) {
+    // The consequence that made the mislabel more than cosmetic: the picker marks its current
+    // row by comparing `body_label()` against the row labels, so it marked JSON as current on
+    // a buffer with no body and could never mark None. Deliberately on a *fresh* buffer — the
+    // existing coverage boots the sample request, whose raw JSON body makes the old label
+    // accidentally correct.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_keystrokes("ctrl-shift-b");
+
+    let rows = picker_rows(&window, &mut cx);
+    let none = rows.iter().find(|row| row.starts_with("None")).expect("a None row");
+    assert!(none.contains("current"), "{rows:?}");
+    let json = rows.iter().find(|row| row.starts_with("JSON")).expect("a JSON row");
+    assert!(
+        !json.contains("current"),
+        "JSON must not claim to be the current body: {rows:?}"
+    );
+}
 
 #[gpui::test]
 async fn a_form_body_reaches_the_wire_urlencoded(cx: &mut TestAppContext) {
