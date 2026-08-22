@@ -77,7 +77,7 @@ zuno/
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
         ├── request_view.rs ✅ one buffer: inputs + response + derived spec()
         ├── request_pane.rs ✅ method, URL bar, headers/query tables, body
-        ├── response_pane.rs✅ status line, timing, headers, body viewer
+        ├── response_pane.rs✅ status line, timing, body/headers tabs, body viewer
         ├── tests.rs        ✅ headless end-to-end tests (GPUI test platform)
         └── input/
             ├── text_input.rs ✅ single-line input primitive
@@ -403,6 +403,37 @@ socket.
 **The viewer is read-only.** This is what makes M1 tractable: rendered rows plus
 selection-for-copy, no editing, no cursor, no IME. All the editor complexity is confined to
 the request side.
+
+### The pane is tabbed, and that was a bug fix rather than a feature
+
+The headers table was rendered inline *above* the body, unbounded, in a pane that is
+`overflow_hidden` and has no scroll anywhere. Everything above was carefully virtualized and
+the one un-virtualized list was the one that broke the layout: a Cloudflare-fronted response
+carries two dozen headers, ~620px of them, which pushed the body region past the bottom edge.
+Not merely small — **unreachable**, since there was nothing to scroll.
+
+So `Body` and `Headers` are now tabs, `Body` default because it's the answer you sent the
+request to get. Four decisions:
+
+- **The status line, the historical notice, and the diff bar sit *above* the tabs**, because
+  they describe the response as a whole. The notice especially: it exists so the pane can't be
+  mistaken for the live run, and putting it inside the Body tab would have recreated exactly
+  the confusion it was added to prevent.
+- **The header count rides on the tab label** (`Headers 24`). It's the one thing hiding the
+  table costs you — without it there's no way to tell a two-header response from a thirty-header
+  one without switching.
+- **The choice is per-`RequestView` and sticky.** Deliberately *not* the history browser's
+  "sending returns you to live" rule: watching one header change across sends is the reason to
+  be on that tab, so snapping back on arrival would undo the thing you were doing. Per-buffer
+  because two requests are open for different reasons.
+- **Only the inactive tab is clickable.** One cycling action serves both tabs, so a handler on
+  both would make clicking the tab you're already on switch *away* from it. Leaving the active
+  tab inert makes "click a tab, land on that tab" true — and it works only because there are
+  exactly two. A third tab has to split this into per-tab actions.
+
+The Headers tab scrolls rather than virtualizing. Header counts are tens, and `uniform_list`
+would impose the fixed row height that the rest of this section is built on, which is the wrong
+constraint for values that ought eventually to wrap.
 
 ---
 

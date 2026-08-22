@@ -379,6 +379,25 @@ hits back to rows. This is where the "huge JSON" claim gets tested.
   interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
 - **No body prettify.** Paste minified JSON and you live with it.
 
+**5. Layout, and it took a screenshot to find — done.** Unplanned, and worth recording because
+of *how* it was found: two screenshots of the running app, not a test and not a read of the code.
+
+- **The response pane hid its own body.** Headers were rendered inline above it, unbounded, in a
+  pane that clips and never scrolls, so a Cloudflare-fronted response's two dozen headers pushed
+  the body off the bottom edge with no way to reach it. `Body` and `Headers` are now tabs
+  (`Alt+R`), Body default. See architecture.md §6.
+- **The tab strip painted the wrong borders.** A div carries one `border_color` for all four
+  sides while widths are per-side, so the active tab's accent overwrote the neutral divider: the
+  active tab drew a stray accent edge on the right, and every inactive tab drew its divider in
+  the panel's own colour — invisibly. The tabs ran together for several milestones. Now a nested
+  element, since two colours need two boxes.
+
+The pattern is the one this file's audit section already warns about from the other direction:
+§11 tracks *unreachable engine capability*, and neither of these is that. Both were plainly
+visible to anyone who opened the window, and invisible to a test suite that asserts on state
+rather than on pixels. Worth remembering the next time the counts and the green suite feel like
+coverage.
+
 **Syntax highlighting stays last** regardless (principle 4): expensive, isolated, and it improves
 nothing structural — it would only flatter a screenshot.
 

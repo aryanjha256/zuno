@@ -71,6 +71,7 @@ pub fn palette() -> Vec<Command> {
         command("Copy response body", CopyResponse),
         command("Save response body to a file", SaveResponse),
         command("Show response history", ShowHistory),
+        command("Switch between response body and headers", ToggleResponseView),
         command("Fold all", FoldAll),
         command("Unfold all", UnfoldAll),
         // Settings.

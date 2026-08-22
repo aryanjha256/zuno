@@ -123,6 +123,19 @@ impl KeyValueRow {
     }
 }
 
+/// Which half of a response the pane shows.
+///
+/// Split into tabs because the headers table is unbounded and the pane clips: a response
+/// with two dozen headers pushed the body region off the bottom edge, and with no scroll
+/// anywhere in the pane the body was not merely small but *unreachable*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseView {
+    /// The default, because the body is the answer you sent the request to get.
+    #[default]
+    Body,
+    Headers,
+}
+
 /// Which table a row belongs to. Used by the row actions to find their target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -183,6 +196,11 @@ pub struct RequestView {
     /// run and `history` stays the only record of what happened. Reset to 0 whenever a new
     /// response lands — you want to see what you just sent, not stay parked in the past.
     viewing: usize,
+    /// Body or headers. A *view* preference rather than response state, which is why
+    /// nothing resets it — not a new response, and not `load`. Switching to Headers to
+    /// watch a `set-cookie` across sends is the reason to be there, and snapping back to
+    /// Body on arrival would undo the thing you were doing.
+    pub response_view: ResponseView,
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
@@ -217,6 +235,7 @@ impl RequestView {
             diff: None,
             history: Vec::new(),
             viewing: 0,
+            response_view: ResponseView::default(),
             body_view: None,
             body_task: None,
             diff_task: None,
@@ -356,6 +375,18 @@ impl RequestView {
     /// How many runs back the display is. `0` is live.
     pub fn viewing(&self) -> usize {
         self.viewing
+    }
+
+    /// Swap between the body and the headers.
+    ///
+    /// Per-buffer, so switching tabs doesn't carry the choice with it — the pane belongs to
+    /// the buffer, and two requests being read for different reasons is the normal case.
+    pub fn toggle_response_view(&mut self, cx: &mut Context<Self>) {
+        self.response_view = match self.response_view {
+            ResponseView::Body => ResponseView::Headers,
+            ResponseView::Headers => ResponseView::Body,
+        };
+        cx.notify();
     }
 
     /// Every run that can be shown, newest first, as `(offset, response)`.

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, Styled, Window, div, px, uniform_list,
+    AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px, uniform_list,
 };
 use zuno_core::{
     EngineError, Header, JsonOutline, LineIndex, ResponseData, ResponseDiff, Row, RowKind,
@@ -23,7 +23,7 @@ use zuno_core::{
 
 use crate::actions::CancelRequest;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
-use crate::request_view::{InFlight, RequestView};
+use crate::request_view::{InFlight, RequestView, ResponseView};
 use crate::theme::Theme;
 
 /// Fixed row height. `uniform_list` measures one item and assumes the rest match, so
@@ -64,25 +64,147 @@ pub fn render(
         return pane.child(failure(error, theme));
     }
     match view.displayed() {
-        Some(response) => pane
-            .child(status_line(response, theme))
-            // Says so when you're not looking at the live response. Without it the pane is
-            // indistinguishable from the current run, which is the one way this feature
-            // could actively mislead.
-            .children(historical_notice(view.viewing(), theme))
-            // The diff describes live-vs-previous, so it's meaningless — and wrong — beside
-            // an older run.
-            .children(
-                (view.viewing() == 0)
-                    .then(|| view.diff.as_ref().map(|diff| diff_bar(diff, theme)))
-                    .flatten(),
-            )
-            .child(section_header("Headers", theme))
-            .child(headers_table(&response.headers, theme))
-            .child(body_header(view, theme, cx))
-            .child(body_region(view, theme, cx)),
+        Some(response) => {
+            // The status line, the historical notice and the diff bar all describe the
+            // response as a whole, so they sit *above* the tabs rather than inside one. The
+            // notice especially: it exists to stop the pane being mistaken for the live run,
+            // and hiding it behind a tab would reintroduce exactly that.
+            let pane = pane
+                .child(status_line(response, theme))
+                .children(historical_notice(view.viewing(), theme))
+                // The diff describes live-vs-previous, so it's meaningless — and wrong —
+                // beside an older run.
+                .children(
+                    (view.viewing() == 0)
+                        .then(|| view.diff.as_ref().map(|diff| diff_bar(diff, theme)))
+                        .flatten(),
+                )
+                .child(view_tabs(view, response.headers.len(), theme, cx));
+
+            match view.response_view {
+                ResponseView::Body => pane
+                    .child(body_header(view, theme, cx))
+                    .child(body_region(view, theme, cx)),
+                ResponseView::Headers => pane.child(headers_region(&response.headers, theme)),
+            }
+        }
         None => pane.child(empty_state(theme)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Body / Headers tabs
+// ---------------------------------------------------------------------------
+
+/// The tab bar over the response detail.
+///
+/// A tab dispatches `ToggleResponseView` rather than setting the view directly, so the click
+/// and `Alt+R` run one path — the "actions, not direct calls" convention.
+///
+/// **Only the inactive tab is clickable, and that is load-bearing rather than cosmetic.** The
+/// action *cycles*, so a handler on both tabs would make clicking the tab you are already on
+/// switch away from it — a control that does the opposite of what its label says. Leaving the
+/// active tab inert makes "click a tab, land on that tab" true, and it works only because
+/// there are exactly two: cycling from the one inactive tab always arrives at it. A third tab
+/// would have to split this into per-tab actions.
+fn view_tabs(
+    view: &RequestView,
+    header_count: usize,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> Div {
+    let active = view.response_view;
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_2()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(view_tab(
+            "response-tab-body",
+            "Body".to_string(),
+            active == ResponseView::Body,
+            theme,
+            cx,
+        ))
+        // The count is on the label because it's the one thing hiding the headers costs you:
+        // without it there's no way to tell a response with two headers from one with thirty
+        // without switching.
+        .child(view_tab(
+            "response-tab-headers",
+            format!("Headers {header_count}"),
+            active == ResponseView::Headers,
+            theme,
+            cx,
+        ))
+}
+
+fn view_tab(
+    id: &'static str,
+    label: String,
+    active: bool,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> impl IntoElement + use<> {
+    let tab = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex_none()
+        .px_2()
+        .py_1()
+        // Underlined rather than filled, and the inactive tab keeps the width in the panel's
+        // own colour — otherwise switching would shift both labels by 2px.
+        .border_b_2()
+        .border_color(if active { theme.accent } else { theme.bg_panel })
+        .text_xs()
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .child(label);
+
+    if active {
+        // Inert on purpose — see `view_tabs`. No pointer cursor either, or it would advertise
+        // a click that does nothing.
+        return tab;
+    }
+
+    tab.cursor_pointer()
+        .hover(|style| style.text_color(theme.text))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                window.dispatch_action(Box::new(crate::actions::ToggleResponseView), cx);
+            }),
+        )
+}
+
+/// The headers, in their own scrollable region.
+///
+/// **The scroll is the point of this tab existing.** The table was previously rendered
+/// inline above the body with no bound and no scroll, inside a pane that clips — so a
+/// response with two dozen headers pushed the body past the bottom edge and left it
+/// unreachable. A plain scroll rather than a `uniform_list`: header counts are tens, and
+/// virtualizing tens of rows buys nothing while costing the fixed row height that headers,
+/// which wrap in principle, shouldn't be forced into.
+///
+/// `AnyElement` rather than `Div` because `.id()` yields `Stateful<Div>`, so the two branches
+/// have different concrete types.
+fn headers_region(headers: &[Header], theme: &Theme) -> AnyElement {
+    if headers.is_empty() {
+        return centered_note("(no headers)", theme).into_any_element();
+    }
+
+    div()
+        .id("response-headers")
+        .flex_1()
+        .min_h(px(0.))
+        // `overflow_y_scroll` is on `StatefulInteractiveElement`, hence the `.id()` above.
+        .overflow_y_scroll()
+        .child(headers_table(headers, theme))
+        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -349,18 +471,6 @@ fn meta(text: impl Into<SharedString>, theme: &Theme) -> Div {
         .text_xs()
         .text_color(theme.text_muted)
         .child(text.into())
-}
-
-fn section_header(title: &str, theme: &Theme) -> Div {
-    div()
-        .px_3()
-        .py_1()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border)
-        .text_xs()
-        .text_color(theme.text_muted)
-        .child(title.to_string())
 }
 
 fn headers_table(headers: &[Header], theme: &Theme) -> Div {

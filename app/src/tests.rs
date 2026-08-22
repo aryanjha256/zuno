@@ -18,7 +18,7 @@ use gpui::{TestAppContext, VisualTestContext};
 use zuno_core::{Body, EngineError, Method, MultipartValue, RawKind, RequestSpec, ResponseData};
 
 use crate::body_view::BodyView;
-use crate::request_view::RequestView;
+use crate::request_view::{RequestView, ResponseView};
 use crate::theme::{Appearance, Theme};
 use crate::workspace::Workspace;
 
@@ -2731,6 +2731,164 @@ async fn history_does_not_survive_loading_a_different_request(cx: &mut TestAppCo
         cx.update(|_, cx| view.read(cx).runs().is_empty()),
         "a replaced buffer has no runs to show"
     );
+}
+
+#[gpui::test]
+async fn clicking_a_tab_in_the_strip_activates_that_buffer(cx: &mut TestAppContext) {
+    // The strip's clickable div gained a nested child, because a div carries one border colour
+    // for all four sides and the active marker needed a different one from the divider between
+    // tabs. `on_mouse_down` is Bubble-phase, so the ancestor still sees a click on its child —
+    // but nothing tested the strip's click path before, and "the label is now a child element"
+    // is exactly the change that would break it silently.
+    let (window, first, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let second = active_view(&window, &mut cx);
+    assert_ne!(first.entity_id(), second.entity_id(), "ctrl-t opens a new buffer");
+    cx.run_until_parked();
+
+    let tab = cx
+        .debug_bounds("tab-0")
+        .expect("the strip should be painted at two buffers");
+    cx.simulate_click(tab.center(), gpui::Modifiers::default());
+
+    assert_eq!(
+        active_view(&window, &mut cx).entity_id(),
+        first.entity_id(),
+        "clicking the first tab must activate the first buffer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Response pane: body / headers tabs
+// ---------------------------------------------------------------------------
+
+fn response_view(
+    view: &gpui::Entity<RequestView>,
+    cx: &mut VisualTestContext,
+) -> crate::request_view::ResponseView {
+    cx.update(|_, cx| view.read(cx).response_view)
+}
+
+#[gpui::test]
+async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppContext) {
+    // The headers table was rendered inline above the body, unbounded, inside a pane that
+    // clips and never scrolls — so a response with two dozen headers pushed the body off the
+    // bottom edge with no way to reach it. Tabs are the fix, and Body has to be the one you
+    // land on: it's the answer you sent the request for.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
+
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
+
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(
+        response_view(&view, &mut cx),
+        ResponseView::Body,
+        "one action for two tabs means it has to cycle back"
+    );
+}
+
+#[gpui::test]
+async fn clicking_the_headers_tab_switches_the_response_view(cx: &mut TestAppContext) {
+    // What this proves: the tab is painted once a response lands, and clicking it is wired to
+    // something. That catches a dead control, which is worth having.
+    //
+    // What it does **not** prove, though a first draft of this comment claimed it did: that the
+    // tab dispatches `ToggleResponseView` rather than calling the view directly. Checked by
+    // replacing the dispatch with a direct call — the test still passed, because with two tabs
+    // and a cycling action both routes end in the same state. The body-kind chip's click test
+    // *can* discriminate only because there, cycling and opening a picker have visibly
+    // different outcomes. Here the convention is held by review, not by this assertion.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    cx.run_until_parked();
+
+    let headers_tab = cx
+        .debug_bounds("response-tab-headers")
+        .expect("the Headers tab should be painted once a response has landed");
+    cx.simulate_click(headers_tab.center(), gpui::Modifiers::default());
+
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
+
+    // Clicking the tab you are already on must land you there, not toggle away. This caught a
+    // real bug: the action cycles, so a handler on *both* tabs made clicking "Headers" while on
+    // Headers jump to Body — a control doing the opposite of its label. Only the inactive tab
+    // is clickable now, which is why this holds.
+    cx.simulate_click(headers_tab.center(), gpui::Modifiers::default());
+    assert_eq!(
+        response_view(&view, &mut cx),
+        ResponseView::Headers,
+        "clicking the active tab must be a no-op"
+    );
+
+    // And back, from the other tab.
+    let body_tab = cx
+        .debug_bounds("response-tab-body")
+        .expect("the Body tab should still be painted");
+    cx.simulate_click(body_tab.center(), gpui::Modifiers::default());
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
+}
+
+#[gpui::test]
+async fn the_response_view_survives_a_resend(cx: &mut TestAppContext) {
+    // Deliberately *not* the history browser's "sending returns you to live" rule. Watching
+    // one header change across sends is the reason to be on that tab, and snapping back to
+    // the body on arrival would undo the thing you were doing.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}"), (201, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
+
+    send_and_wait(&mut cx, &view, 201);
+    assert_eq!(
+        response_view(&view, &mut cx),
+        ResponseView::Headers,
+        "a new response must not move you off the tab you chose"
+    );
+}
+
+#[gpui::test]
+async fn the_response_view_is_per_buffer(cx: &mut TestAppContext) {
+    // The state is on `RequestView`, not `Workspace`. Two requests are open for different
+    // reasons, so carrying the choice across a tab switch would be wrong — and this is the
+    // assertion that fails if the field ever moves up to the workspace.
+    let (window, first, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &first, 200);
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(response_view(&first, &mut cx), ResponseView::Headers);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let second = active_view(&window, &mut cx);
+    assert_eq!(
+        response_view(&second, &mut cx),
+        ResponseView::Body,
+        "a fresh buffer starts on the body"
+    );
+
+    // And switching back finds the first buffer where it was left.
+    cx.simulate_keystrokes("ctrl-shift-tab");
+    assert_eq!(response_view(&first, &mut cx), ResponseView::Headers);
 }
 
 /// A response with an arbitrary content type and raw body bytes.

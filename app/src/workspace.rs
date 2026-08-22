@@ -24,7 +24,7 @@ use crate::actions::{
     OpenBodyType, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
-    ShowHistory, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    ShowHistory, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
@@ -1150,6 +1150,21 @@ impl Workspace {
         self.set_status(&message, cx);
     }
 
+    /// Swap the response pane between the body and the headers.
+    ///
+    /// On `Workspace` like every other handler, but the *state* is on the buffer — two
+    /// requests open for different reasons shouldn't share a pane preference.
+    fn toggle_response_view(
+        &mut self,
+        _: &ToggleResponseView,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.toggle_response_view(cx));
+        }
+    }
+
     fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.set_all_folded(true, cx));
@@ -1450,6 +1465,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_multipart_field))
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::toggle_response_view))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::copy_response))
@@ -1516,27 +1532,18 @@ fn tab_strip(
             .children(tabs.into_iter().map(|(ix, label, active)| {
                 div()
                     .id(("tab", ix))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
+                    // So a test can click a real tab. The click handler sits out here while the
+                    // label sits in a child, and an ancestor's Bubble-phase handler does fire for
+                    // a click on its child — but that is worth pinning rather than assuming.
+                    .debug_selector(move || format!("tab-{ix}"))
                     .flex_none()
                     .max_w(px(180.))
                     // A long label must clip, not push its neighbours off the strip.
                     .overflow_hidden()
-                    .px_3()
-                    .py_1()
+                    // The 1px rule dividing one tab from the next.
                     .border_r_1()
                     .border_color(theme.border)
-                    // The active tab is marked by a top rule in the accent colour rather
-                    // than by text weight: reflowing on switch would shift every label.
-                    .border_t_2()
-                    .border_color(if active { theme.accent } else { theme.bg_panel })
-                    .bg(if active { theme.bg } else { theme.bg_panel })
-                    .text_xs()
-                    .text_color(if active { theme.text } else { theme.text_muted })
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme.bg_hover))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |workspace, _: &MouseDownEvent, window, cx| {
@@ -1552,7 +1559,31 @@ fn tab_strip(
                             workspace.close_tab(&CloseTab, window, cx);
                         }),
                     )
-                    .child(label)
+                    // The active marker is a *nested* element, and it has to be. A div carries
+                    // one `border_color` for all four sides — widths are per-side, colour is
+                    // not — so the accent bracket and the neutral divider above cannot share an
+                    // element. They did, and the second call silently won: the active tab drew
+                    // its right divider in accent, and every inactive tab drew its divider in
+                    // `bg_panel`, which is to say not at all. Two colours, two elements.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_3()
+                            .py_1()
+                            // Accent down both edges rather than a top rule. Inactive tabs
+                            // keep the width and paint it in the strip's own background, so
+                            // switching never reflows the label by 4px.
+                            .border_x_2()
+                            .border_color(if active { theme.accent } else { theme.bg_panel })
+                            .bg(if active { theme.bg } else { theme.bg_panel })
+                            .text_xs()
+                            .text_color(if active { theme.text } else { theme.text_muted })
+                            .hover(|style| style.bg(theme.bg_hover))
+                            .child(label),
+                    )
             })),
     )
 }

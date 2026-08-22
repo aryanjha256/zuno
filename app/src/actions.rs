@@ -45,6 +45,7 @@ actions!(
         AddMultipartField,
         ImportCurl,
         // Response viewer
+        ToggleResponseView,
         FoldAll,
         UnfoldAll,
         CopyResponse,

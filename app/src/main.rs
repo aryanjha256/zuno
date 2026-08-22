@@ -39,7 +39,7 @@ use crate::actions::{
     OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
-    SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -174,6 +174,9 @@ fn register_keymap(cx: &mut App) {
         // Paste-special: import a curl command from the clipboard.
         KeyBinding::new("ctrl-shift-v", ImportCurl, None),
         // --- Response viewer ---
+        // Body ⇄ headers. `alt-` rather than `ctrl-`, to sit with the other two viewer
+        // bindings; `alt-r` is free where `ctrl-shift-r` already focuses this pane.
+        KeyBinding::new("alt-r", ToggleResponseView, None),
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
         // Getting the response back out. `ctrl-c` is taken by text-input copy, scoped to
