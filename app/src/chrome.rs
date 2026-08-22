@@ -130,6 +130,9 @@ fn control_button(
 
     div()
         .id(id)
+        // A no-op outside test builds. It's what lets a test click these buttons, which is the
+        // only way to cover the propagation rule below — the bug was *in* the click path.
+        .debug_selector(|| id.to_string())
         .flex()
         .items_center()
         .justify_center()
@@ -140,9 +143,15 @@ fn control_button(
         .text_color(theme.text_muted)
         .cursor_pointer()
         .hover(|style| style.bg(hover_bg).text_color(theme.text))
-        // `stop_propagation` matters: without it the titlebar's drag handler also fires
-        // and the compositor starts a window move instead of registering the click.
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, _| {
+        // **`stop_propagation` is load-bearing, and for a while this comment described a call
+        // that wasn't here.** `on_mouse_down` registers a *Bubble*-phase listener, and GPUI runs
+        // every bubble listener whose hitbox was hit, in reverse paint order, until one clears
+        // `propagate_event`. The titlebar is this button's ancestor and its hitbox contains the
+        // click, so without stopping here the button acts *and then* the titlebar calls
+        // `start_window_move` — the compositor starts dragging a window the user was trying to
+        // close. Verified against gpui 0.2.2's `Window::dispatch_mouse_event`, not assumed.
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
             action(window);
         })
         .child(glyph.to_string())

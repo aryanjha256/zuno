@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 333 tests, ~9s
+cargo test --workspace                   # 334 tests, ~9s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -114,6 +114,7 @@ No `cx.background_spawn` in 0.2.2 | Use `cx.background_executor().spawn(fut)`. |
 `impl Trait` returns capture **every** in-scope lifetime under edition 2024 | A render helper taking `cx: &mut Context<_>` and returning `impl IntoElement` borrows `cx` for the element's life — fine for one, but collecting several into a `Vec` is several simultaneous mutable borrows. Add `+ use<>` when nothing in the element actually needs the borrow (`cx.listener` returns an *owned* closure). See `settings_panel::setting_row`. |
 `Window::dispatch_action` **defers** — it captures the focus id, then `cx.defer`s the dispatch | So an action dispatched from a modal still resolves against the frame the modal was in. It also means closing-then-dispatching and dispatching-then-closing behave identically for actions. Focus order *does* matter for anything that calls `window.focus` synchronously, like `activate`. |
 A context-less binding does **not** lose to a specific one — it *ties*, and **later registration wins** | `binding_enabled` returns `depth = contexts.len()` for a `None` context, which is the maximum; the tiebreak is `ix_b.cmp(ix_a)`. So `escape` in `Some("Picker")` only beats the global `escape` -> `CancelRequest` because it is registered after it in `register_keymap`. Reordering that list changes behaviour with no compile error. |
+`on_mouse_down` is a **Bubble**-phase listener, so an **ancestor's** handler runs too | Overlapping *siblings* are resolved by hit-testing — the one painted later occludes the rest, which is why `chrome.rs` emits the resize corners last. **Ancestor/descendant is not**: a click inside a child is inside the parent's hitbox as well, so both fire, child first. A clickable nested in a clickable therefore needs `cx.stop_propagation()`. The window controls sit inside the drag-to-move titlebar and went without it for a while — so closing the window also asked the compositor to start dragging it. `platform/test/window.rs`'s `start_window_move` is `unimplemented!()`, which is what makes this testable at all. |
 
 ## Packaging
 

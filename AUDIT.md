@@ -24,8 +24,8 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings and #4–#6 are fixed, each with a test that was confirmed to fail
-against the old code before the fix landed. Findings 7–21 are open.
+**Status.** The three High findings and #4–#7 are fixed, each with a test that was confirmed to fail
+against the old code before the fix landed. Findings 8–21 are open.
 
 ---
 
@@ -259,6 +259,18 @@ leaving the panel visible and inert — the same dead-keymap end state as #5, re
 so the next opener can't get it wrong.
 
 ### 7. The window-control buttons never call `stop_propagation`, though the comment says they do
+
+> **Fixed.** The buttons now stop propagation before acting, and the comment describes the mechanism
+> rather than asserting a call. Guarded by
+> `clicking_a_window_control_does_not_also_start_a_window_drag`.
+>
+> **Confirmed empirically, not just by reading the dispatch code.** With the fix reverted, the test
+> fails with a panic at `gpui-0.2.2/src/platform/test/window.rs:289` — `start_window_move`'s
+> `unimplemented!()` — which is direct proof the titlebar's drag handler was running. The test fires
+> a bare mouse-*down* rather than `simulate_click`, because this button removes the window and the
+> paired mouse-up would then land on a window that no longer exists and panic inside gpui's own test
+> context. Minimize and maximize can't stand in: their platform calls are `unimplemented!()` too, so
+> they panic either way.
 
 [app/src/chrome.rs:143-148](app/src/chrome.rs#L143-L148)
 

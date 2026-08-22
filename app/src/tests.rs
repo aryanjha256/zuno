@@ -2871,6 +2871,44 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
 
 
 #[gpui::test]
+async fn clicking_a_window_control_does_not_also_start_a_window_drag(cx: &mut TestAppContext) {
+    // The whole titlebar is a drag handle, and `on_mouse_down` registers a *Bubble*-phase
+    // listener — GPUI runs every bubble listener whose hitbox was hit, in reverse paint order,
+    // until one clears `propagate_event`. So without `stop_propagation` on the button, the
+    // button acts and *then* its ancestor titlebar calls `start_window_move`: the compositor
+    // starts dragging a window the user was trying to close.
+    //
+    // What makes this observable at all is that the test platform's `start_window_move` is
+    // `unimplemented!()`, so reaching the titlebar's handler panics and fails this test.
+    // Minimize and maximize can't stand in here — their own platform calls are
+    // `unimplemented!()` too, so they'd panic either way — which is why this clicks close,
+    // whose action is a plain flag on the window.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let close = cx
+        .debug_bounds("close")
+        .expect("the close button should be painted");
+    // A bare mouse-*down*, not `simulate_click`: `on_mouse_down` fires on the down event, and
+    // this particular button removes the window, so the paired mouse-up would land on a window
+    // that no longer exists and panic inside gpui's own test context.
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: close.center(),
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+
+    // And the button's own action still has to run: stopping propagation must not cost the
+    // click its effect, which is the plausible way to "fix" this wrongly.
+    assert!(
+        window.update(&mut cx, |_, _, _| ()).is_err(),
+        "the close button should have closed the window"
+    );
+}
+
+#[gpui::test]
 async fn clicking_the_body_chip_opens_the_type_picker(cx: &mut TestAppContext) {
     // The chip used to cycle `RawKind` in place, so it could never reach Form, Binary or
     // Multipart — and on those three it mutated hidden state while the label stayed put, which
