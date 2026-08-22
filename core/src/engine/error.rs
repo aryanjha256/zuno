@@ -65,6 +65,21 @@ pub enum EngineError {
     #[error("the response body ended early: {reason}")]
     IncompleteBody { reason: String },
 
+    /// The response is larger than Zuno will hold in memory.
+    ///
+    /// Distinct from `body_view::MAX_AUTO_PARSE`, which caps the *index* built for display and
+    /// falls back to a raw view. This caps the transfer itself, because until it existed nothing
+    /// did: the body streamed into an unbounded `Vec<u8>`, and `HISTORY_LIMIT` then retained up to
+    /// eleven of them per buffer.
+    ///
+    /// Not `is_local`: the request went out and the server answered, so a retry is not free.
+    #[error(
+        "the response body is at least {} MB, over the {} MB Zuno will hold in memory",
+        size / (1024 * 1024),
+        limit / (1024 * 1024)
+    )]
+    BodyTooLarge { limit: usize, size: usize },
+
     #[error("request failed: {reason}")]
     Other { reason: String },
 }

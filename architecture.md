@@ -368,6 +368,22 @@ Structural errors *are* rejected, since flattening them would produce nonsense.
 Whatever the cap is, *say so in the UI* — a silently truncated response reads as a wrong
 response, and that's a trust bug, not a perf one.
 
+**Two caps, answering different questions — and only one of them existed for a long time.** The one
+above is a *display* cap (`body_view::MAX_AUTO_PARSE`, 10MB): past it the body is shown as raw text
+with a button, and every byte is still held. It says nothing about whether the body should have been
+held at all, and nothing did — `run.rs` collected the stream into an unbounded `Vec<u8>`, so a URL
+pointing at a release artifact instead of an API endpoint buffered the lot, with `HISTORY_LIMIT`
+retaining up to eleven of them per buffer. `run::MAX_BODY_BYTES` (100MB) is the *transfer* cap.
+
+Unlike the display cap it **fails rather than degrading**, which is the opposite of `MAX_DISPLAY_LINE`
+and deliberate: a truncated body is not the response, so `SaveResponse` would write a corrupt file
+from it and the viewer would report a parse error at the cut. Being told the transfer was refused
+beats both. It is checked twice — against a declared `Content-Length` before any body moves, which
+is the cheap half, and again while streaming, because a declared length is a claim and a chunked
+response makes none. The limit is a *parameter* of `run::execute` rather than a constant read inside
+it, so the streaming guard can be tested with a 64KB limit instead of pushing 100MB through a
+socket.
+
 **The viewer is read-only.** This is what makes M1 tractable: rendered rows plus
 selection-for-copy, no editing, no cursor, no IME. All the editor complexity is confined to
 the request side.

@@ -24,8 +24,8 @@ The findings cluster in three places, and the pattern is worth naming:
 
 Nothing here is architectural. The most valuable single fix is #1.
 
-**Status.** The three High findings and #4–#9 are fixed, each with a test that was confirmed to fail
-against the old code before the fix landed. Findings 10–21 are open.
+**Status.** The three High findings and #4–#10 are fixed, each with a test that was confirmed to fail
+against the old code before the fix landed. Findings 11–21 are open.
 
 ---
 
@@ -368,6 +368,23 @@ nothing depends on it completing before the send. The `on_app_quit` path must st
 that one is correct as written and the comment explains why.
 
 ### 10. Response bodies have no size cap
+
+> **Fixed.** `run::MAX_BODY_BYTES` (100MB) caps the transfer, checked twice: against a declared
+> `Content-Length` before any body moves, and again while streaming, since the declaration is a
+> claim and a chunked response makes none. It **fails** rather than truncating — a truncated body
+> would let `SaveResponse` write a corrupt file and make the viewer report a parse error at the cut.
+> `EngineError::BodyTooLarge` is deliberately not `is_local`: the request went out and the server
+> answered.
+>
+> The limit is a *parameter* of `execute` rather than a constant read inside it, which is what lets
+> `a_streamed_body_past_the_limit_fails_instead_of_buffering_without_bound` drive the streaming
+> guard with 64KB instead of moving 100MB through a socket. The pre-check has its own test over the
+> public API. Both were confirmed independently load-bearing; with the pre-check disabled the same
+> request instead fails as `IncompleteBody` after 2.06s rather than 0.16s, which is exactly the
+> wasted transfer it exists to avoid.
+>
+> Left alone: making this a `RequestSettings` field. 100MB is a policy guess, and if a legitimate
+> download ever needs more, a setting is the right answer rather than a larger constant.
 
 `run.rs` streams the whole body into a `Vec<u8>` with no ceiling. `MAX_PREALLOC` caps the
 *pre-allocation* from a hostile `Content-Length`, not the buffer's growth.
