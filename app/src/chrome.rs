@@ -69,6 +69,12 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                         .child("Zuno"),
                 )
                 .child(
+                    // **`border`, not `text_faint`, and deliberately** — this is a rule drawn as
+                    // a character, not text, so barely-there is the point. Every *other* site
+                    // that reached for `border` to mean "dim text" was a bug (see
+                    // `Theme::text_faint`); this one is not, and `border_is_too_dim_to_read_as_
+                    // text` names it as the exception. The real improvement here is a 1px
+                    // element instead of a glyph, not a brighter colour.
                     div()
                         .flex_none()
                         .text_xs()

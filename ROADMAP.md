@@ -457,6 +457,22 @@ visible to anyone who opened the window, and invisible to a test suite that asse
 rather than on pixels. Worth remembering the next time the counts and the green suite feel like
 coverage.
 
+**And it recurred, in the picker, found the same way — from a screenshot.** Two more of the same
+species, so this is now a standing category rather than a one-off:
+
+- **The picker's rows were 76px wide inside a 620px list.** `uniform_list` gives each item the
+  list's width as available space, but taffy only stretches a root node to fill it when the node is
+  `display: block`, and a `.flex()` row sizes to its content instead. The visible symptom was a
+  selection highlight ending mid-row; the real one was that 88% of every row ignored clicks.
+- **`theme.border` was being used as a text colour**, and in the dark theme it equals `bg_hover` —
+  so the command palette's keybindings and the settings panel's hints were invisible on precisely
+  the row under the cursor. A `text_faint` token and a contrast matrix over every text token ×
+  every surface now hold that.
+
+Both are testable *at the consequence* even though the paint isn't: a click in the dead zone, and a
+WCAG ratio. That's the transferable lesson — when a rendering bug can't be observed, find the
+functional half of it and assert that instead. See architecture.md §12.
+
 **Syntax highlighting stays last** regardless (principle 4): expensive, isolated, and it improves
 nothing structural — it would only flatter a screenshot.
 

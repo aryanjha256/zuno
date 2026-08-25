@@ -303,6 +303,7 @@ impl Render for Picker {
             .child(
                 div()
                     .id("picker")
+                    .debug_selector(|| "picker".to_string())
                     .mt(px(96.))
                     .w(px(620.))
                     .flex()
@@ -388,10 +389,22 @@ fn result_list(
 
                 div()
                     .id(("picker-row", ix))
+                    .debug_selector(move || format!("picker-row-{ix}"))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap_2()
+                    // **`w_full` is load-bearing, and its absence is invisible in the code.**
+                    // `uniform_list` lays every item out as a taffy *root* with the list's width
+                    // as definite available space — but taffy only stretches a root to fill that
+                    // space when the node is `display: block`, which is a gate inside
+                    // `compute_root_layout` (taffy 0.9's `style.is_block()`). A `.flex()` row
+                    // takes the other path and sizes to its content, so the row was as wide as
+                    // its label: the selection highlight stopped mid-row, and the right two
+                    // thirds of a 620px list did not respond to a click at all. Nothing in the
+                    // headless platform can see a paint, so the click hole is what
+                    // `a_picker_row_spans_the_full_width_of_the_list` asserts.
+                    .w_full()
                     .h(px(ROW_HEIGHT))
                     .px_3()
                     .overflow_hidden()
@@ -424,7 +437,12 @@ fn result_list(
                             .min_w(px(0.))
                             .overflow_hidden()
                             .text_xs()
-                            .text_color(theme.border)
+                            // Not `theme.border`, which is what this was. In the dark theme
+                            // `border` *equals* `bg_hover`, so the detail — which for the
+                            // command palette is the keybinding — was invisible on the selected
+                            // row. That defeats the palette's stated purpose: the row exists to
+                            // teach the keystroke. See `Theme::text_faint`.
+                            .text_color(theme.text_faint)
                             .child(detail),
                     )
             })

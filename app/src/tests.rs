@@ -320,6 +320,54 @@ async fn a_known_verb_typed_in_full_is_not_offered_twice(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn a_picker_row_spans_the_full_width_of_the_list(cx: &mut TestAppContext) {
+    // A layout bug with a functional half, which is the only half a headless platform can see.
+    //
+    // `uniform_list` lays each item out as a taffy **root**, handing it the list's width as
+    // definite available space — but taffy stretches a root to fill that space only when the
+    // node is `display: block`, a gate inside `compute_root_layout` (taffy 0.9's
+    // `style.is_block()`). Every picker row calls `.flex()`, so it took the other branch and
+    // sized to its own content. Visibly: the selection highlight stopped at the end of the
+    // label. Functionally: most of a 620px-wide list was not clickable.
+    //
+    // **Asserted against the *list's* width, never the row's own.** Before the fix the row's
+    // bounds *are* the narrow box, so a click at `row.right()` lands inside it either way and
+    // the test would pass against the bug — the exact shape of weak assertion this codebase
+    // has been caught by five times. The container is the only honest reference.
+    let (window, view, mut cx) = boot(cx, None, None);
+    assert_eq!(spec_of(&view, &mut cx).method, Method::Post);
+
+    cx.simulate_keystrokes("ctrl-m");
+    cx.simulate_input("del");
+    cx.run_until_parked();
+
+    let list = cx.debug_bounds("picker").expect("the picker should be painted");
+    let row = cx.debug_bounds("picker-row-0").expect("the DELETE row should be painted");
+    // Minus the container's 1px border on each side.
+    assert!(
+        row.size.width >= list.size.width - gpui::px(4.),
+        "a row must span the list, not its label: row {:?} inside list {:?}",
+        row.size.width,
+        list.size.width
+    );
+
+    // And the consequence, at a point that was dead space: far right of the list, vertically
+    // on the row. `on_mouse_down` is Bubble-phase, so the row's handler runs before the
+    // container's `stop_propagation` — a hit here really does choose the row.
+    cx.simulate_click(
+        gpui::point(list.right() - gpui::px(8.), row.center().y),
+        gpui::Modifiers::default(),
+    );
+
+    assert!(!picker_is_open(&window, &mut cx), "choosing a row closes the picker");
+    assert_eq!(
+        spec_of(&view, &mut cx).method,
+        Method::Delete,
+        "clicking the empty right-hand side of a row must choose that row"
+    );
+}
+
+#[gpui::test]
 async fn a_verb_that_could_not_be_sent_is_not_offered(cx: &mut TestAppContext) {
     // The engine rejects anything outside RFC 9110's `tchar` with `InvalidMethod`. Offering
     // a row that fails at send is worse than not offering it.

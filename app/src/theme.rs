@@ -47,6 +47,19 @@ pub struct Theme {
     // Text
     pub text: Hsla,
     pub text_muted: Hsla,
+    /// Tertiary text — a keybinding beside a palette command, a hint under a setting's label.
+    ///
+    /// It exists because three sites were reaching for `border` when they wanted "dimmer than
+    /// muted", and in the dark theme `border` and `bg_hover` are **the same value**: the
+    /// palette's keybindings and the settings hints disappeared completely on whichever row was
+    /// under the cursor, which is the one row you were reading. A border is chosen to sit barely
+    /// off its own background; text has to survive being read on *any* surface it can land on,
+    /// which is a different job and needs a different token. `text_tokens_are_readable_on_every_
+    /// surface` pins that, with `border` as a stated negative control.
+    ///
+    /// Rejected: reusing `text_muted`. The picker row's whole structure is label-over-detail, and
+    /// one colour for both flattens it — the row would read as two equal fields.
+    pub text_faint: Hsla,
     pub text_on_accent: Hsla,
     pub accent: Hsla,
 
@@ -113,6 +126,7 @@ impl Theme {
 
             text: rgb(0xe4e4e7).into(),
             text_muted: rgb(0x8b8b94).into(),
+            text_faint: rgb(0x7a7a84).into(),
             text_on_accent: rgb(0xffffff).into(),
             accent: rgb(0x4470d0).into(),
 
@@ -158,6 +172,7 @@ impl Theme {
 
             text: rgb(0x1c1c1f).into(),
             text_muted: rgb(0x6b6b74).into(),
+            text_faint: rgb(0x84848d).into(),
             text_on_accent: rgb(0xffffff).into(),
             accent: rgb(0x3b6fd4).into(),
 
@@ -258,5 +273,126 @@ pub trait ActiveTheme {
 impl ActiveTheme for App {
     fn theme(&self) -> &Theme {
         self.global::<Theme>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WCAG 2.1 relative luminance. The channel values gpui hands back are sRGB-encoded, so
+    /// they have to be linearized before weighting — averaging the encoded values instead
+    /// overstates dark colours badly, which would make exactly the bug this file just fixed
+    /// look like it passed.
+    fn luminance(color: Hsla) -> f32 {
+        let rgba = gpui::Rgba::from(color);
+        let linear = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(rgba.r) + 0.7152 * linear(rgba.g) + 0.0722 * linear(rgba.b)
+    }
+
+    /// WCAG 2.1 contrast ratio, 1.0 (identical) to 21.0 (black on white).
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let (a, b) = (luminance(a), luminance(b));
+        let (lighter, darker) = if a > b { (a, b) } else { (b, a) };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Every surface a text token can end up drawn on. `bg_hover` is the one that mattered:
+    /// a colour picked to read on the resting surface can still vanish under the cursor, and
+    /// the row under the cursor is the row being read.
+    fn surfaces(theme: &Theme) -> [(&'static str, Hsla); 4] {
+        [
+            ("bg", theme.bg),
+            ("bg_panel", theme.bg_panel),
+            ("bg_elevated", theme.bg_elevated),
+            ("bg_hover", theme.bg_hover),
+        ]
+    }
+
+    #[test]
+    fn text_tokens_are_readable_on_every_surface() {
+        // Floors rather than exact values, so retuning the palette doesn't churn this test —
+        // but low enough to be a real gate: `border` used as text scores 1.0–1.3 and every
+        // threshold here rejects it. Below AA (4.5) for the dimmer two on purpose: they are
+        // deliberately subordinate, and demanding AA of them would collapse the three-step
+        // hierarchy this palette is built on.
+        const FLOORS: &[(&str, f32)] = &[("text", 7.0), ("text_muted", 3.5), ("text_faint", 3.0)];
+
+        for theme in [Theme::dark("mono".into()), Theme::light("mono".into())] {
+            let tokens = [
+                ("text", theme.text),
+                ("text_muted", theme.text_muted),
+                ("text_faint", theme.text_faint),
+            ];
+            for (name, color) in tokens {
+                let floor = FLOORS
+                    .iter()
+                    .find(|(token, _)| *token == name)
+                    .expect("every text token needs a stated floor")
+                    .1;
+                for (surface_name, surface) in surfaces(&theme) {
+                    let ratio = contrast(color, surface);
+                    assert!(
+                        ratio >= floor,
+                        "{:?}: {name} on {surface_name} is {ratio:.2}:1, below {floor}:1",
+                        theme.appearance
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_text_hierarchy_is_ordered_and_distinguishable() {
+        // Three tokens that don't visibly differ are one token with two spare names — and the
+        // fix for the picker's unreadable detail column would have been undone by quietly
+        // setting `text_faint` to `text_muted`. Ratios against the surface the picker actually
+        // draws on, since that is where the ordering has to hold.
+        for theme in [Theme::dark("mono".into()), Theme::light("mono".into())] {
+            let text = contrast(theme.text, theme.bg_elevated);
+            let muted = contrast(theme.text_muted, theme.bg_elevated);
+            let faint = contrast(theme.text_faint, theme.bg_elevated);
+            assert!(
+                text > muted * 1.3 && muted > faint * 1.15,
+                "{:?}: text/muted/faint are {text:.2}/{muted:.2}/{faint:.2} — \
+                 each step must be visible, not nominal",
+                theme.appearance
+            );
+        }
+    }
+
+    #[test]
+    fn border_is_too_dim_to_read_as_text() {
+        // A negative control, and the whole reason `text_faint` exists. `border` is chosen to
+        // sit *just* off its own background, which is correct for a divider and unreadable for
+        // a glyph — in the dark theme it is byte-identical to `bg_hover`, so the palette's
+        // keybindings and the settings hints were invisible on the hovered row.
+        //
+        // Asserting the *failure* pins the reason: brightening `border` to rescue a text site
+        // would break its actual job, and this test is what makes that show up as a decision
+        // rather than as a quiet palette tweak.
+        //
+        // Named for the property, not for a prohibition, because there is one honest exception:
+        // `chrome.rs` paints the titlebar's `│` divider with it. That is a *rule* drawn as a
+        // character, where being barely-there is the entire point, and it wants `border` for the
+        // same reason a real 1px element would. The eventual fix there is an element rather than
+        // a glyph — not a brighter colour, which is why this assertion stays as it is.
+        for theme in [Theme::dark("mono".into()), Theme::light("mono".into())] {
+            for (surface_name, surface) in surfaces(&theme) {
+                let ratio = contrast(theme.border, surface);
+                assert!(
+                    ratio < 3.0,
+                    "{:?}: border reads as text on {surface_name} ({ratio:.2}:1). If that is \
+                     intended, the divider colour has changed meaning — don't just raise this.",
+                    theme.appearance
+                );
+            }
+        }
     }
 }

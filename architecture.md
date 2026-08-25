@@ -1152,6 +1152,33 @@ only by a new focus-moving action.
 Deliberately absent: **no highlighting of matched characters.** It needs match positions threaded
 out of the scorer and styled text runs, and the picker is useful without it.
 
+**Two defects in the row itself, both found from a screenshot rather than from a test.** Recorded
+together because they had the same cause — a value that looked right at the call site and was wrong
+about the thing it was actually feeding.
+
+- **A row is a hitbox, and it wasn't one.** `uniform_list` lays each item out as a taffy *root* and
+  hands it the list's width as definite available space, which reads like a stretch instruction. It
+  isn't: taffy auto-stretches a root to its available width only for `display: block`, and every
+  row here calls `.flex()`. The rows were **76px wide inside a 620px list** — the selection
+  highlight ended at the label, and the other 88% of each row silently swallowed clicks. Fixed with
+  `w_full()`, and the test asserts a *click* at the far right of the list, deliberately measured
+  against the container: the row's own bounds are the narrow box, so anything derived from them
+  passes against the bug. Same weak-assertion shape `CLAUDE.md` tracks, avoided by choosing the
+  reference frame the bug can't move.
+- **`theme.border` was serving as a text colour**, here and in `settings_panel`. In the dark theme
+  `border` and `bg_hover` are the *same value*, so the detail column — which for `Ctrl+K` is the
+  keybinding — was invisible on the selected row. That inverts the palette's stated purpose:
+  §2 argues the mouse path exists to *teach* the keyboard one, and the row is where that teaching
+  happens. `Theme::text_faint` is the token for tertiary text now, and `theme.rs` carries a
+  contrast matrix over every text token × every surface — `bg_hover` included, because a colour
+  that reads at rest can still disappear under the cursor, which is exactly what happened.
+
+  Rejected: reusing `text_muted`, which flattens the row's label-over-detail structure into two
+  equal fields. The matrix is a *token* test and cannot see a bad *use site* — nothing headless
+  observes a paint (§2's third silent failure mode) — so `border_is_too_dim_to_read_as_text` asserts the
+  low ratio on purpose, pinning why `border` must stay a divider colour rather than being
+  brightened the next time something dim is wanted.
+
 **Where `Ctrl+P` and `Ctrl+K` get their content — answered.** `Ctrl+P` lists open buffers then
 `collection::scan`; `Ctrl+K` lists `commands::palette()`. Both go through the one picker.
 

@@ -381,9 +381,13 @@ fn setting_row(
                         .child(row.label()),
                 )
                 .child(
+                    // `theme.text_faint`, not `theme.border` — the same defect the picker's
+                    // detail column had, in the same shape. `border` equals `bg_hover` in the
+                    // dark theme, so the hint explaining a setting vanished on the row you had
+                    // selected, which is the only row whose hint you want.
                     div()
                         .text_xs()
-                        .text_color(theme.border)
+                        .text_color(theme.text_faint)
                         .child(row.hint()),
                 ),
         )
