@@ -13,9 +13,10 @@ Three docs, three jobs. Read them in this order:
   building anything.
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
-Milestone 1 is complete: the request → response loop works end to end. **M2 is complete too** —
-tabs, collections, `Ctrl+P`, and `Ctrl+K`. The navigation thesis is built; M3
-(environments and variables) is next.
+**M1, M2 and M3 are all complete**, and architecture.md §11 — engine capability with no UI path —
+is empty. The loop, the navigation thesis, and reuse are all built; response search and the
+body/headers tabs landed after. ROADMAP's audit section, not its milestone headings, is where the
+remaining work lives.
 
 ## Layout
 
@@ -30,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 394 tests, ~10s
+cargo test --workspace                   # 398 tests, ~11s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -78,12 +79,12 @@ Breaking any of these is a bug, not a tradeoff.
    `parse`'s version dispatch, with a test per migration — there are four now (bare spec, v1, v2,
    v3). Each older version gets its own spelled-out struct rather than a defaulted field, so
    "written by an older Zuno" can't be confused with "written by this one, with everything empty".
+9. **Collection files never carry `RequestId`.** It's written as 0 and reassigned on open. A
+   session-local handle in a committed file is diff churn and invented merge conflicts.
 10. **Environment secrets never touch the committed file.** `dev.json` is committed,
     `dev.local.json` is gitignored and overrides it, and that split *is* the secret marking —
     there's no per-variable flag to forget to set. Anything that writes environment values back to
     disk must preserve the split, or the collection format starts leaking tokens by design.
-9. **Collection files never carry `RequestId`.** It's written as 0 and reassigned on open. A
-   session-local handle in a committed file is diff churn and invented merge conflicts.
 
 ## GPUI 0.2.2 — verify, don't remember
 
@@ -221,6 +222,17 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   pane advertised `Ctrl+C` because an M1 design sketch had said to wire it; `settings_panel` cited a
   `tab_stop(false)` call that was never there — and *that* default is why Tab used to escape the
   modal.
+
+- **And once in the third direction: a doc asserted a bug the code never had.** architecture.md §13
+  listed the editor's per-line horizontal scroll clamp as a "known defect … it's just wrong", while
+  §7 and two comments in `editor.rs` described the same behaviour as a deliberate choice with a
+  named rejected alternative. Reading the clamp settles it for §7 — landing on a short line *must*
+  return the view to x=0, or the cursor goes off-screen left. Retracted, with the reasoning, in §13.
+
+  This direction is the most expensive of the three. Code drifting from a correct comment misleads
+  a reader; a phantom defect sends them hunting for something that isn't there and reads as licence
+  to "fix" working code. **Heuristic when two sections disagree: trust the one that names a rejected
+  alternative**, because it was written while looking at the problem.
 
   The pattern is worth naming, because good docs cause it. A confident comment gets trusted and
   stops being checked, so the code drifts underneath it and every reader inherits the claim. All

@@ -1,11 +1,19 @@
-# Zuno — Milestone One Architecture
+# Zuno — Architecture
 
 > **Goal:** the most ridiculously good request → response loop possible.
 > Open app → create request → send → inspect response → modify → resend.
 
-Everything in this document exists to serve that one loop. Collections, environments,
-scripting, auth, and certificates are explicitly **out of scope** for M1 — but the data
-model is shaped so they don't require a rewrite.
+**This was "Milestone One Architecture" for a long time after it stopped being that.** It now
+records the design through M3 and past it — collections, environments, body authoring, response
+search — and the M1 framing was actively misleading: a reader landing on the title would
+reasonably assume everything after M1 is undocumented and go looking elsewhere. §13 still describes
+M1 as shipped, deliberately, because the honest account of what that milestone did and didn't
+deliver is worth keeping fixed in time.
+
+The goal above has not changed, and the constraints in §1 still decide ties. Everything here exists
+to serve that one loop; features that were once listed as out of scope have since been built *onto*
+it without the rewrite §1 was designed to avoid, which is the main thing this document is evidence
+for.
 
 Pinned stack: `gpui = "0.2.2"` (crates.io release), Rust edition 2024.
 
@@ -1000,10 +1008,17 @@ read — is closed.
 
 Three decisions in `picker.rs` worth recording:
 
-- **Concrete, not a `PickerDelegate` trait.** Principle 2 says build the picker once, but there is
-  one consumer today and invariant 1 says API waits for a caller. The picker owns `Vec<Item>` where
-  each carries a `Target` it never interprets, so `Ctrl+K` is a new variant rather than a rewrite.
-  The trait earns its complexity at the third consumer, if one wants different rendering.
+- **Concrete, not a `PickerDelegate` trait.** Principle 2 says build the picker once; the picker
+  owns `Vec<Item>` where each carries a `Target` it never interprets, so a new consumer is a new
+  variant rather than a rewrite.
+
+  This entry used to justify that with "one consumer today", and **the count has since reached
+  seven** — buffers, files, actions, methods, environments, runs, body types. The decision is
+  unchanged, but for the reason originally written *after* the count: the trait earns its
+  complexity at a consumer that wants **different rendering**, and none of the seven does. They
+  differ only in the data they carry, which is what `Target` exists to absorb, and all seven draw
+  as label plus dimmed detail. Reconsider on a row shape that doesn't fit — a preview pane, an
+  icon column — not on the eighth variant.
 - **Modal, not `anchored()`.** A palette is centred over the window, so it's a full-size `absolute`
   overlay. `anchored()` positions relative to a point and is what the method dropdown will want —
   both exist in 0.2.2; this needed the simpler one.
@@ -1090,10 +1105,26 @@ That's the honest framing to carry into M2: **the loop is excellent and the diff
 unbuilt.** Also absent: syntax highlighting, a method dropdown (cycling only), a settings panel,
 and form or multipart body authoring.
 
-**Known defect, not a missing feature.** The editor clamps horizontal scroll per-line rather than
-per-document, so the offset jumps when the cursor moves between lines of different lengths. It sat
-in the list above for a while, which is a good way for a bug to never get fixed — it isn't waiting
-on a milestone, it's just wrong.
+**A "known defect" that wasn't one — retracted.** This section listed the editor's per-line
+horizontal scroll clamp as a bug: "the offset jumps when the cursor moves between lines of
+different lengths … it's just wrong." §7 and two comments in `editor.rs` described the same
+behaviour as a deliberate choice with a named rejected alternative. Reading the code settles it in
+§7's favour, so the entry is gone.
+
+The clamp is `max_offset = cursor_line.width - viewport + caret`. Land on a short line and the view
+returns to x=0 — which is the only correct thing a cursor-following viewport can do: the cursor sits
+at x≈20 on a 50px line in a 500px viewport, so staying scrolled right would push it off-screen to
+the left. The rejected per-document clamp would leave `h_offset = 20`, scrolling away the start of a
+line that fits entirely. And scrolling with the wheel doesn't move it at all: when the cursor's line
+falls outside the viewport the lookup returns `None` and the offset is left alone, which is exactly
+what the "widest *visible* line" alternative would have broken.
+
+Worth recording as its own failure mode, because it is the mirror of the one this project already
+tracks. The lessons in `CLAUDE.md` are about **code drifting away from a correct comment**. This was
+a **doc asserting a bug the code never had** — and it is the more expensive direction, because a
+confident "known defect, it's just wrong" sends the next reader hunting for something that isn't
+there, and reads as licence to "fix" working code. When two sections disagree, the one that names a
+rejected alternative is usually the one that was written while looking at the problem.
 
 The counts in this section describe M1 as shipped and are deliberately not updated as work
 continues; `CLAUDE.md` carries the live test count.

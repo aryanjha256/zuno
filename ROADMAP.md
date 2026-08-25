@@ -12,22 +12,33 @@ directional, and anything beyond that is a name and a reason.
 
 ## Where we are
 
-**Milestone 1 is complete: the request → response loop.** Author a request, send it over real
-HTTP with streaming progress and cancellation, read the response through a virtualized JSON
-viewer, diff it against the previous run, come back to it after a restart. Plus curl import,
-light/dark themes, window chrome.
+**M1, M2 and M3 are all complete**, and §11 of `architecture.md` — the list of engine capability
+with no way to reach it — is empty. This section said "what's left is reuse, see M3" for a while
+after M3 was finished; rewritten rather than patched, per the note at the top of this file.
 
-Measured: **189 ms** cold start (release), **48 ms** to flatten 10 MB of JSON into 1.31 M rows
-off-thread, 60 fps scrolling on any response size.
+- **M1 — the loop.** Author a request, send it over real HTTP with streaming progress and
+  cancellation, read the response through a virtualized JSON viewer, diff it against the previous
+  run, come back to it after a restart. Plus curl import, themes, window chrome.
+- **M2 — navigation.** Tabs as editor buffers, collections as one-file-per-request in git,
+  `Ctrl+P` over buffers and saved requests, `Ctrl+K` over every command.
+- **M3 — reuse.** Environments and `{{variables}}`, per-request settings, the history browser,
+  response egress, and all four body types authorable.
+- **Since, from the audit below.** Response search, and the response pane split into body and
+  headers tabs.
 
-**M2 is complete.** Tabs as editor buffers, collections as one-file-per-request in git, `Ctrl+P`
-over buffers and saved requests, and `Ctrl+K` over every command. 260 tests across three layers,
-and a `.deb` on tagged releases.
+Measured (release): **189 ms** cold start, **48 ms** to flatten 10 MB of JSON into 1.31 M rows
+off-thread, **6.9 ms** to search that body end to end, 60 fps scrolling at any size.
 
-The navigation thesis is built. What's left is **reuse** — see M3 — and the honest
-next question is no longer "can you get around" but "can you stop retyping things".
+**So what is the frontier?** Not a milestone — the audit's item 4. The loop is excellent, the
+navigation thesis is built, and nothing about using Zuno for real REST work is *blocked*. What
+remains is a short list of asymmetries and conveniences, and then the two named-not-planned items
+(scripting, request chaining) that would decide the product's ceiling. Read the audit, not the
+milestone headings.
 
-That gap *is* the roadmap. Everything below is about closing it.
+> **Test counts, once and not repeated.** `CLAUDE.md` carries the live total. Where a number appears
+> below it describes that milestone as shipped and is deliberately not updated — the same rule
+> architecture.md §13 states. Two of them had drifted into reading as current before this note
+> existed.
 
 ---
 
@@ -45,11 +56,17 @@ These decide phase order, and they're the durable part of this document.
    written four times and feels different each time. **This is the highest-leverage piece of UI
    work remaining.**
 
-3. **Prefer work that exposes capability already built.** §11 of `architecture.md` tracks engine
-   capabilities that are honoured on every request with no way to reach them. `Ctrl+,` closed five
-   of the original nine in one modal and the method picker closed a sixth as a side effect, which is
-   the ratio this principle is about. **Three remain**: form and binary body authoring, multipart,
-   and the response history browser.
+3. **Prefer work that exposes capability already built.** §11 of `architecture.md` tracked engine
+   capabilities honoured on every request with no way to reach them. `Ctrl+,` closed five of the
+   original nine in one modal and the method picker closed a sixth as a side effect, which is the
+   ratio this principle is about — one modal for five features.
+
+   **§11 is now empty, and this text said "Three remain" long after all three landed.** The
+   principle outlives its list: prefer the work where the engine already does the thing and only
+   the UI is missing, because that ratio is unbeatable. §11 is also the wrong place to *look* for
+   such work now — by construction it can only name gaps where the engine was involved, and the
+   two largest found since (nothing could copy a response; the headers table hid the body) appear
+   nowhere in it.
 
 4. **Defer the expensive and isolated.** Syntax highlighting needs tree-sitter plus a highlight
    cache, touches nothing else, and improves nothing structural. It is the most expensive thing
@@ -96,8 +113,10 @@ the next thing that has to land. Folder authoring is also absent; `mkdir` works.
 
 **The picker primitive — done.** Principle 2's one build: `app/src/picker.rs` is a centred modal
 with a filter input, a fuzzy-ranked `uniform_list`, and a `Target` it hands back without
-interpreting. Deliberately *not* a `PickerDelegate` trait yet — one consumer, and invariant 1 says
-API waits for a caller; `Ctrl+K` is a new `Target` variant, not a rewrite.
+interpreting. Deliberately *not* a `PickerDelegate` trait — a new consumer is a new `Target`
+variant, not a rewrite. (This said "one consumer" for a long time after there were seven. The
+count was never the trigger: the trait earns its keep at a consumer wanting different *rendering*,
+and all seven render identically. See architecture.md §12.)
 
 Matching is hand-rolled in `core/src/fuzzy.rs` rather than taking `nucleo`: hundreds of requests and
 a couple of dozen actions is not a scale where a real matcher earns its complexity, and pure code in

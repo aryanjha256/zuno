@@ -323,12 +323,14 @@ impl Workspace {
             })
             .collect();
 
-        let picker = self.show_picker(
-            buffer_items,
-            "No saved requests yet — press Ctrl+S to save the one you're editing",
-            window,
-            cx,
-        );
+        // The hint names a keystroke, so it is built rather than written. `keybinding_label`
+        // returns empty for an unbound action, and a sentence with a hole in it is worse than a
+        // shorter sentence — hence the match rather than an interpolation.
+        let save_hint = match keybinding_label(&SaveRequest, window) {
+            key if key.is_empty() => "No saved requests yet".to_string(),
+            key => format!("No saved requests yet — press {key} to save the one you're editing"),
+        };
+        let picker = self.show_picker(buffer_items, save_hint, window, cx);
 
         // Fill in the saved requests as they arrive. The picker is already usable.
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
@@ -392,7 +394,7 @@ impl Workspace {
     fn show_picker(
         &mut self,
         items: Vec<picker::Item>,
-        empty_hint: &'static str,
+        empty_hint: impl Into<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<picker::Picker> {
@@ -1219,7 +1221,7 @@ impl Workspace {
     /// Text only. A response that isn't valid UTF-8 is a normal outcome here (invariant 4),
     /// and the clipboard needs a `String`, so this points at `SaveResponse` instead of
     /// silently copying mojibake.
-    fn copy_response(&mut self, _: &CopyResponse, _: &mut Window, cx: &mut Context<Self>) {
+    fn copy_response(&mut self, _: &CopyResponse, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
         let Some(response) = view.read(cx).displayed().cloned() else {
             self.set_status("No response to copy yet", cx);
@@ -1232,10 +1234,13 @@ impl Workspace {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
                 self.set_status(&format!("Copied {size} to the clipboard"), cx);
             }
-            None => self.set_status(
-                "This response isn't text — use Ctrl+Shift+S to save it to a file",
-                cx,
-            ),
+            None => {
+                let hint = match keybinding_label(&SaveResponse, window) {
+                    key if key.is_empty() => "This response isn't text — save it to a file instead".to_string(),
+                    key => format!("This response isn't text — use {key} to save it to a file"),
+                };
+                self.set_status(&hint, cx)
+            }
         }
     }
 
@@ -1527,6 +1532,7 @@ impl Render for Workspace {
                 cookies,
                 self.environment.clone().map(SharedString::from),
                 &theme,
+                window,
             ))
             // Above the panes, below the resize edges.
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
@@ -1709,6 +1715,9 @@ fn is_tchar(byte: u8) -> bool {
 /// hint, which said "Ctrl+C or Escape to cancel" for a while — `ctrl-c` has only ever been bound to
 /// `text_input::Copy`, so half of that sentence was telling people to press a key that does
 /// nothing to a request.
+///
+/// gpui's own spelling, so it matches the command palette's trailing column. For prose that reads
+/// "press X to do Y", use [`keybinding_label`].
 pub fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
     window
         .bindings_for_action(action)
@@ -1724,14 +1733,121 @@ pub fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
         .unwrap_or_default()
 }
 
+/// The same binding spelled `Ctrl+Shift+H`, for hints written into a sentence.
+///
+/// **Why a second form rather than one.** gpui renders `ctrl-shift-h`, which is right in the
+/// palette's shortcut column and wrong inside "No headers — press … to add". Every such hint in the
+/// app was a hardcoded literal in that conventional spelling, and the docs told the story of the
+/// in-flight pane's stale `Ctrl+C` as though the class were closed — while `keybinding_hint` had
+/// exactly one caller and ten literals sat beside it. Changing them all to gpui's spelling would
+/// have been a visible regression for the sake of the fix, so the fix brings its own formatter.
+///
+/// Built from the `Keystroke` rather than by reformatting `to_string()`: parsing that output means
+/// splitting on `-`, which a binding on the `-` key itself would break.
+///
+/// Empty when the action is unbound, and **callers must check** — a sentence with a hole where the
+/// key should be is worse than one that never offered a key. See `request_pane::hint_row`.
+pub fn keybinding_label(action: &dyn gpui::Action, window: &Window) -> String {
+    let bindings = window.bindings_for_action(action);
+    let Some(binding) = bindings.first() else {
+        return String::new();
+    };
+
+    binding
+        .keystrokes()
+        .iter()
+        .map(|keystroke| {
+            let modifiers = keystroke.modifiers();
+            let mut parts: Vec<String> = Vec::new();
+            if modifiers.control {
+                parts.push("Ctrl".into());
+            }
+            if modifiers.alt {
+                parts.push("Alt".into());
+            }
+            // control, alt, platform, shift — gpui's own order in `display_modifiers`, matched by
+            // inspection of the vendored source.
+            //
+            // **Not covered by a test, and it's worth knowing why.** The round-trip check in
+            // `keybinding_label_matches_the_keymap` lowercases this back into gpui's spelling and
+            // compares, but a swap here is invisible to it: telling the two orders apart needs a
+            // binding with *both* platform and shift, and Zuno has none. Worse, one could never be
+            // compared that way anyway — gpui renders the platform modifier as the glyph `❖` on
+            // Linux, which does not lowercase into `super`. Reordering these lines was tried
+            // deliberately and the suite stayed green.
+            if modifiers.platform {
+                parts.push("Super".into());
+            }
+            if modifiers.shift {
+                parts.push("Shift".into());
+            }
+            parts.push(capitalize(keystroke.key()));
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `"No headers — Ctrl+Shift+H to add"`, with every key read from the keymap.
+///
+/// **The `is_empty` filter is the whole reason this is one function and not four.** An unbound
+/// action makes `keybinding_label` return empty, and interpolating that yields
+/// `"No headers —  to add"` — a keymap-derived hint failing uglier than the literal it replaced.
+/// The guard was written out at two call sites before this existed, which is exactly how the
+/// `modal_open` checks drifted: repeated logic diverges, and one forgotten copy is the bug.
+///
+/// A clause whose action is unbound is dropped; if none survive, so is the dash.
+pub fn hint_sentence(lead: &str, clauses: &[(&dyn gpui::Action, &str)], window: &Window) -> String {
+    let rendered: Vec<String> = clauses
+        .iter()
+        .filter_map(|(action, verb)| {
+            let key = keybinding_label(*action, window);
+            (!key.is_empty()).then(|| format!("{key} {verb}"))
+        })
+        .collect();
+
+    if rendered.is_empty() {
+        lead.to_string()
+    } else {
+        format!("{lead} — {}", rendered.join(", "))
+    }
+}
+
+/// `h` -> `H`, `enter` -> `Enter`, `,` -> `,`.
+///
+/// Only the first character, and only if it has an uppercase form — so punctuation keys like
+/// `ctrl-,` come through untouched rather than being mangled.
+fn capitalize(key: &str) -> String {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     cookies: bool,
     environment: Option<SharedString>,
     theme: &Theme,
+    window: &Window,
 ) -> impl IntoElement {
-    const HINTS: &str = "Ctrl+P find · Ctrl+K commands · Ctrl+E env · Ctrl+Enter send";
+    // Four hints, each naming a key the keymap actually holds. Unbound actions drop out rather
+    // than printing an empty slot, so this strip shrinks instead of lying.
+    let hints: String = [
+        (&OpenRequest as &dyn gpui::Action, "find"),
+        (&OpenPalette, "commands"),
+        (&SwitchEnvironment, "env"),
+        (&SendRequest, "send"),
+    ]
+    .iter()
+    .filter_map(|(action, what)| {
+        let key = keybinding_label(*action, window);
+        (!key.is_empty()).then(|| format!("{key} {what}"))
+    })
+    .collect::<Vec<_>>()
+    .join(" · ");
 
     div()
         .flex()
@@ -1805,7 +1921,7 @@ fn status_bar(
                     div()
                         .flex_none()
                         .text_color(theme.text_muted)
-                        .child(HINTS.to_string()),
+                        .child(hints),
                 ),
         )
 }

@@ -576,6 +576,190 @@ async fn the_in_flight_hint_names_a_key_that_actually_cancels(cx: &mut TestAppCo
     );
 }
 
+/// Every action whose keystroke appears in a piece of UI copy.
+///
+/// A list rather than "all actions", because only these are *advertised* — an action reachable
+/// only from the palette can be unbound without any sentence going stale.
+fn advertised_actions() -> Vec<Box<dyn gpui::Action>> {
+    use crate::actions::*;
+    vec![
+        Box::new(AddHeader),
+        Box::new(AddQuery),
+        Box::new(AddFormField),
+        Box::new(AddMultipartField),
+        Box::new(ChooseBodyFile),
+        Box::new(OpenBodyType),
+        Box::new(ShowHistory),
+        Box::new(SendRequest),
+        Box::new(SaveRequest),
+        Box::new(SaveResponse),
+        Box::new(ToggleTheme),
+        Box::new(OpenRequest),
+        Box::new(OpenPalette),
+        Box::new(SwitchEnvironment),
+        Box::new(CancelRequest),
+    ]
+}
+
+#[gpui::test]
+async fn keybinding_label_matches_the_keymap(cx: &mut TestAppContext) {
+    // Ten pieces of UI copy used to write their own keystroke as a literal — "Ctrl+Shift+H to
+    // add", "Ctrl+H to pick another", and so on — while `keybinding_hint` had exactly one caller
+    // and the docs told the story as though the class were closed. They read from the keymap now,
+    // through `keybinding_label`, which spells a binding `Ctrl+Shift+H` instead of gpui's
+    // `ctrl-shift-h` so the prose didn't visibly regress for the sake of the fix.
+    //
+    // **That second spelling is the risk this test exists for.** A hand-written formatter can
+    // disagree with the keymap it claims to read — wrong modifier order, a mangled punctuation
+    // key — and every symptom would be cosmetic and unnoticed. So: lowercase the label back into
+    // gpui's form and require it to equal what gpui itself produced.
+    let (window, _view, mut cx) = boot(cx, None, None);
+
+    for action in advertised_actions() {
+        let (label, hint) = window
+            .update(&mut cx, |_, window, _| {
+                (
+                    crate::workspace::keybinding_label(action.as_ref(), window),
+                    crate::workspace::keybinding_hint(action.as_ref(), window),
+                )
+            })
+            .expect("window");
+
+        assert!(
+            !label.is_empty(),
+            "{} is named in UI copy but has no binding, so the copy would render a hole",
+            action.name()
+        );
+        // Both sides lowercased: gpui spells a shifted letter `ctrl-shift-H` while the label
+        // capitalizes every part, so the *key's* case legitimately differs. What must not differ
+        // is the modifier set, its order, or the key itself.
+        assert_eq!(
+            label.to_lowercase().replace('+', "-"),
+            hint.to_lowercase(),
+            "the two spellings of {}'s binding disagree",
+            action.name()
+        );
+    }
+}
+
+#[gpui::test]
+async fn migrated_hints_render_exactly_what_the_literals_did(cx: &mut TestAppContext) {
+    // The migration's real risk isn't a wrong key — it's a *differently spelled* key, quietly
+    // changing ten pieces of copy as a side effect of making them correct. These are the literals
+    // that were in the source before, character for character.
+    //
+    // This also makes the labels load-bearing in the other direction: rebind any of these and the
+    // test fails, which is the moment to notice that the copy now says something new.
+    let (window, _view, mut cx) = boot(cx, None, None);
+    use crate::actions::*;
+
+    let expected: Vec<(Box<dyn gpui::Action>, &str)> = vec![
+        (Box::new(AddHeader), "Ctrl+Shift+H"),
+        (Box::new(AddQuery), "Ctrl+Shift+Y"),
+        (Box::new(AddFormField), "Ctrl+Shift+F"),
+        (Box::new(AddMultipartField), "Ctrl+Shift+M"),
+        (Box::new(ChooseBodyFile), "Ctrl+Shift+O"),
+        (Box::new(OpenBodyType), "Ctrl+Shift+B"),
+        (Box::new(ShowHistory), "Ctrl+H"),
+        (Box::new(SendRequest), "Ctrl+Enter"),
+        (Box::new(SaveRequest), "Ctrl+S"),
+        (Box::new(SaveResponse), "Ctrl+Shift+S"),
+        (Box::new(ToggleTheme), "Ctrl+Shift+T"),
+        (Box::new(OpenRequest), "Ctrl+P"),
+        (Box::new(OpenPalette), "Ctrl+K"),
+        (Box::new(SwitchEnvironment), "Ctrl+E"),
+    ];
+
+    for (action, want) in expected {
+        let got = window
+            .update(&mut cx, |_, window, _| {
+                crate::workspace::keybinding_label(action.as_ref(), window)
+            })
+            .expect("window");
+        assert_eq!(got, want, "{}'s label changed", action.name());
+    }
+}
+
+#[gpui::test]
+async fn an_advertised_key_actually_fires_its_action(cx: &mut TestAppContext) {
+    // The stronger half: a label that merely *parses* is not the same as one that works. Take the
+    // key the copy advertises for "add a header", press it, and require a header row to appear.
+    // This is the shape the in-flight cancel hint is tested in, generalised to the copy that used
+    // to be hardcoded.
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    let label = window
+        .update(&mut cx, |_, window, _| {
+            crate::workspace::keybinding_label(&crate::actions::AddHeader, window)
+        })
+        .expect("window");
+
+    let before = cx.update(|_, cx| view.read(cx).headers.len());
+
+    // Back to gpui's spelling, which is what `simulate_keystrokes` parses.
+    cx.simulate_keystrokes(&label.to_lowercase().replace('+', "-"));
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).headers.len()),
+        before + 1,
+        "pressing the advertised key ({label:?}) must add a header"
+    );
+}
+
+#[gpui::test]
+async fn a_hint_for_an_unbound_action_drops_the_clause(cx: &mut TestAppContext) {
+    // The failure mode of a keymap-derived hint: an unbound action yields an empty key, and
+    // interpolating that leaves "No headers —  to add" — uglier than the literal it replaced.
+    // `hint_sentence` drops the clause instead, and the dash with it when nothing survives.
+    //
+    // `ClearCookies` is the only `zuno::` action with no binding at all (palette-only), which is
+    // what makes it the one honest probe for this. The first assertion guards the premise: if it
+    // ever gains a binding, this test would silently start proving nothing.
+    let (window, _view, mut cx) = boot(cx, None, None);
+    use crate::actions::{AddHeader, ClearCookies};
+
+    let (unbound, dropped, kept, mixed) = window
+        .update(&mut cx, |_, window, _| {
+            (
+                crate::workspace::keybinding_label(&ClearCookies, window),
+                crate::workspace::hint_sentence(
+                    "No cookies",
+                    &[(&ClearCookies as &dyn gpui::Action, "to clear")],
+                    window,
+                ),
+                crate::workspace::hint_sentence(
+                    "No headers",
+                    &[(&AddHeader as &dyn gpui::Action, "to add")],
+                    window,
+                ),
+                crate::workspace::hint_sentence(
+                    "No parts",
+                    &[
+                        (&AddHeader as &dyn gpui::Action, "to add"),
+                        (&ClearCookies as &dyn gpui::Action, "to clear"),
+                    ],
+                    window,
+                ),
+            )
+        })
+        .expect("window");
+
+    assert!(
+        unbound.is_empty(),
+        "ClearCookies is supposed to be unbound; this test proves nothing otherwise"
+    );
+    assert_eq!(dropped, "No cookies", "the whole clause and the dash must go");
+    assert_eq!(
+        kept, "No headers — Ctrl+Shift+H to add",
+        "a bound action still renders, in the conventional spelling"
+    );
+    assert_eq!(
+        mixed, "No parts — Ctrl+Shift+H to add",
+        "one unbound clause among several drops only itself"
+    );
+}
+
 #[gpui::test]
 async fn resending_replaces_the_previous_response(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);

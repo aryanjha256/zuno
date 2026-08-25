@@ -4,13 +4,18 @@
 //! switcher are one interaction, and building it four times would make it feel different
 //! four times. This is that one build.
 //!
-//! **Concrete, not generic.** A `PickerDelegate` trait would be the fully reusable shape,
-//! but there is exactly one consumer today and invariant 1 says API waits for a caller.
-//! Instead the picker owns `Vec<Item>`, each carrying a `Target` the picker never
-//! interprets — it hands the chosen `Target` back to `Workspace` and stays ignorant of what
-//! any of it means. Adding `Ctrl+K` is then a new `Target` variant, not a rewrite; if a
-//! third consumer wants genuinely different rendering, *that* is when the trait earns its
-//! complexity.
+//! **Concrete, not generic.** A `PickerDelegate` trait would be the fully reusable shape. The
+//! picker instead owns `Vec<Item>`, each carrying a `Target` it never interprets — it hands the
+//! chosen `Target` back to `Workspace` and stays ignorant of what any of it means. A new consumer
+//! is a new `Target` variant, not a rewrite.
+//!
+//! **The original reason was "one consumer today"; that is long false and the decision still
+//! holds.** There are seven variants now — buffers, files, palette actions, methods, environments,
+//! runs, body types. The recorded trigger was never the count, though: it was *a consumer wanting
+//! genuinely different rendering*, and that half has not fired. All seven differ in the data they
+//! carry, which is precisely what `Target` absorbs, and every one renders as label plus dimmed
+//! detail. A trait would abstract over a difference that doesn't exist. Revisit when a consumer
+//! needs a different row — multi-line, an icon, a preview pane — not when the next variant lands.
 //!
 //! **Modal, not anchored.** This is a full-size `absolute` overlay with a centred child,
 //! not an `anchored()` popover. An earlier version of this note claimed the method dropdown
@@ -107,7 +112,7 @@ pub struct Picker {
     _filter_changed: Subscription,
     /// Shown when there are no candidates at all, which means something different for a
     /// request list (nothing saved yet) than for a command list (a bug).
-    empty_hint: &'static str,
+    empty_hint: SharedString,
     /// Turns the query itself into an extra candidate.
     ///
     /// Exists for custom HTTP verbs: typing `PURGE` should offer it even though no row
@@ -126,11 +131,14 @@ pub struct Picker {
 impl Picker {
     pub fn new(
         items: Vec<Item>,
-        placeholder: &'static str,
+        placeholder: impl Into<SharedString>,
         restore_focus: Option<FocusHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let filter = cx.new(|cx| TextInput::new(String::new(), placeholder, "Picker", cx));
+        // `SharedString`, not `&'static str`, because the empty hint now names a keystroke read
+        // from the live keymap — see `Workspace::keybinding_label`. A literal cannot do that.
+        let placeholder: SharedString = placeholder.into();
+        let filter = cx.new(|cx| TextInput::new(String::new(), placeholder.clone(), "Picker", cx));
         let empty_hint = placeholder;
 
         // Re-rank on every edit. This used to be a string compare against a stored
@@ -318,7 +326,7 @@ impl Render for Picker {
                             .child(self.filter.clone()),
                     )
                     .child(if count == 0 {
-                        empty_state(&query, self.empty_hint, &theme).into_any_element()
+                        empty_state(&query, &self.empty_hint, &theme).into_any_element()
                     } else {
                         result_list(rows, selected, self.scroll.clone(), &theme, cx)
                             .into_any_element()

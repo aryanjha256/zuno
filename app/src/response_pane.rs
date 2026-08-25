@@ -22,7 +22,7 @@ use zuno_core::{
     ScalarKind, StatusClass,
 };
 
-use crate::actions::CancelRequest;
+use crate::actions::{CancelRequest, SendRequest, ShowHistory};
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
 use crate::theme::Theme;
@@ -72,7 +72,7 @@ pub fn render(
             // and hiding it behind a tab would reintroduce exactly that.
             let pane = pane
                 .child(status_line(response, theme))
-                .children(historical_notice(view.viewing(), theme))
+                .children(historical_notice(view.viewing(), theme, window))
                 // The diff describes live-vs-previous, so it's meaningless — and wrong —
                 // beside an older run.
                 .children(
@@ -95,7 +95,7 @@ pub fn render(
                 ResponseView::Headers => pane.child(headers_region(&response.headers, theme)),
             }
         }
-        None => pane.child(empty_state(theme)),
+        None => pane.child(empty_state(theme, window)),
     }
 }
 
@@ -477,7 +477,7 @@ fn status_line(response: &ResponseData, theme: &Theme) -> Div {
 }
 
 /// A banner marking the pane as showing a retained run rather than the live one.
-fn historical_notice(viewing: usize, theme: &Theme) -> Option<Div> {
+fn historical_notice(viewing: usize, theme: &Theme, window: &Window) -> Option<Div> {
     if viewing == 0 {
         return None;
     }
@@ -497,7 +497,12 @@ fn historical_notice(viewing: usize, theme: &Theme) -> Option<Div> {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.accent)
-            .child(format!("{label} · Ctrl+H to pick another · send to return to live")),
+            .child(match crate::workspace::keybinding_label(&ShowHistory, window) {
+                // Unbound: drop the clause rather than name a key that does nothing. The
+                // "send to return to live" half needs no key, so it always stays.
+                key if key.is_empty() => format!("{label} · send to return to live"),
+                key => format!("{label} · {key} to pick another · send to return to live"),
+            }),
     )
 }
 
@@ -997,7 +1002,7 @@ fn centered_note(message: &str, theme: &Theme) -> Div {
         .child(message.to_string())
 }
 
-fn empty_state(theme: &Theme) -> Div {
+fn empty_state(theme: &Theme, window: &Window) -> Div {
     div()
         .flex_1()
         .flex()
@@ -1012,7 +1017,10 @@ fn empty_state(theme: &Theme) -> Div {
             div()
                 .text_xs()
                 .text_color(theme.text_muted)
-                .child("Ctrl+Enter to send".to_string()),
+                .child(match crate::workspace::keybinding_label(&SendRequest, window) {
+                    key if key.is_empty() => "no send key is bound".to_string(),
+                    key => format!("{key} to send"),
+                }),
         )
 }
 

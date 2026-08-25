@@ -13,7 +13,10 @@ use gpui::{
     SharedString, Styled, Window, div, px,
 };
 
-use crate::actions::{CancelRequest, SendRequest};
+use crate::actions::{
+    AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
+    OpenBodyType, SendRequest,
+};
 use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestView, RowKind};
 use crate::theme::Theme;
 
@@ -53,7 +56,7 @@ pub fn render(
             theme,
             cx,
         ))
-        .child(rows_table(&view.headers, RowKind::Header, theme, cx))
+        .child(rows_table(&view.headers, RowKind::Header, theme, window, cx))
         .child(section_header(
             "Query",
             query_detail,
@@ -61,9 +64,9 @@ pub fn render(
             theme,
             cx,
         ))
-        .child(rows_table(&view.query, RowKind::Query, theme, cx))
+        .child(rows_table(&view.query, RowKind::Query, theme, window, cx))
         .child(body_header(view, body_lines, theme))
-        .child(body_region(view, theme, body_focused, cx))
+        .child(body_region(view, theme, body_focused, window, cx))
 }
 
 /// The Body header, with a chip that opens the body-type picker — the same action
@@ -297,10 +300,11 @@ fn rows_table(
     rows: &[KeyValueRow],
     kind: RowKind,
     theme: &Theme,
+    window: &Window,
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
     if rows.is_empty() {
-        return empty_table(kind, theme);
+        return empty_table(kind, theme, window);
     }
 
     let prefix = match kind {
@@ -319,7 +323,22 @@ fn rows_table(
     )
 }
 
-fn empty_table(kind: RowKind, theme: &Theme) -> Div {
+/// One "nothing here yet — press X to add" line, with X read from the keymap.
+///
+/// **Every hint in this pane used to write its own keystroke as a literal.** All of them happened
+/// to be correct, which is exactly why they were dangerous: a rebinding would have left four
+/// confident sentences naming keys that do nothing, with no test and no compiler to notice. The
+/// in-flight pane already learned this the hard way — it advertised `Ctrl+C` for several
+/// milestones — and `keybinding_hint` was written for that fix and then used at that one site.
+///
+/// The dropping of an unbound clause lives in `workspace::hint_sentence` rather than here, so the
+/// four tables and the two prose hints below cannot disagree about it.
+fn hint_row(
+    what: &str,
+    hints: &[(&dyn gpui::Action, &str)],
+    theme: &Theme,
+    window: &Window,
+) -> Div {
     div()
         .px_3()
         .py_2()
@@ -327,12 +346,28 @@ fn empty_table(kind: RowKind, theme: &Theme) -> Div {
         .border_color(theme.border)
         .text_xs()
         .text_color(theme.text_muted)
-        .child(match kind {
-            RowKind::Header => "No headers — Ctrl+Shift+H to add",
-            RowKind::Query => "No query parameters — Ctrl+Shift+Y to add",
-            RowKind::Form => "No fields — Ctrl+Shift+F to add",
-            RowKind::Multipart => "No parts — Ctrl+Shift+M to add, Ctrl+Shift+O to attach a file",
-        })
+        .child(crate::workspace::hint_sentence(
+            &format!("No {what}"),
+            hints,
+            window,
+        ))
+}
+
+fn empty_table(kind: RowKind, theme: &Theme, window: &Window) -> Div {
+    match kind {
+        RowKind::Header => hint_row("headers", &[(&AddHeader, "to add")], theme, window),
+        RowKind::Query => hint_row("query parameters", &[(&AddQuery, "to add")], theme, window),
+        RowKind::Form => hint_row("fields", &[(&AddFormField, "to add")], theme, window),
+        RowKind::Multipart => hint_row(
+            "parts",
+            &[
+                (&AddMultipartField, "to add"),
+                (&ChooseBodyFile, "to attach a file"),
+            ],
+            theme,
+            window,
+        ),
+    }
 }
 
 /// The multipart table. Separate from `rows_table` because the prefix is per *row* — a part
@@ -340,10 +375,11 @@ fn empty_table(kind: RowKind, theme: &Theme) -> Div {
 fn multipart_table(
     parts: &[MultipartRow],
     theme: &Theme,
+    window: &Window,
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
     if parts.is_empty() {
-        return empty_table(RowKind::Multipart, theme);
+        return empty_table(RowKind::Multipart, theme, window);
     }
 
     div().flex().flex_col().children(parts.iter().enumerate().map(|(ix, part)| {
@@ -441,6 +477,7 @@ fn body_region(
     view: &RequestView,
     theme: &Theme,
     focused: bool,
+    window: &Window,
     cx: &mut gpui::Context<RequestView>,
 ) -> impl IntoElement + use<> {
     let region = div()
@@ -464,17 +501,17 @@ fn body_region(
         // because `FormField` has the same shape as `Header`.
         BodyType::Form => region
             .font_family(theme.mono.clone())
-            .child(rows_table(&view.form, RowKind::Form, theme, cx)),
+            .child(rows_table(&view.form, RowKind::Form, theme, window, cx)),
         BodyType::Multipart => region
             .font_family(theme.mono.clone())
-            .child(multipart_table(&view.multipart, theme, cx)),
-        BodyType::Binary => region.child(binary_body(view, theme)),
+            .child(multipart_table(&view.multipart, theme, window, cx)),
+        BodyType::Binary => region.child(binary_body(view, theme, window)),
         // Not the editor: its text is retained so switching back is lossless, but showing it
         // under a body type of "None" would imply it gets sent.
         BodyType::Empty => region.child(
             div()
                 .text_color(theme.text_muted)
-                .child("No body — Ctrl+Shift+B to pick a type"),
+                .child(crate::workspace::hint_sentence("No body", &[(&OpenBodyType, "to pick a type")], window)),
         ),
         BodyType::Raw => region.child(view.body_editor.clone()),
     }
@@ -484,12 +521,12 @@ fn body_region(
 ///
 /// Clicking anywhere here reopens the picker, so the path doubles as the control — there's
 /// nothing else in this region to click.
-fn binary_body(view: &RequestView, theme: &Theme) -> impl IntoElement + use<> {
+fn binary_body(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoElement + use<> {
     let chosen = view.binary_path.clone();
 
     let headline = match &chosen {
         Some(path) => path.display().to_string(),
-        None => "No file chosen — Ctrl+Shift+O to pick one".to_string(),
+        None => crate::workspace::hint_sentence("No file chosen", &[(&ChooseBodyFile, "to pick one")], window),
     };
 
     div()

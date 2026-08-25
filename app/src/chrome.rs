@@ -95,7 +95,13 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                         .px_3()
                         .text_xs()
                         .text_color(theme.text_muted)
-                        .child(format!("{} · Ctrl+Shift+T", theme.appearance.label())),
+                        .child(match crate::workspace::keybinding_label(
+                            &crate::actions::ToggleTheme,
+                            window,
+                        ) {
+                            key if key.is_empty() => theme.appearance.label().to_string(),
+                            key => format!("{} · {key}", theme.appearance.label()),
+                        }),
                 )
                 .children(controls.minimize.then(|| {
                     control_button("minimize", "–", theme, false, |window| {

@@ -4,8 +4,10 @@
 //! here so they can be tested without opening a window. Nothing in this crate
 //! knows about rendering, colors, or key bindings.
 //!
-//! Landed so far: the request and response models (M1.0), the HTTP engine (M1.2), the
-//! JSON outline and line index (M1.3), response diffing (M1.4).
+//! Landed so far: the request and response models, the HTTP engine, the JSON outline and line
+//! index, response diffing, curl import, the collection format, environments, fuzzy matching for
+//! the picker, and body search. Listed by *what* rather than by milestone — the milestone tags
+//! this line used to carry stopped meaning anything once modules kept arriving after M1.
 
 pub mod collection;
 pub mod curl;
