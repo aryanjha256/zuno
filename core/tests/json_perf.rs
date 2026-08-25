@@ -108,6 +108,63 @@ fn folding_a_huge_document_is_cheap() {
 }
 
 #[test]
+fn searching_a_huge_body_and_mapping_the_hits_is_cheap() {
+    // Search is the one interaction that reads all 10MB on every keystroke, so it's where the
+    // "10MB at 60fps" claim is most exposed. Two separate costs, measured separately because
+    // they fail differently: the scan is O(bytes) and the mapping is O(rows + hits).
+    let source = big_json(10 * 1024 * 1024);
+    let bytes = source.len();
+    let outline = JsonOutline::parse(source).expect("valid json");
+
+    // A needle that misses everywhere is the worst case for the scan: no match ever lets it
+    // skip ahead by the needle's length, so every position pays the first-byte check.
+    let started = Instant::now();
+    let miss = zuno_core::search::find(outline.source(), "zzzzzzzz");
+    let scan = started.elapsed();
+    assert!(miss.is_empty());
+
+    // And one that hits constantly, to exercise the cap and the mapping.
+    let started = Instant::now();
+    let hits = zuno_core::search::find(outline.source(), "record-");
+    let hit_scan = started.elapsed();
+
+    let started = Instant::now();
+    let rows = outline.rows_for_offsets(&hits.offsets);
+    let mapping = started.elapsed();
+
+    eprintln!(
+        "search:       {bytes} bytes -> {} hits (truncated: {}) in {hit_scan:?}; \
+         a full miss in {scan:?}; mapped to rows in {mapping:?}",
+        hits.len(),
+        hits.truncated
+    );
+
+    assert_eq!(rows.len(), hits.len(), "one row per hit");
+    assert!(
+        hits.truncated,
+        "a needle in every record must hit the cap on 10MB — otherwise this measures nothing"
+    );
+    assert!(
+        rows.windows(2).all(|pair| pair[0] <= pair[1]),
+        "mapped rows must be non-decreasing"
+    );
+
+    assert!(
+        scan < Duration::from_secs(1),
+        "a full-body miss took {scan:?}; the first-byte skip has probably been lost"
+    );
+    // The mapping walks rows only as far as the last hit, and the cap stops that early in a
+    // 10MB body — so it should be *far* cheaper than the scan that produced the hits, not
+    // merely comparable. A version that rebuilt positions per hit instead of merging once
+    // would breach this.
+    assert!(
+        mapping < Duration::from_millis(200),
+        "mapping {} hits took {mapping:?}",
+        hits.len()
+    );
+}
+
+#[test]
 fn indexing_lines_of_a_huge_body_is_cheap() {
     // The fallback path has to survive the same input.
     let source = big_json(10 * 1024 * 1024);

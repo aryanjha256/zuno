@@ -366,15 +366,32 @@ exhaustively with no catch-all: adding a variant is a compile error until someon
 it, which is stronger than silently holding the unknown. The compiler forced it — once multipart was
 authorable the catch-all became unreachable and `-D warnings` rejected it.
 
-**3. No search in a response.** The viewer holds 10 MB at 60 fps and folds, but there's no `Ctrl+F`
-— so at exactly the scale it was built for, finding a key means scrolling. Bigger than it looks: the
-viewer is virtualized over an outline, so search has to run over the source bytes off-thread and map
-hits back to rows. This is where the "huge JSON" claim gets tested.
+**3. Search in a response — done.** `Ctrl+F`, `Enter`/`Shift+Enter` to step, `Escape` to close.
+This was where the "huge JSON" claim got tested, and it held: a full-body miss over 10MB scans in
+**6.9 ms**, and the offset-to-row mapping in **148 µs**. Both are asserted in `json_perf`, so a
+regression fails rather than merely feeling slow.
 
-**4. Smaller, but real.**
+"Map hits back to rows" was the right guess about where the work would be, and it was harder than
+the sentence implies — a row's source position isn't stored anywhere, and the first reconstruction
+was wrong by exactly the nesting depth. See architecture.md §6.
+
+Two things it turned out to need that weren't on this list:
+
+- **`TextInput` had to start emitting a `Changed` event.** Incremental search means re-scanning per
+  edit, and the picker's trick of comparing the query in `render` doesn't extend to spawning a
+  background task. The picker moved onto the event too, so there's one mechanism.
+- **The find bar's `Escape` had to be registered after the global one.** Third time this ordering
+  rule has decided behaviour with no compile error to catch it — now with a test that fails when
+  the block moves.
+
+*Still missing from egress, and unchanged:* copying a single row's value or its path. Search built
+the row *cursor* (a current match, revealed and scrolled to) but not a *selection* the user drives,
+so that remains row selection first, then copy.
+
+**4. Smaller, but real.** With search done, this is the live list.
 
 - **No copy-as-curl.** Import exists and export doesn't, which is asymmetric — and "here's the
-  repro" is a constant need.
+  repro" is a constant need. Nearly pure `zuno-core`, so it's the cheapest real thing left.
 - **No delete or rename of a saved request** from inside the app. Mild, because files are the
   interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
 - **No body prettify.** Paste minified JSON and you live with it.

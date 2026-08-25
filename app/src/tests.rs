@@ -2891,6 +2891,322 @@ async fn the_response_view_is_per_buffer(cx: &mut TestAppContext) {
     assert_eq!(response_view(&first, &mut cx), ResponseView::Headers);
 }
 
+// ---------------------------------------------------------------------------
+// Find in response
+// ---------------------------------------------------------------------------
+
+/// Serve one JSON body, send for it, and wait until the body index exists.
+///
+/// Search needs the *index*, not just the response — the offset-to-row mapping reads it — so a
+/// test that only waited for `response` would race the background indexing and search an
+/// absent body.
+fn respond_with_json(
+    cx: &mut TestAppContext,
+    body: &'static str,
+) -> (gpui::Entity<RequestView>, VisualTestContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_typed("application/json", body);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+
+    (view, cx)
+}
+
+/// `(current, total)` from the find bar, or `None` when nothing matched.
+fn find_position(
+    view: &gpui::Entity<RequestView>,
+    cx: &mut VisualTestContext,
+) -> Option<(usize, usize)> {
+    cx.update(|_, cx| view.read(cx).search.as_ref().and_then(|s| s.position()))
+}
+
+/// Replace the find bar's query and wait for the background scan to land.
+///
+/// The `ctrl-a` is not decoration: `simulate_input` appends, so a second call without it types
+/// into whatever is already there and the probe below waits forever for a query that never
+/// appears. `ctrl-a` is `text_input::SelectAll`, which reaches this input because its key
+/// context is `"TextInput ResponseSearch"` — both identifiers in one string, per the leaf-only
+/// predicate rule.
+fn search_for(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext, query: &str) {
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input(query);
+    wait_for(cx, "the search to run", |cx| {
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            let search = view.search.as_ref()?;
+            // The query having reached the input is not the same as the scan having finished;
+            // the scan is a background task. Wait for the two to agree.
+            (search.query.read(cx).text() == query).then_some(())
+        })
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn ctrl_f_opens_the_find_bar_and_counts_matches(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":"hit","b":"miss","c":"hit"}"#);
+
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_searching()),
+        "the bar starts closed"
+    );
+
+    cx.simulate_keystrokes("ctrl-f");
+    assert!(cx.update(|_, cx| view.read(cx).is_searching()));
+
+    search_for(&view, &mut cx, "hit");
+    assert_eq!(
+        find_position(&view, &mut cx),
+        Some((1, 2)),
+        "two matches, sitting on the first"
+    );
+}
+
+#[gpui::test]
+async fn enter_steps_through_matches_and_wraps(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":"x","b":"x","c":"x"}"#);
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "x");
+    assert_eq!(find_position(&view, &mut cx), Some((1, 3)));
+
+    cx.simulate_keystrokes("enter");
+    assert_eq!(find_position(&view, &mut cx), Some((2, 3)));
+    cx.simulate_keystrokes("enter");
+    assert_eq!(find_position(&view, &mut cx), Some((3, 3)));
+
+    // Wrapping in both directions — `rem_euclid`, not a saturating clamp.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(find_position(&view, &mut cx), Some((1, 3)), "forward wrap");
+    cx.simulate_keystrokes("shift-enter");
+    assert_eq!(find_position(&view, &mut cx), Some((3, 3)), "backward wrap");
+}
+
+#[gpui::test]
+async fn the_current_match_is_the_row_the_needle_is_actually_in(cx: &mut TestAppContext) {
+    // The whole point of the offset-to-row mapping, driven end to end rather than as a unit:
+    // the highlighted row has to be the one holding the match.
+    let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1,"beta":2,"gamma":3}"#);
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "gamma");
+
+    let row = cx
+        .update(|_, cx| view.read(cx).current_match_row())
+        .expect("a current match");
+
+    let key = cx.update(|_, cx| {
+        let view = view.read(cx);
+        let outline = view.body_view.as_ref()?.outline()?.clone();
+        let row = outline.row(row as usize)?;
+        Some(outline.text(row.key).to_string())
+    });
+
+    assert_eq!(key.as_deref(), Some("\"gamma\""), "landed on row {row}");
+}
+
+#[gpui::test]
+async fn jumping_to_a_match_unfolds_what_was_hiding_it(cx: &mut TestAppContext) {
+    // Folding a big response and then searching into it is normal, not an edge case. Without
+    // the unfold the target has no visible row at all, so the scroll goes somewhere arbitrary
+    // and the search looks broken while reporting a match.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":{"key":"buried"}},"z":1}"#);
+
+    cx.simulate_keystrokes("alt-f");
+    let folded_rows = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
+    let total = cx.update(|_, cx| {
+        view.read(cx).body_view.as_ref().unwrap().outline().unwrap().len()
+    });
+    assert!(folded_rows < total, "alt-f should have hidden rows");
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "buried");
+    assert_eq!(find_position(&view, &mut cx), Some((1, 1)));
+
+    // The target's row must now be present in the visible index, not merely counted.
+    let row = cx.update(|_, cx| view.read(cx).current_match_row()).unwrap();
+    let visible = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().visible());
+    assert!(
+        visible.contains(&row),
+        "row {row} must be visible after jumping to it; visible = {visible:?}"
+    );
+}
+
+#[gpui::test]
+async fn escape_closes_the_find_bar_without_cancelling_the_request(cx: &mut TestAppContext) {
+    // The keymap-ordering trap, driven through the real keymap: `escape` in the find bar's
+    // context only beats the global `escape` -> CancelRequest because it is registered after
+    // it. Reorder `register_keymap` and this is the test that notices.
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":"x"}"#);
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "x");
+
+    cx.simulate_keystrokes("escape");
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_searching()),
+        "escape must close the bar"
+    );
+    // And the response is untouched — escape reached the find bar, not the request.
+    assert!(
+        cx.update(|_, cx| view.read(cx).displayed().is_some()),
+        "the response must still be on screen"
+    );
+}
+
+#[gpui::test]
+async fn reopening_the_find_bar_keeps_the_query(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":"x","b":"x"}"#);
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "x");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(find_position(&view, &mut cx), Some((2, 2)));
+
+    // Ctrl+F again means "put me back in the box", not "throw away what I typed".
+    cx.simulate_keystrokes("ctrl-f");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search.as_ref().unwrap().query.read(cx).text().to_string()),
+        "x",
+        "the query must survive a reopen"
+    );
+
+    // ...and the text is selected, so typing replaces rather than appends.
+    cx.simulate_input("y");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search.as_ref().unwrap().query.read(cx).text().to_string()),
+        "y",
+        "reopening selects all, so typing overwrites"
+    );
+}
+
+#[gpui::test]
+async fn a_resend_rescans_rather_than_leaving_a_stale_count(cx: &mut TestAppContext) {
+    // Matches are byte offsets into one specific body. A resend replaces those bytes, so a
+    // count carried over would describe a response that is no longer on screen — and the
+    // offsets would index the new body at random.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, r#"{"a":"x","b":"x","c":"x"}"#), (201, r#"{"a":"x"}"#)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "x");
+    assert_eq!(find_position(&view, &mut cx), Some((1, 3)));
+
+    send_and_wait(&mut cx, &view, 201);
+    wait_for(&mut cx, "the rescan", |cx| {
+        find_position(&view, cx).filter(|(_, total)| *total == 1)
+    });
+
+    assert_eq!(
+        find_position(&view, &mut cx),
+        Some((1, 1)),
+        "the new body has one match, not the old body's three"
+    );
+}
+
+#[gpui::test]
+async fn searching_a_non_json_body_uses_lines(cx: &mut TestAppContext) {
+    // The raw fallback has to be searchable too, and it maps through `LineIndex` rather than
+    // the outline — a different code path with the same contract.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_typed("text/plain", "alpha\nbeta needle\ngamma\nneedle again");
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+    assert!(
+        !cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().is_json()),
+        "this fixture must take the raw-text path or the test proves nothing"
+    );
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "needle");
+    assert_eq!(find_position(&view, &mut cx), Some((1, 2)));
+
+    // Line 1 holds the first, line 3 the second.
+    assert_eq!(cx.update(|_, cx| view.read(cx).current_match_row()), Some(1));
+    cx.simulate_keystrokes("enter");
+    assert_eq!(cx.update(|_, cx| view.read(cx).current_match_row()), Some(3));
+}
+
+/// Serve one 200 with the given content type.
+///
+/// Takes the body by value rather than as part of a `&'static [(u16, &str)]` like
+/// `serve_sequence`: that signature only accepts a slice the compiler can promote to `'static`,
+/// which a literal built from a parameter is not. Here the body is moved into the thread, so
+/// `&'static str` is all it needs.
+fn serve_typed(content_type: &'static str, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            // `Connection: close` matters — left keep-alive, reqwest pools the socket and a
+            // server that accepts once can block on a connection the client meant to reuse.
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+#[gpui::test]
+async fn a_query_that_matches_nothing_reports_nothing_rather_than_holding_the_last_hit(
+    cx: &mut TestAppContext,
+) {
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":"findme"}"#);
+
+    cx.simulate_keystrokes("ctrl-f");
+    search_for(&view, &mut cx, "findme");
+    assert_eq!(find_position(&view, &mut cx), Some((1, 1)));
+
+    // Keep typing until it stops matching. The count must clear, not linger on the old hit.
+    search_for(&view, &mut cx, "findmezzz");
+    assert_eq!(find_position(&view, &mut cx), None);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).current_match_row()),
+        None,
+        "no match means no highlighted row"
+    );
+}
+
+#[gpui::test]
+async fn find_is_per_buffer_and_ctrl_f_leaves_the_headers_tab(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":"x"}"#);
+
+    // Searching applies to the body, so opening the bar from the Headers tab has to take you
+    // where the search can be seen.
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).response_view),
+        ResponseView::Headers
+    );
+    cx.simulate_keystrokes("ctrl-f");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).response_view),
+        ResponseView::Body,
+        "Ctrl+F must move to where the matches are"
+    );
+}
+
 /// A response with an arbitrary content type and raw body bytes.
 fn serve_bytes(response: &'static [u8]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

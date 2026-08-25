@@ -60,6 +60,20 @@ actions!(
     ]
 );
 
+/// Emitted whenever the content changes, and only then — not on cursor or selection moves.
+///
+/// Carries no payload: a subscriber that wants the text reads it back off the entity, the same
+/// way `RequestView::spec` reads its inputs rather than mirroring them. Putting the string in
+/// the event would create a second copy that can disagree with the first.
+///
+/// This exists because the alternative is polling. `Picker` used to notice typing by keeping
+/// the query it last ranked and comparing it in `render`, with a comment saying it did so only
+/// because `TextInput` emitted nothing — which is a mirror of state the input already owns, and
+/// the convention here is to derive rather than mirror. It also does not generalise: response
+/// search has to *spawn a background task* when the query changes, and starting one from
+/// `render` on a string compare is a much worse shape than reacting to an event.
+pub struct Changed;
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -145,6 +159,16 @@ impl TextInput {
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_all_text(cx);
+    }
+
+    /// Select everything, without going through the action.
+    ///
+    /// Public for the one caller that isn't a keystroke: reopening the find bar selects the
+    /// existing query so typing replaces it. Dispatching `SelectAll` there would resolve
+    /// against whatever holds focus at that moment, which is the input we are *about* to
+    /// focus — a race the direct call doesn't have.
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
         self.move_to(0, cx);
         self.select_to(self.content.len(), cx);
     }
@@ -400,6 +424,10 @@ impl EntityInputHandler for TextInput {
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range.take();
+        // Both content-mutating methods emit, and between them they are every edit: backspace,
+        // delete, paste and cut all call *this* one, and the IME composition path calls the
+        // other. Anything that only moves the cursor or the selection deliberately does not.
+        cx.emit(Changed);
         cx.notify();
     }
 
@@ -443,6 +471,7 @@ impl EntityInputHandler for TextInput {
                 cursor..cursor
             });
 
+        cx.emit(Changed);
         cx.notify();
     }
 
@@ -488,6 +517,8 @@ impl EntityInputHandler for TextInput {
         Some(self.offset_to_utf16(utf8_index))
     }
 }
+
+impl gpui::EventEmitter<Changed> for TextInput {}
 
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {

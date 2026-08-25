@@ -40,6 +40,7 @@ use crate::actions::{
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseFind, FindInResponse, FindNext, FindPrev,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -207,6 +208,17 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("up", PickerPrev, Some("Picker")),
         KeyBinding::new("enter", PickerConfirm, Some("Picker")),
         KeyBinding::new("escape", PickerDismiss, Some("Picker")),
+        // --- Find in the response ---
+        //
+        // Below the globals for the third time and the same reason: `escape` here has to be
+        // registered after `escape` -> CancelRequest or it merely ties and loses, and closing
+        // the find bar would cancel an in-flight request instead. `ctrl-f` is global so the bar
+        // opens from anywhere; `enter` is scoped because it already means send in the URL bar
+        // and newline in the body editor.
+        KeyBinding::new("ctrl-f", FindInResponse, None),
+        KeyBinding::new("enter", FindNext, Some("ResponseSearch")),
+        KeyBinding::new("shift-enter", FindPrev, Some("ResponseSearch")),
+        KeyBinding::new("escape", CloseFind, Some("ResponseSearch")),
         // --- The settings panel ---
         //
         // Registered after the globals for the same reason as the picker block above: a

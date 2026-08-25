@@ -179,6 +179,85 @@ impl JsonOutline {
             .unwrap_or("")
     }
 
+    /// Map ascending byte offsets to the row each one falls in.
+    ///
+    /// A **merge** rather than a binary search per offset, and not by choice: a row's source
+    /// position isn't stored. `Row` holds spans for the key and the scalar value, but an open
+    /// row inside an array and *every* close row have neither — the `{`, `[`, `}` and `]`
+    /// positions are consumed by the tokenizer and never recorded. Adding a `start` field
+    /// would grow the struct by 4 bytes, which is 5MB on the 1.31M rows a 10MB body produces,
+    /// to serve one caller. So the start is reconstructed here in a single forward walk, where
+    /// a spanless row inherits the position of the row before it. Both sequences are sorted,
+    /// so this is O(rows + offsets) with no allocation beyond the result.
+    ///
+    /// A spanless row inherits where the previous row *ended*, not where it began — which is
+    /// the whole correctness of this. Inheriting the start instead makes every trailing close
+    /// row share the last scalar's position, so a match in that scalar accepts all of them and
+    /// resolves to the outermost `}`. That was the first version, and it was wrong by exactly
+    /// the nesting depth.
+    ///
+    /// With ends, the result is precise even for braces: a `}` resolves to its own close row,
+    /// and a `{` opening an array element resolves to that open row. The only imprecision left
+    /// is structural whitespace, which lands on the row whose content most recently ended.
+    pub fn rows_for_offsets(&self, offsets: &[u32]) -> Vec<u32> {
+        let mut rows = Vec::with_capacity(offsets.len());
+        if self.rows.is_empty() {
+            return rows;
+        }
+
+        // The last row known to begin at or before the offset in hand.
+        let mut best = 0u32;
+        let mut scan = 0usize;
+        // End of the most recently *computed* row. The inheritance chain follows row order, so
+        // this advances even for a row that turns out to be too far along for this offset.
+        let mut computed_end = 0u32;
+        let mut pending: Option<(usize, u32)> = None;
+
+        for &offset in offsets {
+            loop {
+                let (ix, start) = match pending.take() {
+                    Some(peeked) => peeked,
+                    None => {
+                        if scan >= self.rows.len() {
+                            break;
+                        }
+                        let (start, end) = row_bounds(&self.rows[scan], computed_end);
+                        computed_end = end;
+                        let peeked = (scan, start);
+                        scan += 1;
+                        peeked
+                    }
+                };
+
+                if start <= offset {
+                    best = ix as u32;
+                } else {
+                    // Too far. Hold it for the next, larger offset rather than recomputing.
+                    pending = Some((ix, start));
+                    break;
+                }
+            }
+            rows.push(best);
+        }
+
+        rows
+    }
+
+    /// Every folded row that has to open for `row_ix` to be visible.
+    ///
+    /// Walks forward rather than up a parent chain, because `Row` records no parent: an open
+    /// row is an ancestor exactly when its subtree spans `row_ix`. O(row_ix), paid once per
+    /// jump rather than per frame.
+    pub fn ancestors_of(&self, row_ix: usize) -> Vec<usize> {
+        let mut ancestors = Vec::new();
+        for (ix, row) in self.rows.iter().enumerate().take(row_ix) {
+            if row.kind.is_open() && ix + row.subtree_len as usize >= row_ix {
+                ancestors.push(ix);
+            }
+        }
+        ancestors
+    }
+
     /// Build the visible-row index for a set of folded rows.
     ///
     /// O(rows), and the only thing that changes when you fold — the rows themselves are
@@ -200,6 +279,24 @@ impl JsonOutline {
         }
 
         visible
+    }
+}
+
+/// The source range a row covers, as `(start, end)`.
+///
+/// A key comes before its value, so the pair spans from the key's first byte to the value's
+/// last. `inherited` — the previous row's end — covers rows carrying no span at all: close
+/// rows, and open rows that aren't object members.
+fn row_bounds(row: &Row, inherited: u32) -> (u32, u32) {
+    let key = (!row.key.is_none()).then(|| (row.key.start, row.key.start + row.key.len));
+    let value = (!row.value.is_none()).then(|| (row.value.start, row.value.start + row.value.len));
+
+    match (key, value) {
+        (Some((start, _)), Some((_, end))) => (start, end),
+        (Some((start, end)), None) | (None, Some((start, end))) => (start, end),
+        // Nothing recorded, so the row is treated as a zero-width point just past the
+        // previous one — enough to order it without claiming a position it doesn't have.
+        (None, None) => (inherited, inherited),
     }
 }
 
@@ -385,6 +482,152 @@ mod tests {
         let source = b"{\n  \"a\": ?\n}";
         let offset = source.iter().position(|b| *b == b'?').unwrap();
         assert_eq!(line_col(source, offset), (2, 8));
+    }
+
+    /// The row a needle's first occurrence lands in — the whole point of the mapping.
+    fn row_of(json: &'static str, needle: &str) -> u32 {
+        let outline = outline(json);
+        let hits = crate::search::find(outline.source(), needle);
+        assert!(!hits.is_empty(), "{needle:?} should be present in the fixture");
+        outline.rows_for_offsets(&hits.offsets)[0]
+    }
+
+    #[test]
+    fn a_match_in_a_key_maps_to_that_key_s_row() {
+        let json = r#"{"alpha":1,"beta":2,"gamma":3}"#;
+        //             row 0      row 1     row 2     row 3
+        assert_eq!(row_of(json, "beta"), 2);
+        assert_eq!(row_of(json, "gamma"), 3);
+    }
+
+    #[test]
+    fn a_match_in_a_value_maps_to_its_row_not_the_next_one() {
+        // The off-by-one that matters: a value sits *after* its key, so a greedy walk that
+        // advanced past the row would report the following key's row instead.
+        let json = r#"{"a":"needle","b":"other"}"#;
+        assert_eq!(row_of(json, "needle"), 1);
+        assert_eq!(row_of(json, "other"), 2);
+    }
+
+    #[test]
+    fn a_match_deep_inside_nesting_maps_to_the_innermost_row() {
+        let json = r#"{"a":{"b":{"c":"found"}}}"#;
+        // rows: 0 {  1 "a":{  2 "b":{  3 "c":"found"  4 }  5 }  6 }
+        assert_eq!(row_of(json, "found"), 3);
+    }
+
+    #[test]
+    fn matches_inside_an_array_map_to_the_element_rows() {
+        let json = r#"["zero","one","two"]"#;
+        assert_eq!(row_of(json, "zero"), 1);
+        assert_eq!(row_of(json, "one"), 2);
+        assert_eq!(row_of(json, "two"), 3);
+    }
+
+    #[test]
+    fn every_offset_gets_a_row_and_the_rows_never_go_backwards() {
+        // The merge holds one peeked row between offsets; getting that wrong shows up as a
+        // row index that regresses, or as a short result.
+        let json = r#"{"a":"x","b":{"c":"x","d":["x","x"]},"e":"x"}"#;
+        let outline = outline(json);
+        let hits = crate::search::find(outline.source(), "x");
+        let rows = outline.rows_for_offsets(&hits.offsets);
+
+        assert_eq!(rows.len(), hits.len(), "one row per match, always");
+        assert_eq!(hits.len(), 5, "the fixture has five values of \"x\"");
+        assert!(
+            rows.windows(2).all(|pair| pair[0] <= pair[1]),
+            "ascending offsets must yield non-decreasing rows: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| (*row as usize) < outline.len()),
+            "no row index may run past the outline: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_offset_on_a_closing_brace_resolves_to_its_own_close_row() {
+        // Free precision from inheriting the previous row's *end*: the close row's zero-width
+        // point sits exactly at the `}`, so it wins. Inheriting the start instead put every
+        // trailing close row on top of the last scalar, which is the bug this pins.
+        let outline = outline(r#"{"a":1}"#);
+        let close = outline.source().len() as u32 - 1;
+        assert_eq!(outline.rows_for_offsets(&[close]), vec![2], "the closing-brace row");
+    }
+
+    #[test]
+    fn nesting_depth_does_not_drag_a_match_out_to_the_outermost_brace() {
+        // The exact shape of the first version's bug: N trailing close rows all inherited the
+        // innermost scalar's start, so a match in it resolved to the last row in the document.
+        // The deeper the nesting, the further off — so assert on depth, not just one case.
+        let outline = outline(r#"{"a":{"b":{"c":{"d":"deep"}}}}"#);
+        let row = row_of(r#"{"a":{"b":{"c":{"d":"deep"}}}}"#, "deep");
+
+        assert_eq!(outline.text(outline.rows()[row as usize].key), "\"d\"");
+        assert!(
+            (row as usize) < outline.len() - 1,
+            "the match must not land on a close row: {row} of {}",
+            outline.len()
+        );
+    }
+
+    #[test]
+    fn no_offsets_means_no_rows() {
+        assert!(outline(r#"{"a":1}"#).rows_for_offsets(&[]).is_empty());
+    }
+
+    #[test]
+    fn ancestors_are_the_containers_that_have_to_open() {
+        let outline = outline(r#"{"a":{"b":[1]}}"#);
+        // rows: 0 {   1 "a":{   2 "b":[   3 1   4 ]   5 }   6 }
+        assert_eq!(outline.ancestors_of(3), vec![0, 1, 2]);
+        assert_eq!(outline.ancestors_of(1), vec![0]);
+        assert!(
+            outline.ancestors_of(0).is_empty(),
+            "the root has no ancestor to open"
+        );
+    }
+
+    #[test]
+    fn a_sibling_container_is_not_an_ancestor() {
+        // The discriminating case for the `subtree_len` bound: without it, every earlier open
+        // row would count and folding a sibling would look like it hides the target.
+        let outline = outline(r#"{"a":{"x":1},"b":{"y":2}}"#);
+        // rows: 0 {  1 "a":{  2 "x":1  3 }  4 "b":{  5 "y":2  6 }  7 }
+        assert_eq!(
+            outline.ancestors_of(5),
+            vec![0, 4],
+            "\"a\" closes before row 5 and must not appear"
+        );
+    }
+
+    #[test]
+    fn revealing_a_row_needs_exactly_its_ancestors_unfolded() {
+        // Ties the two halves together: fold everything, and unfolding just the ancestors of
+        // a target is enough to make it visible.
+        let outline = outline(r#"{"a":{"b":{"c":1}},"d":2}"#);
+        let target = outline
+            .rows()
+            .iter()
+            .position(|row| outline.text(row.key) == "\"c\"")
+            .expect("the c row");
+
+        let mut folded = vec![false; outline.len()];
+        for (ix, row) in outline.rows().iter().enumerate() {
+            folded[ix] = row.kind.is_open();
+        }
+        assert!(
+            !outline.visible_rows(&folded).contains(&(target as u32)),
+            "fully folded, the target must be hidden"
+        );
+
+        for ancestor in outline.ancestors_of(target) {
+            folded[ancestor] = false;
+        }
+        assert!(
+            outline.visible_rows(&folded).contains(&(target as u32)),
+            "unfolding the ancestors must reveal it"
+        );
     }
 
     #[test]

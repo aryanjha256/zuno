@@ -46,6 +46,10 @@ actions!(
         ImportCurl,
         // Response viewer
         ToggleResponseView,
+        FindInResponse,
+        FindNext,
+        FindPrev,
+        CloseFind,
         FoldAll,
         UnfoldAll,
         CopyResponse,

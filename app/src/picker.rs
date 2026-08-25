@@ -24,10 +24,11 @@ use std::path::PathBuf;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, ScrollStrategy, SharedString, Styled,
-    UniformListScrollHandle, Window, div, px, uniform_list,
+    Subscription, UniformListScrollHandle, Window, div, px, uniform_list,
 };
 
 use crate::input::TextInput;
+use crate::input::text_input::Changed;
 use crate::theme::{ActiveTheme, Theme};
 
 /// Row height, and the unit `uniform_list` measures in. Must match the row's real height
@@ -101,9 +102,9 @@ pub struct Picker {
     /// belonging to the dropped picker, no key context would match, and every binding
     /// would silently stop working. Same failure as switching tabs without moving focus.
     restore_focus: Option<FocusHandle>,
-    /// The query the matches were computed for, so `render` can notice a keystroke landed
-    /// in the input. The input owns its text, and it doesn't emit events yet.
-    last_query: String,
+    /// Held, not detached: dropping a `Subscription` unsubscribes, so this has to outlive
+    /// every keystroke. Dying with the picker is exactly the lifetime wanted.
+    _filter_changed: Subscription,
     /// Shown when there are no candidates at all, which means something different for a
     /// request list (nothing saved yet) than for a command list (a bug).
     empty_hint: &'static str,
@@ -132,6 +133,14 @@ impl Picker {
         let filter = cx.new(|cx| TextInput::new(String::new(), placeholder, "Picker", cx));
         let empty_hint = placeholder;
 
+        // Re-rank on every edit. This used to be a string compare against a stored
+        // `last_query` in `render`, with a comment explaining that `TextInput` emitted nothing
+        // to react to. It does now, so the mirror is gone.
+        let filter_changed = cx.subscribe(&filter, |picker: &mut Self, _, _: &Changed, cx| {
+            picker.refilter(cx);
+            cx.notify();
+        });
+
         let mut picker = Self {
             filter,
             items,
@@ -139,19 +148,19 @@ impl Picker {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             restore_focus,
-            last_query: String::new(),
+            _filter_changed: filter_changed,
             empty_hint,
             fallback: None,
             derived: None,
         };
-        picker.refilter();
+        picker.refilter(cx);
         picker
     }
 
     /// Offer the query itself as a candidate when `build` yields one. See `fallback`.
-    pub fn set_fallback(&mut self, build: fn(&str) -> Option<Item>) {
+    pub fn set_fallback(&mut self, build: fn(&str) -> Option<Item>, cx: &mut Context<Self>) {
         self.fallback = Some(build);
-        self.refilter();
+        self.refilter(cx);
     }
 
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -168,12 +177,13 @@ impl Picker {
         self.filter.read(cx).text().to_string()
     }
 
-    fn refilter(&mut self) {
+    fn refilter(&mut self, cx: &App) {
+        let query = self.query(cx);
         let labels: Vec<&str> = self.items.iter().map(|item| item.label.as_ref()).collect();
-        self.matches = zuno_core::fuzzy::rank(&self.last_query, labels);
+        self.matches = zuno_core::fuzzy::rank(&query, labels);
         // Deliberately not ranked among the real rows: it is the "or use what I typed"
         // escape hatch, so it belongs last regardless of how it would score.
-        self.derived = self.fallback.and_then(|build| build(&self.last_query));
+        self.derived = self.fallback.and_then(|build| build(&query));
         self.selected = 0;
     }
 
@@ -215,7 +225,7 @@ impl Picker {
     pub fn extend(&mut self, items: impl IntoIterator<Item = Item>, cx: &mut Context<Self>) {
         let before = self.selected_item_index();
         self.items.extend(items);
-        self.refilter();
+        self.refilter(cx);
         // Keep the highlight on whatever row the user had chosen, rather than yanking it
         // back to the top underneath them.
         if let Some(item_ix) = before {
@@ -256,16 +266,7 @@ impl Picker {
 
 impl Render for Picker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Re-rank when the query changed. Polled in render rather than driven by an input
-        // event because `TextInput` doesn't emit one, and every keystroke already causes a
-        // frame — so this runs exactly as often as it needs to, and the string compare is
-        // far cheaper than the ranking it guards.
         let query = self.query(cx);
-        if query != self.last_query {
-            self.last_query = query;
-            self.refilter();
-        }
-
         let theme = cx.theme().clone();
         let count = self.visible_count();
         let selected = self.selected;
@@ -317,7 +318,7 @@ impl Render for Picker {
                             .child(self.filter.clone()),
                     )
                     .child(if count == 0 {
-                        empty_state(&self.last_query, self.empty_hint, &theme).into_any_element()
+                        empty_state(&query, self.empty_hint, &theme).into_any_element()
                     } else {
                         result_list(rows, selected, self.scroll.clone(), &theme, cx)
                             .into_any_element()

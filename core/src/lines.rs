@@ -70,6 +70,43 @@ impl LineIndex {
         &self.source
     }
 
+    /// Map ascending byte offsets to the line each one falls in.
+    ///
+    /// A binary search per offset, unlike `JsonOutline::rows_for_offsets` which has to merge —
+    /// the difference is that every line here *has* a recorded span, so the array is directly
+    /// searchable. Offsets are capped at `search::MAX_MATCHES`, so `log n` per offset is
+    /// nothing next to reconstructing positions.
+    ///
+    /// An offset inside a line terminator resolves to the line it ends, since `\r\n` is
+    /// trimmed out of the span but belongs to the line before it.
+    pub fn lines_for_offsets(&self, offsets: &[u32]) -> Vec<u32> {
+        offsets
+            .iter()
+            .map(|offset| {
+                let after = self
+                    .lines
+                    .partition_point(|line| line.start <= *offset);
+                // `after` is 0 only for an offset before the first line, which cannot happen
+                // — line 0 starts at 0 — but saturating beats an underflow if it ever does.
+                after.saturating_sub(1) as u32
+            })
+            .collect()
+    }
+
+    /// Whether `offset` falls within the part of its line that is actually drawn.
+    ///
+    /// Minified JSON is one line that can be megabytes wide, and `line` cuts it at
+    /// `MAX_DISPLAY_LINE`. A match past the cut is real, and scrolling to its row would show
+    /// a line with no visible match in it — which reads as a broken search. The caller is
+    /// expected to say so instead.
+    pub fn offset_is_displayed(&self, offset: u32) -> bool {
+        let line = self.lines_for_offsets(&[offset]);
+        let Some(span) = line.first().and_then(|ix| self.lines.get(*ix as usize)) else {
+            return false;
+        };
+        (offset.saturating_sub(span.start) as usize) < MAX_DISPLAY_LINE
+    }
+
     /// The text of a line, truncated to `MAX_DISPLAY_LINE` bytes on a UTF-8 boundary.
     ///
     /// Returns the text and whether it was cut short, so the caller can mark it instead
@@ -165,6 +202,67 @@ mod tests {
         assert!(truncated);
         assert!(!text.is_empty(), "backing off must not empty the line");
         assert!(text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn offsets_map_to_the_lines_they_fall_in() {
+        let lines = index("alpha\nbeta\ngamma");
+        let hits = crate::search::find(lines.source(), "beta");
+        assert_eq!(lines.lines_for_offsets(&hits.offsets), vec![1]);
+
+        // Every position across the body, including the newlines.
+        let all: Vec<u32> = (0..16).collect();
+        let mapped = lines.lines_for_offsets(&all);
+        assert_eq!(mapped[0], 0, "offset 0 is line 0");
+        assert_eq!(mapped[5], 0, "the \\n ending line 0 belongs to line 0");
+        assert_eq!(mapped[6], 1, "line 1 starts right after it");
+        assert_eq!(mapped[15], 2);
+    }
+
+    #[test]
+    fn a_match_on_the_last_line_without_a_trailing_newline_maps_to_it() {
+        let lines = index("a\nb\nlast");
+        let hits = crate::search::find(lines.source(), "last");
+        assert_eq!(lines.lines_for_offsets(&hits.offsets), vec![2]);
+    }
+
+    #[test]
+    fn a_match_past_the_display_cut_is_reported_as_not_displayed() {
+        // The trust bug this exists to prevent: minified JSON is one line megabytes wide, so
+        // scrolling to a match past the 4KB cut would show a line with no visible match in it.
+        let long = format!("{}needle", "x".repeat(MAX_DISPLAY_LINE * 2));
+        let lines = LineIndex::build(Bytes::from(long));
+        let hits = crate::search::find(lines.source(), "needle");
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(lines.lines_for_offsets(&hits.offsets), vec![0], "still line 0");
+        assert!(
+            !lines.offset_is_displayed(hits.offsets[0]),
+            "a match beyond MAX_DISPLAY_LINE is not on screen and must say so"
+        );
+    }
+
+    #[test]
+    fn a_match_within_the_display_cut_is_reported_as_displayed() {
+        let long = format!("needle{}", "x".repeat(MAX_DISPLAY_LINE * 2));
+        let lines = LineIndex::build(Bytes::from(long));
+        let hits = crate::search::find(lines.source(), "needle");
+        assert!(lines.offset_is_displayed(hits.offsets[0]));
+    }
+
+    #[test]
+    fn displayedness_is_measured_from_the_line_start_not_the_body_start() {
+        // The bug a body-relative check would have: a match early on a *later* line sits past
+        // MAX_DISPLAY_LINE in absolute terms while being perfectly visible.
+        let body = format!("{}\nneedle", "x".repeat(MAX_DISPLAY_LINE * 2));
+        let lines = LineIndex::build(Bytes::from(body));
+        let hits = crate::search::find(lines.source(), "needle");
+
+        assert_eq!(lines.lines_for_offsets(&hits.offsets), vec![1]);
+        assert!(
+            lines.offset_is_displayed(hits.offsets[0]),
+            "column 0 of line 1 is on screen however long line 0 was"
+        );
     }
 
     #[test]

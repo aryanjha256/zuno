@@ -30,7 +30,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 350 tests, ~9s
+cargo test --workspace                   # 394 tests, ~10s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -111,6 +111,9 @@ Key context predicates match **only the leaf** context (`contexts.last()`) | Put
 A focus handle needs explicit `.tab_stop(true)` | Otherwise `focus_next()` skips it silently. |
 No `cx.background_spawn` in 0.2.2 | Use `cx.background_executor().spawn(fut)`. |
 `overflow_*_scroll` is on `StatefulInteractiveElement` | Requires `.id()` first. |
+A `uniform_list` cannot be scrolled programmatically without `.track_scroll(handle)` | The handle is the only way in, and omitting it fails *silently* — `scroll_to_item` sets a deferred request that nothing ever consumes, so jumping to a search match just does nothing. Note the list addresses items by **visible** index, not row index, so anything folded above the target has to be translated through `visible` first. |
+A dropped `Subscription` unsubscribes | `cx.subscribe` returns one; store it in a field (or `.detach()`). Let it fall out of scope and the callback silently never fires again. |
+`impl Trait` with a generic parameter needs `use<A>`, not `use<>` | The return has to mention every type parameter in scope. `use<>` is only for helpers that are non-generic *and* borrow nothing. |
 `truncate()` does **not** clip custom-painted elements | Needs a real `overflow_hidden()`. And clipping alone strands the hidden text — pair it with a scroll offset. |
 `WindowOptions::window_decorations` defaults to `None` | Leaves the window client-decorated with nothing drawn: no buttons, no resize. We set `Client` and draw our own in `chrome.rs`. |
 `TextSystem::shape_line` has a `debug_assert!` against newlines | Sanitize at the edit boundary, not just on paste. |
@@ -258,6 +261,11 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   because a catch-all that quietly preserves is weaker than a match that refuses to build.
 - Actions, not direct calls, for anything a button and a keybinding share. A command palette row
   dispatches the action too, so palette and keystroke can't drift.
+- **`TextInput` emits `Changed`; subscribe to it rather than polling in `render`.** The picker
+  used to notice typing by storing the query it last ranked and comparing it every frame,
+  because the input emitted nothing. It does now — from the two methods that mutate content,
+  which between them are every edit path — so a mirror field is no longer the answer. Hold the
+  `Subscription`: dropping one unsubscribes, silently.
 - **Every new action needs a `commands::palette()` row or an `EXCLUDED` entry with a reason.** The
   drift test fails otherwise, on purpose: an action reachable only by a keystroke nobody remembers
   is the thing a palette exists to prevent.

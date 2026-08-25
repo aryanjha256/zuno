@@ -146,6 +146,81 @@ impl BodyView {
     pub fn is_json(&self) -> bool {
         matches!(self.kind, BodyKind::Json(_))
     }
+
+    /// The raw source of whatever is on screen, for searching.
+    ///
+    /// `None` for an empty or binary body: there is nothing rendered to jump *to*, so
+    /// offering a match count over bytes nobody can see would be a lie about what the find
+    /// bar can do.
+    pub fn searchable_source(&self) -> Option<&Bytes> {
+        match &self.kind {
+            BodyKind::Json(outline) => Some(outline.source()),
+            BodyKind::Text(lines) => Some(lines.source()),
+            BodyKind::Empty | BodyKind::Binary { .. } => None,
+        }
+    }
+
+    /// Turn byte offsets into the rows that hold them.
+    ///
+    /// The two index types answer this differently — a merge for the outline, a binary search
+    /// for lines — which is why this dispatches rather than the caller matching on `kind`.
+    pub fn rows_for_offsets(&self, offsets: &[u32]) -> Vec<u32> {
+        match &self.kind {
+            BodyKind::Json(outline) => outline.rows_for_offsets(offsets),
+            BodyKind::Text(lines) => lines.lines_for_offsets(offsets),
+            BodyKind::Empty | BodyKind::Binary { .. } => Vec::new(),
+        }
+    }
+
+    /// Unfold whatever is needed for `row_ix` to be on screen, and return where it now sits
+    /// in the visible index — which is what `uniform_list` scrolls by.
+    ///
+    /// **Unfolding is the point.** A match inside a folded subtree has no visible row at all,
+    /// so scrolling to it without opening its ancestors lands somewhere arbitrary and the
+    /// search looks broken. Folding a subtree and then searching into it is not an edge case;
+    /// it's the normal way of working through a large response.
+    pub fn reveal(&mut self, row_ix: usize) -> Option<usize> {
+        match &self.kind {
+            // No folding in the raw view, so a line's row index *is* its visible index.
+            BodyKind::Text(lines) => (row_ix < lines.len()).then_some(row_ix),
+            BodyKind::Json(outline) => {
+                let outline = outline.clone();
+                if row_ix >= outline.len() {
+                    return None;
+                }
+
+                let mut changed = false;
+                for ancestor in outline.ancestors_of(row_ix) {
+                    if let Some(flag) = self.folded.get_mut(ancestor) {
+                        if *flag {
+                            *flag = false;
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    self.visible = Arc::new(outline.visible_rows(&self.folded));
+                }
+
+                // The visible index is a sorted list of row indices, so this is a lookup, not
+                // a scan. It cannot miss now that the ancestors are open.
+                self.visible.binary_search(&(row_ix as u32)).ok()
+            }
+            BodyKind::Empty | BodyKind::Binary { .. } => None,
+        }
+    }
+
+    /// Whether a match at `offset` is inside the part of its line that's actually drawn.
+    ///
+    /// Only the raw view can answer no: it cuts lines at `MAX_DISPLAY_LINE`, and minified JSON
+    /// is one line that can be megabytes wide. The JSON view renders whole tokens, so a match
+    /// in a key or value is always visible once its row is.
+    pub fn offset_is_displayed(&self, offset: u32) -> bool {
+        match &self.kind {
+            BodyKind::Text(lines) => lines.offset_is_displayed(offset),
+            _ => true,
+        }
+    }
 }
 
 /// Whether a visible row is a folded container.
@@ -336,6 +411,79 @@ mod tests {
             is_folded_at(&visible, 1, 1),
             "after folding, row 1's successor is no longer row 2"
         );
+    }
+
+    /// `{ "a": {x,y}, "b": {p,q} }` — two sibling containers, so folding one shifts the other's
+    /// visible indices away from its row indices.
+    fn siblings() -> BodyView {
+        build(
+            r#"{"a":{"x":1,"y":2},"b":{"p":3,"q":4}}"#,
+            Some("application/json"),
+        )
+    }
+
+    #[test]
+    fn reveal_returns_the_visible_index_not_the_row_index() {
+        // **The distinction that makes or breaks the scroll.** `uniform_list` addresses items by
+        // visible index, so scrolling to a row index once anything above is folded lands
+        // somewhere else entirely — or past the end. Rows: 0 { 1 "a":{ 2 x 3 y 4 } 5 "b":{
+        // 6 p 7 q 8 } 9 }.
+        let mut view = siblings();
+        view.toggle_fold(1); // fold "a", hiding rows 2..=4
+        assert_eq!(view.row_count(), 7, "visible = [0,1,5,6,7,8,9]");
+
+        // Row 6 is "p". Nothing hides it, so no unfolding is needed — only translation.
+        assert_eq!(
+            view.reveal(6),
+            Some(3),
+            "row 6 sits at visible index 3 once \"a\" is folded"
+        );
+    }
+
+    #[test]
+    fn reveal_unfolds_an_ancestor_and_then_translates() {
+        let mut view = siblings();
+        view.toggle_fold(5); // fold "b", hiding the row we're about to target
+
+        let visible = view.reveal(6).expect("row 6 must be reachable");
+        assert!(
+            view.visible().contains(&6),
+            "revealing has to open the container first"
+        );
+        assert_eq!(
+            view.visible()[visible], 6,
+            "and the returned index must address that row in the visible list"
+        );
+    }
+
+    #[test]
+    fn reveal_leaves_unrelated_folds_alone() {
+        // Only ancestors open. A jump that unfolded everything would throw away the collapsing
+        // someone did to make a large response readable in the first place.
+        let mut view = siblings();
+        view.toggle_fold(1);
+        view.toggle_fold(5);
+
+        view.reveal(6).expect("row 6");
+        assert!(view.visible().contains(&6), "\"b\" opened");
+        assert!(
+            !view.visible().contains(&2),
+            "\"a\" was not an ancestor and must stay folded"
+        );
+    }
+
+    #[test]
+    fn reveal_rejects_a_row_that_does_not_exist() {
+        assert_eq!(siblings().reveal(9_999), None);
+    }
+
+    #[test]
+    fn reveal_on_a_raw_text_body_is_the_line_itself() {
+        // No folding in the raw view, so row and visible index coincide — and a line past the
+        // end must still be refused rather than scrolling nowhere.
+        let mut view = build("one\ntwo\nthree", Some("text/plain"));
+        assert_eq!(view.reveal(2), Some(2));
+        assert_eq!(view.reveal(3), None);
     }
 
     #[test]

@@ -72,6 +72,7 @@ pub fn palette() -> Vec<Command> {
         command("Save response body to a file", SaveResponse),
         command("Show response history", ShowHistory),
         command("Switch between response body and headers", ToggleResponseView),
+        command("Find in response", FindInResponse),
         command("Fold all", FoldAll),
         command("Unfold all", UnfoldAll),
         // Settings.
@@ -104,6 +105,12 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::SettingDecrease", "only valid inside the settings panel"),
     ("zuno::SettingConfirm", "only valid inside the settings panel"),
     ("zuno::SettingsDismiss", "only valid inside the settings panel"),
+    // Only valid while the find bar is open, where they're already bound. "Find in response"
+    // is the entry point and it *is* offered; a palette row for "next match" would be a
+    // command you can only reach by first running another one.
+    ("zuno::FindNext", "only valid inside the find bar"),
+    ("zuno::FindPrev", "only valid inside the find bar"),
+    ("zuno::CloseFind", "only valid inside the find bar"),
     // Tab/Shift-Tab move focus within a buffer. As a named command it reads as "go
     // somewhere" without saying where, which is worse than not offering it.
     ("zuno::FocusNext", "keystroke-only; no meaningful name"),

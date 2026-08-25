@@ -24,6 +24,7 @@ use crate::actions::{
     OpenBodyType, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
+    CloseFind, FindInResponse, FindNext, FindPrev,
     ShowHistory, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
@@ -954,7 +955,7 @@ impl Workspace {
             .collect();
 
         let picker = self.show_picker(items, "No methods", window, cx);
-        picker.update(cx, |picker, _| picker.set_fallback(custom_method_row));
+        picker.update(cx, |picker, cx| picker.set_fallback(custom_method_row, cx));
     }
 
     fn add_header(&mut self, _: &AddHeader, window: &mut Window, cx: &mut Context<Self>) {
@@ -1162,6 +1163,38 @@ impl Workspace {
     ) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.toggle_response_view(cx));
+        }
+    }
+
+    /// Open the find bar over the response body.
+    ///
+    /// Guarded by `modal_open` like every other opener: a find bar takes focus, and taking it
+    /// from behind a modal's scrim is how the modal's leaf key context stops matching and its
+    /// whole keymap — `Escape` included — silently dies.
+    fn find_in_response(&mut self, _: &FindInResponse, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.open_search(window, cx));
+        }
+    }
+
+    fn find_next(&mut self, _: &FindNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.step_search(1, cx));
+        }
+    }
+
+    fn find_prev(&mut self, _: &FindPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.step_search(-1, cx));
+        }
+    }
+
+    fn close_find(&mut self, _: &CloseFind, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.close_search(window, cx));
         }
     }
 
@@ -1466,6 +1499,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::toggle_response_view))
+            .on_action(cx.listener(Self::find_in_response))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_prev))
+            .on_action(cx.listener(Self::close_find))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::copy_response))

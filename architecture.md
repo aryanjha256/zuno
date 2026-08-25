@@ -58,7 +58,8 @@ zuno/
 │       ├── curl.rs         ✅ curl command line -> RequestSpec
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
 │       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
-│       └── fuzzy.rs        ✅ subsequence scoring for the picker
+│       ├── fuzzy.rs        ✅ subsequence scoring for the picker
+│       └── search.rs       ✅ substring search over a response body
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
     └── src/
@@ -434,6 +435,67 @@ request to get. Four decisions:
 The Headers tab scrolls rather than virtualizing. Header counts are tens, and `uniform_list`
 would impose the fixed row height that the rest of this section is built on, which is the wrong
 constraint for values that ought eventually to wrap.
+
+### Search — over the bytes, not over what's drawn
+
+`Ctrl+F`. The decision that shapes everything else: `core/src/search.rs` scans the **source
+bytes**, not the rendered rows.
+
+Searching what's drawn is the obvious choice and it's wrong twice. The match count would depend
+on the fold state, because a folded container renders as `{ … 3 items }` and its contents aren't
+on screen at all. And the raw fallback truncates every line at `MAX_DISPLAY_LINE`, so anything
+past 4KB on a line — which for minified JSON is the whole body — would silently not be findable.
+The bytes are the one answer that doesn't move.
+
+That choice pushes the work onto *reaching* a match, which is where the interesting parts are:
+
+- **Offset → row is a merge, not a binary search, and only for JSON.** A row's source position
+  isn't stored: `Row` carries spans for its key and scalar value, but an open row inside an array
+  and every close row have neither — the tokenizer consumes `{ [ } ]` without recording where.
+  Adding a `start: u32` field would grow `Row` by 4 bytes, which is 5MB across the 1.31M rows a
+  10MB body produces, to serve one caller. So `rows_for_offsets` reconstructs positions in one
+  forward walk, where a spanless row inherits **where the previous row ended**. Inheriting its
+  *start* instead was the first version, and it put every trailing close row on top of the last
+  scalar — so a match nested four deep resolved to the outermost `}`, wrong by exactly the
+  nesting depth. `LineIndex` needs none of this: every line has a recorded span, so it binary
+  searches.
+- **Jumping unfolds.** A match inside a folded subtree has no visible row, so `BodyView::reveal`
+  opens the target's ancestors — found by forward scan, since `Row` records no parent — and only
+  those. Unfolding everything would discard the collapsing someone did to make the response
+  readable in the first place.
+- **`uniform_list` addresses items by visible index, not row index.** With anything folded above
+  the target the two diverge, and `scroll_to_item` with a row index scrolls somewhere else or
+  past the end. `reveal` returns the translated index for exactly this reason.
+- **Three notices, because the honest count and the useful count differ.** The scan stops at
+  `search::MAX_MATCHES` (5000) — searching 10MB for `"` finds ~2M occurrences, and a `Vec` of
+  them costs 8MB — so the bar says `first 5000 only` rather than letting a capped count read as a
+  total. It says `past this line's display limit` when the current match sits beyond the raw
+  view's cut, because the row is on screen and the match isn't. And on JSON it says `matching raw
+  bytes`, since a key includes its quotes and structural whitespace is searchable.
+- **Smart case**, matching every editor: an all-lowercase needle is case-insensitive, one
+  uppercase character makes the whole query case-sensitive. Folding is ASCII-only — doing it
+  properly means decoding UTF-8 per candidate, and a body isn't guaranteed to be UTF-8 at all.
+
+Measured in release on 10MB / 1.31M rows: a **full-body miss in 6.9 ms**, a capped hit scan in
+423 µs, and the offset-to-row mapping in 148 µs. So the scan comfortably fits a frame — and still
+goes to the background executor, because the transfer cap is 100MB and invariant 3 isn't
+conditional on today's body being small. Only the mapping runs on the UI thread, and it has to:
+it reads the live `BodyView`, which a background task can't borrow.
+
+**Match highlighting is per row, not per character.** A row is assembled from separately styled
+key, punctuation, and value elements, so highlighting the exact bytes means splitting a shaped
+text run — that's the syntax-highlighting problem, which principle 4 puts last.
+
+### `TextInput` emits `Changed`
+
+Search is why. The picker used to notice typing by storing the query it last ranked and comparing
+it every frame, with a comment saying it did so only because the input emitted nothing. That
+works for re-ranking a few dozen rows synchronously; it's the wrong shape for *spawning a
+background task*, and it's a mirror of state the input already owns. `TextInput` now emits from
+the two methods that mutate content — which between them are every edit path, since backspace,
+delete, paste and cut all route through `replace_text_in_range` and the IME through
+`replace_and_mark_text_in_range`. The picker was migrated onto it in the same slice, so there is
+one mechanism rather than two.
 
 ---
 

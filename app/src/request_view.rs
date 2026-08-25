@@ -16,10 +16,11 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, IntoElement, ParentElement, Render,
-    SharedString, Styled, Task, Window, div, px,
+    ScrollStrategy, SharedString, Styled, Subscription, Task, UniformListScrollHandle, Window, div,
+    px,
 };
 use zuno_core::{
-    Body, Engine, EngineError, Event, FormField, Header, JobId, Method, MultipartField,
+    Body, Engine, EngineError, Event, FormField, Header, Hits, JobId, Method, MultipartField,
     MultipartValue, QueryParam, RawKind, RequestId, RequestSettings, RequestSpec, Resolver,
     ResponseData, ResponseDiff,
 };
@@ -53,6 +54,7 @@ pub enum BodyType {
 }
 
 use crate::body_view::BodyView;
+use crate::input::text_input::Changed;
 use crate::input::{Editor, TextInput};
 use crate::theme::ActiveTheme;
 use crate::{request_pane, response_pane};
@@ -136,6 +138,36 @@ pub enum ResponseView {
     Headers,
 }
 
+/// The find bar's state. Present only while the bar is open.
+///
+/// An `Option<ResponseSearch>` rather than a `bool` plus fields on `RequestView`, so "closed"
+/// cannot carry stale matches — and so the query input and its subscription are created and
+/// dropped together.
+pub struct ResponseSearch {
+    pub query: Entity<TextInput>,
+    /// Byte offsets of every match, ascending. Empty means the query matched nothing, which is
+    /// different from the bar being closed.
+    pub offsets: Vec<u32>,
+    /// The row each match falls in, parallel to `offsets`.
+    pub rows: Vec<u32>,
+    /// Which match is current, as an index into `offsets`. Meaningless while it's empty.
+    pub current: usize,
+    /// The scan stopped at `search::MAX_MATCHES` with body left unscanned.
+    pub truncated: bool,
+    /// The current match sits past the raw view's per-line display cut, so its row is on
+    /// screen but the match itself isn't. Says so rather than looking broken.
+    pub current_clipped: bool,
+    /// Held, not detached: dropping a `Subscription` unsubscribes.
+    _query_changed: Subscription,
+}
+
+impl ResponseSearch {
+    /// `1 of 47`, or nothing when there is no match to number.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        (!self.offsets.is_empty()).then(|| (self.current + 1, self.offsets.len()))
+    }
+}
+
 /// Which table a row belongs to. Used by the row actions to find their target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
@@ -204,6 +236,15 @@ pub struct RequestView {
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
+    /// The find bar, when open.
+    pub search: Option<ResponseSearch>,
+    /// Holding it keeps it alive; replacing it cancels a superseded scan, the same contract as
+    /// `diff_task`. Typing fast enough to outrun a 10MB scan is exactly when that matters.
+    search_task: Option<Task<()>>,
+    /// Shared by the JSON and raw lists — they are never on screen together — so that a jump
+    /// to a match can scroll the one that is. `uniform_list` needs the handle at render time,
+    /// which is why it lives here rather than in `BodyView`.
+    pub body_scroll: UniformListScrollHandle,
     /// Holding the diff task is what keeps it alive, and replacing it is what makes a
     /// superseded diff harmless — see `diff_against`.
     diff_task: Option<Task<()>>,
@@ -238,6 +279,9 @@ impl RequestView {
             response_view: ResponseView::default(),
             body_view: None,
             body_task: None,
+            search: None,
+            search_task: None,
+            body_scroll: UniformListScrollHandle::new(),
             diff_task: None,
             inflight: None,
             error: None,
@@ -356,6 +400,11 @@ impl RequestView {
         self.inflight = None;
         self.error = None;
         self.status = None;
+        // A find bar left open over a request that has been replaced would show a count for a
+        // body that no longer exists. Its input entity goes with it, and `load` is not a focus
+        // move — curl import lands in a new buffer — so there is nothing to restore focus to.
+        self.search = None;
+        self.search_task = None;
 
         cx.notify();
     }
@@ -786,9 +835,172 @@ impl RequestView {
                     view.row_count()
                 );
                 this.body_view = Some(view);
+                // Matches belong to the bytes they were found in. A resend, or picking a run
+                // out of the history browser, replaces those bytes — so offsets from the old
+                // body would point into the new one at random, and the count would describe a
+                // response that is no longer on screen. Re-scan instead of clearing, because
+                // the query is still what the user wants to know about.
+                if this.is_searching() {
+                    this.run_search(cx);
+                }
                 cx.notify();
             });
         }));
+    }
+
+    // ---- response search ----------------------------------------------------
+
+    /// Open the find bar, or refocus it if it's already open.
+    ///
+    /// Refocus rather than close, because `Ctrl+F` while the bar is open but focus has moved
+    /// elsewhere means "put me back in the search box", not "throw away my query". Selecting
+    /// the existing text is what makes retyping over it the default.
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Searching applies to the body, so being on the Headers tab and pressing Ctrl+F means
+        // you want the body. Switching is less surprising than a find bar that appears to do
+        // nothing.
+        self.response_view = ResponseView::Body;
+
+        if self.search.is_none() {
+            let query = cx.new(|cx| TextInput::new(String::new(), "Find in response…", "ResponseSearch", cx));
+            let query_changed = cx.subscribe(&query, |this: &mut Self, _, _: &Changed, cx| {
+                this.run_search(cx);
+            });
+
+            self.search = Some(ResponseSearch {
+                query,
+                offsets: Vec::new(),
+                rows: Vec::new(),
+                current: 0,
+                truncated: false,
+                current_clipped: false,
+                _query_changed: query_changed,
+            });
+        }
+
+        if let Some(search) = &self.search {
+            let handle = search.query.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            search.query.update(cx, |input, cx| input.select_all_text(cx));
+        }
+        cx.notify();
+    }
+
+    /// Close the bar and put focus back where the response pane can use it.
+    ///
+    /// Focus has to move: the handle belongs to the input entity being dropped, and leaving it
+    /// there means no key context matches and the whole keymap goes quiet — the same failure as
+    /// switching buffers without moving focus.
+    pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            self.search_task = None;
+            window.focus(&self.response_focus);
+            cx.notify();
+        }
+    }
+
+    pub fn is_searching(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Re-scan the body for the current query, off-thread.
+    ///
+    /// Called from the input's `Changed` subscription, so it runs once per edit rather than
+    /// once per frame. 10MB takes ~7ms for a query that matches nothing — comfortably inside a
+    /// frame, and still off the UI thread, because the transfer cap is 100MB and invariant 3
+    /// isn't conditional on the body being small today.
+    pub fn run_search(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &self.search else { return };
+        let query = search.query.read(cx).text().to_string();
+
+        // Bytes and the index are behind `Arc`/`Bytes`, so this is a refcount bump each.
+        let source = self
+            .body_view
+            .as_ref()
+            .and_then(|body| body.searchable_source().cloned());
+
+        let Some(source) = source else {
+            self.apply_search(Hits::default(), cx);
+            return;
+        };
+
+        let scan = cx
+            .background_executor()
+            .spawn(async move { zuno_core::search::find(&source, &query) });
+
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            let hits = scan.await;
+            let _ = this.update(cx, |this, cx| this.apply_search(hits, cx));
+        }));
+    }
+
+    /// Store a finished scan and jump to its first match.
+    ///
+    /// The offset-to-row mapping happens here, on the UI thread, and deliberately: it needs the
+    /// live `BodyView`, which the background task cannot borrow, and it is a merge over at most
+    /// `MAX_MATCHES` offsets — 148µs against 1.31M rows, measured. The *scan* is the O(bytes)
+    /// half and that's what went to the executor.
+    fn apply_search(&mut self, hits: Hits, cx: &mut Context<Self>) {
+        let rows = self
+            .body_view
+            .as_ref()
+            .map(|body| body.rows_for_offsets(&hits.offsets))
+            .unwrap_or_default();
+
+        let Some(search) = self.search.as_mut() else { return };
+        search.offsets = hits.offsets;
+        search.rows = rows;
+        search.truncated = hits.truncated;
+        search.current = 0;
+        search.current_clipped = false;
+
+        self.reveal_current_match(cx);
+        cx.notify();
+    }
+
+    /// Move to another match, wrapping at both ends.
+    pub fn step_search(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_mut() else { return };
+        if search.offsets.is_empty() {
+            return;
+        }
+
+        let count = search.offsets.len() as isize;
+        // `rem_euclid` so stepping back from the first match wraps to the last rather than
+        // underflowing a usize — the same reason `Picker::select` uses it.
+        search.current = (search.current as isize + delta).rem_euclid(count) as usize;
+
+        self.reveal_current_match(cx);
+        cx.notify();
+    }
+
+    /// Unfold and scroll so the current match is on screen, and record whether it's readable.
+    fn reveal_current_match(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.search.as_ref() else { return };
+        let Some(&row) = search.rows.get(search.current) else { return };
+        let Some(&offset) = search.offsets.get(search.current) else { return };
+
+        let Some(body) = self.body_view.as_mut() else { return };
+        let visible = body.reveal(row as usize);
+        let clipped = !body.offset_is_displayed(offset);
+
+        if let Some(visible_ix) = visible {
+            // Centred rather than Top: a match at the very top of the viewport with no
+            // surrounding context is hard to place in a large document.
+            self.body_scroll
+                .scroll_to_item(visible_ix, ScrollStrategy::Center);
+        }
+
+        if let Some(search) = self.search.as_mut() {
+            search.current_clipped = clipped;
+        }
+        cx.notify();
+    }
+
+    /// The row currently highlighted as the active match, if the bar is open.
+    pub fn current_match_row(&self) -> Option<u32> {
+        let search = self.search.as_ref()?;
+        search.rows.get(search.current).copied()
     }
 
     pub fn toggle_fold(&mut self, row_ix: usize, cx: &mut Context<Self>) {

@@ -17,6 +17,7 @@ pub mod json;
 pub mod lines;
 pub mod request;
 pub mod response;
+pub mod search;
 
 pub use collection::CollectionError;
 pub use environment::{Environment, EnvironmentError, Resolver};
@@ -30,3 +31,4 @@ pub use request::{
     RequestId, RequestSettings, RequestSpec, label_for,
 };
 pub use response::{HttpVersion, ResponseData, SizeInfo, StatusClass, Timing};
+pub use search::Hits;

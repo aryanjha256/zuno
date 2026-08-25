@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px, uniform_list,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    Window, div, px, uniform_list,
 };
 use zuno_core::{
     EngineError, Header, JsonOutline, LineIndex, ResponseData, ResponseDiff, Row, RowKind,
@@ -23,7 +24,7 @@ use zuno_core::{
 
 use crate::actions::CancelRequest;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
-use crate::request_view::{InFlight, RequestView, ResponseView};
+use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
 use crate::theme::Theme;
 
 /// Fixed row height. `uniform_list` measures one item and assumes the rest match, so
@@ -84,6 +85,12 @@ pub fn render(
             match view.response_view {
                 ResponseView::Body => pane
                     .child(body_header(view, theme, cx))
+                    // Above the body rather than floating over it: an overlay would cover the
+                    // first rows, which are exactly where a match near the top of the document
+                    // is about to be scrolled to.
+                    .children(view.search.as_ref().map(|search| {
+                        find_bar(search, view.body_view.as_ref().is_some_and(BodyView::is_json), theme, cx)
+                    }))
                     .child(body_region(view, theme, cx)),
                 ResponseView::Headers => pane.child(headers_region(&response.headers, theme)),
             }
@@ -179,6 +186,128 @@ fn view_tab(
                 window.dispatch_action(Box::new(crate::actions::ToggleResponseView), cx);
             }),
         )
+}
+
+// ---------------------------------------------------------------------------
+// Find in response
+// ---------------------------------------------------------------------------
+
+/// The find bar: query, position, and every way the count can mislead.
+///
+/// Three notices, and each exists because the honest count and the useful count differ:
+///
+/// - **`first N`** when the scan stopped at `search::MAX_MATCHES`. Without it, "5000" reads as
+///   the total when it means "at least".
+/// - **`past the 4KB line limit`** when the current match sits beyond where the raw view cuts
+///   its line. The row is on screen and the match isn't, which otherwise looks like a bug in
+///   the search rather than a limit on the display.
+/// - **`searching the raw bytes`** on a JSON body, because the count is over the source and not
+///   over what's drawn: structural whitespace is searchable, a key includes its quotes, and a
+///   folded container's `{ … 3 items }` summary is not in the bytes at all.
+fn find_bar(
+    search: &ResponseSearch,
+    is_json: bool,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> Div {
+    let query_is_empty = search.query.read(cx).text().is_empty();
+
+    let (status, status_color) = match search.position() {
+        Some((at, total)) => (
+            SharedString::from(format!("{at} of {total}")),
+            theme.text_muted,
+        ),
+        None if query_is_empty => (SharedString::from(""), theme.text_muted),
+        None => (SharedString::from("no matches"), theme.status_client_error),
+    };
+
+    let mut notes: Vec<SharedString> = Vec::new();
+    if search.truncated {
+        notes.push(SharedString::from(format!(
+            "first {} only",
+            zuno_core::search::MAX_MATCHES
+        )));
+    }
+    if search.current_clipped {
+        notes.push(SharedString::from("past this line's display limit"));
+    }
+    if is_json && !query_is_empty {
+        notes.push(SharedString::from("matching raw bytes"));
+    }
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .flex_none()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_elevated)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .bg(theme.bg)
+                .border_1()
+                .border_color(theme.border)
+                .font_family(theme.mono.clone())
+                .text_color(theme.text)
+                .child(search.query.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .text_color(status_color)
+                .child(status),
+        )
+        .children(notes.into_iter().map(|note| {
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(note)
+        }))
+        // Both step through the same action a keystroke does, so the buttons and Enter can't
+        // drift. Rendered as text rather than icons for the same reason the rest of this pane
+        // is: there is no icon set.
+        .child(step_button("find-prev", "‹", crate::actions::FindPrev, theme, cx))
+        .child(step_button("find-next", "›", crate::actions::FindNext, theme, cx))
+        .child(step_button("find-close", "×", crate::actions::CloseFind, theme, cx))
+}
+
+/// `use<A>` rather than `use<>`: the return has to mention every type parameter in scope, and
+/// `A` is genuinely captured by the click closure. The empty form is only for helpers that
+/// borrow nothing *and* are non-generic.
+fn step_button<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    glyph: &'static str,
+    action: A,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> impl IntoElement + use<A> {
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .text_color(theme.text_muted)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.bg_hover).text_color(theme.text))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |_, _: &MouseDownEvent, window, cx| {
+                window.dispatch_action(Box::new(action.clone()), cx);
+            }),
+        )
+        .child(glyph.to_string())
 }
 
 /// The headers, in their own scrollable region.
@@ -607,6 +736,11 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
 
     let notice = body.notice.as_ref().map(|notice| notice_bar(notice, theme));
 
+    // The row holding the current match, so it can be highlighted. A plain `Option<u32>` is
+    // `Copy`, so the render closures capture it without borrowing the view.
+    let hit = view.current_match_row();
+    let scroll = view.body_scroll.clone();
+
     let list = match &body.kind {
         BodyKind::Empty => centered_note("(empty body)", theme).into_any_element(),
         BodyKind::Binary { len } => centered_note(
@@ -615,9 +749,9 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
         )
         .into_any_element(),
         BodyKind::Json(outline) => {
-            json_list(outline.clone(), body.visible(), theme, cx).into_any_element()
+            json_list(outline.clone(), body.visible(), hit, scroll, theme, cx).into_any_element()
         }
-        BodyKind::Text(lines) => text_list(lines.clone(), theme).into_any_element(),
+        BodyKind::Text(lines) => text_list(lines.clone(), hit, scroll, theme).into_any_element(),
     };
 
     container.children(notice).child(list)
@@ -631,6 +765,8 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
 fn json_list(
     outline: Arc<JsonOutline>,
     visible: Arc<Vec<u32>>,
+    hit: Option<u32>,
+    scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<RequestView>,
 ) -> impl IntoElement {
@@ -647,10 +783,14 @@ fn json_list(
                     return div().h(px(ROW_HEIGHT));
                 };
                 let folded = row.kind.is_open() && is_folded_at(&visible, visible_ix, row_ix);
-                json_row(&outline, row, row_ix, folded, &row_theme, view.clone())
+                let is_hit = hit == Some(row_ix as u32);
+                json_row(&outline, row, row_ix, folded, is_hit, &row_theme, view.clone())
             })
             .collect()
     })
+    // Without this the list cannot be scrolled programmatically, so jumping to a match would
+    // silently do nothing — the handle is the only way in.
+    .track_scroll(scroll)
     .flex_1()
     .px_2()
     .font_family(mono)
@@ -662,6 +802,7 @@ fn json_row(
     row: Row,
     row_ix: usize,
     folded: bool,
+    is_hit: bool,
     theme: &Theme,
     view: gpui::WeakEntity<RequestView>,
 ) -> Div {
@@ -671,6 +812,14 @@ fn json_row(
         .items_center()
         .h(px(ROW_HEIGHT))
         .pl(px(4.0 + row.depth as f32 * INDENT));
+
+    if is_hit {
+        // Whole-row, because the match is a byte range in the source and the row is built from
+        // separately styled key/punctuation/value elements — highlighting the exact characters
+        // means splitting a shaped run, which is the syntax-highlighting problem (principle 4)
+        // and not this slice's. The row is enough to find it with your eye.
+        line = line.bg(theme.bg_hover).border_l_2().border_color(theme.accent);
+    }
 
     // Fold affordance. Only containers get one, and clicking anywhere on the marker
     // toggles — a 1px chevron would be unusable.
@@ -756,7 +905,12 @@ fn plural(count: u32) -> String {
 
 /// The virtualized raw-text view — the fallback for non-JSON, over-cap, and
 /// failed-to-parse bodies. Also virtualized: a 10MB text body has just as many rows.
-fn text_list(lines: Arc<LineIndex>, theme: &Theme) -> impl IntoElement {
+fn text_list(
+    lines: Arc<LineIndex>,
+    hit: Option<u32>,
+    scroll: UniformListScrollHandle,
+    theme: &Theme,
+) -> impl IntoElement {
     let row_theme = theme.clone();
     let mono = theme.mono.clone();
     let count = lines.len();
@@ -777,6 +931,13 @@ fn text_list(lines: Arc<LineIndex>, theme: &Theme) -> impl IntoElement {
                             .child(text.to_string()),
                     );
 
+                if hit == Some(ix as u32) {
+                    row = row
+                        .bg(row_theme.bg_hover)
+                        .border_l_2()
+                        .border_color(row_theme.accent);
+                }
+
                 if truncated {
                     row = row.child(
                         div()
@@ -790,6 +951,7 @@ fn text_list(lines: Arc<LineIndex>, theme: &Theme) -> impl IntoElement {
             })
             .collect()
     })
+    .track_scroll(scroll)
     .flex_1()
     .px_2()
     .font_family(mono)
