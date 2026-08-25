@@ -259,7 +259,47 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   recalled GPUI APIs** — and when a comment explains why a call is load-bearing, that is precisely
   the moment to check the call is there.
 
+## Design tweaks — the fast path
+
+**Read this before "Finishing a slice", because that checklist does not apply here.** Tweaking
+design is how the app gets its taste, it is continuous, and it is *supposed* to be cheap. Spending
+fifteen minutes on a colour makes the loop so expensive it stops happening, which costs more than
+any bug the ceremony would have caught.
+
+A **visual-only** change — colour, spacing, size, alignment, hover, icon, a chip's label:
+
+1. Make it.
+2. `cargo check --workspace --all-targets` (~0.5s). **Not the suite.**
+3. **Look at it.** That's the verification, and it's a better one than any test here could be —
+   nothing in the headless platform can observe a paint, so a human glance is the only instrument
+   that actually reads the pixels.
+
+No test, no doc edit, no break-it-on-purpose. Three triggers, and only these, promote a tweak to
+something heavier:
+
+| Trigger | What it costs |
+|---|---|
+The fix repairs something **invisible** — a dead hitbox, a silent no-op, a control that dispatches nothing | One test, asserted at the *consequence*. This is the `w_full` case: the short highlight was obvious, the 88% of each row that swallowed clicks was not. |
+It adds a **shared primitive** others will reuse — a theme token, a `ui::` helper | One line where the primitive is defined. Not three documents. |
+It **contradicts a comment or doc** that's already there | Fix that claim. A stale confident note is the failure mode this file's Lessons section is mostly about. |
+
+**Where this rule came from.** The picker's hover width and its unreadable detail column were a
+four-line fix that took fifteen minutes, because "Finishing a slice" got run on a paint change:
+a hand-rolled WCAG implementation and three tests for a hex value, break-it-on-purpose three times,
+and edits to all three docs for a hover colour. The diagnosis was four minutes; the ritual was
+eleven. **The checklist below is priced in behaviour bugs** — session formats discarding requests,
+`preserved_body` overwriting real bodies, an icon set that rendered nothing — and a hover colour is
+not in that class. Applying its weight to paint is cargo cult, and the reason it happened is that
+this file said to.
+
+The one genuine trap in this territory is the opposite of over-testing: a visual bug with an
+invisible functional half. Both bugs above had one. So the question to ask on a design fix is not
+"does this need a test" but **"is there a part of this I could not have seen?"** — if no, ship it.
+
 ## Finishing a slice
+
+**Scope: behaviour changes.** For a visual tweak see the fast path above; running this list on a
+colour is how a four-line fix takes fifteen minutes.
 
 Not ceremony — each line here is something that has actually been missed, and the last two are why
 this list exists at all.
