@@ -54,6 +54,7 @@ actions!(
         UnfoldAll,
         CopyResponse,
         SaveResponse,
+        CopyAsCurl,
         // Settings
         OpenSettings,
         SettingNext,

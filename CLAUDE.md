@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 398 tests, ~11s
+cargo test --workspace                   # 426 tests, ~13s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -125,6 +125,8 @@ A dropped `Subscription` unsubscribes | `cx.subscribe` returns one; store it in 
 `Window::dispatch_action` **defers** — it captures the focus id, then `cx.defer`s the dispatch | So an action dispatched from a modal still resolves against the frame the modal was in. It also means closing-then-dispatching and dispatching-then-closing behave identically for actions. Focus order *does* matter for anything that calls `window.focus` synchronously, like `activate`. |
 A context-less binding does **not** lose to a specific one — it *ties*, and **later registration wins** | `binding_enabled` returns `depth = contexts.len()` for a `None` context, which is the maximum; the tiebreak is `ix_b.cmp(ix_a)`. So `escape` in `Some("Picker")` only beats the global `escape` -> `CancelRequest` because it is registered after it in `register_keymap`. Reordering that list changes behaviour with no compile error. |
 Border **widths** are per-side; `border_color` is **one colour for the whole element** | So `.border_r_1().border_color(a).border_t_2().border_color(b)` paints *both* borders `b`, with no warning — `gpui-macros-0.2.2/src/styles.rs:375` sets a single `style().border_color`. The tab strip did exactly this: the active tab drew its right divider in the accent colour, and every inactive tab drew its divider in `bg_panel`, which is to say invisibly, so the tabs ran together. **Two colours on one box means two elements.** Worth pairing with the entry below — the nested element needs no `stop_propagation` here only because it carries no handler of its own. |
+`svg()` needs an `AssetSource` **and** an explicit `text_color` | It is rendered to an **alpha mask**, so colours in the file are ignored and `style.text.color` paints it — with no colour set, `paint_svg` is never reached. Both failure modes are silent: a missing asset is swallowed by `log_err()`, and a colourless icon just doesn't draw. A button with no glyph still has bounds and still dispatches, so nothing else notices. Hence `every_icon_resolves_and_is_renderable_svg`. |
+`tooltip()` is on `StatefulInteractiveElement` | Needs `.id()` first, same as `overflow_*_scroll`. gpui 0.2.2 ships no tooltip *view* — only the hook, which wants an `AnyView`, so you write the view. |
 `on_mouse_down` is a **Bubble**-phase listener, so an **ancestor's** handler runs too | Overlapping *siblings* are resolved by hit-testing — the one painted later occludes the rest, which is why `chrome.rs` emits the resize corners last. **Ancestor/descendant is not**: a click inside a child is inside the parent's hitbox as well, so both fire, child first. A clickable nested in a clickable therefore needs `cx.stop_propagation()`. The window controls sit inside the drag-to-move titlebar and went without it for a while — so closing the window also asked the compositor to start dragging it. `platform/test/window.rs`'s `start_window_move` is `unimplemented!()`, which is what makes this testable at all. |
 
 ## Packaging
@@ -271,6 +273,12 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   matches **exhaustively with no catch-all** — adding a variant is now a compile error until someone
   decides how to edit it. An interim `preserved_body` field held the unknown instead; it's gone,
   because a catch-all that quietly preserves is weaker than a match that refuses to build.
+- **Every verb needs a mouse path, not just a keybinding.** Keyboard-first is not keyboard-only: an
+  audit found only six of ~40 actions were reachable by mouse, and nine had none at all — find,
+  copy-as-curl, copy response, settings, import, new tab. A shortcut nobody can discover is a
+  feature nobody has. `ui::icon_button` / `ui::text_action` are the way to add one, and their
+  tooltip reads the keystroke from the live keymap so the mouse path *teaches* the keyboard one.
+  `affordances()` in the tests is the table that keeps it honest.
 - Actions, not direct calls, for anything a button and a keybinding share. A command palette row
   dispatches the action too, so palette and keystroke can't drift.
 - **`TextInput` emits `Changed`; subscribe to it rather than polling in `render`.** The picker

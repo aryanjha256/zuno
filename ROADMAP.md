@@ -409,11 +409,34 @@ so that remains row selection first, then copy.
 
 **4. Smaller, but real.** With search done, this is the live list.
 
-- **No copy-as-curl.** Import exists and export doesn't, which is asymmetric — and "here's the
-  repro" is a constant need. Nearly pure `zuno-core`, so it's the cheapest real thing left.
+- **Copy-as-curl — done.** `Ctrl+Shift+X`. `curl.rs` holds both directions now, so a round-trip
+  test can catch the drift that matters: an exported flag the importer drops.
+
+  It needed one decision that wasn't obvious from the outside. A copied command gets pasted into
+  issues and chat, so resolving every variable would leak a live token, and resolving none would
+  make the command un-runnable. It resolves everything *except* values from the gitignored
+  `.local` file, which stay as `{{token}}`, and says so in the status bar. The secret marking being
+  a file split rather than a per-variable flag is what made that free — nothing had to be tagged
+  for export to get it right, which is a point in favour of that original choice.
+
+  A test caught a real bug on the way, and not in the export: the "withheld a secret" notice
+  scanned disabled rows too, so a fresh buffer announced a redaction for a header it never sent.
 - **No delete or rename of a saved request** from inside the app. Mild, because files are the
   interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
 - **No body prettify.** Paste minified JSON and you live with it.
+
+**6. Discoverability — done, and it should not have taken this long.** Only six of ~40 actions were
+reachable by mouse; nine had no affordance at all, including three shipped in the two slices before
+this one. Every verb now has an icon button or a clickable label, and each tooltip names its
+keystroke read from the live keymap — so the mouse path teaches the keyboard one rather than
+replacing it. See architecture.md §2.
+
+The lesson is about how the gap opened, because it is the same shape as §11's. "Keyboard-first"
+became keyboard-only one slice at a time: each feature got a binding and a palette row, both of
+which satisfied the convention checklist, and neither of which can be *seen*. The palette drift test
+proved every action was reachable **by name** and quietly implied it was reachable at all. Worth
+remembering that a green test asserting the thing you thought to assert is not the same as coverage
+of what a new user can find.
 
 **5. Layout, and it took a screenshot to find — done.** Unplanned, and worth recording because
 of *how* it was found: two screenshots of the running app, not a test and not a read of the code.

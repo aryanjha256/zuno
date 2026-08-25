@@ -22,7 +22,11 @@ use zuno_core::{
     ScalarKind, StatusClass,
 };
 
-use crate::actions::{CancelRequest, SendRequest, ShowHistory};
+use crate::actions::{
+    CancelRequest, CopyResponse, FindInResponse, FoldAll, SaveResponse, SendRequest, ShowHistory,
+    UnfoldAll,
+};
+use crate::ui::{Icon, icon_button, text_action};
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
 use crate::theme::Theme;
@@ -148,6 +152,52 @@ fn view_tabs(
             active == ResponseView::Headers,
             theme,
             cx,
+        ))
+        // Pushes the action row to the far right; the tabs stay left where the eye starts.
+        .child(div().flex_1())
+        .child(response_actions(theme))
+}
+
+/// The verbs that act on a response, as icon buttons.
+///
+/// **These were keyboard-only until an audit counted.** Find, copy, save and history were reachable
+/// by shortcut or by the command palette and by nothing you could see — which for a new user means
+/// they did not exist. Each button dispatches its action and carries a tooltip naming its key, so
+/// the mouse path teaches the keyboard one instead of competing with it.
+fn response_actions(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .child(icon_button(
+            "action-find",
+            Icon::Search,
+            "Find in response",
+            FindInResponse,
+            theme,
+        ))
+        .child(icon_button(
+            "action-copy-body",
+            Icon::Copy,
+            "Copy response body",
+            CopyResponse,
+            theme,
+        ))
+        .child(icon_button(
+            "action-save-body",
+            Icon::Download,
+            "Save response body to a file",
+            SaveResponse,
+            theme,
+        ))
+        .child(icon_button(
+            "action-history",
+            Icon::History,
+            "Show response history",
+            ShowHistory,
+            theme,
         ))
 }
 
@@ -685,13 +735,25 @@ fn body_header(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
     let mut actions = div().flex().flex_row().items_center().gap_2().child(detail);
 
     if view.body_view.as_ref().is_some_and(BodyView::is_json) {
+        // **Dispatch, not a direct call.** These two were calling `set_all_folded` straight on the
+        // view, so the buttons and `Alt+F`/`Alt+E` were separate code paths that could drift —
+        // exactly what the body-kind chip was caught doing, and what "actions, not direct calls"
+        // exists to prevent. `text_action` also gives them the tooltip the icons have.
         actions = actions
-            .child(text_button("fold-all", "fold all", theme, cx, |view, cx| {
-                view.set_all_folded(true, cx)
-            }))
-            .child(text_button("unfold-all", "expand", theme, cx, |view, cx| {
-                view.set_all_folded(false, cx)
-            }));
+            .child(text_action(
+                "fold-all",
+                "fold all".into(),
+                "Fold all",
+                FoldAll,
+                theme,
+            ))
+            .child(text_action(
+                "unfold-all",
+                "expand".into(),
+                "Unfold all",
+                UnfoldAll,
+                theme,
+            ));
     }
 
     // The explicit escape hatch for an over-the-cap body. Never parse silently, and

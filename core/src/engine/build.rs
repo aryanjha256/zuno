@@ -13,7 +13,7 @@ use http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Request, Url};
 
 use crate::engine::error::EngineError;
-use crate::request::{Body, Method, MultipartValue, RequestSpec};
+use crate::request::{Body, FormField, Method, MultipartValue, RequestSpec};
 
 /// A body that has been reduced to bytes, plus the Content-Type it implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +190,24 @@ pub fn build_headers(spec: &RequestSpec) -> Result<HeaderMap, EngineError> {
     Ok(headers)
 }
 
+/// A form body's wire bytes: `a=1&b=2`, percent-encoded, disabled and unnamed fields dropped.
+///
+/// **Public because curl export needs the exact same string.** It emits the encoded form as one
+/// `--data-raw`, so that a copied command sends byte-for-byte what Zuno sends — and the alternative
+/// there, one `--data-urlencode` per field, would have let *curl* do the encoding instead, which
+/// differs for a field whose **name** needs escaping (curl only encodes after the `=`). Sharing the
+/// function is what keeps the two from drifting; `exported_form_body_matches_the_wire` pins it.
+pub fn encode_form(fields: &[FormField]) -> String {
+    url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(
+            fields
+                .iter()
+                .filter(|field| field.enabled && !field.name.trim().is_empty())
+                .map(|field| (field.name.trim(), field.value.as_str())),
+        )
+        .finish()
+}
+
 pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
     match &spec.body {
         Body::Empty => Ok(PreparedBody::None),
@@ -205,14 +223,7 @@ pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
         }
 
         Body::Form(fields) => {
-            let encoded = url::form_urlencoded::Serializer::new(String::new())
-                .extend_pairs(
-                    fields
-                        .iter()
-                        .filter(|field| field.enabled && !field.name.trim().is_empty())
-                        .map(|field| (field.name.trim(), field.value.as_str())),
-                )
-                .finish();
+            let encoded = encode_form(fields);
 
             if encoded.is_empty() {
                 return Ok(PreparedBody::None);

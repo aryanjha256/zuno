@@ -63,7 +63,7 @@ zuno/
 │       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
-│       ├── curl.rs         ✅ curl command line -> RequestSpec
+│       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
 │       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
 │       ├── fuzzy.rs        ✅ subsequence scoring for the picker
@@ -83,6 +83,7 @@ zuno/
         ├── settings_panel.rs ✅ per-request engine settings, as a modal
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
+        ├── ui.rs           ✅ icon set + asset source, icon/text buttons, tooltips
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
         ├── request_view.rs ✅ one buffer: inputs + response + derived spec()
         ├── request_pane.rs ✅ method, URL bar, headers/query tables, body
@@ -110,6 +111,48 @@ Three refinements the implementation forced, all worth recording:
   waiting in each one. Deriving instead makes it structurally impossible for the request that
   goes on the wire to disagree with what's on screen. Non-text state (`method`, `body`,
   `settings`, per-row `enabled`) lives on `RequestView`, since nothing else owns it.
+
+### Discoverability — keyboard-first is not keyboard-only
+
+Added late, and the delay is the interesting part. The thesis is "speed and keyboard navigation are
+requirements, not polish", and that quietly became *keyboard-only*: an audit counted **six of ~40
+actions reachable by mouse, and nine with no affordance at all** — find, copy-as-curl, copy
+response, save response, history, settings, import, save request, new tab. Every one of them had a
+keybinding and a palette row, and neither is discoverable by looking at the window. A shortcut
+nobody can find is a feature nobody has.
+
+`app/src/ui.rs` holds the answer: an icon set, `icon_button`, `text_action`, and a tooltip. Four
+decisions worth keeping:
+
+- **The tooltip reads the live keymap** (`workspace::keybinding_label`), so the mouse path *teaches*
+  the keyboard one instead of competing with it, and a rebinding can't leave a tooltip lying. That
+  is the whole reason icons don't undercut the thesis.
+- **Icons are embedded with `include_bytes!`**, not installed. Shipping SVG files would mean a new
+  directory in the `.deb`, a path that differs between a cargo run and an installed binary, and a
+  blank icon whenever the two disagree. Note this is the *opposite* choice from the application
+  icon, which must be a real file in `hicolor/` precisely because the launcher — not Zuno — reads
+  it. Same file type, opposite conclusion, because the reader is different.
+- **`icon_button` stops propagation unconditionally.** One of these sits inside the drag-to-move
+  titlebar, where a Bubble-phase click would also ask the compositor to start dragging the window —
+  the bug the window controls shipped with for several milestones. Unconditional rather than
+  per-site: harmless where no ancestor handles clicks, and impossible to forget when a button is
+  later moved somewhere one does.
+- **The `+` for a new tab lives in the titlebar, not the tab strip.** The conventional place is the
+  end of the strip, but the strip hides itself at one buffer — so a button there would be missing in
+  exactly the state where you want a second tab.
+
+> **Two silent failure modes, and the test that exists because of them.** gpui renders an SVG and
+> keeps only its **alpha channel**, painting with `style.text.color`. So an icon with no explicit
+> text colour never reaches `paint_svg` and draws nothing, and a missing asset is swallowed by
+> `log_err()`. In both cases the button still has bounds and still dispatches, so every other test
+> passes. `every_icon_resolves_and_is_renderable_svg` loads each path through the real
+> `AssetSource` and checks it has a `viewBox` and something paintable.
+
+> **And the audit found a bug while counting.** The `fold all` / `expand` buttons were calling
+> `set_all_folded` directly instead of dispatching `FoldAll`/`UnfoldAll` — the same violation the
+> body-kind chip was caught in, in the same file, found the same way. Two occurrences of one
+> mistake is what promoted "actions, not direct calls" from a convention to something with a test
+> per button.
 
 **Why a workspace and not just modules?** Two concrete wins:
 
@@ -824,6 +867,58 @@ continuations. 35 tests.
 > `curl this is garbage` parses with `url = "this"`. Faithful, and useless as an import —
 > pasting arbitrary text would quietly build a nonsense request. Import now requires either the
 > `curl` word or something that actually looks like a URL.
+
+### curl export — the other direction, added much later
+
+`Ctrl+Shift+X` copies the active request as a runnable curl command. `curl.rs` now holds both
+directions deliberately: a flag the exporter emits and the importer drops is a bug visible in one
+file, and `a_command_round_trips` asserts it rather than trusting it.
+
+**Variables are resolved except the secret ones**, via `Resolver::without_secrets`. This is the
+decision worth recording, because both obvious answers are wrong. Resolving everything puts a live
+credential in the clipboard and therefore in the issue or chat message the command is being pasted
+into — precisely the leak the committed/gitignored split exists to prevent. Resolving nothing makes
+the command un-runnable, which defeats "here's the repro". So `dev.json` values are substituted and
+`dev.local.json` values come out as `{{token}}`, and the status bar names what it withheld so the
+placeholder reads as deliberate rather than broken.
+
+The split does that work for free, which is the argument for it having been a *file* distinction
+rather than a per-variable flag all along: nothing had to be marked for export to get this right.
+
+Four implementation points, each with a rejected alternative:
+
+- **`without_secrets` removes the values rather than adding a redaction pass.** `resolve` already
+  leaves an unknown placeholder verbatim, so "withheld" is just "undefined" — one substitution path
+  instead of two sets of rules to keep in step. A redacting mode could forget a field the way
+  `apply` once forgot form bodies.
+- **The URL goes through `build::resolve_url`**, so the exported URL is the one the engine would
+  request, percent-encoding and all. It *fails* when a secret sits in the URL — normal here, not an
+  error — and falls back to appending rows unencoded, which is honest for a command the recipient
+  must finish editing anyway.
+- **A form body is one `--data-raw` carrying `build::encode_form`'s output**, byte-identical to what
+  Zuno sends. Rejected: one `--data-urlencode` per field, which lets *curl* do the encoding and
+  differs whenever a field **name** needs escaping, since curl only encodes after the `=`. Sharing
+  `encode_form` is what stops the two drifting, and a test compares the exported body against
+  `build_body`'s bytes.
+- **Flags follow the same wire-observable line the import draws**: `-L`, `--compressed`, `-k`, and
+  `--max-time` only when it isn't the default. `--max-redirs` is deliberately absent — the import
+  already judged it not worth faithfulness, and emitting a flag the importer doesn't read would make
+  every exported command report an ignored flag on the way back in. The cookie jar has no
+  representation at all: `cookie_store` is an in-process jar shared per client config, curl's `-b`
+  and `-c` are files, and inventing a flag would export a request that behaves differently.
+
+> **The bug a test caught, and it was in the reporting rather than the export.** `withheld_in`
+> scanned every row instead of only enabled ones — and the sample request ships a *disabled*
+> `Authorization: Bearer {{token}}`, so a fresh buffer announced that a secret had been withheld
+> from a command that never referenced one. A status line has to describe what was exported, not
+> what is merely typed on screen. Same class as the disabled-row rule everywhere else.
+
+> **Shell quoting is checked by re-tokenizing, not by inspection.** `quote` wraps in single quotes
+> and rewrites an embedded `'` as `'\''` — close, escape, reopen. The first test asserted the
+> rendered command had an even number of quotes, which is simply false: POSIX has no escape inside
+> single quotes, so correct output is routinely odd. The test now runs the command back through this
+> module's own `tokenize` and requires the payload to come out as one token, which both proves the
+> shell would reproduce it and pins the exporter's quoting to the importer's parsing.
 
 **Window chrome.** `WindowOptions::window_decorations` defaults to `None`, so GPUI was never
 told which mode to use and the window came up **client-decorated with nothing drawing the

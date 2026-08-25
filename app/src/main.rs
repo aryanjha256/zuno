@@ -23,6 +23,7 @@ mod settings_panel;
 #[cfg(test)]
 mod tests;
 mod theme;
+mod ui;
 mod workspace;
 
 use std::time::Instant;
@@ -40,7 +41,7 @@ use crate::actions::{
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
-    CloseFind, FindInResponse, FindNext, FindPrev,
+    CloseFind, CopyAsCurl, FindInResponse, FindNext, FindPrev,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -69,7 +70,9 @@ impl Boot {
 fn main() {
     let boot = Boot::new();
 
-    Application::new().run(move |cx: &mut App| {
+    // The asset source is what makes `svg()` able to load anything at all — without it every
+    // icon renders as nothing, silently, because `paint_svg` swallows a miss with `log_err`.
+    Application::new().with_assets(ui::Assets).run(move |cx: &mut App| {
         boot.mark("runtime ready");
 
         let mono = theme::pick_mono_font(cx);
@@ -184,6 +187,9 @@ fn register_keymap(cx: &mut App) {
         // `TextInput`; these are global because the response pane has no input to type in.
         KeyBinding::new("ctrl-shift-c", CopyResponse, None),
         KeyBinding::new("ctrl-shift-s", SaveResponse, None),
+        // Export, mirroring `ctrl-shift-v`'s import. `ctrl-shift-c` is already the response body,
+        // so the request-as-curl gets its own key rather than overloading one.
+        KeyBinding::new("ctrl-shift-x", CopyAsCurl, None),
         // --- Request lifecycle ---
         KeyBinding::new("ctrl-s", SaveRequest, None),
         KeyBinding::new("ctrl-enter", SendRequest, None),

@@ -94,14 +94,60 @@ impl Environment {
 pub struct Resolver {
     globals: BTreeMap<String, String>,
     active: BTreeMap<String, String>,
+    /// Names that came from a gitignored `.local` sidecar, in either layer.
+    ///
+    /// Carried but never consulted on the send path — a secret is a secret from *files*, not from
+    /// the server. It exists for `without_secrets`.
+    secret: BTreeSet<String>,
 }
 
 impl Resolver {
     pub fn new(globals: Option<&Environment>, active: Option<&Environment>) -> Self {
+        let mut secret = BTreeSet::new();
+        for env in [globals, active].into_iter().flatten() {
+            secret.extend(env.secret.iter().cloned());
+        }
+
         Self {
             globals: globals.map(|env| env.values.clone()).unwrap_or_default(),
             active: active.map(|env| env.values.clone()).unwrap_or_default(),
+            secret,
         }
+    }
+
+    /// A resolver that treats every secret as undefined.
+    ///
+    /// For curl export: a copied command should be runnable against your dev box without carrying
+    /// a live credential into whatever you paste it into. `dev.json` values are substituted;
+    /// `dev.local.json` values come out as `{{token}}` for the recipient to fill in.
+    ///
+    /// **Deliberately implemented by *removing* the values rather than by adding a redaction pass.**
+    /// `resolve` already leaves an unknown placeholder verbatim — that rule exists so the send
+    /// boundary can name it and so a JSON body's own braces survive — and "withheld" wants exactly
+    /// that behaviour. One substitution path, no second set of rules to keep in step, and no way for
+    /// a redacting mode to forget a field the way `apply` once forgot form bodies.
+    ///
+    /// Note this makes the result *un-sendable* when a secret appears in the URL or a header:
+    /// `build.rs` rejects unresolved variables there. That's correct — this output is for a
+    /// clipboard, never for the wire.
+    pub fn without_secrets(&self) -> Self {
+        let strip = |map: &BTreeMap<String, String>| -> BTreeMap<String, String> {
+            map.iter()
+                .filter(|(name, _)| !self.secret.contains(*name))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect()
+        };
+
+        Self {
+            globals: strip(&self.globals),
+            active: strip(&self.active),
+            secret: self.secret.clone(),
+        }
+    }
+
+    /// Whether `name` came from a gitignored sidecar.
+    pub fn is_secret(&self, name: &str) -> bool {
+        self.secret.contains(name)
     }
 
     /// The selected environment wins over globals — that's the whole point of selecting one.
@@ -146,6 +192,64 @@ impl Resolver {
 
         out.push_str(rest);
         std::borrow::Cow::Owned(out)
+    }
+
+    /// Which secret names this spec actually refers to, in first-seen order.
+    ///
+    /// For the curl export's status line: "copied, and `{{token}}` is left for you to fill in" is
+    /// the difference between a command that looks carefully redacted and one that looks broken.
+    ///
+    /// Exhaustive over `Body` with no catch-all, the same rule `apply` follows — a new variant must
+    /// fail the build until someone decides whether a variable can appear in it. A catch-all here
+    /// would under-report rather than crash, which is the quieter and worse failure.
+    pub fn withheld_in(&self, spec: &RequestSpec) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        let mut scan = |text: &str| {
+            for name in placeholders(text) {
+                if self.secret.contains(&name) && seen.insert(name.clone()) {
+                    found.push(name);
+                }
+            }
+        };
+
+        // **Enabled rows only, and that is the whole correctness of this.** A first version scanned
+        // every row, and the sample request ships a *disabled*
+        // `Authorization: Bearer {{token}}` — so a fresh buffer announced that a secret had been
+        // withheld from a command which never referenced one. This has to describe what was
+        // exported, not what is merely typed on screen.
+        scan(&spec.url);
+        for param in spec.enabled_query() {
+            scan(&param.name);
+            scan(&param.value);
+        }
+        for header in spec.enabled_headers() {
+            scan(&header.name);
+            scan(&header.value);
+        }
+        match &spec.body {
+            Body::Empty => {}
+            Body::Raw { text, .. } => scan(text),
+            Body::Form(fields) => {
+                for field in fields.iter().filter(|field| field.enabled) {
+                    scan(&field.name);
+                    scan(&field.value);
+                }
+            }
+            Body::Multipart(fields) => {
+                for field in fields.iter().filter(|field| field.enabled) {
+                    scan(&field.name);
+                    if let MultipartValue::Text(text) = &field.value {
+                        scan(text);
+                    }
+                }
+            }
+            // A path, never substituted — see `apply`.
+            Body::Binary(_) => {}
+        }
+
+        found
     }
 
     /// A copy of `spec` with variables substituted, ready to send.
@@ -221,6 +325,26 @@ impl Resolver {
 
         resolved
     }
+}
+
+/// Every `{{name}}` in `text`, trimmed, in order of appearance.
+///
+/// Shares `resolve`'s scanning rules on purpose — notably that `}}` is searched from *after* the
+/// `{{`, so `{{}}` cannot find its own opener's tail — because a name this reports and `resolve`
+/// misses (or vice versa) is a placeholder the UI describes wrongly.
+fn placeholders(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find("{{") {
+        let Some(end) = rest[start + 2..].find("}}") else {
+            break;
+        };
+        names.push(rest[start + 2..start + 2 + end].trim().to_string());
+        rest = &rest[start + 2 + end + 2..];
+    }
+
+    names
 }
 
 /// The environments directory inside a collection.

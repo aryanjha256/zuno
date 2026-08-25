@@ -70,6 +70,7 @@ pub fn palette() -> Vec<Command> {
         // The response viewer.
         command("Copy response body", CopyResponse),
         command("Save response body to a file", SaveResponse),
+        command("Copy request as a curl command", CopyAsCurl),
         command("Show response history", ShowHistory),
         command("Switch between response body and headers", ToggleResponseView),
         command("Find in response", FindInResponse),

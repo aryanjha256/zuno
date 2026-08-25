@@ -15,7 +15,7 @@ use gpui::{
     ClipboardItem, Styled, Subscription, Task, Window, div, px,
 };
 use zuno_core::{
-    Environment, RawKind, RequestId, RequestSpec, Resolver, collection, environment,
+    Environment, RawKind, RequestId, RequestSpec, Resolver, collection, curl, environment,
 };
 
 use crate::actions::{
@@ -24,7 +24,7 @@ use crate::actions::{
     OpenBodyType, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
-    CloseFind, FindInResponse, FindNext, FindPrev,
+    CloseFind, CopyAsCurl, FindInResponse, FindNext, FindPrev,
     ShowHistory, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
@@ -1288,6 +1288,37 @@ impl Workspace {
         }));
     }
 
+    /// Copy the active request to the clipboard as a runnable curl command.
+    ///
+    /// **Variables are resolved, except the secret ones.** `Resolver::without_secrets` substitutes
+    /// `dev.json` values and leaves `dev.local.json` ones as `{{token}}`, so the command runs
+    /// against your dev box while a credential never reaches the clipboard — and therefore never
+    /// reaches the issue or the chat message the command is being pasted into. That split is the
+    /// same one invariant 10 protects in the collection files; the point of it being a *file*
+    /// distinction rather than a per-variable flag is that this gets it right for free.
+    ///
+    /// Nothing here can fail: a request too incomplete to send still exports, because "here's what
+    /// I have" is exactly when you reach for this. `to_command` falls back to the raw URL when the
+    /// engine's URL resolution refuses it.
+    fn copy_as_curl(&mut self, _: &CopyAsCurl, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        let spec = view.read(cx).spec(cx);
+        let resolver = self.resolver(cx).without_secrets();
+        let command = curl::to_command(&resolver.apply(&spec));
+
+        let withheld = resolver.withheld_in(&spec);
+        cx.write_to_clipboard(ClipboardItem::new_string(command));
+
+        // Say when a placeholder was left in, or the command looks broken rather than careful.
+        let message = match withheld.as_slice() {
+            [] => "Copied as a curl command".to_string(),
+            [one] => format!("Copied as curl — {{{{{one}}}}} left for you to fill in"),
+            many => format!("Copied as curl — {} secrets left as placeholders", many.len()),
+        };
+        self.set_status(&message, cx);
+    }
+
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         cx.global_mut::<Theme>().toggle();
         // A theme change repaints every window, not just this view.
@@ -1512,6 +1543,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::copy_response))
             .on_action(cx.listener(Self::save_response))
+            .on_action(cx.listener(Self::copy_as_curl))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
@@ -1833,21 +1865,34 @@ fn status_bar(
     theme: &Theme,
     window: &Window,
 ) -> impl IntoElement {
-    // Four hints, each naming a key the keymap actually holds. Unbound actions drop out rather
-    // than printing an empty slot, so this strip shrinks instead of lying.
-    let hints: String = [
-        (&OpenRequest as &dyn gpui::Action, "find"),
-        (&OpenPalette, "commands"),
-        (&SwitchEnvironment, "env"),
-        (&SendRequest, "send"),
-    ]
-    .iter()
-    .filter_map(|(action, what)| {
-        let key = keybinding_label(*action, window);
-        (!key.is_empty()).then(|| format!("{key} {what}"))
-    })
-    .collect::<Vec<_>>()
-    .join(" · ");
+    // Each hint names a key the keymap actually holds, and each is now *clickable* — it was a
+    // single dead string advertising four shortcuts, which is a strange thing for the one strip
+    // whose whole job is telling you what you can do. Unbound actions drop out rather than
+    // printing an empty slot, so this shrinks instead of lying.
+    // A local generic fn rather than a `Vec<Box<dyn Action>>`: `text_action` needs `A: Clone`, and
+    // a boxed trait object isn't `Clone` — `boxed_clone` is the trait's own answer to that, but it
+    // hands back another box, not an `A`. Four monomorphised calls is the simpler shape.
+    fn hint<A: gpui::Action + Clone + 'static>(
+        id: &'static str,
+        what: &'static str,
+        label: &'static str,
+        action: A,
+        theme: &Theme,
+        window: &Window,
+    ) -> Option<gpui::AnyElement> {
+        let key = keybinding_label(&action, window);
+        (!key.is_empty()).then(|| {
+            crate::ui::text_action(id, format!("{key} {what}").into(), label, action, theme)
+                .into_any_element()
+        })
+    }
+
+    let hints = [
+        hint("hint-find", "find", "Find request", OpenRequest, theme, window),
+        hint("hint-commands", "commands", "Command palette", OpenPalette, theme, window),
+        hint("hint-env", "env", "Switch environment", SwitchEnvironment, theme, window),
+        hint("hint-send", "send", "Send request", SendRequest, theme, window),
+    ];
 
     div()
         .flex()
@@ -1899,15 +1944,28 @@ fn status_bar(
                 // goes and what credentials it carries, so it belongs on screen rather than
                 // two keystrokes away. No badge at all means no substitution — a quieter
                 // way of saying it than a badge reading "None".
-                .children(environment.map(|name| {
-                    div()
-                        .flex_none()
-                        .px_1()
-                        .rounded_sm()
-                        .bg(theme.bg_elevated)
-                        .text_color(theme.accent)
-                        .child(name)
-                }))
+                // Clickable in both states, which is the point: the badge was information only,
+                // so with no environment selected there was nothing on screen leading to the
+                // switcher at all. Named `environment-badge` either way so a test doesn't have to
+                // know which branch it's in.
+                .child(match environment {
+                    Some(name) => crate::ui::text_action(
+                        "environment-badge",
+                        name,
+                        "Switch environment",
+                        SwitchEnvironment,
+                        theme,
+                    )
+                    .into_any_element(),
+                    None => crate::ui::icon_button(
+                        "environment-badge",
+                        crate::ui::Icon::Globe,
+                        "Switch environment",
+                        SwitchEnvironment,
+                        theme,
+                    )
+                    .into_any_element(),
+                })
                 .children(cookies.then(|| {
                     div()
                         .flex_none()
@@ -1919,9 +1977,12 @@ fn status_bar(
                 }))
                 .child(
                     div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .flex_none()
-                        .text_color(theme.text_muted)
-                        .child(hints),
+                        .children(hints.into_iter().flatten()),
                 ),
         )
 }

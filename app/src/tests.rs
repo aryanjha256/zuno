@@ -3391,6 +3391,376 @@ async fn find_is_per_buffer_and_ctrl_f_leaves_the_headers_tab(cx: &mut TestAppCo
     );
 }
 
+// ---------------------------------------------------------------------------
+// Copy as curl
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Mouse affordances: icons, tooltips, and the actions behind them
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_icon_resolves_and_is_renderable_svg() {
+    // **The silent failure this exists for.** `paint_svg` swallows a missing asset with `log_err`,
+    // and `Svg` paints nothing when `text.color` is unset — so a typo'd path or a malformed file
+    // is an invisible button, not a crash or a test failure. Nothing else in the suite would
+    // notice, because a button with no glyph still has bounds and still dispatches.
+    use crate::ui::{Assets, Icon};
+    use gpui::AssetSource;
+
+    for icon in Icon::ALL {
+        let bytes = Assets
+            .load(icon.path())
+            .unwrap_or_else(|error| panic!("{} failed to load: {error}", icon.path()))
+            .unwrap_or_else(|| panic!("{} is not in the asset source", icon.path()));
+
+        let text = std::str::from_utf8(&bytes).expect("an svg should be utf-8");
+        assert!(
+            text.contains("<svg") && text.contains("viewBox"),
+            "{} needs a viewBox or usvg cannot scale it",
+            icon.path()
+        );
+        // gpui keeps only the alpha channel, so a shape with no paint at all rasterizes to a fully
+        // transparent mask — which looks exactly like a missing file.
+        assert!(
+            text.contains("stroke=") || text.contains("fill=\"#"),
+            "{} would rasterize to nothing",
+            icon.path()
+        );
+    }
+
+    // And a path that isn't an icon must report absence rather than pretending.
+    assert!(Assets.load("icons/nope.svg").expect("no error").is_none());
+}
+
+#[test]
+fn the_asset_list_matches_the_icon_enum() {
+    // `Icon::ALL` is hand-maintained and feeds the test above; if it falls behind the enum, that
+    // test silently stops covering the new icon. `list` is derived from `ALL`, so comparing the two
+    // catches a path added to `load` without an enum variant.
+    use crate::ui::{Assets, Icon};
+    use gpui::AssetSource;
+
+    let listed = Assets.list("icons").expect("list");
+    assert_eq!(
+        listed.len(),
+        Icon::ALL.len(),
+        "Icon::ALL and the asset listing disagree"
+    );
+    for icon in Icon::ALL {
+        assert!(
+            listed.iter().any(|path| path == icon.path()),
+            "{} is missing from the listing",
+            icon.path()
+        );
+    }
+}
+
+/// Every icon/text button, paired with the action clicking it must dispatch.
+///
+/// The point of the table: this is the list that used to be *empty* for nine of these verbs. A
+/// button added without an entry here isn't covered, and an entry without a button fails outright.
+fn affordances() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("action-find", "zuno::FindInResponse"),
+        ("action-copy-body", "zuno::CopyResponse"),
+        ("action-save-body", "zuno::SaveResponse"),
+        ("action-history", "zuno::ShowHistory"),
+        ("action-save-request", "zuno::SaveRequest"),
+        ("action-import-curl", "zuno::ImportCurl"),
+        ("action-copy-curl", "zuno::CopyAsCurl"),
+        ("action-settings", "zuno::OpenSettings"),
+        ("action-new-tab", "zuno::NewTab"),
+        ("environment-badge", "zuno::SwitchEnvironment"),
+        ("hint-find", "zuno::OpenRequest"),
+        ("hint-commands", "zuno::OpenPalette"),
+        ("hint-env", "zuno::SwitchEnvironment"),
+        ("hint-send", "zuno::SendRequest"),
+        ("theme-toggle", "zuno::ToggleTheme"),
+        ("fold-all", "zuno::FoldAll"),
+        ("unfold-all", "zuno::UnfoldAll"),
+    ]
+}
+
+#[gpui::test]
+async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestAppContext) {
+    // Painted, not merely written: `debug_bounds` returning None means the element never made it
+    // into a frame, which is how a button added to a branch that doesn't render looks fine in the
+    // source and is absent on screen.
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":1}"#);
+    let _ = &view;
+    cx.run_until_parked();
+
+    for (selector, _) in affordances() {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} is not painted — the verb has no mouse path"
+        );
+    }
+}
+
+#[gpui::test]
+async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) {
+    // Three representative clicks, each with an observable effect. The full table above proves the
+    // buttons *exist*; these prove the wiring behind them is real and not a decorative glyph.
+    // Nested on purpose: `set_all_folded` never folds the root, so a flat object has nothing to
+    // fold and the assertion at the end would hold vacuously.
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":{"b":1},"c":2}"#);
+    cx.run_until_parked();
+
+    // Find: opens the find bar.
+    let find = cx.debug_bounds("action-find").expect("find button");
+    cx.simulate_click(find.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_searching()),
+        "the find icon must open the find bar"
+    );
+
+    // Copy as curl: fills the clipboard.
+    let curl = cx.debug_bounds("action-copy-curl").expect("curl button");
+    cx.simulate_click(curl.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        clipboard_text(&mut cx).unwrap_or_default().starts_with("curl "),
+        "the terminal icon must copy a curl command"
+    );
+
+    // Fold all: was calling the view directly instead of dispatching, so this is the regression
+    // guard for that fix as much as for the button.
+    let before = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
+    let fold = cx.debug_bounds("fold-all").expect("fold-all button");
+    cx.simulate_click(fold.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count()) < before,
+        "clicking fold-all must fold"
+    );
+}
+
+#[gpui::test]
+async fn the_new_tab_button_does_not_also_drag_the_window(cx: &mut TestAppContext) {
+    // It sits inside the drag-to-move titlebar, and `on_mouse_down` is Bubble-phase, so without
+    // `stop_propagation` the click reaches the titlebar too. `start_window_move` is
+    // `unimplemented!()` on the test platform, which is precisely what makes this observable: the
+    // bug would be a panic rather than a subtle misbehaviour.
+    let (window, first, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let plus = cx.debug_bounds("action-new-tab").expect("new-tab button");
+    cx.simulate_click(plus.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let second = active_view(&window, &mut cx);
+    assert_ne!(
+        first.entity_id(),
+        second.entity_id(),
+        "clicking + must open a new buffer"
+    );
+}
+
+#[gpui::test]
+async fn a_tooltip_names_the_keystroke_from_the_keymap(cx: &mut TestAppContext) {
+    // The tooltip is what makes the mouse path *teach* the keyboard one rather than replace it, so
+    // it has to read the live keymap — the same rule the migrated hint strings follow. Asserted on
+    // the label builder rather than by hovering, because a rendered tooltip is not inspectable.
+    let (window, _view, mut cx) = boot(cx, None, None);
+
+    let label = window
+        .update(&mut cx, |_, window, _| {
+            crate::ui::Tooltip::label_for("Find in response", &crate::actions::FindInResponse, window)
+        })
+        .expect("window");
+
+    assert_eq!(label, "Find in response · Ctrl+F");
+
+    // And an unbound action must not leave a dangling separator.
+    let unbound = window
+        .update(&mut cx, |_, window, _| {
+            crate::ui::Tooltip::label_for("Clear cookies", &crate::actions::ClearCookies, window)
+        })
+        .expect("window");
+    assert_eq!(unbound, "Clear cookies", "no trailing separator when unbound");
+}
+
+/// The active buffer's status-bar message, or empty.
+fn buffer_status(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> String {
+    cx.update(|_, cx| view.read(cx).status.clone())
+        .map(|status| status.to_string())
+        .unwrap_or_default()
+}
+
+#[gpui::test]
+async fn ctrl_shift_x_copies_the_request_as_curl(cx: &mut TestAppContext) {
+    let (_, _view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.example.com/things");
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+
+    let command = clipboard_text(&mut cx).unwrap_or_default();
+    assert!(command.starts_with("curl "), "{command}");
+    assert!(command.contains("https://api.example.com/things"), "{command}");
+}
+
+#[gpui::test]
+async fn copy_as_curl_resolves_variables_but_withholds_secrets(cx: &mut TestAppContext) {
+    // **The security-relevant claim, and the reason this feature needed a decision at all.** A
+    // copied command is pasted into issues and chat. Resolving everything would put a live token
+    // there; resolving nothing would make the command useless. The committed/gitignored file split
+    // already marks which is which (invariant 10), so this uses it.
+    let (session, root) = scratch_collection("curl-secrets");
+    write_env(&root, "dev.json", r#"{"host":"api.dev.test"}"#);
+    write_env(&root, "dev.local.json", r#"{"token":"sk-live-do-not-leak"}"#);
+
+    let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+    assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("dev"));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://{{host}}/v1/things");
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("Authorization");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("Bearer {{token}}");
+
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+    let command = clipboard_text(&mut cx).unwrap_or_default();
+
+    assert!(
+        !command.contains("sk-live-do-not-leak"),
+        "a gitignored value must never reach the clipboard:\n{command}"
+    );
+    assert!(
+        command.contains("{{token}}"),
+        "and it must be visibly left as a placeholder:\n{command}"
+    );
+    assert!(
+        command.contains("api.dev.test"),
+        "the committed value must be resolved, or the command is useless:\n{command}"
+    );
+    assert!(
+        !command.contains("{{host}}"),
+        "the non-secret placeholder must not survive:\n{command}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn copy_as_curl_says_when_it_withheld_something(cx: &mut TestAppContext) {
+    // A command with `{{token}}` in it looks broken unless the app says it did that on purpose.
+    let (session, root) = scratch_collection("curl-status");
+    write_env(&root, "dev.json", r#"{"host":"api.dev.test"}"#);
+    write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+
+    let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e");
+    cx.simulate_input("dev");
+    cx.simulate_keystrokes("enter");
+
+    // No secret referenced yet: the status must not claim one was held back.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://{{host}}/a");
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+    let quiet = buffer_status(&active_view(&window, &mut cx), &mut cx);
+    assert!(
+        !quiet.contains("token"),
+        "nothing was withheld, so nothing should be announced: {quiet:?}"
+    );
+
+    // Now reference one.
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("Authorization");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("Bearer {{token}}");
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+
+    let told = buffer_status(&active_view(&window, &mut cx), &mut cx);
+    assert!(
+        told.contains("{{token}}"),
+        "the status must name what was left for you to fill in: {told:?}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn copy_as_curl_exports_the_request_on_screen_including_its_body(cx: &mut TestAppContext) {
+    // `spec(cx)` derives from the inputs, so this also proves the export reads what is *typed*
+    // rather than some stored copy — the corollary of "derive state rather than mirroring it".
+    let (_, _view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://x.test/things");
+    cx.simulate_keystrokes("ctrl-m");
+    cx.simulate_input("POST");
+    cx.simulate_keystrokes("enter");
+
+    clear_body(&mut cx);
+    cx.simulate_input("{\"name\":\"ada\"}");
+
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+
+    let command = clipboard_text(&mut cx).unwrap_or_default();
+    assert!(command.contains("-X POST"), "{command}");
+    assert!(
+        command.contains(r#"--data-raw '{"name":"ada"}'"#),
+        "the body as typed must be in the command: {command}"
+    );
+}
+
+#[gpui::test]
+async fn a_copied_command_imports_back_into_an_equivalent_request(cx: &mut TestAppContext) {
+    // Export then import, through the real keystrokes for both. The core test round-trips the
+    // string; this one round-trips through the *app*, which is where the clipboard, the derived
+    // spec, and curl import all have to agree.
+    let (window, _view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://x.test/v1/items");
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("X-Trace-Id");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("abc123");
+
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+
+    // Ctrl+Shift+V imports from the clipboard into a *new* buffer, so the original is untouched.
+    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.run_until_parked();
+
+    let imported = spec_of(&active_view(&window, &mut cx), &mut cx);
+    // The sample buffer ships `per_page=50` as a query row, and `parse` folds a query string into
+    // the URL rather than splitting it — so this is also the assertion that query rows survive the
+    // round trip at all.
+    assert_eq!(imported.url, "https://x.test/v1/items?per_page=50");
+    assert_eq!(
+        imported
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("X-Trace-Id"))
+            .map(|header| header.value.as_str()),
+        Some("abc123"),
+        "headers must survive the trip through the clipboard: {:?}",
+        imported.headers
+    );
+
+    let status = buffer_status(&active_view(&window, &mut cx), &mut cx);
+    assert!(
+        !status.to_lowercase().contains("ignored"),
+        "an exported command must not contain flags the importer drops: {status:?}"
+    );
+}
+
 /// A response with an arbitrary content type and raw body bytes.
 fn serve_bytes(response: &'static [u8]) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

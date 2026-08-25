@@ -15,8 +15,9 @@ use gpui::{
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    OpenBodyType, SendRequest,
+    CopyAsCurl, ImportCurl, OpenBodyType, OpenSettings, SaveRequest, SendRequest,
 };
+use crate::ui::{Icon, icon_button};
 use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestView, RowKind};
 use crate::theme::Theme;
 
@@ -140,6 +141,49 @@ fn toolbar(
         .child(method_chip(view, theme))
         .child(url_bar(view, theme, url_focused))
         .child(send_button(theme, view.is_sending(), cx))
+        .child(request_actions(theme))
+}
+
+/// The verbs that act on the request, as icon buttons beside Send.
+///
+/// Save and Settings act on this request; Import and Copy-as-curl move it in and out of the app.
+/// All four were keyboard-only, which for Copy-as-curl meant a feature shipped the same week with
+/// no way to find it.
+fn request_actions(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .child(icon_button(
+            "action-save-request",
+            Icon::Save,
+            "Save request to collection",
+            SaveRequest,
+            theme,
+        ))
+        .child(icon_button(
+            "action-import-curl",
+            Icon::Clipboard,
+            "Import request from curl on the clipboard",
+            ImportCurl,
+            theme,
+        ))
+        .child(icon_button(
+            "action-copy-curl",
+            Icon::Terminal,
+            "Copy request as a curl command",
+            CopyAsCurl,
+            theme,
+        ))
+        .child(icon_button(
+            "action-settings",
+            Icon::Settings,
+            "Request settings",
+            OpenSettings,
+            theme,
+        ))
 }
 
 /// Clicking opens the method picker, same as `Ctrl+M`.

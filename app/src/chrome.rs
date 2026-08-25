@@ -81,7 +81,18 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                         .text_sm()
                         .text_color(theme.text)
                         .child(title),
-                ),
+                )
+                // **In the titlebar rather than at the end of the tab strip**, which is where a
+                // `+` conventionally goes — because the strip hides itself at one buffer, so a
+                // button there would be missing in exactly the state where you want a second tab.
+                // Sitting inside the drag-to-move region is why `icon_button` stops propagation.
+                .child(crate::ui::icon_button(
+                    "action-new-tab",
+                    crate::ui::Icon::Plus,
+                    "New tab",
+                    crate::actions::NewTab,
+                    theme,
+                )),
         )
         .child(
             div()
@@ -89,19 +100,17 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                 .flex_row()
                 .items_center()
                 .flex_none()
+                // Clickable, not just informative. This label named its own shortcut while being
+                // the one thing in the titlebar you couldn't press — which is the discoverability
+                // gap in miniature: the app *told* you the keystroke and still had no button.
                 .child(
-                    div()
-                        .flex_none()
-                        .px_3()
-                        .text_xs()
-                        .text_color(theme.text_muted)
-                        .child(match crate::workspace::keybinding_label(
-                            &crate::actions::ToggleTheme,
-                            window,
-                        ) {
-                            key if key.is_empty() => theme.appearance.label().to_string(),
-                            key => format!("{} · {key}", theme.appearance.label()),
-                        }),
+                    div().px_2().child(crate::ui::text_action(
+                        "theme-toggle",
+                        theme.appearance.label().into(),
+                        "Toggle theme",
+                        crate::actions::ToggleTheme,
+                        theme,
+                    )),
                 )
                 .children(controls.minimize.then(|| {
                     control_button("minimize", "–", theme, false, |window| {
