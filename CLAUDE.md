@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 426 tests, ~13s
+cargo test --workspace                   # 427 tests, ~14s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -125,7 +125,7 @@ A dropped `Subscription` unsubscribes | `cx.subscribe` returns one; store it in 
 `Window::dispatch_action` **defers** — it captures the focus id, then `cx.defer`s the dispatch | So an action dispatched from a modal still resolves against the frame the modal was in. It also means closing-then-dispatching and dispatching-then-closing behave identically for actions. Focus order *does* matter for anything that calls `window.focus` synchronously, like `activate`. |
 A context-less binding does **not** lose to a specific one — it *ties*, and **later registration wins** | `binding_enabled` returns `depth = contexts.len()` for a `None` context, which is the maximum; the tiebreak is `ix_b.cmp(ix_a)`. So `escape` in `Some("Picker")` only beats the global `escape` -> `CancelRequest` because it is registered after it in `register_keymap`. Reordering that list changes behaviour with no compile error. |
 Border **widths** are per-side; `border_color` is **one colour for the whole element** | So `.border_r_1().border_color(a).border_t_2().border_color(b)` paints *both* borders `b`, with no warning — `gpui-macros-0.2.2/src/styles.rs:375` sets a single `style().border_color`. The tab strip did exactly this: the active tab drew its right divider in the accent colour, and every inactive tab drew its divider in `bg_panel`, which is to say invisibly, so the tabs ran together. **Two colours on one box means two elements.** Worth pairing with the entry below — the nested element needs no `stop_propagation` here only because it carries no handler of its own. |
-`svg()` needs an `AssetSource` **and** an explicit `text_color` | It is rendered to an **alpha mask**, so colours in the file are ignored and `style.text.color` paints it — with no colour set, `paint_svg` is never reached. Both failure modes are silent: a missing asset is swallowed by `log_err()`, and a colourless icon just doesn't draw. A button with no glyph still has bounds and still dispatches, so nothing else notices. Hence `every_icon_resolves_and_is_renderable_svg`. |
+`svg()` needs an `AssetSource` and a `text_color` **on the `svg()` element itself** | Rendered to an **alpha mask**, so colours in the file are ignored and `style.text.color` paints it. **A parent's `text_color` does not reach it:** `Interactivity::compute_style_internal` starts from `Style::default()` and refines only with the element's *own* base style — inherited text style is never merged in. So is `hover`; use `.group()` on the parent and `.group_hover()` on the glyph. Every failure here is silent — a missing asset is swallowed by `log_err()`, an uncoloured icon never reaches `paint_svg`, and the button still hovers, still shows its tooltip, and still dispatches. **This shipped**: the rule was written as a comment on `icon_button` and then applied to the wrapping `div` three lines below it. `ui::glyph` takes the colour as an argument now, so it can't recur. |
 `tooltip()` is on `StatefulInteractiveElement` | Needs `.id()` first, same as `overflow_*_scroll`. gpui 0.2.2 ships no tooltip *view* — only the hook, which wants an `AnyView`, so you write the view. |
 `on_mouse_down` is a **Bubble**-phase listener, so an **ancestor's** handler runs too | Overlapping *siblings* are resolved by hit-testing — the one painted later occludes the rest, which is why `chrome.rs` emits the resize corners last. **Ancestor/descendant is not**: a click inside a child is inside the parent's hitbox as well, so both fire, child first. A clickable nested in a clickable therefore needs `cx.stop_propagation()`. The window controls sit inside the drag-to-move titlebar and went without it for a while — so closing the window also asked the compositor to start dragging it. `platform/test/window.rs`'s `start_window_move` is `unimplemented!()`, which is what makes this testable at all. |
 
@@ -224,6 +224,20 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   pane advertised `Ctrl+C` because an M1 design sketch had said to wire it; `settings_panel` cited a
   `tab_stop(false)` call that was never there — and *that* default is why Tab used to escape the
   modal.
+
+- **And a fourth direction: a comment stating the correct rule, applied to the wrong line.** The
+  icon buttons carried a comment explaining that gpui paints an SVG with `style.text.color` and
+  draws nothing without one — and then set the colour on the wrapping `div` instead of on the
+  `svg()`, which does not inherit it. Every icon in the app was invisible. Tooltips worked, hover
+  worked, clicks worked; only the pixels were missing, so no test noticed and the reviewer (me)
+  read the comment as evidence the code was right.
+
+  Two things came out of it. `ui::glyph` now takes the colour as a parameter, so the rule is a
+  signature rather than a sentence. And the untestable half got separated from the testable half:
+  nothing in the headless platform can observe a paint, but `resvg` — pinned to *gpui's* version —
+  can prove each icon rasterizes to visible pixels, which catches the malformed-file variant of the
+  same silent failure. **When a comment states a rule, check the rule is applied to the thing the
+  comment is about**, not merely present nearby.
 
 - **And once in the third direction: a doc asserted a bug the code never had.** architecture.md §13
   listed the editor's per-line horizontal scroll clamp as a "known defect … it's just wrong", while

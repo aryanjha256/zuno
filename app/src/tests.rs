@@ -3434,6 +3434,52 @@ fn every_icon_resolves_and_is_renderable_svg() {
 }
 
 #[test]
+fn every_icon_rasterizes_to_visible_pixels() {
+    // **The half of "invisible icon" that a test can actually reach.** `every_icon_resolves` proves
+    // the bytes are there; it says nothing about whether they draw. gpui renders an SVG with usvg
+    // and keeps only the alpha channel, so a malformed path, a missing `viewBox`, or a shape with
+    // no paint all rasterize to a fully transparent mask — indistinguishable on screen from a
+    // missing file, and invisible to every other test because the button still hovers and still
+    // dispatches.
+    //
+    // Rendered here through gpui's *own* resvg version (see the dev-dependency note in
+    // Cargo.toml), because a newer renderer could parse an icon that gpui's cannot.
+    //
+    // What this does **not** cover, and did not catch: the glyph element needing its own
+    // `text_color`. That's a property of the element tree, not the file, and the test platform
+    // cannot observe a paint. `ui::glyph` exists so that one is impossible by construction.
+    use crate::ui::{Assets, Icon};
+    use gpui::AssetSource;
+
+    for icon in Icon::ALL {
+        let bytes = Assets.load(icon.path()).expect("load").expect("present");
+        let tree = resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default())
+            .unwrap_or_else(|error| panic!("{} is not parseable svg: {error}", icon.path()));
+
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(32, 32).expect("pixmap");
+        let scale = 32.0 / tree.size().width();
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(scale, scale),
+            &mut pixmap.as_mut(),
+        );
+
+        let opaque = pixmap.pixels().iter().filter(|p| p.alpha() > 16).count();
+        assert!(
+            opaque > 20,
+            "{} rasterizes to {opaque} visible pixels — it would render as an empty button",
+            icon.path()
+        );
+        // And it must not be a solid block, which is what a stray full-canvas `fill` looks like.
+        assert!(
+            opaque < 32 * 32 / 2,
+            "{} covers {opaque} of 1024 pixels — that isn't an icon, it's a rectangle",
+            icon.path()
+        );
+    }
+}
+
+#[test]
 fn the_asset_list_matches_the_icon_enum() {
     // `Icon::ALL` is hand-maintained and feeds the test above; if it falls behind the enum, that
     // test silently stops covering the new icon. `list` is derived from `ALL`, so comparing the two

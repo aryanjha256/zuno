@@ -141,12 +141,25 @@ decisions worth keeping:
   end of the strip, but the strip hides itself at one buffer — so a button there would be missing in
   exactly the state where you want a second tab.
 
-> **Two silent failure modes, and the test that exists because of them.** gpui renders an SVG and
-> keeps only its **alpha channel**, painting with `style.text.color`. So an icon with no explicit
-> text colour never reaches `paint_svg` and draws nothing, and a missing asset is swallowed by
-> `log_err()`. In both cases the button still has bounds and still dispatches, so every other test
-> passes. `every_icon_resolves_and_is_renderable_svg` loads each path through the real
-> `AssetSource` and checks it has a `viewBox` and something paintable.
+> **Three silent failure modes, one of which shipped.** gpui renders an SVG and keeps only its
+> **alpha channel**, painting with `style.text.color`. So: a missing asset is swallowed by
+> `log_err()`; a file that rasterizes to a transparent mask looks identical to a missing one; and an
+> element with no `text.color` never reaches `paint_svg` at all. In every case the button keeps its
+> bounds, its hover, its tooltip and its dispatch — only the pixels are absent.
+>
+> The third one shipped, and it is worth being precise about why. `icon_button` carried a comment
+> explaining the rule, and then set `text_color` on the wrapping `div` — which an `svg()` does not
+> inherit, because `compute_style_internal` starts from `Style::default()` and refines only with the
+> element's own base style. The comment was correct and the code three lines below it was not.
+> `ui::glyph` now takes the colour as a parameter, so the rule is enforced by the signature; hover
+> reaches the glyph through `.group()` / `.group_hover()`, since `hover` doesn't inherit either.
+>
+> The two file-level modes *are* testable and now are: `every_icon_resolves_and_is_renderable_svg`
+> loads each path through the real `AssetSource`, and `every_icon_rasterizes_to_visible_pixels`
+> renders it with **gpui's own resvg version** — pinned deliberately, because a newer renderer could
+> parse an icon that gpui's cannot and pass while the button is blank. The element-tree mode is not
+> testable here at all; nothing in the headless platform can observe a paint. That asymmetry is why
+> it became an API shape instead of a test.
 
 > **And the audit found a bug while counting.** The `fold all` / `expand` buttons were calling
 > `set_all_folded` directly instead of dispatching `FoldAll`/`UnfoldAll` — the same violation the

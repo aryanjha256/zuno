@@ -24,6 +24,12 @@ unicode-segmentation.workspace = true
 # focus through the app without a display server. Dev-only, so `cargo build` keeps
 # the default feature set.
 [dev-dependencies]
+# Pinned to **gpui's** resvg, not the latest (0.48 at time of writing), and deliberately so: the
+# icon test rasterizes the way gpui does, so matching its renderer is the whole point. A newer
+# resvg could parse an icon that gpui's cannot, and the test would pass while the button is blank.
+# It also reuses the already-resolved copy instead of compiling a second one.
+resvg = "0.45"
+
 gpui = { workspace = true, features = ["test-support"] }
 
 [[bin]]

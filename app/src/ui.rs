@@ -10,9 +10,9 @@
 //! rather than replacing it. That is also why a rebinding can never leave a tooltip lying.
 
 use gpui::{
-    AnyView, App, AppContext, AssetSource, InteractiveElement, IntoElement, MouseButton,
+    AnyView, App, AppContext, AssetSource, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, Result, SharedString, StatefulInteractiveElement, Styled,
-    Window, div, px, svg,
+    Svg, Window, div, px, svg,
 };
 
 use crate::theme::{ActiveTheme, Theme};
@@ -159,6 +159,34 @@ impl Render for Tooltip {
     }
 }
 
+/// Ties a glyph's hover colour to its button's hover state.
+///
+/// One shared name is safe: `GroupHitboxes` keeps a *stack* per name and resolves to the innermost
+/// one currently painting, so each button matches itself rather than the first on screen.
+const ICON_GROUP: &str = "icon-button";
+
+/// One icon glyph, always carrying its own colour.
+///
+/// **A parent's `text_color` does not reach an `svg()`, and this function exists because of that.**
+/// `Interactivity::compute_style_internal` starts from `Style::default()` and refines only with the
+/// element's *own* base style — inherited text style is never merged in — so an uncoloured svg has
+/// `text.color == None`, and `Svg::paint` then skips `paint_svg` entirely. The result is an
+/// invisible icon on a button that still hovers, still shows its tooltip, and still dispatches:
+/// nothing looks broken except the pixels.
+///
+/// That is exactly what shipped. The rule was written as a comment on `icon_button` and then
+/// applied to the wrapping `div` instead of to the glyph, so the comment was right and the code was
+/// wrong three lines below it. It is a signature now rather than a sentence: there is no way to
+/// build an icon without passing a colour.
+fn glyph(icon: Icon, color: Hsla, hovered: Hsla) -> Svg {
+    svg()
+        .path(icon.path())
+        .size(px(15.))
+        .text_color(color)
+        // `hover` on the parent cannot reach here either, for the same reason — hence the group.
+        .group_hover(ICON_GROUP, move |style| style.text_color(hovered))
+}
+
 /// An icon button that dispatches an action, with a tooltip naming its keystroke.
 ///
 /// Dispatches rather than calling anything directly, so the button and the keybinding are one verb
@@ -168,9 +196,8 @@ impl Render for Tooltip {
 /// over — it names the element for tests *and* is what makes a tooltip possible at all. Same family
 /// as `overflow_*_scroll`.
 ///
-/// **`text_color` is not decoration here.** gpui renders an SVG to an alpha mask and paints it with
-/// `style.text.color`; with no colour set, `paint_svg` is never reached and the button is silently
-/// blank. Every state below therefore sets one explicitly.
+/// The colour lives on the glyph, not here — see `glyph`. This element only paints the background
+/// and owns the hit area.
 pub fn icon_button<A: gpui::Action + Clone + 'static>(
     id: &'static str,
     icon: Icon,
@@ -183,15 +210,15 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
     div()
         .id(id)
         .debug_selector(move || id.to_string())
+        .group(ICON_GROUP)
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .size(px(22.))
         .rounded_md()
-        .text_color(theme.text_muted)
         .cursor_pointer()
-        .hover(|style| style.bg(theme.bg_hover).text_color(theme.text))
+        .hover(|style| style.bg(theme.bg_hover))
         .tooltip(move |window, cx| Tooltip::for_action(label, &tooltip_action, window, cx))
         .on_mouse_down(
             MouseButton::Left,
@@ -206,7 +233,7 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
                 window.dispatch_action(action.boxed_clone(), cx);
             },
         )
-        .child(svg().path(icon.path()).size(px(15.)))
+        .child(glyph(icon, theme.text_muted, theme.text))
 }
 
 /// A text label that dispatches an action — for places where a word carries information an icon
