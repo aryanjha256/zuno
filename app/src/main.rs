@@ -249,6 +249,32 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("right", text_input::Right, Some("TextInput")),
         KeyBinding::new("shift-left", text_input::SelectLeft, Some("TextInput")),
         KeyBinding::new("shift-right", text_input::SelectRight, Some("TextInput")),
+        // Word-level movement, missing until an audit of the hand-rolled editor. Scoped to
+        // `TextInput`, whose identifier the body editor's leaf context also carries, so one
+        // binding serves the URL bar, every table cell, the find bar, and the body editor.
+        KeyBinding::new("ctrl-left", text_input::WordLeft, Some("TextInput")),
+        KeyBinding::new("ctrl-right", text_input::WordRight, Some("TextInput")),
+        KeyBinding::new("ctrl-shift-left", text_input::SelectWordLeft, Some("TextInput")),
+        KeyBinding::new("ctrl-shift-right", text_input::SelectWordRight, Some("TextInput")),
+        // Word deletion, reusing the same boundaries as the movement above.
+        KeyBinding::new("ctrl-backspace", text_input::DeleteWordLeft, Some("TextInput")),
+        KeyBinding::new("ctrl-delete", text_input::DeleteWordRight, Some("TextInput")),
+        // Document ends. In a single-line input these are Home/End again; in the body editor
+        // they are the difference between the line and the document.
+        KeyBinding::new("ctrl-home", text_input::DocStart, Some("TextInput")),
+        KeyBinding::new("ctrl-end", text_input::DocEnd, Some("TextInput")),
+        KeyBinding::new("ctrl-shift-home", text_input::SelectDocStart, Some("TextInput")),
+        KeyBinding::new("ctrl-shift-end", text_input::SelectDocEnd, Some("TextInput")),
+        // Undo/redo, per text surface — each entity keeps its own history, so undoing in the
+        // URL bar cannot reach into the body. Both redo spellings, since Linux ships both.
+        KeyBinding::new("ctrl-z", text_input::Undo, Some("TextInput")),
+        KeyBinding::new("ctrl-shift-z", text_input::Redo, Some("TextInput")),
+        KeyBinding::new("ctrl-y", text_input::Redo, Some("TextInput")),
+        // Paging is the editor's alone: a single-line input has no page to move by.
+        KeyBinding::new("pageup", editor::PageUp, Some("BodyEditor")),
+        KeyBinding::new("pagedown", editor::PageDown, Some("BodyEditor")),
+        KeyBinding::new("shift-pageup", editor::SelectPageUp, Some("BodyEditor")),
+        KeyBinding::new("shift-pagedown", editor::SelectPageDown, Some("BodyEditor")),
         KeyBinding::new("home", text_input::Home, Some("TextInput")),
         KeyBinding::new("end", text_input::End, Some("TextInput")),
         KeyBinding::new("shift-home", text_input::SelectHome, Some("TextInput")),

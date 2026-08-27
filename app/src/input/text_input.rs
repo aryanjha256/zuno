@@ -49,6 +49,18 @@ actions!(
         Right,
         SelectLeft,
         SelectRight,
+        WordLeft,
+        WordRight,
+        SelectWordLeft,
+        SelectWordRight,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DocStart,
+        DocEnd,
+        SelectDocStart,
+        SelectDocEnd,
+        Undo,
+        Redo,
         SelectAll,
         Home,
         End,
@@ -77,6 +89,7 @@ pub struct Changed;
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
+    history: crate::input::History,
     placeholder: SharedString,
     /// Extra key context identifiers, e.g. `"UrlBar"`. Always joined with
     /// `TextInput` so the shared editing bindings apply too.
@@ -116,6 +129,7 @@ impl TextInput {
             // body and response panes take 1 and 2 to land after every input.
             focus_handle: cx.focus_handle().tab_stop(true),
             content,
+            history: crate::input::History::default(),
             placeholder: sanitize(placeholder.into()),
             key_context: SharedString::from(format!("TextInput {extra_context}")),
             selected_range: cursor..cursor,
@@ -156,6 +170,108 @@ impl TextInput {
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
+    }
+
+    /// Word-level movement collapses a selection to its edge first, the same way `left`/`right`
+    /// do — jumping a word from the far end of a selection you just made is not what the
+    /// keystroke means.
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let from = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.selected_range.start
+        };
+        self.move_to(crate::input::prev_word_boundary(&self.content, from), cx);
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let from = if self.selected_range.is_empty() {
+            self.cursor_offset()
+        } else {
+            self.selected_range.end
+        };
+        self.move_to(crate::input::next_word_boundary(&self.content, from), cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let to = crate::input::prev_word_boundary(&self.content, self.cursor_offset());
+        self.select_to(to, cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let to = crate::input::next_word_boundary(&self.content, self.cursor_offset());
+        self.select_to(to, cx);
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let to = crate::input::prev_word_boundary(&self.content, self.cursor_offset());
+            self.selected_range = to..self.selected_range.end;
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_range.is_empty() {
+            let to = crate::input::next_word_boundary(&self.content, self.cursor_offset());
+            self.selected_range = self.selected_range.start..to;
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    /// A single-line input has one line, so these are `Home`/`End` again. Bound anyway: the
+    /// keystroke has to mean the same thing everywhere text is edited, and `Ctrl+Home` doing
+    /// nothing in the URL bar while working in the body would read as a bug.
+    fn doc_start(&mut self, _: &DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    fn select_doc_start(&mut self, _: &SelectDocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.history.undo(self.snapshot()) {
+            self.restore(previous, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.history.redo(self.snapshot()) {
+            self.restore(next, cx);
+        }
+    }
+
+    fn snapshot(&self) -> crate::input::EditSnapshot {
+        crate::input::EditSnapshot {
+            content: self.content.to_string(),
+            selection: self.selected_range.clone(),
+            reversed: self.selection_reversed,
+        }
+    }
+
+    /// Put a snapshot back, emitting `Changed` like any other edit — a subscriber such as the
+    /// picker's re-rank or the find bar's re-scan has to see an undo as the content change it is.
+    fn restore(&mut self, snapshot: crate::input::EditSnapshot, cx: &mut Context<Self>) {
+        self.content = SharedString::from(snapshot.content);
+        self.selected_range = snapshot.selection;
+        self.selection_reversed = snapshot.reversed;
+        self.marked_range = None;
+        cx.emit(Changed);
+        cx.notify();
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -231,6 +347,21 @@ impl TextInput {
     // ---- mouse --------------------------------------------------------------
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // A single line has no third level, so triple-click takes everything — which is also
+        // what double-click yields on a one-word input.
+        if event.click_count >= 3 {
+            self.select_all_text(cx);
+            return;
+        }
+        if event.click_count == 2 {
+            let offset = self.index_for_mouse_position(event.position);
+            self.selected_range = crate::input::word_at(&self.content, offset);
+            self.selection_reversed = false;
+            self.history.break_run();
+            cx.notify();
+            return;
+        }
+
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -253,6 +384,9 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        // Typing, arrowing away, then typing again is two edits to a person; leaving the run
+        // open would make one Ctrl+Z undo both.
+        self.history.break_run();
         cx.notify();
     }
 
@@ -418,6 +552,19 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // Coalescable only for a plain single-character insertion that replaced nothing and
+        // carries no newline. A paste, a deletion, or replacing a selection each begin their own
+        // undo entry — see `input::History`.
+        // Deliberately *not* requiring an empty range: replacing a selection with a typed
+        // character opens a run too, so select-all-then-type undoes in one press instead of
+        // leaving the first character behind as its own entry.
+        let typed_one_char = new_text.chars().count() == 1 && !new_text.contains('\n');
+        self.history.record(
+            self.snapshot(),
+            typed_one_char.then_some(range.start),
+            new_text.len(),
+        );
+
         self.content =
             (self.content[0..range.start].to_owned() + &new_text + &self.content[range.end..])
                 .into();
@@ -440,6 +587,15 @@ impl EntityInputHandler for TextInput {
         cx: &mut Context<Self>,
     ) {
         let new_text = sanitize_str(new_text);
+
+        // **Recorded only as the composition opens.** This is called on every keystroke while
+        // an IME candidate is being edited, so recording each call would bury the history under
+        // intermediate states nobody typed deliberately. With `marked_range` already set the
+        // composition is in progress and its opening snapshot is on the stack, so one Ctrl+Z
+        // after the commit steps back past the whole thing.
+        if self.marked_range.is_none() {
+            self.history.record(self.snapshot(), None, 0);
+        }
 
         let range = range_utf16
             .as_ref()
@@ -538,6 +694,18 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))

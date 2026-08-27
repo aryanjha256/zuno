@@ -319,6 +319,220 @@ async fn a_known_verb_typed_in_full_is_not_offered_twice(cx: &mut TestAppContext
     assert!(rows[0].starts_with("GET"), "{rows:?}");
 }
 
+/// Put the active buffer's body into a raw text editor with `text` in it.
+fn author_body(cx: &mut VisualTestContext, text: &str) {
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("text");
+    cx.simulate_keystrokes("enter");
+    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.simulate_input(text);
+}
+
+fn body_text(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> String {
+    match &spec_of(view, cx).body {
+        Body::Raw { text, .. } => text.clone(),
+        other => panic!("expected a raw body, got {other:?}"),
+    }
+}
+
+#[gpui::test]
+async fn undo_collapses_a_typed_run_and_redo_replays_it(cx: &mut TestAppContext) {
+    // Undo was absent entirely. `input::history_tests` pins the coalescing rule; this pins that
+    // the keystroke reaches a real surface and that the whole edit path routes through the
+    // history — every insertion funnels through `replace_text_in_range`, so a missed call site
+    // there is the way this silently only half-works.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    let original = spec_of(&view, &mut cx).url.clone();
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://example.test/a");
+    assert_eq!(spec_of(&view, &mut cx).url, "https://example.test/a");
+
+    // One press, and the whole thing goes — including the character that replaced the
+    // selection, which is one edit to a person even though it is a replace then 21 inserts.
+    cx.simulate_keystrokes("ctrl-z");
+    assert_eq!(
+        spec_of(&view, &mut cx).url, original,
+        "select-all then type collapses into a single entry"
+    );
+
+    cx.simulate_keystrokes("ctrl-y");
+    assert_eq!(spec_of(&view, &mut cx).url, "https://example.test/a", "redo replays it");
+
+    // Ctrl+Shift+Z is the other redo spelling, and undo past the start must be a no-op rather
+    // than a panic.
+    cx.simulate_keystrokes("ctrl-z ctrl-shift-z");
+    assert_eq!(spec_of(&view, &mut cx).url, "https://example.test/a");
+    for _ in 0..10 {
+        cx.simulate_keystrokes("ctrl-z");
+    }
+    cx.simulate_input("ok");
+    assert_eq!(spec_of(&view, &mut cx).url, "ok", "undo bottoms out without breaking the input");
+}
+
+#[gpui::test]
+async fn moving_the_caret_starts_a_new_undo_entry(cx: &mut TestAppContext) {
+    // The run has to close when the caret moves: typing, arrowing away, then typing again is two
+    // edits to a person, and one entry would undo both at once.
+    //
+    // **This test exists because deleting `history.break_run()` from `move_to` broke nothing.**
+    // The unit test for the rule calls `break_run` directly, so it covered the History type and
+    // not the call site — the exact shape of gap this repo keeps getting caught by.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("abc");
+
+    // Away and **back**, which is the case the contiguity check alone cannot catch: the caret
+    // ends up exactly where the run left it, so without `break_run` the next character would
+    // silently rejoin the previous entry.
+    cx.simulate_keystrokes("left right");
+    cx.simulate_input("d");
+    assert_eq!(spec_of(&view, &mut cx).url, "abcd");
+
+    cx.simulate_keystrokes("ctrl-z");
+    assert_eq!(
+        spec_of(&view, &mut cx).url, "abc",
+        "the caret having moved makes `d` its own entry, so undo leaves `abc` standing"
+    );
+}
+
+#[gpui::test]
+async fn each_text_surface_has_its_own_undo_history(cx: &mut TestAppContext) {
+    // One history per entity. Sharing one would make Ctrl+Z in the URL bar reach into the body,
+    // which destroys work silently — the worst kind of bug for an undo stack to have.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    // Switch to a text body, then note what the editor holds before we overwrite it.
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("text");
+    cx.simulate_keystrokes("enter");
+    let body_before = body_text(&view, &mut cx);
+
+    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.simulate_input("body text");
+    assert_eq!(body_text(&view, &mut cx), "body text");
+
+    let url_before = spec_of(&view, &mut cx).url.clone();
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://example.test/x");
+
+    // Undo with focus in the URL bar rolls back the URL and leaves the body alone.
+    cx.simulate_keystrokes("ctrl-z");
+    assert_eq!(spec_of(&view, &mut cx).url, url_before, "the URL bar's own edit undoes");
+    assert_eq!(body_text(&view, &mut cx), "body text", "the body is untouched");
+
+    // And the reverse: undo in the body does not disturb the URL.
+    cx.simulate_keystrokes("ctrl-b ctrl-z");
+    assert_eq!(body_text(&view, &mut cx), body_before, "the body's own run undoes");
+    assert_eq!(spec_of(&view, &mut cx).url, url_before, "the URL bar stays where it was");
+}
+
+#[gpui::test]
+async fn ctrl_backspace_and_ctrl_delete_remove_a_word(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.example.com/posts");
+    cx.simulate_keystrokes("ctrl-backspace");
+    assert_eq!(
+        spec_of(&view, &mut cx).url, "https://api.example.com/",
+        "ctrl-backspace takes the word behind the caret, not the whole line"
+    );
+
+    // Forward deletion from the start eats `https`, leaving its punctuation.
+    cx.simulate_keystrokes("home ctrl-delete");
+    assert_eq!(spec_of(&view, &mut cx).url, "://api.example.com/");
+}
+
+#[gpui::test]
+async fn ctrl_home_and_end_span_the_document_in_the_editor(cx: &mut TestAppContext) {
+    // Home and End are deliberately per-line in the editor, so before this there was no way to
+    // reach the document's ends by keyboard at all.
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, "alpha\nbeta\ngamma");
+
+    // The caret is on the last line; plain Home only reaches that line's start.
+    cx.simulate_keystrokes("home");
+    cx.simulate_input(">");
+    assert_eq!(body_text(&view, &mut cx), "alpha\nbeta\n>gamma");
+
+    cx.simulate_keystrokes("ctrl-home");
+    cx.simulate_input("^");
+    assert_eq!(body_text(&view, &mut cx), "^alpha\nbeta\n>gamma", "ctrl-home reaches line one");
+
+    cx.simulate_keystrokes("ctrl-end");
+    cx.simulate_input("$");
+    assert_eq!(body_text(&view, &mut cx), "^alpha\nbeta\n>gamma$", "ctrl-end reaches the last line");
+}
+
+#[gpui::test]
+async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut TestAppContext) {
+    // Word movement was simply absent from the hand-rolled input — `Ctrl+Left`/`Right` did
+    // nothing anywhere in the app. `input::word_tests` pins what a word *is*; this pins that the
+    // keystroke reaches both text surfaces, which is the part a unit test cannot see: the
+    // bindings are scoped to `Some("TextInput")` and the body editor only receives them because
+    // its leaf context string carries that identifier too. A wrong context compiles fine and
+    // does nothing.
+    //
+    // Asserted by typing at the caret rather than by reading the selection, since the offset is
+    // private — where the character lands *is* the caret position.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    // ---- the URL bar -------------------------------------------------------
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.example.com/posts");
+
+    cx.simulate_keystrokes("ctrl-left");
+    cx.simulate_input("X");
+    assert_eq!(
+        spec_of(&view, &mut cx).url,
+        "https://api.example.com/Xposts",
+        "ctrl-left must land at the start of the last word, not at the start of the line"
+    );
+
+    // Two more hops: back over `X`, then over the `/` — punctuation is its own run, so the
+    // caret stops between `com` and `/` rather than skipping to the start of `com`.
+    cx.simulate_keystrokes("ctrl-left ctrl-left");
+    cx.simulate_input("Y");
+    assert_eq!(spec_of(&view, &mut cx).url, "https://api.example.comY/Xposts");
+
+    // Selection, and the pair that makes it useful: select a word and replace it.
+    cx.simulate_keystrokes("end");
+    cx.simulate_keystrokes("ctrl-shift-left");
+    cx.simulate_input("Z");
+    assert_eq!(
+        spec_of(&view, &mut cx).url,
+        "https://api.example.comY/Z",
+        "ctrl-shift-left selects the trailing word so typing replaces it"
+    );
+
+    // ---- the body editor, a different entity with its own handlers ---------
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("text");
+    cx.simulate_keystrokes("enter");
+
+    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.simulate_input("alpha beta gamma");
+
+    cx.simulate_keystrokes("ctrl-left");
+    cx.simulate_input("Q");
+    let Body::Raw { text, .. } = &spec_of(&view, &mut cx).body else {
+        panic!("expected a raw body")
+    };
+    assert_eq!(
+        text, "alpha beta Qgamma",
+        "the editor gets word movement through the same action, not a second implementation"
+    );
+
+    cx.simulate_keystrokes("ctrl-shift-right");
+    cx.simulate_input("!");
+    let Body::Raw { text, .. } = &spec_of(&view, &mut cx).body else {
+        panic!("expected a raw body")
+    };
+    assert_eq!(text, "alpha beta Q!", "ctrl-shift-right selects to the word end in the editor");
+}
+
 #[gpui::test]
 async fn focus_body_never_lands_on_an_unpainted_handle(cx: &mut TestAppContext) {
     // `Ctrl+B` used to focus `body_focus` — the *editor's* handle — for every body type, and the

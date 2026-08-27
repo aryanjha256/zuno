@@ -37,12 +37,16 @@ use gpui::{
 use crate::input::text_input;
 use crate::theme::ActiveTheme;
 
-actions!(editor, [Up, Down, SelectUp, SelectDown, Newline]);
+actions!(
+    editor,
+    [Up, Down, SelectUp, SelectDown, Newline, PageUp, PageDown, SelectPageUp, SelectPageDown]
+);
 
 pub struct Editor {
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
     content: String,
+    history: crate::input::History,
     /// Byte offset where each line starts. Always contains at least `0`.
     line_starts: Vec<usize>,
     placeholder: SharedString,
@@ -73,6 +77,7 @@ impl Editor {
             scroll: ScrollHandle::new(),
             content,
             line_starts,
+            history: crate::input::History::default(),
             placeholder: placeholder.into(),
             selection: 0..0,
             selection_reversed: false,
@@ -195,6 +200,164 @@ impl Editor {
         }
     }
 
+    /// Word movement shares `input::prev_word_boundary` with `TextInput` rather than
+    /// reimplementing it — two definitions of "a word" would drift, and the body editor and the
+    /// URL bar behaving differently on the same keystroke is exactly the kind of thing nobody
+    /// notices until it is annoying.
+    fn word_left(&mut self, _: &text_input::WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let from = if self.selection.is_empty() {
+            self.cursor()
+        } else {
+            self.selection.start
+        };
+        self.move_to(crate::input::prev_word_boundary(&self.content, from), cx);
+    }
+
+    fn word_right(&mut self, _: &text_input::WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let from = if self.selection.is_empty() {
+            self.cursor()
+        } else {
+            self.selection.end
+        };
+        self.move_to(crate::input::next_word_boundary(&self.content, from), cx);
+    }
+
+    fn select_word_left(
+        &mut self,
+        _: &text_input::SelectWordLeft,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let to = crate::input::prev_word_boundary(&self.content, self.cursor());
+        self.select_to(to, cx);
+    }
+
+    fn select_word_right(
+        &mut self,
+        _: &text_input::SelectWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let to = crate::input::next_word_boundary(&self.content, self.cursor());
+        self.select_to(to, cx);
+    }
+
+    /// A page is however many whole lines the viewport last showed, minus one so a landmark on
+    /// the edge stays visible across the jump. Falls back to a single line before the first
+    /// paint, when there is no measured height to divide.
+    fn page_lines(&self) -> isize {
+        let Some(bounds) = self.last_bounds else { return 1 };
+        let line_height = self.last_line_height.max(px(1.));
+        let lines = (bounds.size.height / line_height).floor() as isize;
+        (lines - 1).max(1)
+    }
+
+    fn page_up(&mut self, _: &PageUp, _: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.page_lines();
+        self.move_vertically(-lines, false, cx);
+    }
+
+    fn page_down(&mut self, _: &PageDown, _: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.page_lines();
+        self.move_vertically(lines, false, cx);
+    }
+
+    fn select_page_up(&mut self, _: &SelectPageUp, _: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.page_lines();
+        self.move_vertically(-lines, true, cx);
+    }
+
+    fn select_page_down(&mut self, _: &SelectPageDown, _: &mut Window, cx: &mut Context<Self>) {
+        let lines = self.page_lines();
+        self.move_vertically(lines, true, cx);
+    }
+
+    fn delete_word_left(
+        &mut self,
+        _: &text_input::DeleteWordLeft,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection.is_empty() {
+            let to = crate::input::prev_word_boundary(&self.content, self.cursor());
+            self.selection = to..self.selection.end;
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn delete_word_right(
+        &mut self,
+        _: &text_input::DeleteWordRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selection.is_empty() {
+            let to = crate::input::next_word_boundary(&self.content, self.cursor());
+            self.selection = self.selection.start..to;
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    /// Unlike `Home`/`End`, which are per-line here, these are the document ends — the
+    /// distinction that makes an editor an editor.
+    fn doc_start(&mut self, _: &text_input::DocStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn doc_end(&mut self, _: &text_input::DocEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.content.len(), cx);
+    }
+
+    fn select_doc_start(
+        &mut self,
+        _: &text_input::SelectDocStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, cx);
+    }
+
+    fn select_doc_end(
+        &mut self,
+        _: &text_input::SelectDocEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(self.content.len(), cx);
+    }
+
+    fn undo(&mut self, _: &text_input::Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.history.undo(self.snapshot()) {
+            self.restore(previous, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &text_input::Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.history.redo(self.snapshot()) {
+            self.restore(next, cx);
+        }
+    }
+
+    fn snapshot(&self) -> crate::input::EditSnapshot {
+        crate::input::EditSnapshot {
+            content: self.content.clone(),
+            selection: self.selection.clone(),
+            reversed: self.selection_reversed,
+        }
+    }
+
+    /// **The line index has to be rebuilt here.** It is derived from the content, so restoring
+    /// text without it leaves every offset lookup reading stale line starts — which is a panic
+    /// waiting in `line_of`, not a cosmetic problem.
+    fn restore(&mut self, snapshot: crate::input::EditSnapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.content;
+        self.line_starts = compute_line_starts(&self.content);
+        self.selection = snapshot.selection;
+        self.selection_reversed = snapshot.reversed;
+        self.marked_range = None;
+        cx.notify();
+    }
+
     fn select_left(&mut self, _: &text_input::SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.prev_boundary(self.cursor()), cx);
     }
@@ -301,8 +464,26 @@ impl Editor {
     // ---- mouse --------------------------------------------------------------
 
     fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.is_selecting = true;
         let offset = self.offset_for_position(event.position);
+
+        // Triple-click takes the line *without* its newline: including it would make
+        // triple-click-then-type join this line to the next.
+        if event.click_count >= 3 {
+            self.selection = crate::input::line_at(&self.content, offset);
+            self.selection_reversed = false;
+            self.history.break_run();
+            cx.notify();
+            return;
+        }
+        if event.click_count == 2 {
+            self.selection = crate::input::word_at(&self.content, offset);
+            self.selection_reversed = false;
+            self.history.break_run();
+            cx.notify();
+            return;
+        }
+
+        self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(offset, cx);
         } else {
@@ -348,6 +529,7 @@ impl Editor {
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selection = offset..offset;
         self.selection_reversed = false;
+        self.history.break_run();
         cx.notify();
     }
 
@@ -482,6 +664,16 @@ impl EntityInputHandler for Editor {
             .or(self.marked_range.clone())
             .unwrap_or(self.selection.clone());
 
+        // Deliberately *not* requiring an empty range: replacing a selection with a typed
+        // character opens a run too, so select-all-then-type undoes in one press instead of
+        // leaving the first character behind as its own entry.
+        let typed_one_char = new_text.chars().count() == 1 && !new_text.contains('\n');
+        self.history.record(
+            self.snapshot(),
+            typed_one_char.then_some(range.start),
+            new_text.len(),
+        );
+
         self.content
             .replace_range(range.clone(), new_text);
         // Line starts shift on every edit. A full rescan is a memchr sweep — ~10µs on a
@@ -508,6 +700,11 @@ impl EntityInputHandler for Editor {
             .map(|range| self.range_from_utf16(range))
             .or(self.marked_range.clone())
             .unwrap_or(self.selection.clone());
+
+        // Only as the composition opens — see the same note in `text_input`.
+        if self.marked_range.is_none() {
+            self.history.record(self.snapshot(), None, 0);
+        }
 
         self.content.replace_range(range.clone(), new_text);
         self.line_starts = compute_line_starts(&self.content);
@@ -591,6 +788,22 @@ impl Render for Editor {
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::select_left))
             .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::page_up))
+            .on_action(cx.listener(Self::page_down))
+            .on_action(cx.listener(Self::select_page_up))
+            .on_action(cx.listener(Self::select_page_down))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::doc_start))
+            .on_action(cx.listener(Self::doc_end))
+            .on_action(cx.listener(Self::select_doc_start))
+            .on_action(cx.listener(Self::select_doc_end))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::up))
             .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::select_up))

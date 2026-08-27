@@ -636,6 +636,54 @@ slice with, and panic. Invisible while `range.start == range.end`, which is ever
 insertion, and that is why it survived being copied in. `editor.rs` had it right all along; the two
 had silently disagreed since M1.4.
 
+**Word-level movement was simply missing, and it was missing everywhere.** `Ctrl+Left`/`Right`
+and their shifted pair did nothing in the URL bar, in every table cell, in the find bar, or in the
+body editor — the upstream example has no word movement and nothing added it. `input::{prev,next}_
+word_boundary` now backs all four actions, and lives in `input/mod.rs` **shared by both entities
+rather than implemented twice**: two definitions of "a word" would drift, and the URL bar would
+expose it immediately since a URL is mostly punctuation.
+
+Three characters classes — whitespace, word (alphanumeric plus `_`), and everything else — with the
+runs between them as the boundaries. That is what makes `https://api.example.com` step
+`https` → `://` → `api` rather than jumping the whole string, which a whitespace-only rule would.
+Movement is deliberately **asymmetric**, matching every code editor: `Ctrl+Right` stops at a word's
+*end*, `Ctrl+Left` at its *start*.
+
+One binding each, scoped to `Some("TextInput")`, serves both surfaces — the editor receives them
+because its own leaf context string is `"TextInput BodyEditor"`, not through nesting (§10's note).
+That is also the failure mode the keystroke test exists for: scoping them to the wrong identifier
+compiles and silently does nothing in the editor while still working in the URL bar.
+
+**And then the rest of that audit's list landed**, all of it shared between the two entities the
+same way: word deletion (`Ctrl+Backspace`/`Delete`), document ends (`Ctrl+Home`/`End` — distinct
+from `Home`/`End`, which stay per-line in the editor), double-click for a word and triple-click for
+a line, `PageUp`/`PageDown` in the editor only, and undo/redo.
+
+**Undo is the one with a real design decision in it.** `input::History` holds whole-`String`
+snapshots rather than diffs — the same bet §7 makes about not needing a rope, since these are URLs,
+header values and hand-authored bodies. The selection is *part of* the snapshot, because undo that
+restores text but leaves the caret where it happened to be makes the second undo land somewhere
+unpredictable.
+
+Coalescing is **structural, with no clock**: a run of typed characters collapses to one entry, and
+the run closes on a deletion, a paste, a newline, or the caret moving. Rejected: the idle timer
+most editors use, which feels marginally better and puts wall-clock time in the edit path — this
+repo already lost six hours of CI to one timing race, and a deterministic rule that is 95% as good
+is the better trade. One history per entity, so `Ctrl+Z` in the URL bar cannot reach into the body.
+
+Two subtleties worth keeping. A single-character insert opens a run **even when it replaced a
+selection**, so select-all-then-type undoes in one press instead of stranding the first character
+as its own entry — requiring an empty range there was the first version and it was wrong. And the
+IME path records only as a composition *opens*: it is called on every keystroke while a candidate
+is being edited, so recording each call would bury the history under states nobody typed.
+
+> **`break_run` on a caret move looked redundant and isn't.** The contiguity check already splits
+> a run when the caret moves *somewhere else*, so the first test written for this passed with the
+> call deleted. It earns its keep only when the caret moves away and comes **back** to the same
+> offset — left then right, or a click landing where it already was — which is what
+> `moving_the_caret_starts_a_new_undo_entry` exercises. Another instance of a unit test covering
+> the type while leaving the call site unheld.
+
 **Explicitly deferred to M3+:** syntax highlighting (needs tree-sitter plus a highlight
 cache), autocomplete, multi-cursor, code folding in the *editor*, bracket matching. The
 an "excellent request/code editor" is a milestone of its own — treating it as a
