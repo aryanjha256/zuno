@@ -15,10 +15,11 @@ use gpui::{
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    CopyAsCurl, ImportCurl, OpenBodyType, OpenSettings, SaveRequest, SendRequest,
+    CopyAsCurl, ImportCurl, OpenBodyType, OpenSettings, SaveRequest, SendRequest, ShowBodyTab,
+    ShowHeadersTab, ShowParamsTab,
 };
 use crate::ui::{Icon, icon_button};
-use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestView, RowKind};
+use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind};
 use crate::theme::Theme;
 
 pub fn render(
@@ -30,7 +31,7 @@ pub fn render(
     // Read focus state before any `&mut cx` use below — the immutable borrow from
     // `read` has to end first.
     let url_focused = view.url_focus(cx).is_focused(window);
-    let body_focused = view.body_focus(cx).is_focused(window);
+    let body_focused = view.body_region_focused(window, cx);
     let body_lines = view.body_editor.read(cx).line_count();
 
     let header_detail = count_label(
@@ -42,7 +43,7 @@ pub fn render(
         view.query.len(),
     );
 
-    div()
+    let pane = div()
         .flex_1()
         .flex()
         .flex_col()
@@ -50,24 +51,118 @@ pub fn render(
         .overflow_hidden()
         .bg(theme.bg)
         .child(toolbar(view, theme, url_focused, cx))
-        .child(section_header(
-            "Headers",
-            header_detail,
-            RowKind::Header,
+        .child(section_tabs(view, theme, cx));
+
+    match view.request_tab {
+        RequestTab::Headers => pane
+            .child(section_header("Headers", header_detail, RowKind::Header, theme, cx))
+            .child(rows_table(&view.headers, RowKind::Header, theme, window, cx)),
+        RequestTab::Query => pane
+            .child(section_header("Params", query_detail, RowKind::Query, theme, cx))
+            .child(rows_table(&view.query, RowKind::Query, theme, window, cx)),
+        RequestTab::Body => pane
+            .child(body_header(view, body_lines, theme))
+            .child(body_region(view, theme, body_focused, window, cx)),
+    }
+}
+
+/// The tab bar over the request's three sections, with the request-level verbs at its far end.
+///
+/// **Three tabs, so each needs its own action** — the response pane's two-tab trick of one
+/// cycling action plus an inert active tab cannot work here, since clicking Body while on
+/// Headers is two steps rather than one. See `response_pane::view_tabs`.
+///
+/// Counts ride on the labels for the reason the response pane's `Headers 24` does: what a
+/// hidden section costs you is knowing there's anything in it. Zero is omitted rather than
+/// shown, since `Headers 0` is noise where `Headers 3` is information.
+fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<RequestView>) -> Div {
+    let active = view.request_tab;
+    let body_label = match view.body_type {
+        BodyType::Empty => "Body".to_string(),
+        _ => format!("Body {}", view.body_label()),
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_2()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(section_tab(
+            "request-tab-headers",
+            count_suffix("Headers", view.headers.len()),
+            active == RequestTab::Headers,
+            ShowHeadersTab,
             theme,
             cx,
         ))
-        .child(rows_table(&view.headers, RowKind::Header, theme, window, cx))
-        .child(section_header(
-            "Query",
-            query_detail,
-            RowKind::Query,
+        .child(section_tab(
+            "request-tab-params",
+            count_suffix("Params", view.query.len()),
+            active == RequestTab::Query,
+            ShowParamsTab,
             theme,
             cx,
         ))
-        .child(rows_table(&view.query, RowKind::Query, theme, window, cx))
-        .child(body_header(view, body_lines, theme))
-        .child(body_region(view, theme, body_focused, window, cx))
+        .child(section_tab(
+            "request-tab-body",
+            body_label,
+            active == RequestTab::Body,
+            ShowBodyTab,
+            theme,
+            cx,
+        ))
+        .child(div().flex_1())
+        .child(request_actions(theme))
+}
+
+fn count_suffix(label: &str, count: usize) -> String {
+    if count == 0 {
+        label.to_string()
+    } else {
+        format!("{label} {count}")
+    }
+}
+
+fn section_tab<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    label: String,
+    active: bool,
+    action: A,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> impl IntoElement + use<A> {
+    let tab = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex_none()
+        .px_2()
+        .py_1()
+        // The inactive tab keeps the border width in the panel's own colour, or switching
+        // would shift every label by 2px.
+        .border_b_2()
+        .border_color(if active { theme.accent } else { theme.bg_panel })
+        .text_xs()
+        .text_color(if active { theme.text } else { theme.text_muted })
+        .child(label);
+
+    if active {
+        // No pointer cursor either — it would advertise a click that changes nothing.
+        return tab;
+    }
+
+    tab.cursor_pointer()
+        .hover(|style| style.text_color(theme.text))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |_, _: &MouseDownEvent, window, cx| {
+                window.dispatch_action(Box::new(action.clone()), cx);
+            }),
+        )
 }
 
 /// The Body header, with a chip that opens the body-type picker — the same action
@@ -122,6 +217,23 @@ fn body_header(view: &RequestView, lines: usize, theme: &Theme) -> Div {
         )
 }
 
+/// The address bar: method, URL and Send as one segmented control, edge to edge.
+///
+/// **One control, no frames.** These were three separately bordered, rounded boxes on a padded
+/// row, which read as three unrelated widgets and made Send look like one button among several.
+/// Now they share a single fill and are divided by a 1px rule, so the row reads as one thing you
+/// act on. Nothing here is rounded, and the row has no padding of its own — the segment *is* the
+/// row.
+///
+/// **The 2px bottom border is always 2px**, and only its colour changes on focus. Growing it from
+/// 1px to 2px would shift every row below by a pixel each time focus arrived; `border` is nearly
+/// invisible against the panel anyway, so the resting weight costs nothing.
+///
+/// The fill is `bg_elevated` rather than `bg_hover` so that `bg_hover` stays available as the
+/// method segment's hover — with the field itself painted `bg_hover` there would be nowhere for a
+/// hover to go and the method would look dead. Worth knowing: in the light theme `bg_elevated`
+/// sits at 1.04:1 against `bg_panel`, so there the bottom border does most of the work of saying
+/// the field is a field. A dedicated `bg_field` token is the fix whenever that starts to grate.
 fn toolbar(
     view: &RequestView,
     theme: &Theme,
@@ -132,23 +244,28 @@ fn toolbar(
         .flex()
         .flex_row()
         .items_center()
-        .gap_2()
-        .px_3()
-        .py_2()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border)
+        .flex_none()
+        .h(px(crate::ui::BAR_HEIGHT))
+        .bg(theme.bg_elevated)
+        .border_b_2()
+        .border_color(if url_focused { theme.accent } else { theme.border })
         .child(method_chip(view, theme))
-        .child(url_bar(view, theme, url_focused))
+        .child(segment_divider(theme))
+        .child(url_bar(view, theme))
         .child(send_button(theme, view.is_sending(), cx))
-        .child(request_actions(theme))
 }
 
-/// The verbs that act on the request, as icon buttons beside Send.
+/// The rule between two segments. A filled 1px child rather than a border on either neighbour,
+/// because a div carries one `border_color` for all four sides and the row's already spoken for.
+fn segment_divider(theme: &Theme) -> impl IntoElement + use<> {
+    div().flex_none().w(px(1.)).h_full().bg(theme.border)
+}
+
+/// The verbs that act on the request, at the far end of the section tabs.
 ///
-/// Save and Settings act on this request; Import and Copy-as-curl move it in and out of the app.
-/// All four were keyboard-only, which for Copy-as-curl meant a feature shipped the same week with
-/// no way to find it.
+/// They sat beside Send until the tabs landed, where four grey icons touching the one accent
+/// button made Send read as button 1 of 5. They belong with the request's sections, not with
+/// the thing that sends it.
 fn request_actions(theme: &Theme) -> Div {
     div()
         .flex()
@@ -195,13 +312,11 @@ fn request_actions(theme: &Theme) -> Div {
 fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
     div()
         .id("method-chip")
+        .flex()
+        .items_center()
         .flex_none()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(theme.bg_elevated)
-        .border_1()
-        .border_color(theme.border)
+        .h_full()
+        .px(px(10.))
         .text_xs()
         .font_weight(FontWeight::BOLD)
         .text_color(theme.method_color(&view.method))
@@ -219,7 +334,7 @@ fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
         .child(view.method.as_str().to_string())
 }
 
-fn url_bar(view: &RequestView, theme: &Theme, focused: bool) -> Div {
+fn url_bar(view: &RequestView, theme: &Theme) -> Div {
     div()
         .flex_1()
         .min_w(px(0.))
@@ -227,11 +342,6 @@ fn url_bar(view: &RequestView, theme: &Theme, focused: bool) -> Div {
         // Without this the shaped URL paints straight over the Send button.
         .overflow_hidden()
         .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(theme.bg)
-        .border_1()
-        .border_color(theme.focus_border(focused))
         .font_family(theme.mono.clone())
         .text_sm()
         .text_color(theme.text)
@@ -246,10 +356,11 @@ fn url_bar(view: &RequestView, theme: &Theme, focused: bool) -> Div {
 fn send_button(theme: &Theme, sending: bool, cx: &mut gpui::Context<RequestView>) -> impl IntoElement {
     let base = div()
         .id("send-button")
+        .flex()
+        .items_center()
         .flex_none()
-        .px_3()
-        .py_1()
-        .rounded_md()
+        .h_full()
+        .px_4()
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme.text_on_accent)
@@ -529,7 +640,6 @@ fn body_region(
         .min_h(px(0.))
         .m_2()
         .p_2()
-        .rounded_md()
         .bg(theme.bg)
         .border_1()
         .border_color(theme.focus_border(focused))

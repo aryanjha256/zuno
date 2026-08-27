@@ -36,7 +36,8 @@ use gpui::{
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile, CloseTab,
     CopyResponse, FocusBody, FocusNext,
-    FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab, OpenBodyType,
+    FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
+    OpenBodyType, PrevRequestTab,
     OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
@@ -177,6 +178,11 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-m", AddMultipartField, None),
         // Paste-special: import a curl command from the clipboard.
         KeyBinding::new("ctrl-shift-v", ImportCurl, None),
+        // Headers ⇄ Params ⇄ Body, cycling forward and back like `ctrl-tab` does for buffers.
+        // Not `alt-tab`, which the compositor's window switcher takes before we ever see it;
+        // `alt-q` sits beside `alt-r` for the response pane's equivalent.
+        KeyBinding::new("alt-q", NextRequestTab, None),
+        KeyBinding::new("alt-shift-q", PrevRequestTab, None),
         // --- Response viewer ---
         // Body ⇄ headers. `alt-` rather than `ctrl-`, to sit with the other two viewer
         // bindings; `alt-r` is free where `ctrl-shift-r` already focuses this pane.

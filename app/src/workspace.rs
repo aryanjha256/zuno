@@ -20,17 +20,17 @@ use zuno_core::{
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    ClearCookies, CloseTab, CopyResponse, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextTab,
-    OpenBodyType, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
+    ClearCookies, CloseTab, CopyResponse, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
+    OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     CloseFind, CopyAsCurl, FindInResponse, FindNext, FindPrev,
-    ShowHistory, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
+    ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
 use crate::picker;
 use crate::settings_panel::{SettingsEvent, SettingsPanel};
-use crate::request_view::{BodyType, RequestView, RowKind};
+use crate::request_view::{BodyType, RequestTab, RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
 pub struct Workspace {
@@ -893,8 +893,22 @@ impl Workspace {
         self.focus_region(window, cx, |view, cx| view.url_focus(cx));
     }
 
+    /// Reveals the Body tab, then focuses whatever that body type actually paints.
+    ///
+    /// **Not `body_focus`**, which is the editor's handle and is only on screen for a raw body.
+    /// Targeting it on a form focused an element that did not exist, and because dispatch walks up
+    /// the focus tree that severed the path to `Workspace` — every binding died, `Ctrl+L`
+    /// included, with nothing on screen saying why. See `RequestView::body_focus_target`.
+    ///
+    /// A body with nothing focusable says so rather than moving focus somewhere useless; a silent
+    /// no-op here reads as the keystroke being broken.
     fn focus_body(&mut self, _: &FocusBody, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_region(window, cx, |view, cx| view.body_focus(cx));
+        self.show_request_tab(RequestTab::Body, cx);
+        let Some(view) = self.active() else { return };
+        match view.read(cx).body_focus_target(cx) {
+            Some(handle) => window.focus(&handle),
+            None => self.set_status("This body has nothing to type into", cx),
+        }
     }
 
     fn focus_response(&mut self, _: &FocusResponse, window: &mut Window, cx: &mut Context<Self>) {
@@ -962,13 +976,49 @@ impl Workspace {
 
     fn add_header(&mut self, _: &AddHeader, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
-            view.update(cx, |view, cx| view.add_row(RowKind::Header, window, cx));
+            view.update(cx, |view, cx| {
+                view.show_request_tab(RequestTab::Headers, cx);
+                view.add_row(RowKind::Header, window, cx);
+            });
         }
     }
 
     fn add_query(&mut self, _: &AddQuery, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
-            view.update(cx, |view, cx| view.add_row(RowKind::Query, window, cx));
+            view.update(cx, |view, cx| {
+                view.show_request_tab(RequestTab::Query, cx);
+                view.add_row(RowKind::Query, window, cx);
+            });
+        }
+    }
+
+    fn next_request_tab(&mut self, _: &NextRequestTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_request_tab(1, cx));
+        }
+    }
+
+    fn prev_request_tab(&mut self, _: &PrevRequestTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_request_tab(-1, cx));
+        }
+    }
+
+    fn show_headers_tab(&mut self, _: &ShowHeadersTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_request_tab(RequestTab::Headers, cx);
+    }
+
+    fn show_params_tab(&mut self, _: &ShowParamsTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_request_tab(RequestTab::Query, cx);
+    }
+
+    fn show_body_tab(&mut self, _: &ShowBodyTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_request_tab(RequestTab::Body, cx);
+    }
+
+    fn show_request_tab(&mut self, tab: RequestTab, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.show_request_tab(tab, cx));
         }
     }
 
@@ -1000,6 +1050,7 @@ impl Workspace {
             return;
         }
         let Some(view) = self.active() else { return };
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
         let current = view.read(cx).body_label();
 
         let choices: [(&str, BodyType, Option<RawKind>, &str); 8] = [
@@ -1040,6 +1091,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(view) = self.active() else { return };
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
 
         // One verb, two meanings, decided by where focus is: with a multipart part focused it
         // fills that part, otherwise it sets the whole binary body. Two separate actions for
@@ -1088,6 +1140,7 @@ impl Workspace {
 
         // Adding a field to a body that isn't a form would put a row somewhere invisible, so
         // switch first and say so — it's what the keystroke plainly means.
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
         if view.read(cx).body_type != BodyType::Form {
             view.update(cx, |view, cx| view.set_body_type(BodyType::Form, cx));
             self.set_status("Switched the body to a form", cx);
@@ -1103,6 +1156,7 @@ impl Workspace {
     ) {
         let Some(view) = self.active() else { return };
 
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
         if view.read(cx).body_type != BodyType::Multipart {
             view.update(cx, |view, cx| view.set_body_type(BodyType::Multipart, cx));
             self.set_status("Switched the body to multipart", cx);
@@ -1548,6 +1602,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
+            .on_action(cx.listener(Self::next_request_tab))
+            .on_action(cx.listener(Self::prev_request_tab))
+            .on_action(cx.listener(Self::show_headers_tab))
+            .on_action(cx.listener(Self::show_params_tab))
+            .on_action(cx.listener(Self::show_body_tab))
             .size_full()
             .flex()
             .flex_col()

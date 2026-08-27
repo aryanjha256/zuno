@@ -61,6 +61,11 @@ pub fn palette() -> Vec<Command> {
         command("Change method", OpenMethod),
         command("Change body type", OpenBodyType),
         command("Add form field", AddFormField),
+        command("Show request headers", ShowHeadersTab),
+        command("Show request params", ShowParamsTab),
+        command("Show request body", ShowBodyTab),
+        command("Next request tab", NextRequestTab),
+        command("Previous request tab", PrevRequestTab),
         command("Add multipart part", AddMultipartField),
         command("Attach a file to the body", ChooseBodyFile),
         // Moving around.

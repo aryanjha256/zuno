@@ -86,7 +86,7 @@ zuno/
         ├── ui.rs           ✅ icon set + asset source, icon/text buttons, tooltips
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
         ├── request_view.rs ✅ one buffer: inputs + response + derived spec()
-        ├── request_pane.rs ✅ method, URL bar, headers/query tables, body
+        ├── request_pane.rs ✅ method, URL bar, send, Headers/Params/Body tabs
         ├── response_pane.rs✅ status line, timing, body/headers tabs, body viewer
         ├── tests.rs        ✅ headless end-to-end tests (GPUI test platform)
         └── input/
@@ -499,6 +499,47 @@ request to get. Four decisions:
 The Headers tab scrolls rather than virtualizing. Header counts are tens, and `uniform_list`
 would impose the fixed row height that the rest of this section is built on, which is the wrong
 constraint for values that ought eventually to wrap.
+
+**The request pane is tabbed too now, and the third tab is why it isn't the same code.** Headers,
+query and body used to stack, so the two sections you weren't editing still cost a header row and
+an empty-state row apiece — about 130px to say "nothing here" — while the body editor got whatever
+was left. `Headers │ Params │ Body` (`Alt+Q` forward, `Alt+Shift+Q` back), each with the slim
+control row that used to be its section header, and the four request verbs at the far end of the
+strip where the response pane keeps its own.
+
+Four decisions, and the first is the one that matters:
+
+- **Three tabs need three actions.** The bullet above about only the inactive tab being clickable
+  *predicted* this: cycling works for two because the single inactive tab is always one step away,
+  and with three, clicking Body while on Headers is two steps — so a cycling handler sends the
+  click to Params. `clicking_a_request_tab_lands_on_that_tab` fails with exactly that, `Query`
+  where `Body` was asked for. Hence `ShowHeadersTab`/`ShowParamsTab`/`ShowBodyTab` alongside the
+  cycle pair. The active tab stays inert, which still earns its keep: a click that dispatches its
+  own tab is harmless but advertises a change that never comes.
+- **Cycle order is visual order, not most-recently-used.** `Alt+Tab`'s actual behaviour was the
+  brief, but MRU on a fixed three-item strip means one keystroke lands somewhere different each
+  time and destroys the muscle memory the strip gives for free. (`alt-tab` is also unbindable —
+  the compositor's window switcher takes it before Zuno sees the key.)
+- **Every verb that acts on a hidden section reveals it first.** `Ctrl+Shift+H` on the Body tab
+  would otherwise add a header you cannot see, which reads as a dead keystroke; the same applies
+  to query rows, all three body verbs, and `FocusBody`, where focusing an unpainted editor is the
+  "keymap goes dead with nothing on screen" failure. This isn't a new rule — it's what
+  `Ctrl+Shift+F` already did by switching the body to a form. It's also *already tested*: deleting
+  the reveal from `add_header` alone fails nine pre-existing tests, because they all reach header
+  cells by pressing that key.
+- **Sticky per buffer with Body default**, matching the response pane rather than the history
+  browser's snap-back-to-live rule, and for the same reason: watching one section across sends is
+  the reason to be on it.
+
+`RequestTab::Query` is labelled **Params**. The label is the only place the word changes —
+`RowKind::Query` and `RequestSpec::query` keep theirs, because that serde field name is in every
+saved collection file and renaming it would fail them with `missing field query`, which is the
+`cookie_store` lesson exactly.
+
+**Tab traversal deliberately shrank.** A hidden tab isn't painted, so its `TextInput`s are no
+longer tab stops: `Tab` walks the active section instead of every row in the pane. That is the
+intended consequence, not a side effect — but it is the sort of change that silently alters focus
+order, which is why it's recorded here.
 
 ### Search — over the bytes, not over what's drawn
 

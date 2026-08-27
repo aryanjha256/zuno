@@ -44,6 +44,13 @@ actions!(
         ChooseBodyFile,
         AddMultipartField,
         ImportCurl,
+        // Request sections. Three tabs, so unlike the response pane's two these cannot be
+        // served by one cycling action: clicking Body from Headers is two steps, not one.
+        NextRequestTab,
+        PrevRequestTab,
+        ShowHeadersTab,
+        ShowParamsTab,
+        ShowBodyTab,
         // Response viewer
         ToggleResponseView,
         FindInResponse,

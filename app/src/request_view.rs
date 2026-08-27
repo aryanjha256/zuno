@@ -125,6 +125,36 @@ impl KeyValueRow {
     }
 }
 
+/// Which section of the request the pane shows.
+///
+/// Headers, query and body used to stack, so the two you weren't editing still cost a header
+/// row and an empty-state row each — about 130px to say "nothing here". Tabbed, they cost one
+/// strip, and the body editor gets the pane's full height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestTab {
+    Headers,
+    /// Labelled "Params" but named Query throughout the code, matching `RowKind::Query` and
+    /// `RequestSpec::query` — that serde field is in every saved collection file, so renaming
+    /// it would break them with `missing field query`.
+    Query,
+    /// Default: authoring a body is where the time goes.
+    #[default]
+    Body,
+}
+
+impl RequestTab {
+    /// Visual order, which is also cycle order — deliberately not most-recently-used. With
+    /// three tabs in a fixed strip, MRU sends the same keystroke somewhere different each time
+    /// and throws away the muscle memory the strip gives for free.
+    pub const ALL: [RequestTab; 3] = [RequestTab::Headers, RequestTab::Query, RequestTab::Body];
+
+    fn step(self, delta: isize) -> Self {
+        let at = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(at + delta).rem_euclid(len) as usize]
+    }
+}
+
 /// Which half of a response the pane shows.
 ///
 /// Split into tabs because the headers table is unbounded and the pane clips: a response
@@ -233,6 +263,8 @@ pub struct RequestView {
     /// watch a `set-cookie` across sends is the reason to be there, and snapping back to
     /// Body on arrival would undo the thing you were doing.
     pub response_view: ResponseView,
+    /// Sticky per buffer, like `response_view`: two requests are open for different reasons.
+    pub request_tab: RequestTab,
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
@@ -277,6 +309,7 @@ impl RequestView {
             history: Vec::new(),
             viewing: 0,
             response_view: ResponseView::default(),
+            request_tab: RequestTab::default(),
             body_view: None,
             body_task: None,
             search: None,
@@ -430,6 +463,21 @@ impl RequestView {
     ///
     /// Per-buffer, so switching tabs doesn't carry the choice with it — the pane belongs to
     /// the buffer, and two requests being read for different reasons is the normal case.
+    pub fn cycle_request_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.request_tab = self.request_tab.step(delta);
+        cx.notify();
+    }
+
+    /// Reveal a section. Called by the verbs that act on one — adding a header while the
+    /// Headers tab is hidden would otherwise put a row somewhere you can't see, which reads
+    /// as the keystroke having done nothing.
+    pub fn show_request_tab(&mut self, tab: RequestTab, cx: &mut Context<Self>) {
+        if self.request_tab != tab {
+            self.request_tab = tab;
+            cx.notify();
+        }
+    }
+
     pub fn toggle_response_view(&mut self, cx: &mut Context<Self>) {
         self.response_view = match self.response_view {
             ResponseView::Body => ResponseView::Headers,
@@ -610,6 +658,58 @@ impl RequestView {
 
     pub fn body_focus(&self, cx: &App) -> FocusHandle {
         self.body_editor.read(cx).focus_handle(cx)
+    }
+
+    /// The handle `FocusBody` should move focus to, or `None` when this body has nothing to
+    /// type into.
+    ///
+    /// **It has to be a handle that is actually painted, and that is the whole point of this
+    /// existing.** `body_focus` hands back the editor's, and the editor is only rendered for a
+    /// raw body — a `FocusHandle` belongs to the entity that made it whether or not it is on
+    /// screen, so `Ctrl+B` on a form body focused a handle with no element. Action dispatch
+    /// travels *up the focus tree*, so with no element there is no path to `Workspace` and every
+    /// binding stops resolving: `Ctrl+L` did nothing, and typing went nowhere. The keyboard was
+    /// dead until you clicked something, with nothing on screen to explain it.
+    ///
+    /// Exhaustive with no catch-all: a new `Body` variant has to say where focus goes rather than
+    /// inheriting a handle that might not be rendered.
+    pub fn body_focus_target(&self, cx: &App) -> Option<FocusHandle> {
+        match self.body_type {
+            BodyType::Raw => Some(self.body_focus(cx)),
+            BodyType::Form => self
+                .form
+                .first()
+                .map(|row| row.name.read(cx).focus_handle(cx)),
+            BodyType::Multipart => self
+                .multipart
+                .first()
+                .map(|part| part.row.name.read(cx).focus_handle(cx)),
+            // A path you click and a sentence: there is no input to land on.
+            BodyType::Binary | BodyType::Empty => None,
+        }
+    }
+
+    /// Whether anything inside the body region holds focus.
+    ///
+    /// **Not the same question as `body_focus`**, which hands back the *editor's* handle. The
+    /// editor is only painted for `BodyType::Raw`, and a handle belongs to the entity that made
+    /// it whether or not it is on screen — so a focus ring keyed on `body_focus` stayed grey
+    /// while you were plainly editing a form field. Form and multipart rows own their own inputs,
+    /// so there is no single handle to ask and this has to poll them.
+    ///
+    /// Matched exhaustively with no catch-all, like `load`: a new `Body` variant should not
+    /// silently inherit "never focused".
+    pub fn body_region_focused(&self, window: &Window, cx: &App) -> bool {
+        match self.body_type {
+            BodyType::Raw => self.body_focus(cx).is_focused(window),
+            BodyType::Form => self.form.iter().any(|row| row.is_focused(window, cx)),
+            BodyType::Multipart => {
+                self.multipart.iter().any(|part| part.row.is_focused(window, cx))
+            }
+            // Neither has anything focusable: a binary body is a path you click, and an empty
+            // one is a sentence.
+            BodyType::Binary | BodyType::Empty => false,
+        }
     }
 
     // ---- the send loop ------------------------------------------------------

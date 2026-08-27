@@ -17,6 +17,12 @@ use gpui::{
 
 use crate::theme::{ActiveTheme, Theme};
 
+/// The height of the two bars that head the panes: the request's address bar and the response's
+/// status line. Shared rather than written twice, because their whole job is to line up — and
+/// `taffy` sizes with `BoxSizing::BorderBox`, so this includes each one's bottom border even
+/// though the address bar's is 2px and the status line's is 1px.
+pub const BAR_HEIGHT: f32 = 30.;
+
 /// Icons, embedded at compile time.
 ///
 /// **Embedded rather than installed.** gpui resolves an asset path through this source, so shipping
@@ -234,6 +240,15 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
             },
         )
         .child(glyph(icon, theme.text_muted, theme.text))
+}
+
+/// A vertical rule drawn as a glyph, for separating items inside a single row.
+///
+/// `theme.border` and not a text colour: this is a rule that happens to be a character, so being
+/// barely-there is the point. It is the one place `border` is legitimately used to paint text —
+/// `theme::tests::border_is_too_dim_to_read_as_text` names this function as that exception.
+pub fn separator(theme: &Theme) -> impl IntoElement + use<> {
+    div().flex_none().text_xs().text_color(theme.border).child("│")
 }
 
 /// A text label that dispatches an action — for places where a word carries information an icon

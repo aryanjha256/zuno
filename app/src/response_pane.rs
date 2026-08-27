@@ -497,32 +497,37 @@ fn status_line(response: &ResponseData, theme: &Theme) -> Div {
         .flex()
         .flex_row()
         .items_center()
-        .gap_3()
+        .gap_2()
+        .flex_none()
+        // Matches the address bar exactly, so the two panes' first rows line up and every row
+        // below them does too. A fixed height rather than `py_2`, which is what made it ~34px
+        // against the bar's 30 — see `ui::BAR_HEIGHT`.
+        .h(px(crate::ui::BAR_HEIGHT))
         .px_3()
-        .py_2()
         .bg(theme.bg_panel)
         .border_b_1()
         .border_color(theme.border)
+        // The status was a filled, bordered pill. It is now plain bold text in the status
+        // colour, divided from the rest by the same rule the titlebar uses — one separated
+        // list rather than a badge followed by a cloud of grey values.
         .child(
             div()
                 .flex_none()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(theme.bg_elevated)
-                .border_1()
-                .border_color(status_color)
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
                 .text_color(status_color)
                 .child(format!("{} {}", response.status, response.status_text)),
         )
+        .child(crate::ui::separator(theme))
         .child(meta(response.version.as_str().to_string(), theme))
+        .child(crate::ui::separator(theme))
         .child(meta(format_duration(response.timing.total), theme))
+        .child(crate::ui::separator(theme))
         .child(meta(
             format!("TTFB {}", format_duration(response.timing.ttfb)),
             theme,
         ))
+        .child(crate::ui::separator(theme))
         .child(meta(size_label(response), theme))
 }
 

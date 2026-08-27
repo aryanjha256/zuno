@@ -379,10 +379,12 @@ mod tests {
         // rather than as a quiet palette tweak.
         //
         // Named for the property, not for a prohibition, because there is one honest exception:
-        // `chrome.rs` paints the titlebar's `│` divider with it. That is a *rule* drawn as a
-        // character, where being barely-there is the entire point, and it wants `border` for the
-        // same reason a real 1px element would. The eventual fix there is an element rather than
-        // a glyph — not a brighter colour, which is why this assertion stays as it is.
+        // `ui::separator` paints a `│` divider with it. That is a *rule* drawn as a character,
+        // where being barely-there is the entire point, and it wants `border` for the same reason
+        // a real 1px element would. It is a single function precisely so the exception stays one
+        // place as its call sites multiply — the titlebar and every gap in the response status
+        // line. The eventual fix is an element rather than a glyph, not a brighter colour, which
+        // is why this assertion stays as it is.
         for theme in [Theme::dark("mono".into()), Theme::light("mono".into())] {
             for (surface_name, surface) in surfaces(&theme) {
                 let ratio = contrast(theme.border, surface);

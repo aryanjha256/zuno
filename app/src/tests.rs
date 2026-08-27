@@ -18,7 +18,7 @@ use gpui::{TestAppContext, VisualTestContext};
 use zuno_core::{Body, EngineError, Method, MultipartValue, RawKind, RequestSpec, ResponseData};
 
 use crate::body_view::BodyView;
-use crate::request_view::{RequestView, ResponseView};
+use crate::request_view::{RequestTab, RequestView, ResponseView};
 use crate::theme::{Appearance, Theme};
 use crate::workspace::Workspace;
 
@@ -317,6 +317,94 @@ async fn a_known_verb_typed_in_full_is_not_offered_twice(cx: &mut TestAppContext
     let rows = picker_rows(&window, &mut cx);
     assert_eq!(rows.len(), 1, "exactly the real GET row: {rows:?}");
     assert!(rows[0].starts_with("GET"), "{rows:?}");
+}
+
+#[gpui::test]
+async fn focus_body_never_lands_on_an_unpainted_handle(cx: &mut TestAppContext) {
+    // `Ctrl+B` used to focus `body_focus` — the *editor's* handle — for every body type, and the
+    // editor is only painted for a raw body. A handle belongs to the entity that made it whether
+    // or not it is on screen, so on a form this focused an element that did not exist. Action
+    // dispatch walks up the focus tree, so that severed the path to `Workspace` and **every**
+    // binding stopped resolving.
+    //
+    // Asserted through `Ctrl+L` rather than by inspecting focus, because "the keymap still works"
+    // is the thing that broke. Checking which handle is focused would pass against the bug: the
+    // old code *did* focus the editor, that was precisely the problem.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    let url_reachable = |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| {
+        cx.simulate_keystrokes("ctrl-l");
+        cx.update(|window, cx| view.read(cx).url_focus(cx).is_focused(window))
+    };
+
+    // Raw: the editor is painted, so this always worked.
+    cx.simulate_keystrokes("ctrl-b");
+    assert!(url_reachable(&view, &mut cx), "raw body: ctrl-l must still reach the URL bar");
+
+    // Form: the case that killed the keyboard.
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.simulate_keystrokes("ctrl-b");
+    assert!(
+        url_reachable(&view, &mut cx),
+        "form body: ctrl-b must not strand focus on the unpainted editor"
+    );
+
+    // Multipart, which has the same shape.
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.simulate_keystrokes("ctrl-b");
+    assert!(url_reachable(&view, &mut cx), "multipart body: same");
+
+    // And typing after ctrl-b has to land in the body, not vanish.
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_input("part-name");
+    let spec = spec_of(&view, &mut cx);
+    let Body::Multipart(parts) = &spec.body else {
+        panic!("expected a multipart body, got {:?}", spec.body)
+    };
+    assert!(
+        parts.iter().any(|p| p.name == "part-name"),
+        "typing after ctrl-b must reach the focused part: {parts:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_body_region_reports_focus_for_every_body_type(cx: &mut TestAppContext) {
+    // The focus ring around the body used to ask `body_focus`, which is the *editor's* handle —
+    // and the editor is only painted for a raw body. So on a form it stayed grey while you were
+    // plainly typing into a field, because focus was on that row's own `TextInput` instead.
+    //
+    // **What this proves, precisely.** It pins the predicate: reverting the Form arm to ask the
+    // editor's handle fails the assertion below. It does *not* prove `request_pane::render` keys
+    // the border off it — reverting that call site leaves this test green, because the test calls
+    // the method directly and nothing in the headless platform can observe a paint. Same
+    // admission as `clicking_the_headers_tab_switches_the_response_view`: the wiring is held by
+    // review, and saying so is the point, since a test that looks like it covers the border
+    // would stop anyone checking.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    let focused = |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| {
+        cx.update(|window, cx| view.read(cx).body_region_focused(window, cx))
+    };
+
+    // Raw: focus the editor and the region reports it.
+    cx.simulate_keystrokes("ctrl-b");
+    assert!(focused(&view, &mut cx), "a raw body is focused through the editor");
+
+    // Form: Ctrl+Shift+F switches the body to a form and focuses the new field's name cell.
+    // That cell belongs to the row, not to the editor.
+    cx.simulate_keystrokes("ctrl-shift-f");
+    assert!(
+        matches!(spec_of(&view, &mut cx).body, Body::Form(_)),
+        "ctrl-shift-f switches the body to a form"
+    );
+    assert!(
+        focused(&view, &mut cx),
+        "a form field holds focus, so the body region has it — this is the case that was broken"
+    );
+
+    // Moving focus out of the body clears it, or the ring would never turn off.
+    cx.simulate_keystrokes("ctrl-l");
+    assert!(!focused(&view, &mut cx), "focus in the URL bar is not focus in the body");
 }
 
 #[gpui::test]
@@ -3000,6 +3088,91 @@ fn response_view(
     cx: &mut VisualTestContext,
 ) -> crate::request_view::ResponseView {
     cx.update(|_, cx| view.read(cx).response_view)
+}
+
+fn request_tab(
+    view: &gpui::Entity<RequestView>,
+    cx: &mut VisualTestContext,
+) -> crate::request_view::RequestTab {
+    cx.update(|_, cx| view.read(cx).request_tab)
+}
+
+#[gpui::test]
+async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
+    // Three tabs, so this cannot reuse the response pane's single toggling action. Cycle order
+    // is the visual order, deliberately not most-recently-used: with a fixed three-item strip,
+    // MRU means the same keystroke lands somewhere different each time.
+    let (_, view, mut cx) = boot(cx, None, None);
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body, "authoring is the default");
+
+    cx.simulate_keystrokes("alt-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers, "forward wraps past the end");
+    cx.simulate_keystrokes("alt-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Query);
+    cx.simulate_keystrokes("alt-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body);
+
+    cx.simulate_keystrokes("alt-shift-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Query, "and back the other way");
+    cx.simulate_keystrokes("alt-shift-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
+}
+
+#[gpui::test]
+async fn clicking_a_request_tab_lands_on_that_tab(cx: &mut TestAppContext) {
+    // The response pane gets away with one cycling action because it has exactly two tabs, so
+    // "cycle from the only inactive tab" always arrives where you clicked. With three that is
+    // false — clicking Body from Headers is two steps — so each tab dispatches its own action.
+    // A cycling handler here would send this click to Params.
+    let (_, view, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let headers = cx
+        .debug_bounds("request-tab-headers")
+        .expect("the Headers tab should be painted");
+    cx.simulate_click(headers.center(), gpui::Modifiers::default());
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
+
+    // Two tabs away from Headers, so a cycle would land on Params instead.
+    let body = cx.debug_bounds("request-tab-body").expect("the Body tab should be painted");
+    cx.simulate_click(body.center(), gpui::Modifiers::default());
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body);
+
+    // The active tab is inert, so clicking where you already are is not a no-op by accident.
+    cx.simulate_click(body.center(), gpui::Modifiers::default());
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body);
+}
+
+#[gpui::test]
+async fn the_request_tab_is_sticky_per_buffer(cx: &mut TestAppContext) {
+    // Same rule as the response pane's: two requests are open for different reasons, so the
+    // section you were editing has to survive both a send and a trip through another buffer.
+    let (window, first, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}")]);
+
+    cx.simulate_keystrokes("alt-q");
+    assert_eq!(request_tab(&first, &mut cx), RequestTab::Headers);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &first, 200);
+    assert_eq!(
+        request_tab(&first, &mut cx),
+        RequestTab::Headers,
+        "a response arriving must not move you off the section you were editing"
+    );
+
+    cx.simulate_keystrokes("ctrl-t");
+    let second = active_view(&window, &mut cx);
+    assert_eq!(
+        request_tab(&second, &mut cx),
+        RequestTab::Body,
+        "a new buffer gets the default, not the other buffer's choice"
+    );
+
+    cx.simulate_keystrokes("ctrl-shift-tab");
+    assert_eq!(request_tab(&first, &mut cx), RequestTab::Headers);
+    assert_eq!(request_tab(&second, &mut cx), RequestTab::Body);
 }
 
 #[gpui::test]
