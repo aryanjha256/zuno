@@ -201,8 +201,6 @@ impl Render for ContextMenu {
                             .flex()
                             .flex_col()
                             .min_w(px(MIN_WIDTH))
-                            .py_1()
-                            .rounded_md()
                             .bg(theme.bg_elevated)
                             .border_1()
                             .border_color(theme.border)
