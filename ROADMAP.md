@@ -26,8 +26,9 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
 - **Since, from the audit below.** Response search; the response pane split into body and headers
   tabs; the request pane split into Headers / Params / Body; the editing set the text inputs were
   missing (word movement and deletion, document ends, double- and triple-click, `PageUp`/`PageDown`,
-  undo/redo); row selection in the response viewer with copy-value and copy-path; and a
-  right-click context menu on response rows, built as a reusable primitive.
+  undo/redo); row selection in the response viewer with copy-value and copy-path; a right-click
+  context menu on response rows, built as a reusable primitive; and horizontal scrolling, which
+  had been missing from every body surface.
 
   This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
   and both absent from it — which is the rot the note at the top of this file predicts. Worth
@@ -453,6 +454,23 @@ cursors stayed separate, because a match and where you are standing are differen
   are items still on this list: **delete/rename a saved request**, tab close/rename, and
   toggle/remove on header rows. It is also the first real consumer of `anchored()`, which
   architecture.md §12 had guessed at twice and placed wrongly both times.
+- **Horizontal scrolling — done, and it was a capability gap rather than a convenience.** Found
+  by using the app, not by reading it. Soft-wrap is off, so a long line runs off the right edge —
+  and in the response body there was no horizontal scroll *and* no cursor to fake one, which made
+  anything past the pane width unreachable rather than awkward. The request editor only looked
+  better: its offset followed the caret, so `End` reached text a trackpad could not.
+
+  Both bodies and the response headers scroll now, with `left`/`right`/`home` in the response
+  pane and a thin auto-hiding indicator.
+
+  **It took two attempts, and the first one shipped broken on every surface with a green suite.**
+  Worth recording as an ordering lesson rather than a feature note: the tests asserted that
+  something overflowed and that an offset changed, neither of which distinguishes working
+  scrolling from a region sized to the wrong row, a scrollbar drawn along the top edge, or an
+  editor that snapped back to column zero on the next frame. The headers tab had no test at all.
+  architecture.md §6 lists the four traps; the transferable one is that **a green assertion about
+  a scroll offset says nothing about whether the content can be reached.**
+
 - **No delete or rename of a saved request** from inside the app. Mild, because files are the
   interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
 - **No body prettify.** Paste minified JSON and you live with it.

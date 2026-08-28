@@ -134,6 +134,9 @@ const EXCLUDED: &[(&str, &str)] = &[
     // verbs that act *on* the selection — copy value, copy path — are offered.
     ("zuno::ResponseRowNext", "cursor movement; the arrow keys are the interface"),
     ("zuno::ResponseRowPrev", "cursor movement; the arrow keys are the interface"),
+    ("zuno::ScrollLeft", "view movement; the arrow keys are the interface"),
+    ("zuno::ScrollRight", "view movement; the arrow keys are the interface"),
+    ("zuno::ScrollStart", "view movement; the arrow keys are the interface"),
     // Tab/Shift-Tab move focus within a buffer. As a named command it reads as "go
     // somewhere" without saying where, which is worse than not offering it.
     ("zuno::FocusNext", "keystroke-only; no meaningful name"),

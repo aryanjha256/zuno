@@ -21,7 +21,8 @@ use zuno_core::{
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
-    MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
+    MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ScrollLeft, ScrollRight,
+    ScrollStart, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
     OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
@@ -1296,6 +1297,24 @@ impl Workspace {
         }
     }
 
+    fn scroll_left(&mut self, _: &ScrollLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.scroll_body_horizontally(-1., cx));
+        }
+    }
+
+    fn scroll_right(&mut self, _: &ScrollRight, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.scroll_body_horizontally(1., cx));
+        }
+    }
+
+    fn scroll_start(&mut self, _: &ScrollStart, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.scroll_body_to_start(cx));
+        }
+    }
+
     fn toggle_fold(&mut self, _: &ToggleFold, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.toggle_selected_fold(cx));
@@ -1783,6 +1802,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::response_row_next))
             .on_action(cx.listener(Self::response_row_prev))
             .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::scroll_left))
+            .on_action(cx.listener(Self::scroll_right))
+            .on_action(cx.listener(Self::scroll_start))
             .on_action(cx.listener(Self::open_row_menu))
             .on_action(cx.listener(Self::menu_next))
             .on_action(cx.listener(Self::menu_prev))

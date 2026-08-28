@@ -546,6 +546,122 @@ longer tab stops: `Tab` walks the active section instead of every row in the pan
 intended consequence, not a side effect — but it is the sort of change that silently alters focus
 order, which is why it's recorded here.
 
+### Horizontal scrolling — and the one-row measurement that decides it
+
+Soft-wrap is off (§7), so a long line runs off the right edge. Until this landed there was
+nowhere for it to go: the response body had no horizontal scrolling at all *and* no cursor to
+fake one, so anything past the pane's width was unreachable rather than merely awkward. The
+request editor was better off only by accident — its `h_offset` follows the caret, so `End`
+reached the text a trackpad could not.
+
+**Wrapping was never an option here, whatever one's taste.** `uniform_list` demands
+O(1)-indexable fixed-height rows, which is the entire premise of this section; a wrapped row has
+a height that depends on its content and on the viewport width. Wrap in the response viewer means
+a different element and a different virtualization strategy, not a setting.
+
+- **The content width comes from a single sampled row.**
+  `with_horizontal_sizing_behavior(Unconstrained)` looks like the whole fix and is half of it:
+  `measure_item` measures *one* row, the one named by `with_width_from_item`, which defaults to
+  index 0. Row 0 of a JSON document is `{`. So the obvious version switches horizontal scrolling
+  on and gives it nothing to scroll to, which is indistinguishable from the feature not working.
+  `BodyView` therefore computes the widest row while indexing — background executor, invariant 3
+  — and hands over its *visible* index.
+- **The widest row is estimated, not measured.** Character counts weighted by depth, because
+  gpui shapes whatever row it is given and takes the real pixel width from that; this only has to
+  pick the right index. It works because the viewer is monospace, which is the one assumption
+  that would make it wrong elsewhere. The raw view has the same problem and a different index,
+  `LineIndex::widest_line` — measured **as drawn**, so a minified megabyte on one line doesn't
+  size the scroll region to a megabyte of blank space past the display cut.
+- **The extent follows folding, and that is not a detail.** It is recomputed over the *visible*
+  rows on every fold, in `rebuild_visible` — the same funnel the selection clamp uses. Computed
+  once at index time over the whole document instead, collapsing a response left the scroll
+  region as wide as the longest row it used to show, so the view stayed parked in blank space
+  with nothing out there to find. Folding is *how* a wide response is made readable, so an extent
+  that ignores it defeats the feature it is part of. Once the extent shrinks, gpui's own prepaint
+  clamp pulls the offset back with it, which is why the fix is one place and not two.
+- **The indicator is a `UniformListDecoration`, and it has to be.** A scrollbar drawn as a
+  sibling `div` reads `max_offset` and `bounds` off the scroll handle — both written during
+  `interactivity.prepaint`, which runs *after* the surrounding tree is built. So it draws nothing
+  on the frame the body first appears and then waits for an unrelated repaint to show up.
+  Decorations are computed inside that same prepaint and laid out at the list's own bounds.
+  `a_wide_body_shows_the_scroll_indicator` fails against the sibling version.
+- **It is an indicator, not a control.** Three pixels, no hover, no pointer cursor. Dragging
+  would mean mirroring the track geometry onto the view plus a drag mode, to duplicate a gesture
+  the trackpad, the wheel and `left`/`right` already perform — and a thing that looks draggable
+  and isn't is the dead-control bug this codebase keeps finding. The answer is to not look
+  draggable.
+- **The headers tab does not scroll sideways at all — it wraps.** It briefly did scroll, by
+  making the container a flex row so the table could exceed it, and that was wrong twice over: a
+  short table stopped filling the pane, and scrolling carried the *name* column off the left edge
+  so you lost track of which header you were reading. Dropping `truncate` from the value lets it
+  wrap instead, which is the answer this section named for the tab in the first place — it is not
+  virtualized and header counts are in the tens, so a variable row height costs nothing. That is
+  precisely what the body cannot do, being virtualized on fixed-height rows.
+- **A sideways swipe must not drag the document vertically, and `stop_propagation` cannot stop
+  it.** The container's wheel handler gates on `hitbox.should_handle_scroll`, which only
+  hit-tests and never consults propagation, so it runs whatever a listener does. Declaring *both*
+  axes `overflow_scroll` on the editor is the fix: `allow_concurrent_scroll` is false by default,
+  so with two non-zero deltas gpui zeroes the smaller axis itself. The x axis is never actually
+  scrolled there — the element is `relative(1.)` wide — but declaring it is what makes gpui look
+  at `delta.x` at all.
+- **`left`/`right`/`home` scroll, scoped to `ResponsePane`.** `up`/`down` already move the row
+  selection there, so this completes that idiom rather than inventing one. In the editor a wheel
+  writes `h_offset` directly, which composes with the caret clamp instead of fighting it: prepaint
+  starts from the previous offset and overrides it only when the caret would otherwise be
+  off-screen, so a manual scroll survives until you type. Shift-wheel is translated to the
+  horizontal axis by hand — a trackpad reports a real `x` delta, a wheel mouse reports `y` and
+  leaves the convention to the application.
+
+> **Four guards were written and then deleted, because none could be shown to do anything.** A
+> clamp on the response body's scroll offset — gpui re-clamps `scroll_offset.x` to `[-max, 0]` on
+> every prepaint, from a content width fresher than any the caller holds. `min_w(100%)` on the
+> rows in place of `w_full`, on the reasoning that a fixed width caps a row at the viewport and
+> clips it: it doesn't, because the list lays each row out with
+> `available_width = viewport + |scroll_x|` and shifts the row origin by `scroll_x`, so a 100%
+> row spans exactly the visible region at every offset. And two on the headers tab — making the
+> value cell `flex_none` and dropping its `truncate`, and marking the table `flex_none` — where
+> only the container becoming a flex row mattered.
+
+**This section describes the second attempt.** The first shipped broken on every surface it
+touched, with a green suite throughout, and the failure was uniformly in what the tests asserted:
+`max_offset > 0` and "the offset changed" are both true of a region sized to the wrong row, a
+scrollbar painted along the top edge, a thumb travelling the wrong way, and an editor that snapped
+back to column zero on the next frame. Four things it got wrong, each now asserted at the
+consequence:
+
+- **The headers tab could not scroll at all**, and `overflow_scroll` could never have made it.
+  See below.
+- **The scrollbar was drawn along the top edge and slid out of the viewport.** A decoration is
+  laid out as a *root* at the list's origin, so a 3px-tall element with `bottom_0` puts the bar at
+  the bottom of its own 3px box. And it is a child of the list, so gpui translates it with the
+  content — on **both** axes. The bar is now placed by arithmetic off the `bounds` `compute` is
+  given, cancelling both. Two tidier versions each pinned one axis and broke the other:
+  `justify_end` ignores a top margin on the child, since flex end-alignment pins it regardless;
+  and a `relative` root with an `absolute` child lost the horizontal pin. The vertical half went
+  unnoticed for a round because the bug only appears once the body is tall enough to scroll down,
+  and the test used `down` — which moves the row *selection* and scrolls nothing until the
+  selection leaves the viewport.
+- **The scroll region was sized from the wrong row, then in the wrong font.** The per-character
+  advance in `widest_json_row` was 7.0 against a measured ~8.5, which over-weighted depth enough
+  to rank a deep-short row above a shallow-long one. Correcting it was not enough: `measure_item`
+  runs *before* `interactivity.prepaint` pushes the list's text style, so gpui shaped the sampled
+  row in the ambient font rather than the `mono`/`text_xs` it draws in. The pane now computes the
+  width itself from an advance measured in the render font, and the rows carry that style so any
+  measurement of them is taken in it.
+
+  **This one is barely testable and the docs should say so.** The headless platform's ambient
+  font measures *wider* than the render font, so the bug made the region too large there and
+  every assertion passed; in the real window it went the other way and the line's end stayed out
+  of reach. `the_widest_row_can_actually_be_reached` brackets the total from both sides, which is
+  a font-metric assertion and fragile on purpose — it is the only thing that can distinguish
+  which font decided the answer.
+- **The editor was worst.** Its clamp bounded `h_offset` by the width of the *cursor's* line, so a
+  caret parked on `{` gave a maximum of zero and any scroll snapped home on the next frame; and
+  when that line scrolled out of view the clamp never ran at all, so the text could be pushed
+  arbitrarily into blank space. Two opposite bugs from one wrong reference line. It now bounds
+  against the document's widest line — stable, unlike §7's rejected "widest *visible* line" — and
+  follows the caret only when the caret has actually moved.
+
 ### Search — over the bytes, not over what's drawn
 
 `Ctrl+F`. The decision that shapes everything else: `core/src/search.rs` scans the **source
@@ -1175,7 +1291,8 @@ straight over the Send button, and long header values pushed the row's `×` out 
 Clipping alone only converted the bug into a worse one: the hidden text became unreachable. Both
 `TextInput` and `Editor` now carry a **horizontal scroll offset that follows the cursor** —
 recomputed each prepaint, clamped so the text never scrolls past its end or leaves a gap when it
-fits. Hit-testing and the IME rectangle both undo the offset, or clicking in a scrolled input
+fits. *Cursor*-following was the whole story for several milestones, and it meant a trackpad did
+nothing: `Editor` now also takes a wheel delta, which §6's horizontal-scrolling section covers. Hit-testing and the IME rectangle both undo the offset, or clicking in a scrolled input
 would land on the wrong character. The `overflow_hidden` clip is what makes it safe to paint
 outside the box, so the two fixes are one mechanism.
 

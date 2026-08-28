@@ -44,7 +44,8 @@ use crate::actions::{
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
     CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue, FindInResponse, FindNext, FindPrev,
-    MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ToggleFold,
+    MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
+    ScrollRight, ScrollStart, ToggleFold,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -202,6 +203,13 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-c", CopyRowValue, Some("ResponsePane")),
         KeyBinding::new("alt-c", CopyRowPath, Some("ResponsePane")),
         KeyBinding::new("space", ToggleFold, Some("ResponsePane")),
+        // Horizontal scrolling. `up`/`down` already move the row selection in this context, so
+        // `left`/`right` moving the view across is the completion of that idiom rather than a
+        // new one. Both are unbound here today; `home` is `text_input::Home` under a different
+        // leaf context, so the two cannot collide.
+        KeyBinding::new("left", ScrollLeft, Some("ResponsePane")),
+        KeyBinding::new("right", ScrollRight, Some("ResponsePane")),
+        KeyBinding::new("home", ScrollStart, Some("ResponsePane")),
         // Getting the response back out. `ctrl-c` is taken by text-input copy, scoped to
         // `TextInput`; these are global because the response pane has no input to type in.
         KeyBinding::new("ctrl-shift-c", CopyResponse, None),

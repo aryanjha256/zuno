@@ -242,6 +242,102 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
         .child(glyph(icon, theme.text_muted, theme.text))
 }
 
+/// A thin bar showing how far a horizontally scrollable list is scrolled, and how much it hides.
+///
+/// **A `UniformListDecoration`, and it has to be.** The obvious build — a sibling `div` reading
+/// the scroll handle — draws nothing on the frame the body first appears, because
+/// `max_offset` and `bounds` are written during `interactivity.prepaint`, which runs *after* the
+/// surrounding element tree was built. The bar would then wait for some unrelated repaint to
+/// show up. Decorations are computed inside that same prepaint, after the geometry lands, and
+/// are laid out at the list's own bounds — which is exactly an overlay.
+///
+/// **An indicator, not a control**, and styled to admit it: no hover state, no pointer cursor,
+/// three pixels tall. Dragging would mean mirroring the track geometry onto the view plus a drag
+/// mode, to duplicate a gesture the trackpad, the wheel and `left`/`right` already perform. A
+/// thing that looks draggable and isn't is the dead-control bug this codebase keeps finding, so
+/// the answer is to not look draggable.
+pub struct HScrollIndicator {
+    pub scroll: gpui::UniformListScrollHandle,
+    pub color: gpui::Hsla,
+}
+
+impl gpui::UniformListDecoration for HScrollIndicator {
+    fn compute(
+        &self,
+        _visible: std::ops::Range<usize>,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        scroll_offset: gpui::Point<gpui::Pixels>,
+        _item_height: gpui::Pixels,
+        _item_count: usize,
+        _window: &mut Window,
+        _cx: &mut gpui::App,
+    ) -> gpui::AnyElement {
+        let hidden = self.scroll.0.borrow().base_handle.max_offset().width;
+        let viewport = bounds.size.width;
+
+        // Nothing hidden means nothing to say. The bar exists to report "there is more to the
+        // right"; drawing it permanently would report that when it isn't true.
+        if hidden <= px(0.) || viewport <= px(0.) {
+            return div().into_any_element();
+        }
+
+        // The thumb is as much of the *track* as the viewport is of the content, expressed as a
+        // fraction rather than in pixels. `bounds` here is the list's outer width but the
+        // decoration is laid out inside its padding, so a pixel figure is wrong by the padding
+        // on both sides; a fraction is right whatever the padding turns out to be.
+        let content = viewport + hidden;
+        let ratio = (viewport / content).clamp(0.02, 1.);
+        // Offsets run negative as you scroll right, hence the negation.
+        let progress = (-scroll_offset.x / hidden).clamp(0., 1.);
+
+        // **Full height, pushed to the bottom with `justify_end`.** The first version made the
+        // root itself 3px tall and set `bottom_0` on it — which does nothing, because gpui lays
+        // a decoration out as a *root* at the list's origin, so "bottom" meant the bottom of the
+        // 3px box and the bar appeared along the top edge of the response.
+        //
+        // Safe to cover the whole list: `should_insert_hitbox` creates a hitbox only for an
+        // element with a cursor, a group, a hover style, a focus handle or a listener, and this
+        // has none — so it cannot swallow a click meant for a row.
+        // **The bar is placed by arithmetic, not by alignment.** A decoration is a child of the
+        // list, so gpui shifts it by `scroll_offset` along with the rows — the bar slid *left*
+        // by the amount you scrolled right and *up* by the amount you scrolled down, drifting
+        // into the middle of the response.
+        //
+        // Two tidier-looking versions each pinned one axis and not the other. `justify_end` with
+        // a top margin on the child does nothing vertically, because flex end-alignment pins the
+        // item to the bottom whatever its margin. Moving both margins to a `relative` root with
+        // an `absolute` child then lost the *horizontal* pin. Margins on the bar itself, offset
+        // from the viewport height `compute` already hands us, need neither.
+        div()
+            .w_full()
+            .h_full()
+            .child(
+                div()
+                    .debug_selector(|| "h-scroll".to_string())
+                    .ml(-scroll_offset.x)
+                    .mt(bounds.size.height - px(3.) - scroll_offset.y)
+                    .w_full()
+                    .h(px(3.))
+                    .flex()
+                    .flex_row()
+                    .child(
+                        div()
+                            .debug_selector(|| "h-scroll-thumb".to_string())
+                            .flex_none()
+                            .ml(gpui::DefiniteLength::Fraction(progress * (1. - ratio)))
+                            .w(gpui::DefiniteLength::Fraction(ratio))
+                            // A floor, or a very wide body leaves a thumb too small to see —
+                            // the one thing it must never be.
+                            .min_w(px(24.))
+                            .h_full()
+                            .rounded_full()
+                            .bg(self.color),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
 /// A vertical rule drawn as a glyph, for separating items inside a single row.
 ///
 /// `theme.border` and not a text colour: this is a rule that happens to be a character, so being

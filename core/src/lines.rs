@@ -107,6 +107,28 @@ impl LineIndex {
         (offset.saturating_sub(span.start) as usize) < MAX_DISPLAY_LINE
     }
 
+    /// The index of the widest line *as drawn*, for sizing a horizontal scroll region.
+    ///
+    /// Measured against `MAX_DISPLAY_LINE`, not the true length: a minified 10MB body is one
+    /// line, and sizing the scroll region to 10MB of text would let you scroll ten megabytes
+    /// into blank space. What is drawn is what you can scroll to.
+    ///
+    /// Ties go to the first, so the answer is stable across runs.
+    pub fn widest_line(&self) -> usize {
+        let mut widest = 0;
+        let mut best = 0;
+
+        for (ix, span) in self.lines.iter().enumerate() {
+            let drawn = (span.len as usize).min(MAX_DISPLAY_LINE);
+            if drawn > widest {
+                widest = drawn;
+                best = ix;
+            }
+        }
+
+        best
+    }
+
     /// A whole line, however long it is.
     ///
     /// The counterpart to `line`, and the distinction matters at exactly one call site:
@@ -202,6 +224,34 @@ mod tests {
 
         assert!(truncated, "an over-long line should report truncation");
         assert!(text.len() <= MAX_DISPLAY_LINE);
+    }
+
+    #[test]
+    fn the_widest_line_is_measured_as_drawn_not_as_stored() {
+        // A minified body is one enormous line. Sizing a scroll region to its true length
+        // would let you scroll megabytes past the last glyph, because the row stops at
+        // MAX_DISPLAY_LINE — so a merely-long line must not beat a shorter one once both are
+        // past the cut.
+        let over = "x".repeat(MAX_DISPLAY_LINE * 3);
+        let also_over = "y".repeat(MAX_DISPLAY_LINE + 1);
+        let index = LineIndex::build(Bytes::from(format!("{also_over}\n{over}")));
+
+        assert_eq!(
+            index.widest_line(),
+            0,
+            "both are clipped to the same drawn width, so the first wins"
+        );
+    }
+
+    #[test]
+    fn the_widest_line_is_the_longest_one_below_the_cut() {
+        let index = LineIndex::build(Bytes::from_static(b"a\nlonger line\nbb"));
+        assert_eq!(index.widest_line(), 1);
+    }
+
+    #[test]
+    fn an_empty_body_has_no_widest_line_to_speak_of() {
+        assert_eq!(LineIndex::build(Bytes::from_static(b"")).widest_line(), 0);
     }
 
     #[test]

@@ -4810,6 +4810,531 @@ async fn double_clicking_a_container_folds_it(cx: &mut TestAppContext) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Horizontal scrolling
+// ---------------------------------------------------------------------------
+
+/// How far the response body is scrolled sideways, in pixels. Negative as you scroll right,
+/// which is gpui's convention.
+fn body_h_offset(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> f32 {
+    cx.update(|_, cx| {
+        f32::from(
+            view.read(cx)
+                .body_scroll
+                .0
+                .borrow()
+                .base_handle
+                .offset()
+                .x,
+        )
+    })
+}
+
+/// How much of the body is hidden to the right. Zero means it fits.
+fn body_h_hidden(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> f32 {
+    cx.update(|_, cx| {
+        f32::from(
+            view.read(cx)
+                .body_scroll
+                .0
+                .borrow()
+                .base_handle
+                .max_offset()
+                .width,
+        )
+    })
+}
+
+/// Serve a response carrying one very long header value.
+fn respond_with_header(
+    cx: &mut TestAppContext,
+    value: &str,
+) -> (gpui::Entity<RequestView>, VisualTestContext) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let value = value.to_string();
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Trace: {value}\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let (_, view, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&format!("http://{addr}"));
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+    cx.run_until_parked();
+
+    (view, cx)
+}
+
+/// Serve one body of the given type and wait for the index, keeping the view.
+fn respond_with(
+    cx: &mut TestAppContext,
+    content_type: &'static str,
+    body: String,
+) -> (gpui::Entity<RequestView>, VisualTestContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_typed_owned(content_type, body);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+    cx.run_until_parked();
+
+    (view, cx)
+}
+
+#[gpui::test]
+async fn the_scroll_region_is_sized_from_the_widest_row_not_the_first(cx: &mut TestAppContext) {
+    // The whole slice turns on this. `uniform_list` sizes its horizontal content from **one**
+    // sampled row — `with_width_from_item`, default index 0 — and row 0 of a JSON document is
+    // `{`, the narrowest row there is. Take the default and `Unconstrained` is switched on with
+    // nothing to scroll to, which looks exactly like horizontal scrolling not working.
+    let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(400));
+    let (view, mut cx) = respond_with(cx, "application/json", wide);
+
+    let widest = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().widest_visible_ix());
+    assert_ne!(widest, 0, "row 0 is the opening brace, never the widest");
+
+    assert!(
+        body_h_hidden(&view, &mut cx) > 0.,
+        "a 400-character value must leave something hidden to the right"
+    );
+}
+
+#[gpui::test]
+async fn a_body_that_fits_hides_the_scroll_indicator(cx: &mut TestAppContext) {
+    // The bar reports "there is more to the right". Drawing it permanently would report that
+    // when it isn't true, which is worse than not drawing it at all.
+    let (view, mut cx) = respond_with(cx, "application/json", r#"{"a":1}"#.to_string());
+
+    assert_eq!(body_h_hidden(&view, &mut cx), 0., "this fits");
+    assert!(
+        cx.debug_bounds("h-scroll").is_none(),
+        "nothing is hidden, so nothing should be indicated"
+    );
+}
+
+#[gpui::test]
+async fn a_wide_body_shows_the_scroll_indicator(cx: &mut TestAppContext) {
+    // Painted on the *first* frame, which is the reason it is a `UniformListDecoration` rather
+    // than a sibling div: `max_offset` and `bounds` are written during `interactivity.prepaint`,
+    // after the surrounding tree is built, so a sibling reading the handle draws nothing until
+    // some unrelated repaint happens along. This assertion fails against that version.
+    let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(400));
+    let (_view, mut cx) = respond_with(cx, "application/json", wide);
+
+    assert!(
+        cx.debug_bounds("h-scroll").is_some(),
+        "a body wider than the pane must say so without waiting for another frame"
+    );
+}
+
+#[gpui::test]
+async fn the_arrow_keys_scroll_the_body_sideways_and_clamp(cx: &mut TestAppContext) {
+    let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(400));
+    let (view, mut cx) = respond_with(cx, "application/json", wide);
+    focus_response(&mut cx);
+
+    assert_eq!(body_h_offset(&view, &mut cx), 0.);
+
+    cx.simulate_keystrokes("right");
+    cx.run_until_parked();
+    let stepped = body_h_offset(&view, &mut cx);
+    assert!(stepped < 0., "right must scroll right; offsets run negative");
+
+    // Clamped at both ends — by gpui, in `interactivity.prepaint`, not by us. Asserted anyway,
+    // because it is the behaviour the pane depends on: without it the view slides into blank
+    // space and there is nothing on screen to say which way back is.
+    cx.simulate_keystrokes("left left left");
+    cx.run_until_parked();
+    assert_eq!(body_h_offset(&view, &mut cx), 0., "left stops at column zero");
+
+    for _ in 0..80 {
+        cx.simulate_keystrokes("right");
+    }
+    cx.run_until_parked();
+    let hidden = body_h_hidden(&view, &mut cx);
+    assert!(
+        (body_h_offset(&view, &mut cx) + hidden).abs() < 1.,
+        "right stops at the end of the content"
+    );
+
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    assert_eq!(body_h_offset(&view, &mut cx), 0., "home returns to column zero");
+}
+
+#[gpui::test]
+async fn arrow_keys_in_the_url_bar_still_move_its_caret(cx: &mut TestAppContext) {
+    // `left`/`right` are scoped to `ResponsePane`. **This test does not prove that scoping**,
+    // and saying so is the point — it was written believing it did.
+    //
+    // Making the bindings global leaves it passing, in either registration position, because
+    // `text_input::Left` already exists under `TextInput` and wins regardless. Compare
+    // `arrow_keys_in_the_url_bar_are_still_the_url_bars` for the selection verbs, which *does*
+    // fail when globalised: nothing binds `up`/`down` in a plain `TextInput`, so there a global
+    // binding really would steal the key. The difference is whether the input has a competing
+    // binding at all, which is not something the scoping itself can be credited for.
+    //
+    // What it does pin is worth keeping: that the URL bar's caret keys still work, asserted
+    // where the *character lands* rather than by watching the body sit still.
+    let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(400));
+    let (view, mut cx) = respond_with(cx, "application/json", wide);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("abc");
+    cx.simulate_keystrokes("left");
+    cx.simulate_input("X");
+    cx.run_until_parked();
+
+    assert_eq!(
+        spec_of(&view, &mut cx).url,
+        "abXc",
+        "left must move the URL bar's caret, not scroll the response"
+    );
+    assert_eq!(
+        body_h_offset(&view, &mut cx),
+        0.,
+        "and the body must not have moved"
+    );
+}
+
+#[gpui::test]
+async fn a_raw_body_scrolls_from_its_widest_line(cx: &mut TestAppContext) {
+    // The raw view has the same problem and a different index: `LineIndex::widest_line`, which
+    // measures as *drawn* so a minified megabyte doesn't size the region to a megabyte.
+    let long = "y".repeat(400);
+    let (view, mut cx) = respond_with(cx, "text/plain", format!("short\n{long}\nalso short"));
+
+    let widest = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().widest_visible_ix());
+    assert_eq!(widest, 1, "the long line, not the first one");
+    assert!(body_h_hidden(&view, &mut cx) > 0.);
+}
+
+/// Send a scroll-wheel gesture at a point.
+fn wheel(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, dx: f32, dy: f32) {
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: at,
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(dx), gpui::px(dy))),
+        modifiers: gpui::Modifiers::default(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn the_scroll_bar_sits_at_the_bottom_and_stays_put_while_scrolling(
+    cx: &mut TestAppContext,
+) {
+    // Two bugs in one assertion, both of which shipped.
+    //
+    // The bar was drawn along the **top** edge: a decoration is laid out as a root at the
+    // list's origin, so a 3px-tall element with `bottom_0` puts the bar at the bottom of its own
+    // 3px box, which is the top of the list.
+    //
+    // And the whole bar **slid left as you scrolled right**, by exactly the scroll offset,
+    // because a decoration is a child of the list and gpui translates it with the content. A
+    // scrollbar that leaves the viewport is worse than none.
+    // Wide *and* tall: the vertical assertion at the end needs somewhere to scroll down to.
+    let rows: Vec<String> = (0..200).map(|i| format!(r#""k{i}":"{}""#, "x".repeat(400))).collect();
+    let wide = format!("{{{}}}", rows.join(","));
+    let (_view, mut cx) = respond_with(cx, "application/json", wide);
+
+    let list = cx.debug_bounds("response-body").expect("the body list");
+    let bar = cx.debug_bounds("h-scroll").expect("the scroll bar");
+    assert!(
+        (bar.bottom() - list.bottom()).abs() < gpui::px(1.),
+        "the bar belongs on the bottom edge: bar {:?} vs list {:?}",
+        bar.bottom(),
+        list.bottom()
+    );
+
+    let thumb_before = cx.debug_bounds("h-scroll-thumb").expect("the thumb").left();
+    focus_response(&mut cx);
+    for _ in 0..6 {
+        cx.simulate_keystrokes("right");
+    }
+    cx.run_until_parked();
+
+    let bar_after = cx.debug_bounds("h-scroll").expect("the scroll bar");
+    let thumb_after = cx.debug_bounds("h-scroll-thumb").expect("the thumb").left();
+
+    assert!(
+        (bar_after.left() - bar.left()).abs() < gpui::px(1.),
+        "the bar must stay pinned to the viewport, not scroll with the rows"
+    );
+    assert!(
+        thumb_after > thumb_before,
+        "the thumb must move right as the body scrolls right: {thumb_before:?} -> {thumb_after:?}"
+    );
+
+    // **And it must not drift up as the body scrolls down.** The translation a decoration
+    // inherits is two-dimensional; only the x half was cancelled the first time, so the bar
+    // climbed into the middle of the response as soon as the body was tall enough to scroll.
+    // A wheel, not `down`: `down` moves the row *selection*, and `scroll_to_item` only scrolls
+    // once the selection leaves the viewport — fifty rows fit, so thirty presses scrolled
+    // nothing at all and the assertion below was vacuous.
+    wheel(&mut cx, list.center(), 0., -600.);
+    let bar_scrolled = cx.debug_bounds("h-scroll").expect("the scroll bar");
+    assert!(
+        (bar_scrolled.bottom() - list.bottom()).abs() < gpui::px(1.),
+        "the bar must stay on the bottom edge while the body scrolls vertically: {:?} vs {:?}",
+        bar_scrolled.bottom(),
+        list.bottom()
+    );
+}
+
+#[gpui::test]
+async fn a_long_header_value_wraps_instead_of_being_cut_off(cx: &mut TestAppContext) {
+    // Three assertions for three separate ways this has been wrong.
+    //
+    // It first shipped with the value `truncate`d, so a JWT or a CSP header was unreadable past
+    // the pane's edge. Then it shipped scrolling sideways, which broke two other things: a short
+    // table no longer filled the pane, and scrolling carried the *name* column off the left edge
+    // so you could not tell which header you were reading. Wrapping is the answer §6 named for
+    // this tab all along — it is not virtualized, so a variable row height costs nothing.
+    let (view, mut cx) = respond_with_header(cx, &"e".repeat(400));
+
+    cx.simulate_keystrokes("alt-r");
+    cx.run_until_parked();
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
+
+    // `header-row` resolves to the last row painted, and `collect_headers` sorts by name, so
+    // `x-trace` is the one measured.
+    let row = cx.debug_bounds("header-row").expect("a header row");
+    let container = cx.debug_bounds("response-headers").expect("the headers pane");
+
+    assert!(
+        (row.size.width - container.size.width).abs() < gpui::px(2.),
+        "a row must span the pane. Sizing the table to its content instead left short tables \
+         floating in a narrow column: row {:?} in {:?}",
+        row.size.width,
+        container.size.width
+    );
+    assert!(
+        row.size.height > gpui::px(40.),
+        "400 characters must wrap onto several lines rather than being clipped to one: {:?}",
+        row.size.height
+    );
+
+    let hidden = cx.update(|_, cx| f32::from(view.read(cx).headers_scroll.max_offset().width));
+    assert_eq!(
+        hidden, 0.,
+        "and nothing may overflow sideways, or the name column scrolls out of view"
+    );
+}
+
+#[gpui::test]
+async fn a_hand_scroll_in_the_editor_survives_the_next_paint(cx: &mut TestAppContext) {
+    // **The bug that made the editor feel broken.** The horizontal clamp bounded `h_offset` by
+    // the width of the *cursor's* line. Park the caret on a short line — the start of the body,
+    // say — and the maximum is zero, so any scroll was clamped straight back to column zero on
+    // the very next frame: the view snapped home the instant you let go.
+    //
+    // Asserted after `run_until_parked`, which is what makes it a *next paint* assertion rather
+    // than a read of the handler's own write.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_input(&"x".repeat(400));
+    cx.simulate_keystrokes("ctrl-home");
+    cx.run_until_parked();
+
+    let editor = cx.debug_bounds("body-editor").expect("the body editor");
+    wheel(&mut cx, editor.center(), -200., 0.);
+
+    let offset = cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).h_offset()));
+    assert!(
+        offset > 0.,
+        "a hand scroll must still be there on the next paint, not snap back to zero"
+    );
+}
+
+#[gpui::test]
+async fn a_sideways_swipe_in_the_editor_does_not_drift_vertically(cx: &mut TestAppContext) {
+    // The handler shares the wheel with the container, which owns vertical scrolling. Without
+    // consuming a predominantly horizontal gesture, the small vertical component every trackpad
+    // swipe carries also scrolls the document — so sliding sideways wanders up and down.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    // Loaded from a spec rather than typed: 300 lines through `simulate_input` is 36,000
+    // keystrokes and forty seconds, and the document has to be tall enough to *have* somewhere
+    // vertical to drift to or the assertion is vacuous.
+    let body = (0..300)
+        .map(|_| "x".repeat(120))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut spec = RequestSpec::sample();
+    spec.body = Body::Raw {
+        text: body,
+        kind: RawKind::Text,
+    };
+    cx.update(|_, cx| view.update(cx, |view, cx| view.load(spec, cx)));
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.run_until_parked();
+
+    // Scroll down first, so there is room to drift in *either* direction.
+    let editor = cx.debug_bounds("body-editor").expect("the body editor");
+    wheel(&mut cx, editor.center(), 0., -400.);
+    let before = cx.update(|_, cx| {
+        f32::from(view.read(cx).body_editor.read(cx).vertical_offset())
+    });
+    assert_ne!(before, 0., "the document must actually be scrollable vertically");
+
+    // Mostly sideways, with the slight vertical wobble a real trackpad produces.
+    wheel(&mut cx, editor.center(), -200., -6.);
+
+    let after = cx.update(|_, cx| {
+        f32::from(view.read(cx).body_editor.read(cx).vertical_offset())
+    });
+    assert_eq!(
+        before, after,
+        "a sideways swipe must not scroll the document up or down"
+    );
+}
+
+#[gpui::test]
+async fn folding_shrinks_the_scroll_region_and_pulls_the_view_back(cx: &mut TestAppContext) {
+    // Folding is *how* a wide response is made readable, so a horizontal extent that ignores it
+    // defeats the point. The extent was computed once at index time over every row in the
+    // document and never revisited, so collapsing everything left the region as wide as the
+    // longest row it used to show — and the view sat scrolled into blank space with nothing out
+    // there to find.
+    //
+    // Asserted at both consequences: the region shrinks, *and* the offset comes back with it.
+    let long = "x".repeat(400);
+    let body = format!(r#"{{"outer":{{"buried":"{long}"}},"z":1}}"#);
+    let (view, mut cx) = respond_with(cx, "application/json", body);
+    focus_response(&mut cx);
+
+    let wide = body_h_hidden(&view, &mut cx);
+    assert!(wide > 0., "the long value must overflow to begin with");
+
+    for _ in 0..40 {
+        cx.simulate_keystrokes("right");
+    }
+    cx.run_until_parked();
+    assert!(body_h_offset(&view, &mut cx) < 0., "and we must be scrolled into it");
+
+    // Fold everything. The long value is now inside a collapsed container and off screen.
+    cx.simulate_keystrokes("alt-f");
+    cx.run_until_parked();
+
+    assert!(
+        body_h_hidden(&view, &mut cx) < wide,
+        "the region must shrink to what is still drawn: {} vs {wide}",
+        body_h_hidden(&view, &mut cx)
+    );
+    assert_eq!(
+        body_h_offset(&view, &mut cx),
+        0.,
+        "and the view must come back, not stay parked past the end of the content"
+    );
+}
+
+#[gpui::test]
+async fn the_widest_row_is_found_in_a_realistically_shaped_body(cx: &mut TestAppContext) {
+    // The reported shape: one long `description` nested three levels down among many shallow
+    // short rows. The extent feeds the pixel width the pane computes, so getting the wrong row
+    // here is what leaves the end of the longest line unreachable.
+    let desc = "Pagination metadata returned by registries that implement dynamic search. Its presence on a catalog response signals that the items are already filtered and paged by the registry.";
+    let body = format!(
+        r#"{{"a":1,"properties":{{"pagination":{{"description":"{desc}","type":"object"}},"name":{{"type":"string"}}}}}}"#
+    );
+    let (view, mut cx) = respond_with(cx, "application/json", body);
+
+    let (depth, chars) = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().widest_extent());
+    assert_eq!(depth, 3, "the description is three levels down");
+    assert!(
+        chars as usize > desc.len(),
+        "the extent must cover the key and the whole quoted value, not a prefix: {chars}"
+    );
+}
+
+#[gpui::test]
+async fn the_widest_row_can_actually_be_reached(cx: &mut TestAppContext) {
+    // The complaint this slice was reopened for: scrolling worked, but stopped short of the end.
+    // Asserting `hidden > 0` — which is what the first version of these tests did — is true for
+    // a region sized to the *wrong* row, so it cannot see that at all.
+    //
+    // 400 characters at any plausible monospace advance is well over 2500px; a region sized from
+    // the wrong row collapses to roughly the viewport, about 960px, so the floor separates the
+    // two by a wide margin without pinning a font metric.
+    //
+    // **The threshold was 3000 and had to come down, which is the interesting part.** gpui was
+    // measuring the row *before* the list's text style applied, so it shaped in the ambient font
+    // at 8.47px per character where the row actually draws at 7.29. The old number was calibrated
+    // against that over-measurement. Computing the width from the render font gives 2977 — and
+    // being wrong in the other direction is what left the real window short of the line's end.
+    let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(400));
+    let (view, mut cx) = respond_with(cx, "application/json", wide);
+
+    let viewport = cx.update(|_, cx| {
+        f32::from(view.read(cx).body_scroll.0.borrow().base_handle.bounds().size.width)
+    });
+    let content = viewport + body_h_hidden(&view, &mut cx);
+
+    assert!(
+        content > 2500.,
+        "the scroll region must span the whole 400-character value, not stop short: {content}"
+    );
+
+    // **And the upper bound is the load-bearing half.** Below 2500 means the region was sized
+    // from the wrong row; above ~3300 means it was sized by gpui measuring a row *before* the
+    // list's text style applied, which shapes in the ambient font — 8.47px per character here
+    // against the 7.29 the row actually draws at. Only the second of those was the reported bug,
+    // and only this bound can see it: with the pane computing the width from the render font the
+    // total is 2977, and with gpui measuring it in the ambient font it is 3465.
+    //
+    // It is a font-metric assertion and therefore fragile, which is a fair price: the headless
+    // platform cannot reproduce the real font pair, so a range is the only way to pin *which*
+    // font decided the answer rather than merely that the answer is large.
+    assert!(
+        content < 3300.,
+        "the region must be sized in the font the rows are drawn in, not the ambient one: \
+         {content}"
+    );
+}
+
+#[gpui::test]
+async fn the_editor_cannot_be_scrolled_past_its_longest_line(cx: &mut TestAppContext) {
+    // The mirror of the bug above, from the same wrong reference line: when the cursor's line
+    // was scrolled out of view the clamp never ran at all, so there was no bound and the text
+    // could be pushed arbitrarily far off to the left into blank space.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_input(&"x".repeat(120));
+    cx.simulate_keystrokes("ctrl-home");
+    cx.run_until_parked();
+
+    let editor = cx.debug_bounds("body-editor").expect("the body editor");
+    for _ in 0..40 {
+        wheel(&mut cx, editor.center(), -400., 0.);
+    }
+
+    let offset = cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).h_offset()));
+    // 120 monospace characters is well under 4000px however it shapes, so anything past that
+    // means the offset ran away rather than stopping at the end of the content.
+    assert!(
+        offset < 4000.,
+        "scrolling must stop at the widest line, not run on forever: {offset}"
+    );
+}
+
 #[gpui::test]
 async fn a_raw_body_copies_the_whole_line_and_refuses_a_path(cx: &mut TestAppContext) {
     // Two halves of the same decision. The drawn line stops at `MAX_DISPLAY_LINE`; a copy that

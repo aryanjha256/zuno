@@ -64,6 +64,9 @@ pub struct Editor {
     /// ours, because soft-wrap is off and long lines otherwise run off the edge with no
     /// way to reach them.
     h_offset: Pixels,
+    /// The caret offset the last paint saw, so `h_offset` can follow the caret when it *moves*
+    /// and leave a hand-scrolled view alone when it doesn't.
+    last_cursor: Option<usize>,
     is_selecting: bool,
 }
 
@@ -86,8 +89,23 @@ impl Editor {
             last_bounds: None,
             last_line_height: px(16.),
             h_offset: px(0.),
+            last_cursor: None,
             is_selecting: false,
         }
+    }
+
+    /// The container's vertical scroll offset, for the test that a sideways swipe does not
+    /// drift the document up or down.
+    #[cfg(test)]
+    pub fn vertical_offset(&self) -> Pixels {
+        self.scroll.offset().y
+    }
+
+    /// The horizontal scroll offset, for tests that assert a hand scroll survives the next
+    /// paint — which it did not, for as long as the clamp used the cursor's own line.
+    #[cfg(test)]
+    pub fn h_offset(&self) -> Pixels {
+        self.h_offset
     }
 
     pub fn text(&self) -> &str {
@@ -495,6 +513,47 @@ impl Editor {
         self.is_selecting = false;
     }
 
+    /// Trackpad and wheel horizontal scrolling.
+    ///
+    /// The vertical half is the container's, via `overflow_y_scroll`; this deliberately does not
+    /// call `stop_propagation`, so a diagonal trackpad gesture still scrolls both ways.
+    ///
+    /// **Shift-wheel is translated here rather than trusted to arrive as `x`.** A trackpad
+    /// reports a real horizontal delta, but a wheel mouse reports `y` and leaves the convention
+    /// to the application — so without this the gesture everyone reaches for on a mouse does
+    /// nothing.
+    ///
+    /// Writing `h_offset` composes with the caret-following clamp instead of fighting it, but
+    /// only because prepaint was fixed to follow the caret *when it moves* and to bound against
+    /// the whole document's widest line. Before that, this handler appeared to do nothing: the
+    /// next paint recomputed the offset against the cursor's own line and snapped the view home.
+    fn on_scroll_wheel(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `pixel_delta` is gpui's own line-to-pixel conversion, so a wheel click moves this
+        // axis by the same amount it moves the vertical one. `last_line_height` is recorded by
+        // the previous paint; before the first, it is the default and the gesture is a no-op
+        // rather than a jump.
+        let delta = event.delta.pixel_delta(self.last_line_height);
+
+        let dx = if event.modifiers.shift && delta.x == px(0.) {
+            delta.y
+        } else {
+            delta.x
+        };
+        if dx == px(0.) {
+            return;
+        }
+
+        // Clamped at zero here and at the document's width in prepaint, which is the only place
+        // that knows how wide the longest line shapes to.
+        self.h_offset = (self.h_offset - dx).max(px(0.));
+        cx.notify();
+    }
+
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
             let offset = self.offset_for_position(event.position);
@@ -776,6 +835,7 @@ impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("body-editor")
+            .debug_selector(|| "body-editor".to_string())
             // Both identifiers: the shared text bindings match on `TextInput`, the
             // line-aware ones on `BodyEditor`. GPUI matches only the leaf context, so
             // they have to live in one string.
@@ -821,8 +881,19 @@ impl Render for Editor {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .size_full()
-            .overflow_y_scroll()
+            // **Both axes, and the x half is not for gpui to scroll.** The element is
+            // `relative(1.)` wide, so there is never horizontal overflow for the container to
+            // move — `h_offset` does the real horizontal work. Declaring `overflow.x = Scroll`
+            // is what lets gpui's own wheel handler see a horizontal delta at all, and with
+            // `allow_concurrent_scroll` false by default it then zeroes the *smaller* axis. So
+            // a sideways swipe stops dragging the document up and down.
+            //
+            // `cx.stop_propagation()` was the obvious fix and cannot work: the container's
+            // scroll handler gates on `hitbox.should_handle_scroll`, which only hit-tests and
+            // never consults propagation, so it runs whatever a listener does.
+            .overflow_scroll()
             .track_scroll(&self.scroll)
             .child(EditorElement {
                 editor: cx.entity(),
@@ -839,6 +910,8 @@ struct EditorElement {
 }
 
 struct Prepaint {
+    /// Where the caret was this frame, so the next one can tell whether it moved.
+    cursor_offset: usize,
     lines: Vec<(usize, ShapedLine)>,
     line_height: Pixels,
     cursor: Option<PaintQuad>,
@@ -950,25 +1023,64 @@ impl Element for EditorElement {
             lines.push((line_ix, layout));
         }
 
-        // Horizontal scroll, driven by the cursor's line. Long lines are not wrapped
-        // (§7), so without this the end of a long JSON line is unreachable — the same
-        // problem the URL bar had. Clamped against the cursor line's own width rather
-        // than the widest visible line, which would jitter as you scroll vertically.
-        let mut h_offset = previous_h_offset;
-        if let Some((_, layout)) = lines.iter().find(|(ix, _)| *ix == cursor_line) {
-            let cursor_x = layout.x_for_index(cursor_offset - editor.line_start(cursor_line));
-            let visible = bounds.size.width;
-            let caret = px(2.);
+        // Horizontal scroll. Long lines are not wrapped (§7), so without this the end of a long
+        // JSON line is unreachable — the same problem the URL bar had.
+        //
+        // **The limit is the whole document's widest line, not the cursor's**, and that
+        // correction is the difference between this working and not. Bounding by the cursor's
+        // line meant a caret parked on `{` gave a maximum of zero, so *any* scroll — trackpad,
+        // wheel, anything — was clamped straight back to column zero on the very next frame:
+        // the view snapped home the instant you let go. And when the cursor's line was scrolled
+        // out of view the `if let` never ran, so there was no bound at all and you could scroll
+        // forever into blank space. Two opposite bugs from one wrong reference line.
+        //
+        // §7 rejected "the widest *visible* line" because it jitters as you scroll vertically.
+        // The widest line in the *document* is stable, which is what makes it usable as a limit;
+        // it costs one extra `shape_line` on the frames where that line isn't already on screen.
+        let visible_w = bounds.size.width;
+        let caret = px(2.);
 
-            if cursor_x - h_offset > visible - caret {
-                h_offset = cursor_x - visible + caret;
+        let widest_line = (0..editor.line_count())
+            .max_by_key(|ix| editor.line_end(*ix) - editor.line_start(*ix))
+            .unwrap_or(0);
+        let doc_width = match lines.iter().find(|(ix, _)| *ix == widest_line) {
+            Some((_, layout)) => layout.width,
+            None => {
+                let text = SharedString::from(editor.line_text(widest_line).to_string());
+                let runs = [TextRun {
+                    len: text.len(),
+                    font: style.font(),
+                    color: style.color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }];
+                window
+                    .text_system()
+                    .shape_line(text, font_size, &runs, None)
+                    .width
             }
-            if cursor_x - h_offset < px(0.) {
-                h_offset = cursor_x;
+        };
+        let max_offset = (doc_width - visible_w + caret).max(px(0.));
+
+        // **Follow the caret only when the caret moved.** Recomputing this every frame is what
+        // made a manual scroll impossible to hold: the follow would drag the view back to the
+        // caret on the next paint even though nothing had been typed.
+        let mut h_offset = previous_h_offset;
+        let cursor_moved = editor.last_cursor != Some(cursor_offset);
+        if cursor_moved {
+            if let Some((_, layout)) = lines.iter().find(|(ix, _)| *ix == cursor_line) {
+                let cursor_x = layout.x_for_index(cursor_offset - editor.line_start(cursor_line));
+
+                if cursor_x - h_offset > visible_w - caret {
+                    h_offset = cursor_x - visible_w + caret;
+                }
+                if cursor_x - h_offset < px(0.) {
+                    h_offset = cursor_x;
+                }
             }
-            let max_offset = (layout.width - visible + caret).max(px(0.));
-            h_offset = h_offset.max(px(0.)).min(max_offset);
         }
+        h_offset = h_offset.clamp(px(0.), max_offset);
 
         let origin_x = bounds.left() - h_offset;
 
@@ -1007,6 +1119,7 @@ impl Element for EditorElement {
         }
 
         Prepaint {
+            cursor_offset,
             lines,
             line_height,
             cursor,
@@ -1053,11 +1166,13 @@ impl Element for EditorElement {
 
         let lines = std::mem::take(&mut prepaint.lines);
         let h_offset = prepaint.h_offset;
+        let cursor_offset = prepaint.cursor_offset;
         self.editor.update(cx, |editor, _| {
             editor.last_layouts = lines;
             editor.last_bounds = Some(bounds);
             editor.last_line_height = line_height;
             editor.h_offset = h_offset;
+            editor.last_cursor = Some(cursor_offset);
         });
     }
 }

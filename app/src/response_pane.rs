@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, UniformListScrollHandle,
+    ListHorizontalSizingBehavior, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
+    Styled, UniformListScrollHandle,
     Window, div, px, uniform_list,
 };
 use zuno_core::{
@@ -26,7 +27,7 @@ use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
     ShowHistory, ToggleFold, UnfoldAll,
 };
-use crate::ui::{Icon, icon_button, text_action};
+use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
@@ -96,8 +97,10 @@ pub fn render(
                     .children(view.search.as_ref().map(|search| {
                         find_bar(search, view.body_view.as_ref().is_some_and(BodyView::is_json), theme, cx)
                     }))
-                    .child(body_region(view, theme, cx)),
-                ResponseView::Headers => pane.child(headers_region(&response.headers, theme)),
+                    .child(body_region(view, theme, window, cx)),
+                ResponseView::Headers => {
+                    pane.child(headers_region(&response.headers, &view.headers_scroll, theme))
+                }
             }
         }
         None => pane.child(empty_state(theme, window)),
@@ -378,16 +381,30 @@ fn step_button<A: gpui::Action + Clone + 'static>(
 ///
 /// `AnyElement` rather than `Div` because `.id()` yields `Stateful<Div>`, so the two branches
 /// have different concrete types.
-fn headers_region(headers: &[Header], theme: &Theme) -> AnyElement {
+fn headers_region(
+    headers: &[Header],
+    headers_scroll: &gpui::ScrollHandle,
+    theme: &Theme,
+) -> AnyElement {
     if headers.is_empty() {
         return centered_note("(no headers)", theme).into_any_element();
     }
 
     div()
         .id("response-headers")
+        .debug_selector(|| "response-headers".to_string())
+        .track_scroll(headers_scroll)
         .flex_1()
         .min_h(px(0.))
-        // `overflow_y_scroll` is on `StatefulInteractiveElement`, hence the `.id()` above.
+        // **Vertical only, on purpose — long values wrap instead of scrolling sideways.** This
+        // tab did scroll horizontally for one revision, by making the container a flex row so
+        // the table could exceed it, and that was the wrong answer twice over: a short table no
+        // longer filled the pane, and scrolling sideways carried the *name* column off the left
+        // edge, so you lost track of which header you were reading.
+        //
+        // Wrapping is what §6 said this tab wanted all along. It is not virtualized and header
+        // counts are in the tens, so a variable row height costs nothing here — which is exactly
+        // why the body, which is virtualized on fixed-height rows, cannot do the same.
         .overflow_y_scroll()
         .child(headers_table(headers, theme))
         .into_any_element()
@@ -678,9 +695,12 @@ fn headers_table(headers: &[Header], theme: &Theme) -> Div {
 
 fn header_row(header: &Header, theme: &Theme) -> Div {
     div()
+        .debug_selector(|| "header-row".to_string())
         .flex()
         .flex_row()
-        .items_center()
+        // `items_start`, not `items_center`: a wrapped value is several lines tall and its name
+        // should sit beside the first of them, not float in the middle of the block.
+        .items_start()
         .gap_2()
         .px_3()
         .py_1()
@@ -697,11 +717,12 @@ fn header_row(header: &Header, theme: &Theme) -> Div {
                 .text_color(theme.text)
                 .child(header.name.clone()),
         )
+        // No `truncate`: that is what clipped a JWT or a CSP header to the pane's width with no
+        // way to reach the rest. Without it the value wraps onto as many lines as it needs.
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .truncate()
                 .text_color(theme.text_muted)
                 .child(header.value.clone()),
         )
@@ -806,8 +827,51 @@ fn text_button(
         .child(label.to_string())
 }
 
-fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>) -> Div {
-    let container = div().flex_1().flex().flex_col().min_h(px(0.));
+/// The width the widest row needs, in the font the rows are actually drawn in.
+///
+/// One `shape_line` of a ten-character sample per frame — negligible, and the only way to get an
+/// advance that matches what the viewer paints. See `BodyView::widest_extent` for why measuring
+/// this ourselves beats letting `uniform_list` measure a row.
+fn content_width(view: &RequestView, theme: &Theme, window: &Window) -> Pixels {
+    let Some(body) = &view.body_view else {
+        return px(0.);
+    };
+    let (depth, chars) = body.widest_extent();
+    if chars == 0 {
+        return px(0.);
+    }
+
+    const SAMPLE: &str = "0123456789";
+    let font_size = window.rem_size() * 0.75;
+    let font = gpui::font(theme.mono.clone());
+    let runs = [gpui::TextRun {
+        len: SAMPLE.len(),
+        font,
+        color: theme.text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }];
+    let advance = window
+        .text_system()
+        .shape_line(SAMPLE.into(), font_size, &runs, None)
+        .width
+        / SAMPLE.len() as f32;
+
+    // Indent, fold marker, the text itself, and a little slack so rounding never clips the last
+    // glyph — over-reaching by a few pixels is invisible, falling short is the bug.
+    px(4.) + px(depth as f32 * INDENT) + px(12.) + advance * chars as f32 + px(8.)
+}
+
+fn body_region(
+    view: &RequestView,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<RequestView>,
+) -> Div {
+    // `relative` so the scroll indicator can sit over the bottom edge of the list rather than
+    // taking a row of layout from it.
+    let container = div().flex_1().flex().flex_col().min_h(px(0.)).relative();
 
     let Some(body) = &view.body_view else {
         return container.child(centered_note("Indexing response…", theme));
@@ -821,6 +885,8 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
     // selection is where *you* are, and a row is routinely both.
     let hit = view.current_match_row();
     let selected = view.selected_body_row();
+    let widest = body.widest_visible_ix();
+    let content = content_width(view, theme, window);
     let scroll = view.body_scroll.clone();
 
     let list = match &body.kind {
@@ -835,13 +901,15 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
             body.visible(),
             hit,
             selected,
+            widest,
+            content,
             scroll,
             theme,
             cx,
         )
         .into_any_element(),
         BodyKind::Text(lines) => {
-            text_list(lines.clone(), hit, selected, scroll, theme, cx).into_any_element()
+            text_list(lines.clone(), hit, selected, widest, content, scroll, theme, cx).into_any_element()
         }
     };
 
@@ -853,11 +921,14 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
 /// `uniform_list` only builds elements for the visible range, so this stays O(visible)
 /// no matter how many rows exist. The closure captures two `Arc`s and the theme — never
 /// the fold flags, which would be a megabyte-scale clone per frame (see `is_folded_at`).
+#[allow(clippy::too_many_arguments)]
 fn json_list(
     outline: Arc<JsonOutline>,
     visible: Arc<Vec<u32>>,
     hit: Option<u32>,
     selected: Option<u32>,
+    widest: usize,
+    content: Pixels,
     scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<RequestView>,
@@ -865,6 +936,7 @@ fn json_list(
     let row_theme = theme.clone();
     let mono = theme.mono.clone();
     let view = cx.entity().downgrade();
+    let indicator_scroll = scroll.clone();
     let count = visible.len();
 
     uniform_list("json-body", count, move |range, _window, _cx| {
@@ -880,6 +952,7 @@ fn json_list(
                     row,
                     row_ix,
                     visible_ix,
+                    content,
                     folded,
                     hit == Some(row_ix as u32),
                     selected == Some(row_ix as u32),
@@ -892,6 +965,16 @@ fn json_list(
     // Without this the list cannot be scrolled programmatically, so jumping to a match would
     // silently do nothing — the handle is the only way in.
     .track_scroll(scroll)
+    // Horizontal scrolling, and the second call is not optional. `Unconstrained` sizes the
+    // content to the widest item — but "widest" means *one sampled row*, `with_width_from_item`,
+    // which defaults to index 0. Row 0 of a JSON document is `{`, so the default sizes the region
+    // to nothing and the switch above appears not to work at all.
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .with_width_from_item(Some(widest))
+    .with_decoration(HScrollIndicator {
+        scroll: indicator_scroll,
+        color: theme.text_faint,
+    })
     // The reference frame for `a_response_row_spans_the_full_width_of_the_list`. A row's own
     // bounds agree with the width bug, so the container is the only honest thing to measure a
     // click against.
@@ -908,6 +991,7 @@ fn json_row(
     row: Row,
     row_ix: usize,
     visible_ix: usize,
+    content: Pixels,
     folded: bool,
     is_hit: bool,
     is_selected: bool,
@@ -928,10 +1012,25 @@ fn json_row(
         // root to its available width only for `display: block` (`compute_root_layout`'s
         // `style.is_block()` gate), and `.flex()` above takes the other branch and sizes to
         // content. Without this the row is as wide as its own text — so the highlights below
-        // end mid-row, and, worse, the click target added here covers only the text and the
-        // rest of the row silently swallows clicks. This is the picker's bug (see `picker.rs`)
-        // in the surface that has a million rows.
+        // end mid-row, and, worse, the click target covers only the text and the rest of the
+        // row silently swallows clicks. This is the picker's bug (see `picker.rs`) in the
+        // surface that has a million rows.
+        //
+        // **Horizontal scrolling needed no change here**, which is worth recording because a
+        // minimum width looks like the obvious answer and is not. Once the list scrolls
+        // sideways it lays each row out with `available_width = viewport + |scroll_x|` and
+        // shifts the row origin by `scroll_x`, so a 100% row already spans exactly the visible
+        // region at every offset. Swapping in `min_w(100%)` was tried and changed nothing any
+        // test or eye could see.
         .w_full()
+        // The scroll region's real size. `uniform_list` would otherwise take it from measuring
+        // one row *before* the list's text style is in effect (see `BodyView::widest_extent`),
+        // which shapes it in the wrong font and can fall short of the longest line.
+        .min_w(content)
+        // And the row carries its own text style rather than inheriting the list's, so anything
+        // that does measure it measures the font it is drawn in.
+        .font_family(theme.mono.clone())
+        .text_xs()
         .flex_row()
         .items_center()
         .h(px(ROW_HEIGHT))
@@ -1068,6 +1167,8 @@ fn text_list(
     lines: Arc<LineIndex>,
     hit: Option<u32>,
     selected: Option<u32>,
+    widest: usize,
+    content: Pixels,
     scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<RequestView>,
@@ -1075,6 +1176,7 @@ fn text_list(
     let row_theme = theme.clone();
     let mono = theme.mono.clone();
     let view = cx.entity().downgrade();
+    let indicator_scroll = scroll.clone();
     let count = lines.len();
 
     uniform_list("text-body", count, move |range, _window, _cx| {
@@ -1088,8 +1190,13 @@ fn text_list(
                     .flex()
                     // See `json_row` — a `.flex()` row inside a `uniform_list` sizes to its
                     // content, not to the list, so without this the click target and both
-                    // highlights stop at the end of the line's text.
+                    // highlights stop at the end of the line's text. Still `w_full` after
+                    // horizontal scrolling landed — see `json_row` for why a minimum isn't
+                    // needed.
                     .w_full()
+                    .min_w(content)
+                    .font_family(row_theme.mono.clone())
+                    .text_xs()
                     .flex_row()
                     .items_center()
                     .h(px(ROW_HEIGHT))
@@ -1143,6 +1250,14 @@ fn text_list(
             .collect()
     })
     .track_scroll(scroll)
+    // See `json_list`: the sampled-row index is what makes this do anything.
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .with_width_from_item(Some(widest))
+    .with_decoration(HScrollIndicator {
+        scroll: indicator_scroll,
+        color: theme.text_faint,
+    })
+    .debug_selector(|| "response-body".to_string())
     .flex_1()
     .px_2()
     .font_family(mono)

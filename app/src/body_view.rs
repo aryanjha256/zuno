@@ -41,6 +41,15 @@ pub struct BodyView {
     /// `is_folded_at` for how the renderer infers fold state from `visible` instead.
     folded: Vec<bool>,
     visible: Arc<Vec<u32>>,
+    /// The **visible** index of the row to measure the horizontal scroll region from, and that
+    /// row's indent depth and drawn character count. See `widest_json_row`.
+    ///
+    /// Recomputed on every fold, because folding is how a wide response is made readable and a
+    /// horizontal extent that ignores it defeats the point: collapsing a document left the
+    /// region as wide as the longest row it *used* to show, so the view stayed scrolled into
+    /// blank space with nothing left out there to find.
+    widest_visible: usize,
+    widest_extent: (u16, u32),
     /// Where the reader is standing, as a **row** index rather than a visible one.
     ///
     /// Row index because folding rewrites `visible` underneath it: holding a visible index
@@ -70,14 +79,20 @@ impl BodyView {
             match JsonOutline::parse(body.clone()) {
                 Ok(outline) => {
                     let folded = vec![false; outline.len()];
-                    let visible = Arc::new(outline.visible_rows(&folded));
-                    return Self {
+                    let mut view = Self {
                         kind: BodyKind::Json(Arc::new(outline)),
                         notice: None,
                         folded,
-                        visible,
+                        visible: Arc::new(Vec::new()),
+                        widest_visible: 0,
+                        widest_extent: (0, 0),
                         selected: None,
                     };
+                    // The same path a fold takes, so the initial state cannot disagree with
+                    // every later one.
+                    let outline = view.outline().cloned().expect("just built");
+                    view.rebuild_visible(&outline);
+                    return view;
                 }
                 Err(error) => {
                     // Fall back to raw text and say precisely where it broke — a bad
@@ -95,13 +110,46 @@ impl BodyView {
     }
 
     fn plain(kind: BodyKind, notice: Option<BodyNotice>) -> Self {
+        let (widest_visible, widest_extent) = match &kind {
+            BodyKind::Text(lines) => {
+                let ix = lines.widest_line();
+                (ix, (0, lines.line(ix).0.chars().count() as u32))
+            }
+            _ => (0, (0, 0)),
+        };
+
         Self {
             kind,
             notice,
             folded: Vec::new(),
             visible: Arc::new(Vec::new()),
+            widest_visible,
+            widest_extent,
             selected: None,
         }
+    }
+
+    /// The widest row's `(depth, characters)`, for sizing the horizontal scroll region.
+    ///
+    /// **The pane converts this to pixels itself rather than letting `uniform_list` measure a
+    /// row**, because that measurement is taken *before* `interactivity.prepaint` pushes the
+    /// list's own text style — so the row is shaped in whatever font is ambient, not the
+    /// `mono`/`text_xs` it will actually be drawn in. The two agree in the headless platform,
+    /// which is why every test passed while the real window scrolled short of the line's end.
+    pub fn widest_extent(&self) -> (u16, u32) {
+        self.widest_extent
+    }
+
+    /// The row `uniform_list` should measure to size its horizontal scroll region.
+    ///
+    /// It measures exactly **one** row (`with_width_from_item`, default 0) rather than scanning
+    /// for the widest, so handing it the wrong index is not a rounding error — it is the
+    /// difference between scrolling and not. Row 0 of a JSON document is `{`, the narrowest row
+    /// there is, so the default would size the region to nothing.
+    ///
+    /// Returned as a **visible** index, because that is how the list addresses items.
+    pub fn widest_visible_ix(&self) -> usize {
+        self.widest_visible
     }
 
     pub fn outline(&self) -> Option<&Arc<JsonOutline>> {
@@ -228,6 +276,13 @@ impl BodyView {
     /// lands on the container that was just folded, which is where the reader is looking.
     fn rebuild_visible(&mut self, outline: &JsonOutline) {
         self.visible = Arc::new(outline.visible_rows(&self.folded));
+
+        // Over the rows now *drawn*, not every row in the document. A folded container's
+        // contents are not on screen, so they must not decide how far the view can scroll —
+        // once the extent shrinks, gpui's own prepaint clamp pulls the offset back in.
+        let (widest_visible, widest_extent) = widest_json_row(outline, &self.visible);
+        self.widest_visible = widest_visible;
+        self.widest_extent = widest_extent;
 
         if let Some(selected) = self.selected {
             if self.visible.binary_search(&selected).is_err() {
@@ -360,6 +415,53 @@ impl BodyView {
     }
 }
 
+/// The widest row *currently drawn*, estimated rather than measured.
+///
+/// One pass over the visible index — 1.31M entries for an unfolded 10MB body. That is the same
+/// order as `visible_rows`, which `rebuild_visible` has always run right beside it, so folding
+/// costs about twice what it did rather than something new.
+///
+/// **Not background-only, unlike `build`.** This comment said it was, and said so because the
+/// only caller was `build`; folding now calls it too, from the UI thread. Deliberate: the extent
+/// has to follow a fold or the scroll region keeps the width of rows that are no longer on
+/// screen, and re-indexing off-thread for a keystroke would be worse than the pass itself.
+///
+/// The estimate only has to pick the right *index and extent* — the pane converts that to pixels
+/// with an advance measured in the render font. Character counts work because the body is drawn
+/// in a monospace face, which is the one assumption a proportional font would break.
+fn widest_json_row(outline: &JsonOutline, visible: &[u32]) -> (usize, (u16, u32)) {
+    // Per-character and per-depth-level advances at the viewer's text size. **Only the ratio
+    // matters** — this is an argmax, never a measurement — but the ratio matters a great deal:
+    // it decides a deep-short row against a shallow-long one, and getting it wrong points the
+    // scroll region at a row that isn't the widest, so the end of the real one stays out of
+    // reach. `CHAR` was 7.0 against a measured advance of ~8.5, which over-weighted depth.
+    //
+    // `DEPTH` is `response_pane::INDENT` exactly. `CHAR` is the monospace advance measured from
+    // the rendered list, and `a_shallow_long_row_beats_a_deep_short_one` pins the consequence
+    // rather than the number.
+    const CHAR: f32 = 8.5;
+    const DEPTH: f32 = 13.0;
+
+    let mut widest = 0.;
+    let mut best = 0;
+    let mut extent = (0, 0);
+
+    for (visible_ix, row_ix) in visible.iter().enumerate() {
+        let Some(row) = outline.row(*row_ix as usize) else {
+            continue;
+        };
+        let chars = row.key.len + row.value.len;
+        let width = row.depth as f32 * DEPTH + chars as f32 * CHAR;
+        if width > widest {
+            widest = width;
+            best = visible_ix;
+            extent = (row.depth, chars);
+        }
+    }
+
+    (best, extent)
+}
+
 /// Whether a visible row is a folded container.
 ///
 /// Derived from `visible` rather than from the fold flags, so the render closure never
@@ -421,6 +523,29 @@ mod tests {
             content_type.map(str::to_string),
             false,
         )
+    }
+
+    #[test]
+    fn a_shallow_long_row_beats_a_deep_short_one() {
+        // The ratio between the per-depth indent and the per-character advance is the only
+        // thing `widest_json_row` decides with, and this is the shape that exposes it: the
+        // first row has ten more characters, the second sits six levels deeper. At the real
+        // advance the shallow row is wider; at the 7.0 this shipped with, the deep one wins and
+        // the scroll region is sized to the wrong row — so the end of the long value can never
+        // be reached, which is exactly what it felt like.
+        let long = "x".repeat(41);
+        let deep = "y".repeat(31);
+        let json = format!(r#"{{"k":"{long}","a":{{"b":{{"c":{{"d":{{"e":{{"f":{{"d":"{deep}"}}}}}}}}}}}}}}"#);
+        let view = BodyView::build(Bytes::from(json), Some("application/json".into()), false);
+
+        let outline = view.outline().expect("json");
+        let row = outline.row(view.widest_visible_ix()).expect("a row");
+        assert_eq!(
+            outline.text(row.key),
+            "\"k\"",
+            "the shallow row with the long value is the widest one actually drawn"
+        );
+        assert_eq!(row.depth, 1);
     }
 
     #[test]

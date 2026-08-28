@@ -209,6 +209,12 @@ pub enum RowKind {
     Multipart,
 }
 
+/// How far one `left`/`right` press moves the response body.
+///
+/// Roughly ten monospace characters at the viewer's text size: small enough to land where you
+/// meant, large enough that crossing a long token isn't a drum solo.
+const H_SCROLL_STEP: f32 = 70.;
+
 pub struct RequestView {
     pub id: RequestId,
     pub name: String,
@@ -277,6 +283,9 @@ pub struct RequestView {
     /// to a match can scroll the one that is. `uniform_list` needs the handle at render time,
     /// which is why it lives here rather than in `BodyView`.
     pub body_scroll: UniformListScrollHandle,
+    /// The headers tab's scroll state. Tracked so the tab can scroll *sideways* — header values
+    /// routinely exceed the pane, and until this existed the cell was told to shrink and clip.
+    pub headers_scroll: gpui::ScrollHandle,
     /// Where the last right-click in the body landed, in window coordinates.
     ///
     /// The menu itself is owned by `Workspace`, beside the picker and the settings panel — it
@@ -323,6 +332,7 @@ impl RequestView {
             search: None,
             search_task: None,
             body_scroll: UniformListScrollHandle::new(),
+            headers_scroll: gpui::ScrollHandle::new(),
             menu_anchor: None,
             diff_task: None,
             inflight: None,
@@ -1186,6 +1196,36 @@ impl RequestView {
             body.toggle_selected_fold();
             cx.notify();
         }
+    }
+
+    /// Scroll the body sideways by `steps` of `H_SCROLL_STEP`.
+    ///
+    /// **Offsets run negative as you scroll right** — gpui's convention, stated on
+    /// `ScrollHandle::set_offset`.
+    ///
+    /// **Deliberately does not clamp**, which is the opposite of the obvious code. `set_offset`
+    /// writes without checking, so an explicit clamp here looks required — but gpui re-clamps
+    /// `scroll_offset.x` to `[-scroll_max.width, 0]` on every `interactivity.prepaint`, using a
+    /// maximum computed from the content as it is *now*. A clamp here would duplicate that
+    /// against a `max_offset` recorded by the previous frame, which is the staler of the two.
+    /// Tried, and no test or eye could tell the difference.
+    pub fn scroll_body_horizontally(&mut self, steps: f32, cx: &mut Context<Self>) {
+        let handle = self.body_scroll.0.borrow().base_handle.clone();
+        let mut offset = handle.offset();
+
+        offset.x -= px(steps * H_SCROLL_STEP);
+        handle.set_offset(offset);
+        cx.notify();
+    }
+
+    /// Back to column zero. `Home` rather than a long press on `left`, for the same reason
+    /// every editor has one.
+    pub fn scroll_body_to_start(&mut self, cx: &mut Context<Self>) {
+        let handle = self.body_scroll.0.borrow().base_handle.clone();
+        let mut offset = handle.offset();
+        offset.x = px(0.);
+        handle.set_offset(offset);
+        cx.notify();
     }
 
     /// The selected row's value and path, for the copy verbs.
