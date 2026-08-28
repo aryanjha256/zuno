@@ -3764,6 +3764,32 @@ async fn searching_a_non_json_body_uses_lines(cx: &mut TestAppContext) {
 /// `serve_sequence`: that signature only accepts a slice the compiler can promote to `'static`,
 /// which a literal built from a parameter is not. Here the body is moved into the thread, so
 /// `&'static str` is all it needs.
+/// `serve_typed` for a body built at runtime.
+///
+/// Exists because `MAX_DISPLAY_LINE` is 4096 and a `&'static str` that long cannot be written
+/// inline — and a copy test that stays under the display cut cannot tell `line` from
+/// `full_line` at all.
+fn serve_typed_owned(content_type: &'static str, body: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
 fn serve_typed(content_type: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3941,6 +3967,11 @@ fn the_asset_list_matches_the_icon_enum() {
 ///
 /// The point of the table: this is the list that used to be *empty* for nine of these verbs. A
 /// button added without an entry here isn't covered, and an entry without a button fails outright.
+///
+/// **The action column is documentation, not an assertion** — nothing headless can read which
+/// action an element would dispatch, so only the selector is checked here. That the wiring is
+/// real rather than a decorative glyph is spot-checked by
+/// `clicking_an_icon_button_dispatches_its_action` below, at four representative buttons.
 fn affordances() -> Vec<(&'static str, &'static str)> {
     vec![
         ("action-find", "zuno::FindInResponse"),
@@ -3960,6 +3991,11 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("theme-toggle", "zuno::ToggleTheme"),
         ("fold-all", "zuno::FoldAll"),
         ("unfold-all", "zuno::UnfoldAll"),
+        // These two appear only with a row selected, which is why the test below selects one
+        // before it checks the table. Offering them permanently would mean two controls that
+        // spend most of their life saying "select a row first".
+        ("action-copy-row-value", "zuno::CopyRowValue"),
+        ("action-copy-row-path", "zuno::CopyRowPath"),
     ]
 }
 
@@ -3969,8 +4005,14 @@ async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestApp
     // into a frame, which is how a button added to a branch that doesn't render looks fine in the
     // source and is absent on screen.
     let (view, mut cx) = respond_with_json(cx, r#"{"a":1}"#);
-    let _ = &view;
     cx.run_until_parked();
+
+    // A selection is part of the setup, not an aside: two of the verbs in the table act *on*
+    // the selected row and are absent without one. It hides nothing else in the pane.
+    focus_response(&mut cx);
+    cx.simulate_keystrokes("down down");
+    cx.run_until_parked();
+    assert_eq!(selected_row(&view, &mut cx), Some(1), "a scalar row, which has a path");
 
     for (selector, _) in affordances() {
         assert!(
@@ -3982,7 +4024,7 @@ async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestApp
 
 #[gpui::test]
 async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) {
-    // Three representative clicks, each with an observable effect. The full table above proves the
+    // Four representative clicks, each with an observable effect. The full table above proves the
     // buttons *exist*; these prove the wiring behind them is real and not a decorative glyph.
     // Nested on purpose: `set_all_folded` never folds the root, so a flat object has nothing to
     // fold and the assertion at the end would hold vacuously.
@@ -4016,6 +4058,23 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
     assert!(
         cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count()) < before,
         "clicking fold-all must fold"
+    );
+
+    // Copy row value: the affordance that only exists while a row is selected, so a click here
+    // also proves it is painted in the state the table checks it in.
+    cx.simulate_keystrokes("alt-e");
+    focus_response(&mut cx);
+    cx.simulate_keystrokes("down down down");
+    cx.run_until_parked();
+    assert_eq!(selected_row(&view, &mut cx), Some(2), "the b row");
+
+    let value = cx.debug_bounds("action-copy-row-value").expect("copy-value button");
+    cx.simulate_click(value.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some("1"),
+        "clicking the value label must copy the selected row"
     );
 }
 
@@ -4261,6 +4320,310 @@ fn serve_bytes(response: &'static [u8]) -> String {
 
 fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
     cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+}
+
+// ---------------------------------------------------------------------------
+// Row selection in the response viewer
+// ---------------------------------------------------------------------------
+
+/// The row index the reader has selected, if any.
+fn selected_row(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> Option<u32> {
+    cx.update(|_, cx| view.read(cx).selected_body_row())
+}
+
+/// Focus the response pane, which is what makes `up`/`down` resolve to the selection verbs.
+fn focus_response(cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("ctrl-shift-r");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn a_response_row_spans_the_full_width_of_the_list(cx: &mut TestAppContext) {
+    // The picker's bug, in the surface that has a million rows — and here it was latent rather
+    // than merely ugly: the search highlight was ragged, and the moment a row became a click
+    // target most of it would have swallowed clicks.
+    //
+    // `uniform_list` lays each item out as a taffy **root** with the list's width as definite
+    // available space, but taffy stretches a root to fill that only for `display: block`
+    // (`compute_root_layout`'s `style.is_block()` gate in taffy 0.9). A `.flex()` row takes the
+    // other branch and sizes to its content.
+    //
+    // **Measured against the *list*, never the row.** Before the fix the row's own bounds *are*
+    // the narrow box, so anything derived from them passes against the bug.
+    let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1,"beta":2}"#);
+    cx.run_until_parked();
+
+    let list = cx.debug_bounds("response-body").expect("the body list should be painted");
+    let row = cx.debug_bounds("response-row-1").expect("the alpha row should be painted");
+    // The list carries `px_2` on each side, so the row is inset by 8px twice.
+    assert!(
+        row.size.width >= list.size.width - gpui::px(20.),
+        "a row must span the list, not its text: row {:?} inside list {:?}",
+        row.size.width,
+        list.size.width
+    );
+
+    // And the consequence, at a point that was dead space: far right of the list, on the row.
+    assert_eq!(selected_row(&view, &mut cx), None, "nothing is selected yet");
+    cx.simulate_click(
+        gpui::point(list.right() - gpui::px(12.), row.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        Some(1),
+        "clicking the empty right-hand side of a row must select that row"
+    );
+}
+
+#[gpui::test]
+async fn clicking_a_row_takes_focus_so_the_keyboard_can_carry_on(cx: &mut TestAppContext) {
+    // Asserted through *another binding working*, never by inspecting which handle has focus:
+    // a click that highlights a row and leaves focus in the URL bar sends the next `down` to a
+    // text input, so the selection the click just made refuses to move. That is the failure,
+    // and it is invisible to any check of the selection alone.
+    //
+    // Nothing in `select_body_row_at` moves focus — the pane's `track_focus` does it, via a
+    // Bubble-phase listener gpui registers in `Interactivity::paint`. This test held when an
+    // explicit `window.focus` was deleted from that method, which is how the call was found to
+    // be dead code. It still earns its keep: removing `track_focus`, or stopping propagation
+    // anywhere between the row and the pane, breaks it — see the chevron test above.
+    let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1,"beta":2}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-1").expect("the alpha row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(selected_row(&view, &mut cx), Some(1));
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        Some(2),
+        "after clicking a row, the arrow keys must keep working"
+    );
+}
+
+#[gpui::test]
+async fn clicking_a_fold_chevron_folds_and_still_leaves_the_keyboard_working(
+    cx: &mut TestAppContext,
+) {
+    // The chevron is a clickable nested inside a clickable, which `CLAUDE.md`'s trap table says
+    // needs `cx.stop_propagation()`. It deliberately does not, and this test is why.
+    //
+    // `track_focus` transfers focus by registering an ordinary **Bubble-phase** mouse listener
+    // rather than by anything special-cased, so stopping propagation on a descendant silently
+    // suppresses it too. With the call in place the fold worked, the row stayed unselected, and
+    // the response pane never took focus — so the next arrow key did nothing at all, which
+    // reads as a dead keystroke with nothing on screen explaining it.
+    //
+    // Asserted through a *later keystroke* working, never by asking which handle has focus.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    cx.run_until_parked();
+
+    let before = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
+    let row = cx.debug_bounds("response-row-1").expect("the outer object's row");
+    // Past the depth indent, on the 12px chevron itself.
+    cx.simulate_click(
+        gpui::point(row.left() + gpui::px(4.0 + 13.0 + 6.0), row.center().y),
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count()) < before,
+        "clicking the chevron must fold the container"
+    );
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        Some(1),
+        "and select it — folding a container and standing on it is one intent, not two"
+    );
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        Some(4),
+        "the pane must have taken focus, and `down` must skip the folded subtree"
+    );
+}
+
+#[gpui::test]
+async fn the_arrow_keys_step_the_selection_and_stop_at_the_ends(cx: &mut TestAppContext) {
+    // Clamped rather than wrapping: running off the end of a huge response and reappearing at
+    // the top loses your place, with no scrollbar movement to explain it.
+    let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1}"#);
+    focus_response(&mut cx);
+
+    // Rows: 0 `{`, 1 alpha, 2 `}`. The first press lands on an end, not one step in from it.
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected_row(&view, &mut cx), Some(0));
+
+    cx.simulate_keystrokes("down down");
+    assert_eq!(selected_row(&view, &mut cx), Some(2));
+
+    cx.simulate_keystrokes("down");
+    assert_eq!(selected_row(&view, &mut cx), Some(2), "the last row is the floor");
+
+    cx.simulate_keystrokes("up up up up");
+    assert_eq!(selected_row(&view, &mut cx), Some(0), "and the first is the ceiling");
+}
+
+#[gpui::test]
+async fn arrow_keys_in_the_url_bar_are_still_the_url_bars(cx: &mut TestAppContext) {
+    // `up`/`down` are scoped to `ResponsePane`, and GPUI matches only the *leaf* context. Scope
+    // them wrongly — or globally — and typing in the URL bar starts moving a selection in the
+    // response instead. Driven through the real keymap, which is the only way to see it.
+    let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1}"#);
+
+    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes("down down");
+    cx.run_until_parked();
+
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        None,
+        "the response selection must not move while the URL bar has focus"
+    );
+}
+
+#[gpui::test]
+async fn copying_a_row_value_decodes_the_string(cx: &mut TestAppContext) {
+    // Decoded, not merely unquoted. `\n` pasted as a backslash and an `n` is the tempting
+    // version and the wrong one: it *looks* decoded, so nothing tells you it isn't.
+    let (view, mut cx) = respond_with_json(cx, r#"{"note":"first\nsecond","n":42}"#);
+    focus_response(&mut cx);
+
+    cx.simulate_keystrokes("down down");
+    assert_eq!(selected_row(&view, &mut cx), Some(1), "the note row");
+
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(clipboard_text(&mut cx).as_deref(), Some("first\nsecond"));
+
+    // A number keeps its own text — `unquote` passes anything unquoted straight through, which
+    // is why there is no match on ScalarKind at the call site.
+    cx.simulate_keystrokes("down ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(clipboard_text(&mut cx).as_deref(), Some("42"));
+}
+
+#[gpui::test]
+async fn copying_a_container_row_gives_the_whole_subtree(cx: &mut TestAppContext) {
+    // A `{` is a row you can land on, so copying it has to mean something. Without the braces
+    // this verb would be dead on every open and close row — roughly half a nested document.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    focus_response(&mut cx);
+
+    cx.simulate_keystrokes("down down");
+    assert_eq!(selected_row(&view, &mut cx), Some(1), "the outer object's row");
+
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(clipboard_text(&mut cx).as_deref(), Some(r#"{"inner":1}"#));
+}
+
+#[gpui::test]
+async fn copying_a_row_path_gives_a_jsonpath(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_json(cx, r#"{"users":[{"email":"a@b.test"}]}"#);
+    focus_response(&mut cx);
+
+    // 0 `{`, 1 `users` array, 2 the element `{`, 3 email.
+    cx.simulate_keystrokes("down down down down");
+    assert_eq!(selected_row(&view, &mut cx), Some(3), "the email row");
+
+    cx.simulate_keystrokes("alt-c");
+    cx.run_until_parked();
+    assert_eq!(clipboard_text(&mut cx).as_deref(), Some("$.users[0].email"));
+}
+
+#[gpui::test]
+async fn a_copy_with_nothing_selected_explains_itself(cx: &mut TestAppContext) {
+    // Silence here reads as a broken keystroke. The palette can dispatch these with focus
+    // anywhere, so "nothing is selected" is a normal state, not a misuse.
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":1}"#);
+    cx.run_until_parked();
+    assert_eq!(selected_row(&view, &mut cx), None);
+
+    // Dispatched rather than typed: `ctrl-c` is scoped to the response pane, and the point
+    // here is the path a palette row takes, which resolves with focus anywhere.
+    cx.update(|window, cx| {
+        window.dispatch_action(gpui::Action::boxed_clone(&crate::actions::CopyRowValue), cx)
+    });
+    cx.run_until_parked();
+
+    let status = buffer_status(&view, &mut cx);
+    assert!(
+        status.contains("Select a row"),
+        "a copy with no selection must say so, not do nothing: {status:?}"
+    );
+    assert_eq!(clipboard_text(&mut cx), None, "and must not put anything on the clipboard");
+}
+
+#[gpui::test]
+async fn folding_a_container_keeps_the_selection_on_something_drawn(cx: &mut TestAppContext) {
+    // Folding removes the selected row from `visible`. A selection nothing paints is a cursor
+    // the reader has lost: the next `down` jumps from wherever it secretly still was.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    focus_response(&mut cx);
+
+    // Land on `inner`, which lives inside `outer`.
+    cx.simulate_keystrokes("down down down");
+    assert_eq!(selected_row(&view, &mut cx), Some(2), "the inner row");
+
+    cx.simulate_keystrokes("alt-f");
+    cx.run_until_parked();
+
+    let selected = selected_row(&view, &mut cx).expect("still a selection");
+    let visible = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().visible());
+    assert!(
+        visible.contains(&selected),
+        "the selection must land on a drawn row; selected {selected}, visible {visible:?}"
+    );
+    assert_eq!(selected, 1, "specifically the container that swallowed it");
+}
+
+#[gpui::test]
+async fn a_raw_body_copies_the_whole_line_and_refuses_a_path(cx: &mut TestAppContext) {
+    // Two halves of the same decision. The drawn line stops at `MAX_DISPLAY_LINE`; a copy that
+    // silently handed back 4KB of a longer one would be a wrong answer wearing a right one.
+    // And there is no structure to name a position within, so the path verb says so rather
+    // than inventing a line number no tool downstream accepts.
+    let (_, view, mut cx) = boot(cx, None, None);
+    // Deliberately past `MAX_DISPLAY_LINE`. A short line would make `line` and `full_line`
+    // identical, so the test would pass against a call site that copies the drawn text — the
+    // unit test on `full_line` would be covering the type while leaving this unheld.
+    let long = "x".repeat(zuno_core::lines::MAX_DISPLAY_LINE * 2);
+    let url = serve_typed_owned("text/plain", format!("alpha\n{long}"));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+    focus_response(&mut cx);
+
+    cx.simulate_keystrokes("down down");
+    assert_eq!(selected_row(&view, &mut cx), Some(1), "the long line");
+
+    cx.simulate_keystrokes("ctrl-c");
+    cx.run_until_parked();
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some(long.as_str()),
+        "the whole line, not the 4KB the viewer draws"
+    );
+
+    cx.simulate_keystrokes("alt-c");
+    cx.run_until_parked();
+    let status = buffer_status(&view, &mut cx);
+    assert!(
+        status.contains("JSON"),
+        "a raw body has no path, and the verb has to say why: {status:?}"
+    );
 }
 
 #[gpui::test]

@@ -23,8 +23,16 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   `Ctrl+P` over buffers and saved requests, `Ctrl+K` over every command.
 - **M3 — reuse.** Environments and `{{variables}}`, per-request settings, the history browser,
   response egress, and all four body types authorable.
-- **Since, from the audit below.** Response search, and the response pane split into body and
-  headers tabs.
+- **Since, from the audit below.** Response search; the response pane split into body and headers
+  tabs; the request pane split into Headers / Params / Body; the editing set the text inputs were
+  missing (word movement and deletion, document ends, double- and triple-click, `PageUp`/`PageDown`,
+  undo/redo); and row selection in the response viewer with copy-value and copy-path.
+
+  This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
+  and both absent from it — which is the rot the note at the top of this file predicts. Worth
+  noticing *how*: each of those slices updated architecture.md, where its design decisions belong,
+  and neither updated the file that owns **order**. A doc nobody has to touch to finish a slice is
+  the one that silently stops being true.
 
 Measured (release): **189 ms** cold start, **48 ms** to flatten 10 MB of JSON into 1.31 M rows
 off-thread, **6.9 ms** to search that body end to end, 60 fps scrolling at any size.
@@ -294,9 +302,10 @@ Three decisions worth keeping:
   extension comes from the content type, ignoring parameters, and defaults to `.bin` because an
   unknown type shouldn't claim to be text.
 
-*Still missing from egress:* copying a single JSON row's value or its path. That needs a selected
-row in the response viewer, which doesn't exist — the pane has focus but no cursor — so it's row
-selection first, then copy. Worth doing alongside response search, which wants the same thing.
+*The rest of egress — done, in the slice after search.* Copying a single row's value or its path
+needed a selected row, which is why it waited: the pane had focus but no cursor. `up`/`down` and a
+click now place one, `Ctrl+C` copies the row's value and `Alt+C` its JSONPath. See
+architecture.md §6.
 
 **2. Body authoring — done** (2a–2d below). As found, this was the real capability blocker: no
 workaround for multipart or binary, and file upload is bread-and-butter REST. Multipart was the only
@@ -403,9 +412,10 @@ Two things it turned out to need that weren't on this list:
   rule has decided behaviour with no compile error to catch it — now with a test that fails when
   the block moves.
 
-*Still missing from egress, and unchanged:* copying a single row's value or its path. Search built
-the row *cursor* (a current match, revealed and scrolled to) but not a *selection* the user drives,
-so that remains row selection first, then copy.
+*And it built half of what egress was waiting for.* Search produced a row *cursor* — a current
+match, revealed and scrolled to — but not a *selection* the user drives. Row selection reused the
+reveal-and-translate machinery wholesale, which is why the follow-up slice was small; the two
+cursors stayed separate, because a match and where you are standing are different questions.
 
 **4. Smaller, but real.** With search done, this is the live list.
 
@@ -421,6 +431,15 @@ so that remains row selection first, then copy.
 
   A test caught a real bug on the way, and not in the export: the "withheld a secret" notice
   scanned disabled rows too, so a fresh buffer announced a redaction for a header it never sent.
+- **Row selection and row-level copy — done.** `up`/`down` or a click place a cursor in the
+  response body; `Ctrl+C` copies that row's value (a JSON string arrives *decoded*, a container
+  arrives as its own source text) and `Alt+C` copies its JSONPath. This was the last item on the
+  egress list above, held back through two slices for want of a selection.
+
+  It also closed a latent version of the picker's width bug: both body row builders sized to their
+  own text inside a full-width list, which was merely ugly while the fold chevron was the only
+  click target and would have made ~90% of every row dead the moment one was added. The fix and
+  the feature were one change, which is the argument for having done them together.
 - **No delete or rename of a saved request** from inside the app. Mild, because files are the
   interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
 - **No body prettify.** Paste minified JSON and you live with it.

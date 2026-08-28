@@ -42,7 +42,8 @@ use crate::actions::{
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
-    CloseFind, CopyAsCurl, FindInResponse, FindNext, FindPrev,
+    CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue, FindInResponse, FindNext, FindPrev,
+    ResponseRowNext, ResponseRowPrev,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -189,6 +190,16 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("alt-r", ToggleResponseView, None),
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
+        // Moving a selection through the body. Scoped to the pane rather than global: `up` and
+        // `down` are the editor's and the picker's too, and a context predicate matches only the
+        // leaf, so the three cannot collide.
+        KeyBinding::new("down", ResponseRowNext, Some("ResponsePane")),
+        KeyBinding::new("up", ResponseRowPrev, Some("ResponsePane")),
+        // `ctrl-c` finally means copy here. It is bound to `text_input::Copy` under
+        // `TextInput`, and leaf-only matching keeps the two apart — which is why this can be
+        // the obvious key while `CancelRequest` had to settle for `escape`.
+        KeyBinding::new("ctrl-c", CopyRowValue, Some("ResponsePane")),
+        KeyBinding::new("alt-c", CopyRowPath, Some("ResponsePane")),
         // Getting the response back out. `ctrl-c` is taken by text-input copy, scoped to
         // `TextInput`; these are global because the response pane has no input to type in.
         KeyBinding::new("ctrl-shift-c", CopyResponse, None),

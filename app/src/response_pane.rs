@@ -23,10 +23,10 @@ use zuno_core::{
 };
 
 use crate::actions::{
-    CancelRequest, CopyResponse, FindInResponse, FoldAll, SaveResponse, SendRequest, ShowHistory,
-    UnfoldAll,
+    CancelRequest, CopyResponse, CopyRowPath, CopyRowValue, FindInResponse, FoldAll, SaveResponse,
+    SendRequest, ShowHistory, UnfoldAll,
 };
-use crate::ui::{Icon, icon_button, text_action};
+use crate::ui::{Icon, icon_button, separator, text_action};
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
 use crate::theme::Theme;
@@ -155,7 +155,7 @@ fn view_tabs(
         ))
         // Pushes the action row to the far right; the tabs stay left where the eye starts.
         .child(div().flex_1())
-        .child(response_actions(theme))
+        .child(response_actions(view, theme))
 }
 
 /// The verbs that act on a response, as icon buttons.
@@ -164,13 +164,40 @@ fn view_tabs(
 /// by shortcut or by the command palette and by nothing you could see — which for a new user means
 /// they did not exist. Each button dispatches its action and carries a tooltip naming its key, so
 /// the mouse path teaches the keyboard one instead of competing with it.
-fn response_actions(theme: &Theme) -> Div {
+fn response_actions(view: &RequestView, theme: &Theme) -> Div {
+    // Shown only with a row selected, because both verbs are *about* that row: offering them
+    // permanently would mean two controls that spend most of their life reporting "select a
+    // row first", which teaches nothing. Appearing on selection is itself the explanation.
+    let selected = view.selected_body_row().is_some();
+    let has_path = selected && view.selected_body_path().is_some();
+
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
         .flex_none()
+        .children(selected.then(|| {
+            text_action(
+                "action-copy-row-value",
+                "value".into(),
+                "Copy the selected row's value",
+                CopyRowValue,
+                theme,
+            )
+        }))
+        // Absent rather than inert on a raw body, where there is no structure to name a
+        // position within — a control that cannot work is worse than no control.
+        .children(has_path.then(|| {
+            text_action(
+                "action-copy-row-path",
+                "path".into(),
+                "Copy the selected row's path",
+                CopyRowPath,
+                theme,
+            )
+        }))
+        .children(selected.then(|| separator(theme)))
         .child(icon_button(
             "action-find",
             Icon::Search,
@@ -808,9 +835,12 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
 
     let notice = body.notice.as_ref().map(|notice| notice_bar(notice, theme));
 
-    // The row holding the current match, so it can be highlighted. A plain `Option<u32>` is
-    // `Copy`, so the render closures capture it without borrowing the view.
+    // The row holding the current match, and the row the reader has selected. Both are
+    // plain `Option<u32>` and therefore `Copy`, so the render closures capture them without
+    // borrowing the view. They are separate on purpose: a match is where the *search* is, a
+    // selection is where *you* are, and a row is routinely both.
     let hit = view.current_match_row();
+    let selected = view.selected_body_row();
     let scroll = view.body_scroll.clone();
 
     let list = match &body.kind {
@@ -820,10 +850,19 @@ fn body_region(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
             theme,
         )
         .into_any_element(),
-        BodyKind::Json(outline) => {
-            json_list(outline.clone(), body.visible(), hit, scroll, theme, cx).into_any_element()
+        BodyKind::Json(outline) => json_list(
+            outline.clone(),
+            body.visible(),
+            hit,
+            selected,
+            scroll,
+            theme,
+            cx,
+        )
+        .into_any_element(),
+        BodyKind::Text(lines) => {
+            text_list(lines.clone(), hit, selected, scroll, theme, cx).into_any_element()
         }
-        BodyKind::Text(lines) => text_list(lines.clone(), hit, scroll, theme).into_any_element(),
     };
 
     container.children(notice).child(list)
@@ -838,6 +877,7 @@ fn json_list(
     outline: Arc<JsonOutline>,
     visible: Arc<Vec<u32>>,
     hit: Option<u32>,
+    selected: Option<u32>,
     scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<RequestView>,
@@ -852,38 +892,73 @@ fn json_list(
             .map(|visible_ix| {
                 let row_ix = visible[visible_ix] as usize;
                 let Some(row) = outline.row(row_ix).copied() else {
-                    return div().h(px(ROW_HEIGHT));
+                    return div().w_full().h(px(ROW_HEIGHT));
                 };
                 let folded = row.kind.is_open() && is_folded_at(&visible, visible_ix, row_ix);
-                let is_hit = hit == Some(row_ix as u32);
-                json_row(&outline, row, row_ix, folded, is_hit, &row_theme, view.clone())
+                json_row(
+                    &outline,
+                    row,
+                    row_ix,
+                    visible_ix,
+                    folded,
+                    hit == Some(row_ix as u32),
+                    selected == Some(row_ix as u32),
+                    &row_theme,
+                    view.clone(),
+                )
             })
             .collect()
     })
     // Without this the list cannot be scrolled programmatically, so jumping to a match would
     // silently do nothing — the handle is the only way in.
     .track_scroll(scroll)
+    // The reference frame for `a_response_row_spans_the_full_width_of_the_list`. A row's own
+    // bounds agree with the width bug, so the container is the only honest thing to measure a
+    // click against.
+    .debug_selector(|| "response-body".to_string())
     .flex_1()
     .px_2()
     .font_family(mono)
     .text_xs()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn json_row(
     outline: &JsonOutline,
     row: Row,
     row_ix: usize,
+    visible_ix: usize,
     folded: bool,
     is_hit: bool,
+    is_selected: bool,
     theme: &Theme,
     view: gpui::WeakEntity<RequestView>,
 ) -> Div {
+    let selecting = view.clone();
+
     let mut line = div()
+        .debug_selector(move || format!("response-row-{visible_ix}"))
         .flex()
+        // **`w_full` is load-bearing, and its absence looks like nothing.** `uniform_list`
+        // lays each item out as a taffy *root* and hands it the list's width as definite
+        // available space, which reads like a stretch instruction. It isn't: taffy stretches a
+        // root to its available width only for `display: block` (`compute_root_layout`'s
+        // `style.is_block()` gate), and `.flex()` above takes the other branch and sizes to
+        // content. Without this the row is as wide as its own text — so the highlights below
+        // end mid-row, and, worse, the click target added here covers only the text and the
+        // rest of the row silently swallows clicks. This is the picker's bug (see `picker.rs`)
+        // in the surface that has a million rows.
+        .w_full()
         .flex_row()
         .items_center()
         .h(px(ROW_HEIGHT))
-        .pl(px(4.0 + row.depth as f32 * INDENT));
+        .pl(px(4.0 + row.depth as f32 * INDENT))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+            let _ = selecting.update(cx, |view, cx| {
+                view.select_body_row_at(visible_ix, cx);
+            });
+        });
 
     if is_hit {
         // Whole-row, because the match is a byte range in the source and the row is built from
@@ -891,6 +966,13 @@ fn json_row(
         // means splitting a shaped run, which is the syntax-highlighting problem (principle 4)
         // and not this slice's. The row is enough to find it with your eye.
         line = line.bg(theme.bg_hover).border_l_2().border_color(theme.accent);
+    }
+
+    // After the hit, so a row that is both keeps the accent bar saying "this is a match" while
+    // the fill says "you are here". One `border_color` paints every side, so the selection
+    // deliberately adds no border of its own — two colours would need two boxes.
+    if is_selected {
+        line = line.bg(theme.selection);
     }
 
     // Fold affordance. Only containers get one, and clicking anywhere on the marker
@@ -906,6 +988,14 @@ fn json_row(
                 .cursor_pointer()
                 .hover(|style| style.text_color(theme.accent))
                 .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    // **Deliberately does *not* stop propagation**, which is the opposite of
+                    // what a clickable nested in a clickable usually needs. Two reasons, and
+                    // the second is the one that bites. The row's own effect is wanted here —
+                    // folding a container and standing on it is one intent, not two. And
+                    // `track_focus` transfers focus by registering an ordinary Bubble-phase
+                    // mouse listener (`div.rs`, `Interactivity::paint`), so stopping
+                    // propagation silently suppresses *that* too: with it, clicking a chevron
+                    // left the response pane unfocused and the next arrow key did nothing.
                     let _ = view.update(cx, |view, cx| view.toggle_fold(row_ix, cx));
                 })
                 .child(marker.to_string()),
@@ -980,22 +1070,36 @@ fn plural(count: u32) -> String {
 fn text_list(
     lines: Arc<LineIndex>,
     hit: Option<u32>,
+    selected: Option<u32>,
     scroll: UniformListScrollHandle,
     theme: &Theme,
+    cx: &mut Context<RequestView>,
 ) -> impl IntoElement {
     let row_theme = theme.clone();
     let mono = theme.mono.clone();
+    let view = cx.entity().downgrade();
     let count = lines.len();
 
     uniform_list("text-body", count, move |range, _window, _cx| {
         range
             .map(|ix| {
                 let (text, truncated) = lines.line(ix);
+                let selecting = view.clone();
                 let mut row = div()
                     .flex()
+                    // See `json_row` — a `.flex()` row inside a `uniform_list` sizes to its
+                    // content, not to the list, so without this the click target and both
+                    // highlights stop at the end of the line's text.
+                    .w_full()
                     .flex_row()
                     .items_center()
                     .h(px(ROW_HEIGHT))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                        let _ = selecting.update(cx, |view, cx| {
+                            view.select_body_row_at(ix, cx);
+                        });
+                    })
                     .child(
                         div()
                             .flex_none()
@@ -1008,6 +1112,10 @@ fn text_list(
                         .bg(row_theme.bg_hover)
                         .border_l_2()
                         .border_color(row_theme.accent);
+                }
+
+                if selected == Some(ix as u32) {
+                    row = row.bg(row_theme.selection);
                 }
 
                 if truncated {

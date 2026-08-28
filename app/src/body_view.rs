@@ -41,6 +41,14 @@ pub struct BodyView {
     /// `is_folded_at` for how the renderer infers fold state from `visible` instead.
     folded: Vec<bool>,
     visible: Arc<Vec<u32>>,
+    /// Where the reader is standing, as a **row** index rather than a visible one.
+    ///
+    /// Row index because folding rewrites `visible` underneath it: holding a visible index
+    /// would silently retarget the selection at whatever row slid into that slot. Deliberately
+    /// separate from the search cursor — a match and where you are standing are different
+    /// questions, and sharing one highlight would make stepping through matches move a
+    /// selection the user placed.
+    selected: Option<u32>,
 }
 
 impl BodyView {
@@ -68,6 +76,7 @@ impl BodyView {
                         notice: None,
                         folded,
                         visible,
+                        selected: None,
                     };
                 }
                 Err(error) => {
@@ -91,6 +100,7 @@ impl BodyView {
             notice,
             folded: Vec::new(),
             visible: Arc::new(Vec::new()),
+            selected: None,
         }
     }
 
@@ -126,7 +136,7 @@ impl BodyView {
         if let Some(flag) = self.folded.get_mut(row_ix) {
             *flag = !*flag;
         }
-        self.visible = Arc::new(outline.visible_rows(&self.folded));
+        self.rebuild_visible(&outline);
     }
 
     /// Fold or unfold every container at once.
@@ -140,7 +150,7 @@ impl BodyView {
             let is_root = ix == 0;
             self.folded[ix] = folded && row.kind.is_open() && !is_root;
         }
-        self.visible = Arc::new(outline.visible_rows(&self.folded));
+        self.rebuild_visible(&outline);
     }
 
     pub fn is_json(&self) -> bool {
@@ -199,7 +209,7 @@ impl BodyView {
                     }
                 }
                 if changed {
-                    self.visible = Arc::new(outline.visible_rows(&self.folded));
+                    self.rebuild_visible(&outline);
                 }
 
                 // The visible index is a sorted list of row indices, so this is a lookup, not
@@ -208,6 +218,104 @@ impl BodyView {
             }
             BodyKind::Empty | BodyKind::Binary { .. } => None,
         }
+    }
+
+    /// Recompute the visible index, keeping the selection on a row that still exists.
+    ///
+    /// Folding a container the selection sits inside removes its row from `visible`, and a
+    /// selection nothing draws is a cursor the user has lost track of: the next `down` would
+    /// jump from wherever it secretly was. Snapping to the nearest visible row at or above it
+    /// lands on the container that was just folded, which is where the reader is looking.
+    fn rebuild_visible(&mut self, outline: &JsonOutline) {
+        self.visible = Arc::new(outline.visible_rows(&self.folded));
+
+        if let Some(selected) = self.selected {
+            if self.visible.binary_search(&selected).is_err() {
+                let above = self.visible.partition_point(|row| *row < selected);
+                self.selected = above
+                    .checked_sub(1)
+                    .and_then(|ix| self.visible.get(ix).copied());
+            }
+        }
+    }
+
+    /// The selected **row** index, for highlighting and for the copy verbs.
+    pub fn selected(&self) -> Option<u32> {
+        self.selected
+    }
+
+    /// Where the selection sits in the visible index, which is what `uniform_list` scrolls by.
+    fn selected_visible_ix(&self) -> Option<usize> {
+        let selected = self.selected?;
+        match &self.kind {
+            BodyKind::Text(_) => Some(selected as usize),
+            BodyKind::Json(_) => self.visible.binary_search(&selected).ok(),
+            BodyKind::Empty | BodyKind::Binary { .. } => None,
+        }
+    }
+
+    /// Select the row currently drawn at `visible_ix`, returning it for scrolling.
+    pub fn select_visible(&mut self, visible_ix: usize) -> Option<usize> {
+        let row_ix = match &self.kind {
+            BodyKind::Text(lines) => (visible_ix < lines.len()).then_some(visible_ix as u32),
+            BodyKind::Json(_) => self.visible.get(visible_ix).copied(),
+            BodyKind::Empty | BodyKind::Binary { .. } => None,
+        }?;
+
+        self.selected = Some(row_ix);
+        Some(visible_ix)
+    }
+
+    /// Step the selection by `delta` visible rows, returning where it landed.
+    ///
+    /// Clamped rather than wrapping: running off the end of a 1.3M-row response and reappearing
+    /// at the top loses your place completely, and there is no scrollbar cue that it happened.
+    pub fn move_selection(&mut self, delta: isize) -> Option<usize> {
+        let count = self.row_count();
+        if count == 0 {
+            return None;
+        }
+
+        let next = match self.selected_visible_ix() {
+            Some(current) => (current as isize + delta).clamp(0, count as isize - 1) as usize,
+            // The first press lands on an end rather than one step in from it, so `down` from
+            // nothing selects the first row instead of the second.
+            None if delta > 0 => 0,
+            None => count - 1,
+        };
+
+        self.select_visible(next)
+    }
+
+    /// The selected row's value, ready for the clipboard.
+    ///
+    /// A JSON scalar comes back decoded — see `json::unquote` for why stripping the quotes
+    /// alone is the wrong answer — and a container comes back as its own source text, braces
+    /// included. `unquote` passes both containers and non-string scalars through untouched,
+    /// which is why there is no match on `ScalarKind` here.
+    ///
+    /// In the raw view it is the **whole** line, not the drawn one: what you paste has to be
+    /// what came back, the same rule `CopyResponse` follows.
+    pub fn selected_value(&self) -> Option<String> {
+        let selected = self.selected? as usize;
+
+        match &self.kind {
+            BodyKind::Json(outline) => {
+                let span = outline.value_span(selected)?;
+                Some(json::unquote(outline.text(span)))
+            }
+            BodyKind::Text(lines) => lines.full_line(selected).map(str::to_string),
+            BodyKind::Empty | BodyKind::Binary { .. } => None,
+        }
+    }
+
+    /// The selected row's JSONPath.
+    ///
+    /// `None` in the raw view, where there is no structure to name a position within — the
+    /// verb is hidden there rather than copying a line number that no tool accepts.
+    pub fn selected_path(&self) -> Option<String> {
+        let selected = self.selected? as usize;
+        self.outline()?.path_to(selected)
     }
 
     /// Whether a match at `offset` is inside the part of its line that's actually drawn.

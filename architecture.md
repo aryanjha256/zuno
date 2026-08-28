@@ -466,8 +466,13 @@ it, so the streaming guard can be tested with a 64KB limit instead of pushing 10
 socket.
 
 **The viewer is read-only.** This is what makes M1 tractable: rendered rows plus
-selection-for-copy, no editing, no cursor, no IME. All the editor complexity is confined to
-the request side.
+selection-for-copy, no editing, no IME. All the editor complexity is confined to the request
+side.
+
+> This sentence said "no cursor" until row selection landed, and the distinction it was
+> reaching for is worth keeping rather than deleting: there is a **row** cursor now, and still
+> no *text* cursor. Nothing addresses a character, nothing has a selection anchor, and no
+> element accepts input — so none of §7's cost arrives. See "Selection" below.
 
 ### The pane is tabbed, and that was a bug fix rather than a feature
 
@@ -590,6 +595,94 @@ it reads the live `BodyView`, which a background task can't borrow.
 **Match highlighting is per row, not per character.** A row is assembled from separately styled
 key, punctuation, and value elements, so highlighting the exact bytes means splitting a shaped
 text run — that's the syntax-highlighting problem, which principle 4 puts last.
+
+### Selection — a row cursor, and the two verbs that need one
+
+`Ctrl+F` built a cursor the *search* drove; this is one the reader drives. `up`/`down` step it,
+a click places it, and `Ctrl+C` / `Alt+C` copy the row's value or its path. It closes the last
+item on ROADMAP's egress list, which had been "row selection first, then copy" through two
+slices.
+
+Five decisions, and the first three are all the same mistake avoided in different places.
+
+- **The selection is a *row* index, not a visible one.** Folding rewrites `visible` underneath
+  it, so a visible index would silently retarget the selection at whatever row slid into that
+  slot. The translation to a visible index happens at the two moments that need one — scrolling
+  and rendering — and nowhere else.
+- **Folding the container you are standing in moves the selection to the container.** The row
+  leaves `visible` entirely, and a selection nothing paints is a cursor the reader has lost: the
+  next `down` jumps from wherever it secretly still was. Every rebuild of `visible` goes through
+  one `rebuild_visible`, so the clamp cannot be forgotten by one of the three callers — the same
+  funnelling argument as `Workspace::activate`.
+- **It is deliberately *not* the search cursor.** A match is where the search is; a selection is
+  where you are, and a row is routinely both. Sharing one would mean stepping through matches
+  drags a selection the user placed. They render distinctly and stack: the accent bar says "this
+  is a match", the fill says "you are here".
+- **Copy value is decoded, not merely unquoted.** `json::unquote` turns the source token into
+  the string it denotes. Stripping the quotes alone is the tempting middle option and the worst
+  of the three: a value holding `\n` pastes as a backslash and an `n`, it *looks* decoded, and
+  nothing says otherwise. Copying the token verbatim would at least be honest. It is permissive
+  in the same way `flatten` is — a broken escape passes through as written, because an inspector
+  that mangles a response in order to show it is worse than one that shows it raw. Non-string
+  scalars and containers pass through untouched, which is why no call site matches on
+  `ScalarKind`.
+- **On an open or close row, copy value gives the whole container.** A `{` is a row you can land
+  on, so the verb has to mean something there or it is dead on roughly half a nested document.
+
+**Reconstructing a container's braces is the one genuinely awkward part**, and for the reason
+`rows_for_offsets` already documents: the tokenizer consumes `{ [ } ]` without recording where.
+`value_span` walks forward from the start of the document resolving each structural token against
+the source, stopping at the container's own close row — so a small object near the top costs a
+short walk and only the root costs a full one.
+
+The walk carries a **cursor past each brace as it is resolved**, and that is the whole
+correctness of it. `row_bounds` treats a close row as a zero-width point, so several nested `}`
+all inherit the same position; scanning forward from it finds the *innermost* one, and the
+container comes back one brace short per level of nesting. That was the first version. The test
+that catches it asserts on the **root of a nested document** — a flat object passes either way,
+which is exactly the weak-assertion shape `CLAUDE.md` tracks.
+
+Between tokens the scan crosses whitespace, `:` and `,` and nothing else; reaching any other byte
+means the reconstruction has lost the thread, and it gives up rather than returning a range that
+would copy the wrong text.
+
+**Paths are JSONPath, built top-down from `ancestors_of`.** Consecutive pairs in that chain are
+parent and child, and the *parent* decides how the segment reads: an object member by the child's
+key, an array element by counting siblings — hopping whole subtrees, since a nested container is
+one element however many rows it spans. Counting rows instead yields `$.users[4]` where `[1]` was
+meant.
+
+A bracket segment carries the key's **source token verbatim, quotes and escapes included**. That
+is already valid JSONPath, so the one place a wrong path could be produced is the one place this
+does no work. Only a plain ASCII identifier takes the `.name` form; anything uncertain takes
+brackets, because the bracket form is always correct.
+
+A close row reports the path of the container it closes rather than nothing — `}` is a row you
+can land on, and refusing it would make the verb look broken on every third row.
+
+**No path in the raw view**, where there is no structure to name a position within. The
+affordance is *absent* there rather than inert, and the keystroke says why. Copy value still
+works and gives the **whole** line, not the `MAX_DISPLAY_LINE` truncation the viewer draws —
+`LineIndex::full_line` exists for exactly that one call site, and the test that holds it uses a
+line past the cut, because a short one makes `line` and `full_line` indistinguishable.
+
+**And the rows became hitboxes, which they were not.** Both body row builders called `.flex()`
+without `w_full()`, so each row was as wide as its own text inside a full-width list — the
+picker's bug (§12), in the surface with 1.31M rows. It had been merely ugly while the only click
+target was the 12px fold chevron: the search highlight ended mid-row. Adding a click target is
+what would have made it a dead-control bug, so the fix and the feature are one change. The test
+clicks the far right of the list and is measured against the **list's** bounds, since the row's
+own bounds agree with the bug.
+
+> **The chevron deliberately does *not* stop propagation, against the usual rule.** A clickable
+> nested in a clickable normally needs `cx.stop_propagation()` (§2, and the window-controls bug).
+> Here the ancestor's effect is wanted — folding a container and standing on it is one intent —
+> but that is not the reason it had to go. `track_focus` transfers focus by registering an
+> **ordinary Bubble-phase mouse listener**, so stopping propagation suppressed *that* as well:
+> clicking a chevron folded correctly, left the pane unfocused, and the next arrow key did
+> nothing. Found by probing rather than by reading, and it is also why `select_body_row_at`
+> moves no focus of its own — an explicit `window.focus` there was dead code, proved by deleting
+> it and watching the test still pass.
 
 ### `TextInput` emits `Changed`
 

@@ -258,6 +258,173 @@ impl JsonOutline {
         ancestors
     }
 
+    /// The path to a row, in JSONPath notation — `$.users[0].email`.
+    ///
+    /// Built top-down from `ancestors_of`, which yields the enclosing open rows outermost
+    /// first, so consecutive pairs in the chain are parent and child. Each pair contributes
+    /// one segment, and how it reads is decided by the *parent*: an object member is named by
+    /// the child's key, an array element by counting the siblings before it.
+    ///
+    /// A close row has no value of its own, so it answers with the path of the container it
+    /// closes — `}` is a row you can land on, and reporting no path for it would make the
+    /// verb look broken on every third row of a nested document.
+    ///
+    /// **A bracket segment carries the key's source token verbatim, quotes and all.** That is
+    /// already valid JSONPath, and it means a key containing a quote or a `\u` escape needs no
+    /// decoding here — the one place this could produce a wrong path is the one place it does
+    /// no work. Only a plain identifier takes the `.name` form.
+    pub fn path_to(&self, row_ix: usize) -> Option<String> {
+        let target = self.value_row(row_ix)?;
+
+        let mut chain = self.ancestors_of(target);
+        chain.push(target);
+
+        let mut path = String::from("$");
+        for pair in chain.windows(2) {
+            let (parent, child) = (pair[0], pair[1]);
+            match self.rows[parent].kind {
+                RowKind::ObjectOpen => {
+                    let token = self.text(self.rows[child].key);
+                    match identifier(token) {
+                        Some(name) => {
+                            path.push('.');
+                            path.push_str(name);
+                        }
+                        None => {
+                            path.push('[');
+                            path.push_str(token);
+                            path.push(']');
+                        }
+                    }
+                }
+                RowKind::ArrayOpen => {
+                    path.push('[');
+                    path.push_str(&self.element_index(parent, child).to_string());
+                    path.push(']');
+                }
+                // Only containers have children, so a scalar parent means the chain is not a
+                // chain and any path built from it would be a guess.
+                _ => return None,
+            }
+        }
+
+        Some(path)
+    }
+
+    /// The source range a row's value occupies — the scalar token, or the whole container
+    /// for an open or close row.
+    ///
+    /// Scalars are free, because the span is recorded. Containers are not: the tokenizer
+    /// consumes `{`, `[`, `}` and `]` without noting where, for the same reason
+    /// `rows_for_offsets` has to reconstruct positions. So this walks forward from the start
+    /// of the document resolving each structural token against the source, and stops at the
+    /// container's own close row — copying a small object near the top of a huge body costs
+    /// a short walk, and only the root costs a full one.
+    ///
+    /// **Reconstructing the close brace is why the walk cannot stop at the last recorded
+    /// span.** Close rows are zero-width points in `row_bounds`, so several nested `}` all
+    /// inherit the same position and a scan forward from it finds the innermost one — which
+    /// would copy a container missing its own closing brace, and the deeper the nesting the
+    /// more it loses. Tracking a cursor *past* each brace as it is resolved is what keeps the
+    /// depth straight.
+    ///
+    /// Scanning between tokens crosses whitespace, `:` and `,` and nothing else. Reaching any
+    /// other byte means the reconstruction has lost the thread, so it gives up rather than
+    /// returning a range that would copy the wrong text.
+    pub fn value_span(&self, row_ix: usize) -> Option<Span> {
+        let row = *self.rows.get(row_ix)?;
+        if !row.value.is_none() {
+            return Some(row.value);
+        }
+
+        let open_ix = self.value_row(row_ix)?;
+        let open = self.rows.get(open_ix)?;
+        if !open.kind.is_open() {
+            return None;
+        }
+        let close_ix = open_ix + open.subtree_len as usize;
+        if close_ix >= self.rows.len() {
+            return None;
+        }
+
+        let mut cursor = 0u32;
+        let mut opens_at = None;
+
+        for (ix, row) in self.rows.iter().enumerate().take(close_ix + 1) {
+            if row.kind.is_open() {
+                // A key is recorded and precedes its brace, so start looking past it.
+                let from = if row.key.is_none() {
+                    cursor
+                } else {
+                    row.key.start + row.key.len
+                };
+                let at = self.scan_to(from, |byte| byte == b'{' || byte == b'[')?;
+                if ix == open_ix {
+                    opens_at = Some(at);
+                }
+                cursor = at + 1;
+            } else if row.kind.is_close() {
+                cursor = self.scan_to(cursor, |byte| byte == b'}' || byte == b']')? + 1;
+            } else {
+                cursor = row.value.start + row.value.len;
+            }
+        }
+
+        let start = opens_at?;
+        Some(Span::new(start as usize, (cursor - start) as usize))
+    }
+
+    /// The row whose value `row_ix` refers to: itself, or for a close row, its matching open.
+    fn value_row(&self, row_ix: usize) -> Option<usize> {
+        let row = self.rows.get(row_ix)?;
+        if !row.kind.is_close() {
+            return Some(row_ix);
+        }
+        self.rows[..row_ix]
+            .iter()
+            .enumerate()
+            .rfind(|(ix, open)| open.kind.is_open() && ix + open.subtree_len as usize == row_ix)
+            .map(|(ix, _)| ix)
+    }
+
+    /// How many siblings precede `child` inside the array opened at `parent`.
+    ///
+    /// Counts by hopping whole subtrees rather than rows, since a nested container is one
+    /// element however many rows it spans.
+    fn element_index(&self, parent: usize, child: usize) -> usize {
+        let mut ix = parent + 1;
+        let mut index = 0;
+
+        while ix < child {
+            let row = &self.rows[ix];
+            ix += if row.kind.is_open() {
+                1 + row.subtree_len as usize
+            } else {
+                1
+            };
+            index += 1;
+        }
+
+        index
+    }
+
+    /// Move forward to the next byte matching `wanted`, crossing only structural filler.
+    fn scan_to(&self, from: u32, wanted: impl Fn(u8) -> bool) -> Option<u32> {
+        let mut ix = from as usize;
+
+        while let Some(&byte) = self.source.get(ix) {
+            if wanted(byte) {
+                return Some(ix as u32);
+            }
+            if !(byte.is_ascii_whitespace() || byte == b':' || byte == b',') {
+                return None;
+            }
+            ix += 1;
+        }
+
+        None
+    }
+
     /// Build the visible-row index for a set of folded rows.
     ///
     /// O(rows), and the only thing that changes when you fold — the rows themselves are
@@ -298,6 +465,134 @@ fn row_bounds(row: &Row, inherited: u32) -> (u32, u32) {
         // previous one — enough to order it without claiming a position it doesn't have.
         (None, None) => (inherited, inherited),
     }
+}
+
+/// The contents of a JSON string token, escapes decoded and quotes removed.
+///
+/// Anything that isn't a quoted token comes back unchanged, so a number, `true` or `null`
+/// can be passed straight through without the caller matching on `ScalarKind` first.
+///
+/// **Decoding rather than merely unquoting is the whole point.** Stripping the quotes alone
+/// is the tempting version and it is the worst of the three options available: it *looks*
+/// decoded, so a value holding `\n` pastes as a backslash and an `n` into whatever fixture or
+/// bug report it was copied for, and nothing on screen says otherwise. Copying the token
+/// verbatim would at least be honest; this is honest and useful.
+///
+/// **Permissive, matching the tokenizer.** `flatten` deliberately validates structure and not
+/// string contents (architecture.md §6), so an unknown escape or a malformed `\u` is passed
+/// through exactly as written rather than swallowed or refused — an inspector that mangles a
+/// response to display it is worse than one that shows it raw.
+pub fn unquote(token: &str) -> String {
+    let Some(inner) = token
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return token.to_string();
+    };
+
+    if !inner.contains('\\') {
+        return inner.to_string();
+    }
+
+    // Indexing chars beats an iterator here because `\u` needs to look ahead for a surrogate
+    // pair. One allocation on a copy action, never on a render path.
+    let chars: Vec<char> = inner.chars().collect();
+    let mut out = String::with_capacity(inner.len());
+    let mut ix = 0;
+
+    while ix < chars.len() {
+        if chars[ix] != '\\' {
+            out.push(chars[ix]);
+            ix += 1;
+            continue;
+        }
+
+        let Some(&escape) = chars.get(ix + 1) else {
+            out.push('\\');
+            break;
+        };
+        ix += 2;
+
+        match escape {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            // On failure `ix` already sits past the `\u`, so the hex digits fall through the
+            // loop as ordinary characters and the escape comes out verbatim.
+            'u' => match decode_escape(&chars, &mut ix) {
+                Some(decoded) => out.push(decoded),
+                None => out.push_str("\\u"),
+            },
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+    }
+
+    out
+}
+
+/// Decode the four hex digits of a `\u` escape, joining a surrogate pair if one follows.
+///
+/// `ix` points just past the `u` and is advanced only on success. A lone surrogate is not a
+/// character, so it fails rather than being replaced — the caller then emits it verbatim,
+/// which is the only lossless answer.
+fn decode_escape(chars: &[char], ix: &mut usize) -> Option<char> {
+    let high = hex_quad(chars, *ix)?;
+
+    if (0xD800..0xDC00).contains(&high) {
+        if chars.get(*ix + 4) != Some(&'\\') || chars.get(*ix + 5) != Some(&'u') {
+            return None;
+        }
+        let low = hex_quad(chars, *ix + 6)?;
+        if !(0xDC00..0xE000).contains(&low) {
+            return None;
+        }
+        let joined = 0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00);
+        let decoded = char::from_u32(joined)?;
+        *ix += 10;
+        return Some(decoded);
+    }
+
+    let decoded = char::from_u32(high)?;
+    *ix += 4;
+    Some(decoded)
+}
+
+fn hex_quad(chars: &[char], at: usize) -> Option<u32> {
+    let mut value = 0u32;
+    for offset in 0..4 {
+        value = value * 16 + chars.get(at + offset)?.to_digit(16)?;
+    }
+    Some(value)
+}
+
+/// The unquoted key, when it is plain enough to write after a dot in a path.
+///
+/// Deliberately narrow — ASCII word characters not starting with a digit. A key that is
+/// merely *probably* fine in dot form is not worth the risk: the bracket form is always
+/// correct, so anything uncertain takes it.
+fn identifier(token: &str) -> Option<&str> {
+    let inner = token
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))?;
+
+    let mut chars = inner.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return None;
+    }
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+        return None;
+    }
+
+    Some(inner)
 }
 
 /// Translate a byte offset to 1-based line and column, for error messages.
@@ -628,6 +923,197 @@ mod tests {
             outline.visible_rows(&folded).contains(&(target as u32)),
             "unfolding the ancestors must reveal it"
         );
+    }
+
+    // A shape with every path segment kind in it: an identifier key, a key that cannot be
+    // written after a dot, an array of objects, and enough nesting for a close row to be
+    // ambiguous about which container it ends.
+    const NESTED: &str = r#"{"users":[{"email":"a@b.test","x-id":7},{"email":"c@d.test"}]}"#;
+
+    #[test]
+    fn a_path_names_an_object_key() {
+        let outline = outline(NESTED);
+        let row = outline
+            .rows()
+            .iter()
+            .position(|row| outline.text(row.key) == "\"email\"")
+            .expect("an email row");
+
+        assert_eq!(outline.path_to(row).as_deref(), Some("$.users[0].email"));
+    }
+
+    #[test]
+    fn a_path_counts_array_elements_by_subtree_not_by_row() {
+        let outline = outline(NESTED);
+        // The second element's email — six rows past the first, because the first element is a
+        // whole object. Counting rows instead of subtrees would call this `[3]`.
+        let row = outline
+            .rows()
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| outline.text(row.key) == "\"email\"")
+            .nth(1)
+            .expect("a second email row")
+            .0;
+
+        assert_eq!(outline.path_to(row).as_deref(), Some("$.users[1].email"));
+    }
+
+    #[test]
+    fn a_key_that_is_not_an_identifier_takes_the_bracket_form() {
+        let outline = outline(NESTED);
+        let row = outline
+            .rows()
+            .iter()
+            .position(|row| outline.text(row.key) == "\"x-id\"")
+            .expect("an x-id row");
+
+        assert_eq!(
+            outline.path_to(row).as_deref(),
+            Some(r#"$.users[0]["x-id"]"#),
+            "a hyphen cannot follow a dot, so the quoted token is used verbatim"
+        );
+    }
+
+    #[test]
+    fn the_root_has_a_path_and_so_does_a_close_row() {
+        let outline = outline(NESTED);
+        assert_eq!(outline.path_to(0).as_deref(), Some("$"));
+
+        let last = outline.len() - 1;
+        assert!(outline.rows()[last].kind.is_close());
+        assert_eq!(
+            outline.path_to(last).as_deref(),
+            Some("$"),
+            "a close row names the container it closes"
+        );
+    }
+
+    #[test]
+    fn a_close_row_deep_in_the_document_names_its_own_container() {
+        let outline = outline(NESTED);
+        // The `}` ending the first user, not the `]` ending the array or the outer `}`.
+        let close = outline
+            .rows()
+            .iter()
+            .position(|row| row.kind == RowKind::ObjectClose)
+            .expect("a close row");
+
+        assert_eq!(outline.path_to(close).as_deref(), Some("$.users[0]"));
+    }
+
+    #[test]
+    fn a_path_for_a_row_that_does_not_exist_is_none() {
+        assert_eq!(outline(NESTED).path_to(9_999), None);
+    }
+
+    #[test]
+    fn a_scalars_value_span_is_the_token_itself() {
+        let outline = outline(NESTED);
+        let row = outline
+            .rows()
+            .iter()
+            .position(|row| outline.text(row.key) == "\"x-id\"")
+            .expect("an x-id row");
+
+        let span = outline.value_span(row).expect("a span");
+        assert_eq!(outline.text(span), "7");
+    }
+
+    #[test]
+    fn a_containers_value_span_covers_its_own_braces() {
+        let outline = outline(NESTED);
+        let array = outline
+            .rows()
+            .iter()
+            .position(|row| row.kind == RowKind::ArrayOpen)
+            .expect("an array row");
+
+        let span = outline.value_span(array).expect("a span");
+        assert_eq!(
+            outline.text(span),
+            r#"[{"email":"a@b.test","x-id":7},{"email":"c@d.test"}]"#
+        );
+    }
+
+    #[test]
+    fn the_roots_value_span_is_the_whole_document_including_the_last_brace() {
+        // The regression that motivates the cursor in `value_span`. Close rows are zero-width
+        // points in `row_bounds`, so every nested `}` inherits the same position — scanning
+        // forward from it finds the *innermost* one, and the root comes back one brace short
+        // per level of nesting. Asserting on the root of a nested document is what makes that
+        // visible; a flat object passes either way.
+        let outline = outline(NESTED);
+        let span = outline.value_span(0).expect("a span");
+        assert_eq!(outline.text(span), NESTED);
+    }
+
+    #[test]
+    fn a_close_rows_value_span_is_its_whole_container() {
+        let outline = outline(NESTED);
+        let close = outline
+            .rows()
+            .iter()
+            .position(|row| row.kind == RowKind::ObjectClose)
+            .expect("a close row");
+
+        let span = outline.value_span(close).expect("a span");
+        assert_eq!(outline.text(span), r#"{"email":"a@b.test","x-id":7}"#);
+    }
+
+    #[test]
+    fn a_value_span_survives_whitespace_between_every_token() {
+        // Pretty-printed input puts newlines and indentation where the minified fixture has
+        // nothing, which is exactly what `scan_to` has to cross.
+        let outline = outline("{\n  \"a\" : [\n    1 ,\n    2\n  ]\n}");
+        let array = outline
+            .rows()
+            .iter()
+            .position(|row| row.kind == RowKind::ArrayOpen)
+            .expect("an array row");
+
+        assert_eq!(
+            outline.text(outline.value_span(array).expect("a span")),
+            "[\n    1 ,\n    2\n  ]"
+        );
+    }
+
+    #[test]
+    fn unquote_decodes_escapes_rather_than_only_stripping_quotes() {
+        assert_eq!(unquote(r#""plain""#), "plain");
+        assert_eq!(unquote(r#""a\nb""#), "a\nb");
+        assert_eq!(unquote(r#""say \"hi\"""#), "say \"hi\"");
+        assert_eq!(unquote(r#""a\\b""#), r"a\b");
+        assert_eq!(unquote(r#""http:\/\/x.test""#), "http://x.test");
+        assert_eq!(unquote(r#""café""#), "café");
+    }
+
+    #[test]
+    fn unquote_joins_a_surrogate_pair() {
+        // Two escapes, one character. Decoding them separately yields two replacement
+        // characters and silently corrupts any body carrying an emoji.
+        assert_eq!(unquote(r#""🚀""#), "\u{1f680}");
+    }
+
+    #[test]
+    fn unquote_passes_a_broken_escape_through_verbatim() {
+        // Permissive like the tokenizer: an inspector that refuses or mangles a response in
+        // order to show it is worse than one that shows it as written.
+        assert_eq!(unquote(r#""\q""#), r"\q");
+        assert_eq!(unquote(r#""\u00zz""#), r"\u00zz");
+        assert_eq!(
+            unquote(r#""\ud83d""#),
+            r"\ud83d",
+            "a lone surrogate is not a character"
+        );
+    }
+
+    #[test]
+    fn unquote_leaves_a_non_string_token_alone() {
+        // So a caller can hand over any scalar without first matching on ScalarKind.
+        assert_eq!(unquote("42"), "42");
+        assert_eq!(unquote("true"), "true");
+        assert_eq!(unquote("null"), "null");
     }
 
     #[test]

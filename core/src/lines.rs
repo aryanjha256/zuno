@@ -107,6 +107,18 @@ impl LineIndex {
         (offset.saturating_sub(span.start) as usize) < MAX_DISPLAY_LINE
     }
 
+    /// A whole line, however long it is.
+    ///
+    /// The counterpart to `line`, and the distinction matters at exactly one call site:
+    /// copying. What is *drawn* stops at `MAX_DISPLAY_LINE`, but a copy that silently handed
+    /// back 4KB of a minified 10MB body would be a wrong answer wearing a right one — the
+    /// same reason `CopyResponse` copies the raw bytes rather than the rendered outline.
+    pub fn full_line(&self, ix: usize) -> Option<&str> {
+        let span = self.lines.get(ix)?;
+        let bytes = self.source.get(span.range())?;
+        std::str::from_utf8(bytes).ok()
+    }
+
     /// The text of a line, truncated to `MAX_DISPLAY_LINE` bytes on a UTF-8 boundary.
     ///
     /// Returns the text and whether it was cut short, so the caller can mark it instead
@@ -190,6 +202,25 @@ mod tests {
 
         assert!(truncated, "an over-long line should report truncation");
         assert!(text.len() <= MAX_DISPLAY_LINE);
+    }
+
+    #[test]
+    fn a_full_line_is_not_truncated_the_way_the_drawn_one_is() {
+        // The pair that matters: `line` is what fits on screen, `full_line` is what a copy
+        // has to hand back. Asserting the two separately would let either drift into the
+        // other's job without a failure.
+        let long = "x".repeat(MAX_DISPLAY_LINE * 3);
+        let index = LineIndex::build(Bytes::from(long.clone()));
+
+        let (drawn, truncated) = index.line(0);
+        assert!(truncated && drawn.len() <= MAX_DISPLAY_LINE);
+        assert_eq!(index.full_line(0), Some(long.as_str()));
+    }
+
+    #[test]
+    fn there_is_no_full_line_past_the_end() {
+        let index = LineIndex::build(Bytes::from_static(b"a\nb"));
+        assert_eq!(index.full_line(2), None);
     }
 
     #[test]

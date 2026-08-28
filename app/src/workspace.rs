@@ -20,7 +20,8 @@ use zuno_core::{
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    ClearCookies, CloseTab, CopyResponse, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
+    ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, ResponseRowNext,
+    ResponseRowPrev, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
     OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
@@ -1266,6 +1267,75 @@ impl Workspace {
         }
     }
 
+    fn response_row_next(&mut self, _: &ResponseRowNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.move_body_selection(1, cx));
+        }
+    }
+
+    fn response_row_prev(&mut self, _: &ResponseRowPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.move_body_selection(-1, cx));
+        }
+    }
+
+    /// Copy the selected row's value.
+    ///
+    /// The counterpart to `copy_response` at a finer grain: that verb answers "give me the
+    /// response", this one answers "give me *that*". A JSON string arrives decoded and a
+    /// container arrives as its own source text — see `BodyView::selected_value`.
+    ///
+    /// Every failure says which one it is. "Nothing selected" and "this row has no value" are
+    /// different problems with different fixes, and a single silent no-op for both is how a
+    /// working control comes to look broken.
+    fn copy_row_value(&mut self, _: &CopyRowValue, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        if view.read(cx).selected_body_row().is_none() {
+            self.set_status(&self.select_a_row_hint(window), cx);
+            return;
+        }
+
+        match view.read(cx).selected_body_value() {
+            Some(value) => {
+                let size = format_bytes(value.len() as u64);
+                cx.write_to_clipboard(ClipboardItem::new_string(value));
+                self.set_status(&format!("Copied {size} to the clipboard"), cx);
+            }
+            None => self.set_status("That row has no value to copy", cx),
+        }
+    }
+
+    /// Copy the selected row's path, as JSONPath.
+    ///
+    /// Raw bodies have no path — there is no structure to name a position within — so this
+    /// says so rather than falling back to a line number, which no tool downstream accepts.
+    fn copy_row_path(&mut self, _: &CopyRowPath, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        if view.read(cx).selected_body_row().is_none() {
+            self.set_status(&self.select_a_row_hint(window), cx);
+            return;
+        }
+
+        match view.read(cx).selected_body_path() {
+            Some(path) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                self.set_status(&format!("Copied {path}"), cx);
+            }
+            None => self.set_status("Paths need a JSON body", cx),
+        }
+    }
+
+    /// Told from the keymap, so it can't advertise a key that isn't bound — the same rule the
+    /// in-flight pane's cancel hint follows after it spent several milestones naming `Ctrl+C`.
+    fn select_a_row_hint(&self, window: &mut Window) -> String {
+        match keybinding_label(&FocusResponse, window) {
+            key if key.is_empty() => "Select a row in the response first".to_string(),
+            key => format!("Select a row first — {key} focuses the response, then ↑/↓"),
+        }
+    }
+
     /// Copy the displayed response body to the clipboard.
     ///
     /// **Raw bytes, exactly as the server sent them** — not the pretty-printed outline on
@@ -1595,6 +1665,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::close_find))
             .on_action(cx.listener(Self::fold_all))
             .on_action(cx.listener(Self::unfold_all))
+            .on_action(cx.listener(Self::response_row_next))
+            .on_action(cx.listener(Self::response_row_prev))
+            .on_action(cx.listener(Self::copy_row_value))
+            .on_action(cx.listener(Self::copy_row_path))
             .on_action(cx.listener(Self::copy_response))
             .on_action(cx.listener(Self::save_response))
             .on_action(cx.listener(Self::copy_as_curl))

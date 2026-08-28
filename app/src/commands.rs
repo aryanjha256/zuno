@@ -81,6 +81,8 @@ pub fn palette() -> Vec<Command> {
         command("Find in response", FindInResponse),
         command("Fold all", FoldAll),
         command("Unfold all", UnfoldAll),
+        command("Copy selected row's value", CopyRowValue),
+        command("Copy selected row's path", CopyRowPath),
         // Settings.
         command("Request settings", OpenSettings),
         command("Clear stored cookies", ClearCookies),
@@ -117,6 +119,12 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::FindNext", "only valid inside the find bar"),
     ("zuno::FindPrev", "only valid inside the find bar"),
     ("zuno::CloseFind", "only valid inside the find bar"),
+    // Stepping the selection through the response body. Same reasoning as the find bar's
+    // next/previous: the entry point is offered ("Focus response"), and a row-at-a-time cursor
+    // move run from a palette you had to open first is not a command anyone wants. The two
+    // verbs that act *on* the selection — copy value, copy path — are offered.
+    ("zuno::ResponseRowNext", "cursor movement; the arrow keys are the interface"),
+    ("zuno::ResponseRowPrev", "cursor movement; the arrow keys are the interface"),
     // Tab/Shift-Tab move focus within a buffer. As a named command it reads as "go
     // somewhere" without saying where, which is worse than not offering it.
     ("zuno::FocusNext", "keystroke-only; no meaningful name"),

@@ -1103,6 +1103,64 @@ impl RequestView {
         search.rows.get(search.current).copied()
     }
 
+    /// The selected body row, for the highlight.
+    pub fn selected_body_row(&self) -> Option<u32> {
+        self.body_view.as_ref()?.selected()
+    }
+
+    /// Step the selection through the body, scrolling to keep it on screen.
+    ///
+    /// Only moves focus's *content*, never focus itself — the pane already has focus when
+    /// these keys resolve, since the binding is scoped to its context.
+    pub fn move_body_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(body) = self.body_view.as_mut() else { return };
+        let Some(visible_ix) = body.move_selection(delta) else {
+            return;
+        };
+
+        // The strategy follows the direction of travel, and there is no `Nearest` to reach
+        // for: `scroll_to_item` skips scrolling entirely while the row is on screen, but once
+        // it isn't, it *does* apply the strategy — so a fixed `Top` would fling the viewport a
+        // whole page whenever you stepped off the bottom edge. Matching the strategy to the
+        // direction makes both edges scroll by exactly the row that went out of view.
+        let strategy = if delta > 0 {
+            ScrollStrategy::Bottom
+        } else {
+            ScrollStrategy::Top
+        };
+        self.body_scroll.scroll_to_item(visible_ix, strategy);
+        cx.notify();
+    }
+
+    /// Select the row drawn at `visible_ix`.
+    ///
+    /// **Focus is not moved here, and that is checked rather than assumed.** Clicking a row
+    /// while the URL bar has focus has to leave the keyboard able to continue, or the
+    /// selection the click just made refuses to move — but the pane's own `track_focus`
+    /// already does it: `Interactivity::paint` registers a Bubble-phase mouse listener that
+    /// focuses the tracked handle on any hit inside the element. An explicit `window.focus`
+    /// here was the first version and it was dead code, which
+    /// `clicking_a_row_takes_focus_so_the_keyboard_can_carry_on` proved by passing without it.
+    /// The corollary is in `json_row`: anything nested that stops propagation suppresses that
+    /// listener too.
+    pub fn select_body_row_at(&mut self, visible_ix: usize, cx: &mut Context<Self>) {
+        let Some(body) = self.body_view.as_mut() else { return };
+        if body.select_visible(visible_ix).is_none() {
+            return;
+        }
+
+        cx.notify();
+    }
+
+    /// The selected row's value and path, for the copy verbs.
+    pub fn selected_body_value(&self) -> Option<String> {
+        self.body_view.as_ref()?.selected_value()
+    }
+
+    pub fn selected_body_path(&self) -> Option<String> {
+        self.body_view.as_ref()?.selected_path()
+    }
+
     pub fn toggle_fold(&mut self, row_ix: usize, cx: &mut Context<Self>) {
         if let Some(body) = self.body_view.as_mut() {
             body.toggle_fold(row_ix);
