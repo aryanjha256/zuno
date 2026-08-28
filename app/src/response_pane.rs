@@ -23,10 +23,11 @@ use zuno_core::{
 };
 
 use crate::actions::{
-    CancelRequest, CopyResponse, CopyRowPath, CopyRowValue, FindInResponse, FoldAll, SaveResponse,
-    SendRequest, ShowHistory, UnfoldAll,
+    CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
+    ShowHistory, ToggleFold, UnfoldAll,
 };
-use crate::ui::{Icon, icon_button, separator, text_action};
+use crate::ui::{Icon, icon_button, text_action};
+use gpui::Action as _;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
 use crate::theme::Theme;
@@ -155,7 +156,7 @@ fn view_tabs(
         ))
         // Pushes the action row to the far right; the tabs stay left where the eye starts.
         .child(div().flex_1())
-        .child(response_actions(view, theme))
+        .child(response_actions(theme))
 }
 
 /// The verbs that act on a response, as icon buttons.
@@ -164,40 +165,19 @@ fn view_tabs(
 /// by shortcut or by the command palette and by nothing you could see — which for a new user means
 /// they did not exist. Each button dispatches its action and carries a tooltip naming its key, so
 /// the mouse path teaches the keyboard one instead of competing with it.
-fn response_actions(view: &RequestView, theme: &Theme) -> Div {
-    // Shown only with a row selected, because both verbs are *about* that row: offering them
-    // permanently would mean two controls that spend most of their life reporting "select a
-    // row first", which teaches nothing. Appearing on selection is itself the explanation.
-    let selected = view.selected_body_row().is_some();
-    let has_path = selected && view.selected_body_path().is_some();
-
+fn response_actions(theme: &Theme) -> Div {
+    // **The row verbs deliberately do not live here.** `value` and `path` labels sat in this
+    // row for one slice, rendered only once a row was selected — which made the mouse path
+    // findable only by someone who already knew the keyboard path, a smaller copy of the very
+    // gap the discoverability audit was about. They also made this row shift as the selection
+    // changed. Right-clicking a row is the discoverable gesture, and it needs no standing
+    // control; these four are whole-response verbs and are always applicable.
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
         .flex_none()
-        .children(selected.then(|| {
-            text_action(
-                "action-copy-row-value",
-                "value".into(),
-                "Copy the selected row's value",
-                CopyRowValue,
-                theme,
-            )
-        }))
-        // Absent rather than inert on a raw body, where there is no structure to name a
-        // position within — a control that cannot work is worse than no control.
-        .children(has_path.then(|| {
-            text_action(
-                "action-copy-row-path",
-                "path".into(),
-                "Copy the selected row's path",
-                CopyRowPath,
-                theme,
-            )
-        }))
-        .children(selected.then(|| separator(theme)))
         .child(icon_button(
             "action-find",
             Icon::Search,
@@ -934,7 +914,10 @@ fn json_row(
     theme: &Theme,
     view: gpui::WeakEntity<RequestView>,
 ) -> Div {
-    let selecting = view.clone();
+    let opening = view.clone();
+    // The original moves into `selecting`; nothing below needs a third handle, since the fold
+    // chevron dispatches an action rather than reaching into the view.
+    let selecting = view;
 
     let mut line = div()
         .debug_selector(move || format!("response-row-{visible_ix}"))
@@ -954,10 +937,24 @@ fn json_row(
         .h(px(ROW_HEIGHT))
         .pl(px(4.0 + row.depth as f32 * INDENT))
         .cursor_pointer()
-        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+        .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, window, cx| {
             let _ = selecting.update(cx, |view, cx| {
                 view.select_body_row_at(visible_ix, cx);
             });
+            // Double-click folds, the file-tree convention — and it means the 12px chevron is
+            // no longer the only fold target. Dispatched rather than called, because three
+            // surfaces now reach this verb.
+            if event.click_count == 2 {
+                window.dispatch_action(ToggleFold.boxed_clone(), cx);
+            }
+        })
+        .on_mouse_down(MouseButton::Right, move |event: &MouseDownEvent, window, cx| {
+            // Select first: "Copy value" has to be unambiguous about which row it means.
+            let _ = opening.update(cx, |view, cx| {
+                view.select_body_row_at(visible_ix, cx);
+                view.set_menu_anchor(event.position);
+            });
+            window.dispatch_action(OpenRowMenu.boxed_clone(), cx);
         });
 
     if is_hit {
@@ -987,16 +984,16 @@ fn json_row(
                 .text_color(theme.text_muted)
                 .cursor_pointer()
                 .hover(|style| style.text_color(theme.accent))
-                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     // **Deliberately does *not* stop propagation**, which is the opposite of
                     // what a clickable nested in a clickable usually needs. Two reasons, and
                     // the second is the one that bites. The row's own effect is wanted here —
-                    // folding a container and standing on it is one intent, not two. And
-                    // `track_focus` transfers focus by registering an ordinary Bubble-phase
-                    // mouse listener (`div.rs`, `Interactivity::paint`), so stopping
-                    // propagation silently suppresses *that* too: with it, clicking a chevron
-                    // left the response pane unfocused and the next arrow key did nothing.
-                    let _ = view.update(cx, |view, cx| view.toggle_fold(row_ix, cx));
+                    // the row handler selects, which is what lets this dispatch a verb that
+                    // takes no row index. And `track_focus` transfers focus by registering an
+                    // ordinary Bubble-phase mouse listener (`div.rs`, `Interactivity::paint`),
+                    // so stopping propagation silently suppresses *that* too: with it, clicking
+                    // a chevron left the pane unfocused and the next arrow key did nothing.
+                    window.dispatch_action(ToggleFold.boxed_clone(), cx);
                 })
                 .child(marker.to_string()),
         );
@@ -1085,7 +1082,9 @@ fn text_list(
             .map(|ix| {
                 let (text, truncated) = lines.line(ix);
                 let selecting = view.clone();
+                let opening = view.clone();
                 let mut row = div()
+                    .debug_selector(move || format!("response-row-{ix}"))
                     .flex()
                     // See `json_row` — a `.flex()` row inside a `uniform_list` sizes to its
                     // content, not to the list, so without this the click target and both
@@ -1100,6 +1099,18 @@ fn text_list(
                             view.select_body_row_at(ix, cx);
                         });
                     })
+                    // Same gesture as the JSON view. No double-click here: raw lines have no
+                    // structure to fold, so binding it would be a keystroke that does nothing.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        move |event: &MouseDownEvent, window, cx| {
+                            let _ = opening.update(cx, |view, cx| {
+                                view.select_body_row_at(ix, cx);
+                                view.set_menu_anchor(event.position);
+                            });
+                            window.dispatch_action(OpenRowMenu.boxed_clone(), cx);
+                        },
+                    )
                     .child(
                         div()
                             .flex_none()

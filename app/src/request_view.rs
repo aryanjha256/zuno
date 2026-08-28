@@ -277,6 +277,14 @@ pub struct RequestView {
     /// to a match can scroll the one that is. `uniform_list` needs the handle at render time,
     /// which is why it lives here rather than in `BodyView`.
     pub body_scroll: UniformListScrollHandle,
+    /// Where the last right-click in the body landed, in window coordinates.
+    ///
+    /// The menu itself is owned by `Workspace`, beside the picker and the settings panel — it
+    /// has to be, or `modal_open` cannot see it and the response pane's `overflow_hidden`
+    /// clips it. But an action carries no payload without pulling `schemars` in for a derived
+    /// `Action`, so the position is parked here and `take`n by the handler. Consumed on read,
+    /// so a stale anchor can never place a later menu.
+    menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     /// Holding the diff task is what keeps it alive, and replacing it is what makes a
     /// superseded diff harmless — see `diff_against`.
     diff_task: Option<Task<()>>,
@@ -315,6 +323,7 @@ impl RequestView {
             search: None,
             search_task: None,
             body_scroll: UniformListScrollHandle::new(),
+            menu_anchor: None,
             diff_task: None,
             inflight: None,
             error: None,
@@ -1152,6 +1161,33 @@ impl RequestView {
         cx.notify();
     }
 
+    pub fn set_menu_anchor(&mut self, at: gpui::Point<gpui::Pixels>) {
+        self.menu_anchor = Some(at);
+    }
+
+    pub fn take_menu_anchor(&mut self) -> Option<gpui::Point<gpui::Pixels>> {
+        self.menu_anchor.take()
+    }
+
+    pub fn selected_is_container(&self) -> bool {
+        self.body_view
+            .as_ref()
+            .is_some_and(|body| body.selected_is_container())
+    }
+
+    pub fn selected_is_folded(&self) -> bool {
+        self.body_view
+            .as_ref()
+            .is_some_and(|body| body.selected_is_folded())
+    }
+
+    pub fn toggle_selected_fold(&mut self, cx: &mut Context<Self>) {
+        if let Some(body) = self.body_view.as_mut() {
+            body.toggle_selected_fold();
+            cx.notify();
+        }
+    }
+
     /// The selected row's value and path, for the copy verbs.
     pub fn selected_body_value(&self) -> Option<String> {
         self.body_view.as_ref()?.selected_value()
@@ -1159,13 +1195,6 @@ impl RequestView {
 
     pub fn selected_body_path(&self) -> Option<String> {
         self.body_view.as_ref()?.selected_path()
-    }
-
-    pub fn toggle_fold(&mut self, row_ix: usize, cx: &mut Context<Self>) {
-        if let Some(body) = self.body_view.as_mut() {
-            body.toggle_fold(row_ix);
-            cx.notify();
-        }
     }
 
     pub fn set_all_folded(&mut self, folded: bool, cx: &mut Context<Self>) {

@@ -26,7 +26,8 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
 - **Since, from the audit below.** Response search; the response pane split into body and headers
   tabs; the request pane split into Headers / Params / Body; the editing set the text inputs were
   missing (word movement and deletion, document ends, double- and triple-click, `PageUp`/`PageDown`,
-  undo/redo); and row selection in the response viewer with copy-value and copy-path.
+  undo/redo); row selection in the response viewer with copy-value and copy-path; and a
+  right-click context menu on response rows, built as a reusable primitive.
 
   This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
   and both absent from it — which is the rot the note at the top of this file predicts. Worth
@@ -440,6 +441,18 @@ cursors stayed separate, because a match and where you are standing are differen
   own text inside a full-width list, which was merely ugly while the fold chevron was the only
   click target and would have made ~90% of every row dead the moment one was added. The fix and
   the feature were one change, which is the argument for having done them together.
+
+- **Row context menu — done, and it repaired the slice above.** Those two verbs first shipped as
+  toolbar labels that appeared *only once a row was selected*, so the mouse path was findable only
+  by someone who already knew the keyboard path — the discoverability audit's own finding, one
+  level down, one slice after the audit. Right-click is a blind reflex, so it answers without
+  being taught. Double-click folds a container, the file-tree convention; the labels were removed.
+
+  Built as `ui`-level primitive `app/src/context_menu.rs` rather than a response-pane feature, on
+  principle 2 — and the leverage is already visible, because three of its obvious next consumers
+  are items still on this list: **delete/rename a saved request**, tab close/rename, and
+  toggle/remove on header rows. It is also the first real consumer of `anchored()`, which
+  architecture.md §12 had guessed at twice and placed wrongly both times.
 - **No delete or rename of a saved request** from inside the app. Mild, because files are the
   interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
 - **No body prettify.** Paste minified JSON and you live with it.

@@ -12,6 +12,7 @@ mod body_view;
 mod chrome;
 mod collections;
 mod commands;
+mod context_menu;
 mod engine;
 mod input;
 mod picker;
@@ -43,7 +44,7 @@ use crate::actions::{
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
     CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue, FindInResponse, FindNext, FindPrev,
-    ResponseRowNext, ResponseRowPrev,
+    MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ToggleFold,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -200,6 +201,7 @@ fn register_keymap(cx: &mut App) {
         // the obvious key while `CancelRequest` had to settle for `escape`.
         KeyBinding::new("ctrl-c", CopyRowValue, Some("ResponsePane")),
         KeyBinding::new("alt-c", CopyRowPath, Some("ResponsePane")),
+        KeyBinding::new("space", ToggleFold, Some("ResponsePane")),
         // Getting the response back out. `ctrl-c` is taken by text-input copy, scoped to
         // `TextInput`; these are global because the response pane has no input to type in.
         KeyBinding::new("ctrl-shift-c", CopyResponse, None),
@@ -246,6 +248,14 @@ fn register_keymap(cx: &mut App) {
         //
         // Registered after the globals for the same reason as the picker block above: a
         // context-less binding ties on depth, and later registration breaks the tie.
+        // --- Context menu ---
+        // Registered after the global `escape` -> CancelRequest. A context-less binding does not
+        // lose to a specific one, it *ties* at maximum depth and the later registration wins —
+        // the same ordering the find bar depends on.
+        KeyBinding::new("down", MenuNext, Some("ContextMenu")),
+        KeyBinding::new("up", MenuPrev, Some("ContextMenu")),
+        KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
+        KeyBinding::new("escape", MenuDismiss, Some("ContextMenu")),
         KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("down", SettingNext, Some("SettingsPanel")),
         KeyBinding::new("up", SettingPrev, Some("SettingsPanel")),

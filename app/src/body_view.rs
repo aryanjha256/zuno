@@ -287,6 +287,35 @@ impl BodyView {
         self.select_visible(next)
     }
 
+    /// Whether the selected row opens a container, and so can be folded.
+    pub fn selected_is_container(&self) -> bool {
+        let Some(selected) = self.selected else {
+            return false;
+        };
+        self.outline()
+            .and_then(|outline| outline.row(selected as usize))
+            .is_some_and(|row| row.kind.is_open())
+    }
+
+    /// Whether the selected container is currently folded, for the menu's label.
+    pub fn selected_is_folded(&self) -> bool {
+        let Some(selected) = self.selected else {
+            return false;
+        };
+        self.folded.get(selected as usize).copied().unwrap_or(false)
+    }
+
+    /// Fold or unfold the selected container.
+    ///
+    /// Takes no row index, unlike `toggle_fold`, because all three surfaces that reach it —
+    /// the chevron, a double-click, the context menu — select the row first. One verb on the
+    /// selection beats three callers each naming their own row.
+    pub fn toggle_selected_fold(&mut self) {
+        if let Some(selected) = self.selected {
+            self.toggle_fold(selected as usize);
+        }
+    }
+
     /// The selected row's value, ready for the clipboard.
     ///
     /// A JSON scalar comes back decoded — see `json::unquote` for why stripping the quotes

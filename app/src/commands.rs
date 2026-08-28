@@ -83,6 +83,7 @@ pub fn palette() -> Vec<Command> {
         command("Unfold all", UnfoldAll),
         command("Copy selected row's value", CopyRowValue),
         command("Copy selected row's path", CopyRowPath),
+        command("Fold or unfold the selected row", ToggleFold),
         // Settings.
         command("Request settings", OpenSettings),
         command("Clear stored cookies", ClearCookies),
@@ -119,6 +120,14 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::FindNext", "only valid inside the find bar"),
     ("zuno::FindPrev", "only valid inside the find bar"),
     ("zuno::CloseFind", "only valid inside the find bar"),
+    // The menu is placed by a right-click, so it has no meaning without one — there is nowhere
+    // to put it. Everything inside it is offered directly above, which is the point: the menu is
+    // the *mouse* path to verbs the keyboard already reaches.
+    ("zuno::OpenRowMenu", "needs a click position; its items are all offered directly"),
+    ("zuno::MenuNext", "only valid inside the row menu"),
+    ("zuno::MenuPrev", "only valid inside the row menu"),
+    ("zuno::MenuConfirm", "only valid inside the row menu"),
+    ("zuno::MenuDismiss", "only valid inside the row menu"),
     // Stepping the selection through the response body. Same reasoning as the find bar's
     // next/previous: the entry point is offered ("Focus response"), and a row-at-a-time cursor
     // move run from a palette you had to open first is not a command anyone wants. The two

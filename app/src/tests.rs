@@ -1231,8 +1231,14 @@ async fn folding_hides_rows_without_losing_them(cx: &mut TestAppContext) {
     let (_, visible_before, total) = wait_for_body(&view, &mut cx);
     assert_eq!(visible_before, total);
 
-    // Row 1 is the nested object's open row.
-    cx.update(|_, cx| view.update(cx, |view, cx| view.toggle_fold(1, cx)));
+    // Row 1 is the nested object's open row. Folding acts on the selection now — one verb for
+    // the chevron, the double-click and the menu — so select it first.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.select_body_row_at(1, cx);
+            view.toggle_selected_fold(cx);
+        })
+    });
     cx.run_until_parked();
 
     let visible_after = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
@@ -3523,7 +3529,23 @@ fn respond_with_json(
     cx: &mut TestAppContext,
     body: &'static str,
 ) -> (gpui::Entity<RequestView>, VisualTestContext) {
-    let (_, view, mut cx) = boot(cx, None, None);
+    let (_, view, cx) = respond_with_json_in_window(cx, body);
+    (view, cx)
+}
+
+/// As `respond_with_json`, keeping the window handle.
+///
+/// Needed wherever a test has to read whether a modal is *actually* open. `debug_bounds`
+/// cannot answer that — see `menu_is_open`.
+fn respond_with_json_in_window(
+    cx: &mut TestAppContext,
+    body: &'static str,
+) -> (
+    gpui::WindowHandle<Workspace>,
+    gpui::Entity<RequestView>,
+    VisualTestContext,
+) {
+    let (window, view, mut cx) = boot(cx, None, None);
     let url = serve_typed("application/json", body);
 
     cx.simulate_keystrokes("ctrl-l ctrl-a");
@@ -3531,7 +3553,7 @@ fn respond_with_json(
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
 
-    (view, cx)
+    (window, view, cx)
 }
 
 /// `(current, total)` from the find bar, or `None` when nothing matched.
@@ -3991,13 +4013,12 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("theme-toggle", "zuno::ToggleTheme"),
         ("fold-all", "zuno::FoldAll"),
         ("unfold-all", "zuno::UnfoldAll"),
-        // These two appear only with a row selected, which is why the test below selects one
-        // before it checks the table. Offering them permanently would mean two controls that
-        // spend most of their life saying "select a row first".
-        ("action-copy-row-value", "zuno::CopyRowValue"),
-        ("action-copy-row-path", "zuno::CopyRowPath"),
     ]
 }
+
+/// The row menu's mouse path is a *gesture*, not a standing control, so it cannot be in the
+/// table above — nothing is painted until you right-click. `right_clicking_a_row_opens_a_menu_
+/// of_what_applies_to_it` covers it instead.
 
 #[gpui::test]
 async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestAppContext) {
@@ -4005,14 +4026,8 @@ async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestApp
     // into a frame, which is how a button added to a branch that doesn't render looks fine in the
     // source and is absent on screen.
     let (view, mut cx) = respond_with_json(cx, r#"{"a":1}"#);
+    let _ = &view;
     cx.run_until_parked();
-
-    // A selection is part of the setup, not an aside: two of the verbs in the table act *on*
-    // the selected row and are absent without one. It hides nothing else in the pane.
-    focus_response(&mut cx);
-    cx.simulate_keystrokes("down down");
-    cx.run_until_parked();
-    assert_eq!(selected_row(&view, &mut cx), Some(1), "a scalar row, which has a path");
 
     for (selector, _) in affordances() {
         assert!(
@@ -4024,7 +4039,7 @@ async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestApp
 
 #[gpui::test]
 async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) {
-    // Four representative clicks, each with an observable effect. The full table above proves the
+    // Three representative clicks, each with an observable effect. The full table above proves the
     // buttons *exist*; these prove the wiring behind them is real and not a decorative glyph.
     // Nested on purpose: `set_all_folded` never folds the root, so a flat object has nothing to
     // fold and the assertion at the end would hold vacuously.
@@ -4060,22 +4075,6 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
         "clicking fold-all must fold"
     );
 
-    // Copy row value: the affordance that only exists while a row is selected, so a click here
-    // also proves it is painted in the state the table checks it in.
-    cx.simulate_keystrokes("alt-e");
-    focus_response(&mut cx);
-    cx.simulate_keystrokes("down down down");
-    cx.run_until_parked();
-    assert_eq!(selected_row(&view, &mut cx), Some(2), "the b row");
-
-    let value = cx.debug_bounds("action-copy-row-value").expect("copy-value button");
-    cx.simulate_click(value.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(
-        clipboard_text(&mut cx).as_deref(),
-        Some("1"),
-        "clicking the value label must copy the selected row"
-    );
 }
 
 #[gpui::test]
@@ -4585,6 +4584,230 @@ async fn folding_a_container_keeps_the_selection_on_something_drawn(cx: &mut Tes
         "the selection must land on a drawn row; selected {selected}, visible {visible:?}"
     );
     assert_eq!(selected, 1, "specifically the container that swallowed it");
+}
+
+/// Right-click a point, which `simulate_click` cannot do — it hardcodes the left button.
+fn right_click(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+    cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::default());
+    cx.run_until_parked();
+}
+
+/// Double-click a point. `simulate_click` hardcodes `click_count: 1`, and the count is the
+/// entire signal the fold gesture reads.
+fn double_click(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>) {
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: at,
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.run_until_parked();
+}
+
+/// Whether the row menu is open, read from the workspace rather than from the painted frame.
+///
+/// **`debug_bounds` cannot answer this.** It reads `window.rendered_frame`, so an element that
+/// has been removed keeps its entry until another frame is drawn — `is_some()` is trustworthy,
+/// `is_none()` is not. Four tests here asserted a menu had closed by its bounds vanishing and
+/// failed against code that was closing it correctly, with the chosen action demonstrably run.
+fn menu_is_open(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext) -> bool {
+    window
+        .update(cx, |workspace, _, _| workspace.menu_open())
+        .expect("window")
+}
+
+/// How many rows the open menu is offering.
+///
+/// Counted by probing selectors rather than reading the entity, because the count is the
+/// *adaptation* being asserted — the menu drops items that cannot apply, and a check against
+/// its own item vector would pass even if none of them were painted.
+fn menu_row_count(cx: &mut VisualTestContext) -> usize {
+    // Literals, because `debug_bounds` takes `&'static str` — a formatted selector cannot
+    // outlive the call. Six is well past any menu this app builds.
+    const ROWS: [&str; 6] = [
+        "menu-row-0",
+        "menu-row-1",
+        "menu-row-2",
+        "menu-row-3",
+        "menu-row-4",
+        "menu-row-5",
+    ];
+
+    let mut count = 0;
+    while count < ROWS.len() && cx.debug_bounds(ROWS[count]).is_some() {
+        count += 1;
+    }
+    count
+}
+
+#[gpui::test]
+async fn right_clicking_a_row_opens_a_menu_of_what_applies_to_it(cx: &mut TestAppContext) {
+    // The menu is the mouse path for verbs that previously had a toolbar label visible only
+    // once a row was selected — which meant it was findable only by someone who already knew
+    // the keyboard path. A right-click is a blind reflex, so it has to answer.
+    let (window, view, mut cx) = respond_with_json_in_window(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    cx.run_until_parked();
+
+    assert!(!menu_is_open(&window, &mut cx), "closed to begin with");
+
+    let row = cx.debug_bounds("response-row-2").expect("the inner row");
+    right_click(&mut cx, row.center());
+
+    assert!(cx.debug_bounds("context-menu").is_some(), "right-click must open the menu");
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        Some(2),
+        "and select the row first, or \"Copy value\" is ambiguous about which row it means"
+    );
+}
+
+#[gpui::test]
+async fn the_menu_offers_fold_only_on_a_container(cx: &mut TestAppContext) {
+    // Adapt, don't disable. A greyed row that can never apply is noise in a menu this short,
+    // and it is the same rule the pane already followed for the raw view's missing path.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    cx.run_until_parked();
+
+    // A scalar: two items, no fold.
+    let scalar = cx.debug_bounds("response-row-2").expect("the inner row");
+    right_click(&mut cx, scalar.center());
+    assert_eq!(menu_row_count(&mut cx), 2, "value and path, no fold on a scalar");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // A container: three.
+    let container = cx.debug_bounds("response-row-1").expect("the outer object's row");
+    right_click(&mut cx, container.center());
+    assert!(view.read_with(&cx, |view, _| view.selected_is_container()));
+    assert_eq!(menu_row_count(&mut cx), 3, "value, path, and fold on a container");
+}
+
+#[gpui::test]
+async fn the_menu_drops_copy_path_on_a_raw_body(cx: &mut TestAppContext) {
+    // No structure to name a position within, so the item is absent rather than inert.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_typed("text/plain", "alpha\nbeta");
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-0").expect("the alpha line");
+    right_click(&mut cx, row.center());
+    assert_eq!(menu_row_count(&mut cx), 1, "copy value only");
+}
+
+#[gpui::test]
+async fn choosing_a_menu_row_runs_it_and_closes(cx: &mut TestAppContext) {
+    // The whole point of the gesture: right-click, click, done — no keyboard, no toolbar.
+    let (window, view, mut cx) = respond_with_json_in_window(cx, r#"{"note":"hello","n":2}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-1").expect("the note row");
+    right_click(&mut cx, row.center());
+
+    let item = cx.debug_bounds("menu-row-0").expect("the first menu row");
+    cx.simulate_click(item.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(clipboard_text(&mut cx).as_deref(), Some("hello"));
+    assert!(!menu_is_open(&window, &mut cx), "choosing must close the menu");
+
+    // And the consequence closing has to deliver: focus is back in the response pane, so the
+    // keyboard carries on. Asserting the menu is gone without this would miss a close that
+    // strands focus on the dropped entity and kills every binding.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    assert_eq!(
+        selected_row(&view, &mut cx),
+        Some(2),
+        "focus must return to the pane, not stay on the dismissed menu"
+    );
+}
+
+#[gpui::test]
+async fn the_menu_is_keyboard_navigable_and_escape_does_not_cancel_the_request(
+    cx: &mut TestAppContext,
+) {
+    // Two things at once. A menu you can only click is a mouse-only feature in a keyboard-first
+    // app. And `escape` here must beat the global `escape` -> CancelRequest, which it does only
+    // because a context-less binding *ties* at maximum depth and the later registration wins —
+    // the fourth time that ordering has decided behaviour with no compile error to catch it.
+    let (window, view, mut cx) = respond_with_json_in_window(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-1").expect("the outer object's row");
+    right_click(&mut cx, row.center());
+    assert_eq!(menu_row_count(&mut cx), 3);
+
+    // Third row is Fold. Arrow down twice and confirm.
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+
+    assert!(!menu_is_open(&window, &mut cx), "confirming closes the menu");
+    assert!(
+        view.read_with(&cx, |view, _| view.selected_is_folded()),
+        "the third row must be Fold, reached by the keyboard alone"
+    );
+
+    // And escape dismisses without cancelling the request — the ordering half.
+    right_click(&mut cx, row.center());
+    assert!(menu_is_open(&window, &mut cx));
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!menu_is_open(&window, &mut cx), "escape must dismiss the menu");
+}
+
+#[gpui::test]
+async fn a_menu_cannot_stack_over_another_modal(cx: &mut TestAppContext) {
+    // `modal_open` is consulted by every opener because the checks had drifted once already —
+    // four openers checked both modals and two checked only the picker. A menu opening behind
+    // a picker would leave focus restoring to the wrong place on dismiss.
+    let (window, _view, mut cx) = respond_with_json_in_window(cx, r#"{"a":1}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-1").expect("a row");
+    cx.simulate_keystrokes("ctrl-k");
+    cx.run_until_parked();
+
+    right_click(&mut cx, row.center());
+    assert!(
+        !menu_is_open(&window, &mut cx),
+        "the palette is open, so the menu must refuse"
+    );
+}
+
+#[gpui::test]
+async fn double_clicking_a_container_folds_it(cx: &mut TestAppContext) {
+    // The file-tree convention, and it stops the 12px chevron being the only fold target.
+    // Dispatched rather than called directly, because three surfaces now reach this one verb.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    cx.run_until_parked();
+
+    let before = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
+    let row = cx.debug_bounds("response-row-1").expect("the outer object's row");
+    double_click(&mut cx, row.center());
+
+    assert!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count()) < before,
+        "double-clicking a container must fold it"
+    );
+
+    // A scalar has nothing to fold, and must not become a dead-feeling gesture that changes
+    // the row count by accident.
+    let steady = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
+    // Visible index 2, not row index 4: the selector counts *drawn* rows, and folding `outer`
+    // above just renumbered everything below it.
+    let scalar = cx.debug_bounds("response-row-2").expect("the z row");
+    double_click(&mut cx, scalar.center());
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count()),
+        steady,
+        "double-clicking a scalar must do nothing"
+    );
 }
 
 #[gpui::test]

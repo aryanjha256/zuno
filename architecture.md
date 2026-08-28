@@ -666,6 +666,47 @@ works and gives the **whole** line, not the `MAX_DISPLAY_LINE` truncation the vi
 `LineIndex::full_line` exists for exactly that one call site, and the test that holds it uses a
 line past the cut, because a short one makes `line` and `full_line` indistinguishable.
 
+**The verbs are reached by right-click, and the toolbar labels are gone.** `value` and `path`
+sat in the response pane's action row for one slice, rendered only once a row was selected — so
+the mouse path was findable only by someone who already knew the keyboard path. That is the
+discoverability audit's own finding one level down, and it shipped. A right-click is a blind
+reflex, which is what makes it the right gesture; the labels were removed rather than kept
+alongside, since two paths to the same verb bought nothing and the action row stopped shifting as
+the selection changed.
+
+Double-click folds a container, the file-tree convention. Deliberately *not* the menu gesture: the
+text inputs already use double-click for select-word and triple-click for select-line, and one
+gesture meaning two things across panes is worse than a menu nobody finds.
+
+`app/src/context_menu.rs` is a **primitive**, not a response-pane feature, for principle 2's
+reason — saved requests want delete/rename, the tab strip wants close/rename, header rows want
+toggle/remove. It is also the first genuine consumer of `anchored()`, a question §12 left open
+twice: the picker chose modal, then the method dropdown turned out not to want anchoring either. A
+menu settles it, because appearing where you clicked *is* the feature.
+
+Five decisions:
+
+- **Owned by `Workspace`, beside the picker and the settings panel.** It has to be. `modal_open`
+  cannot see a menu the view owns, and the response pane is `overflow_hidden`, which masks an
+  absolutely-positioned child just as it would any other — a menu opened near the bottom of the
+  pane would be clipped by it.
+- **The click position travels on the view, not in the action.** A data-carrying action needs
+  `build(serde_json::Value)` and therefore `schemars`, which is a dependency for one `Point`. So
+  the row parks the position on its `RequestView` and `OpenRowMenu` carries nothing; the handler
+  `take`s it, so a stale anchor can never place a later menu.
+- **Items adapt rather than disable.** No path on a raw body, no fold on a scalar. A greyed row
+  that can never apply is noise in a menu this short — the same rule the pane already followed.
+- **Every item is an action**, with its keystroke read from the live keymap. So the menu teaches
+  the shortcut instead of replacing it, and it cannot drift from what dispatch does.
+- **Fold became one verb on the selection.** `ToggleFold` acts on the selected row rather than
+  taking an index, because all three surfaces that reach it — chevron, double-click, menu — select
+  first. The chevron used to call `toggle_fold` directly; three surfaces is where "actions, not
+  direct calls" stops being a style preference, and this is the third time that convention has
+  been caught (after the body-kind chip and the fold-all buttons).
+
+> **The chevron still does not stop propagation**, now for a third reason on top of the two above:
+> the row handler's select is what makes a verb with no index possible at all.
+
 **And the rows became hitboxes, which they were not.** Both body row builders called `.flex()`
 without `w_full()`, so each row was as wide as its own text inside a full-width list — the
 picker's bug (§12), in the surface with 1.31M rows. It had been merely ugly while the only click
@@ -1310,8 +1351,16 @@ Three decisions in `picker.rs` worth recording:
   as label plus dimmed detail. Reconsider on a row shape that doesn't fit — a preview pane, an
   icon column — not on the eighth variant.
 - **Modal, not `anchored()`.** A palette is centred over the window, so it's a full-size `absolute`
-  overlay. `anchored()` positions relative to a point and is what the method dropdown will want —
-  both exist in 0.2.2; this needed the simpler one.
+  overlay. `anchored()` positions relative to a point; both exist in 0.2.2 and this needed the
+  simpler one.
+
+  **This sentence guessed twice at what would want anchoring and was wrong both times**, which is
+  worth keeping rather than tidying away. It first named the method dropdown; M4 found a centred
+  picker was better there, one idiom and keyboard-first. The row context menu is the real answer —
+  a menu that doesn't appear where you clicked isn't a context menu — and it is a *separate
+  primitive* rather than a picker mode, because the picker's centred overlay is the one thing it
+  must not be. See §6 and `app/src/context_menu.rs`. The pattern: a guess about the future consumer
+  of an unused API is worth less than the reason the current one didn't need it.
 - **Scan on open, off-thread, results streamed in.** The picker opens instantly with the buffer rows
   and gains saved requests when `scan` returns (invariant 3). Caching at startup was rejected: a
   collection is a git directory, so it changes under us on every pull. `Picker::extend` re-ranks

@@ -20,8 +20,8 @@ use zuno_core::{
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, ResponseRowNext,
-    ResponseRowPrev, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
+    ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
+    MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
     OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
@@ -29,6 +29,7 @@ use crate::actions::{
     ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
+use crate::context_menu;
 use crate::picker;
 use crate::settings_panel::{SettingsEvent, SettingsPanel};
 use crate::request_view::{BodyType, RequestTab, RequestView, RowKind};
@@ -51,6 +52,10 @@ pub struct Workspace {
     picker_scan: Option<Task<()>>,
     /// The settings panel, while it's open.
     settings: Option<SettingsState>,
+    /// The row context menu, while it's open. Owned here rather than by the view that opened
+    /// it for two reasons: `modal_open` has to be able to see it, and the response pane is
+    /// `overflow_hidden`, which would clip a menu near its bottom edge.
+    menu: Option<MenuState>,
     /// Holding the task is what keeps a save-response dialog and its write alive.
     response_save: Option<Task<()>>,
     /// Same, for the checkpoint write a send kicks off.
@@ -69,6 +74,12 @@ pub struct Workspace {
 /// `PickerState` pairs them: either alone leaves a modal nothing can dismiss.
 struct SettingsState {
     panel: Entity<SettingsPanel>,
+    _subscription: Subscription,
+}
+
+/// Same pairing as `PickerState`, for the same reason.
+struct MenuState {
+    menu: Entity<context_menu::ContextMenu>,
     _subscription: Subscription,
 }
 
@@ -131,6 +142,7 @@ impl Workspace {
             picker: None,
             picker_scan: None,
             settings: None,
+            menu: None,
             response_save: None,
             session_save: None,
             body_file_prompt: None,
@@ -152,7 +164,12 @@ impl Workspace {
     ///
     /// Everything that opens a modal, and everything that moves focus, has to consult this.
     fn modal_open(&self) -> bool {
-        self.picker.is_some() || self.settings.is_some()
+        self.picker.is_some() || self.settings.is_some() || self.menu.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn menu_open(&self) -> bool {
+        self.menu.is_some()
     }
 
     /// How many buffers are open. The strip renders from `render`'s own collected list, so
@@ -1279,6 +1296,104 @@ impl Workspace {
         }
     }
 
+    fn toggle_fold(&mut self, _: &ToggleFold, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.toggle_selected_fold(cx));
+        }
+    }
+
+    /// Open the row menu where the right-click landed.
+    ///
+    /// The items are built here rather than by the pane because only `Workspace` can read the
+    /// keymap for each keystroke *and* owns the modal slot. They **adapt rather than disable**:
+    /// no path on a raw body, no fold on a scalar. A greyed-out row that can never apply is
+    /// noise in a menu this short, and the same rule the removed toolbar labels followed.
+    fn open_row_menu(&mut self, _: &OpenRowMenu, window: &mut Window, cx: &mut Context<Self>) {
+        // The anchor is consumed either way: leaving it set after a refused open would place
+        // the *next* menu where this click was.
+        let Some(view) = self.active() else { return };
+        let at = view.update(cx, |view, _| view.take_menu_anchor());
+
+        if self.modal_open() {
+            return;
+        }
+        let Some(at) = at else { return };
+        if view.read(cx).selected_body_row().is_none() {
+            return;
+        }
+
+        let mut items = vec![context_menu::MenuItem::new(
+            "Copy value",
+            CopyRowValue,
+            window,
+        )];
+        if view.read(cx).selected_body_path().is_some() {
+            items.push(context_menu::MenuItem::new("Copy path", CopyRowPath, window));
+        }
+        if view.read(cx).selected_is_container() {
+            let label = if view.read(cx).selected_is_folded() {
+                "Unfold"
+            } else {
+                "Fold"
+            };
+            items.push(context_menu::MenuItem::new(label, ToggleFold, window));
+        }
+
+        let restore = Some(view.read(cx).response_focus.clone());
+        let menu = cx.new(|cx| context_menu::ContextMenu::new(items, at, restore, cx));
+
+        let subscription =
+            cx.subscribe_in(&menu, window, |workspace, _, event, window, cx| match event {
+                context_menu::ContextMenuEvent::Dismissed => workspace.close_row_menu(window, cx),
+                // Close *then* dispatch. `Window::dispatch_action` defers, so the two orders
+                // are indistinguishable for actions (§12) — but closing first is what puts
+                // focus back in the response pane before anything runs.
+                context_menu::ContextMenuEvent::Chose(action) => {
+                    let action = action.boxed_clone();
+                    workspace.close_row_menu(window, cx);
+                    window.dispatch_action(action, cx);
+                }
+            });
+
+        let focus = menu.read(cx).focus_handle();
+        self.menu = Some(MenuState {
+            menu,
+            _subscription: subscription,
+        });
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn close_row_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.menu.take() else { return };
+        if let Some(handle) = state.menu.read(cx).restore_focus() {
+            window.focus(&handle);
+        }
+        cx.notify();
+    }
+
+    fn menu_next(&mut self, _: &MenuNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.menu {
+            state.menu.update(cx, |menu, cx| menu.select(1, cx));
+        }
+    }
+
+    fn menu_prev(&mut self, _: &MenuPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.menu {
+            state.menu.update(cx, |menu, cx| menu.select(-1, cx));
+        }
+    }
+
+    fn menu_confirm(&mut self, _: &MenuConfirm, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = &self.menu {
+            state.menu.update(cx, |menu, cx| menu.confirm(cx));
+        }
+    }
+
+    fn menu_dismiss(&mut self, _: &MenuDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_row_menu(window, cx);
+    }
+
     /// Copy the selected row's value.
     ///
     /// The counterpart to `copy_response` at a finer grain: that verb answers "give me the
@@ -1667,6 +1782,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::response_row_next))
             .on_action(cx.listener(Self::response_row_prev))
+            .on_action(cx.listener(Self::toggle_fold))
+            .on_action(cx.listener(Self::open_row_menu))
+            .on_action(cx.listener(Self::menu_next))
+            .on_action(cx.listener(Self::menu_prev))
+            .on_action(cx.listener(Self::menu_confirm))
+            .on_action(cx.listener(Self::menu_dismiss))
             .on_action(cx.listener(Self::copy_row_value))
             .on_action(cx.listener(Self::copy_row_path))
             .on_action(cx.listener(Self::copy_response))
@@ -1702,6 +1823,7 @@ impl Render for Workspace {
             // Above the panes, below the resize edges.
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
+            .children(self.menu.as_ref().map(|state| state.menu.clone()))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
     }
