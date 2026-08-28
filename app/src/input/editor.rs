@@ -67,6 +67,9 @@ pub struct Editor {
     /// The caret offset the last paint saw, so `h_offset` can follow the caret when it *moves*
     /// and leave a hand-scrolled view alone when it doesn't.
     last_cursor: Option<usize>,
+    /// Set while a batch edit is in flight, so the batch records one undo entry instead of one
+    /// per splice. See `replace_ranges`.
+    suppress_history: bool,
     /// Whether to colour the content as JSON.
     ///
     /// A plain `bool` rather than a language enum, because JSON is the only thing the lexer
@@ -96,6 +99,7 @@ impl Editor {
             last_line_height: px(16.),
             h_offset: px(0.),
             last_cursor: None,
+            suppress_history: false,
             highlight_json: false,
             is_selecting: false,
         }
@@ -131,6 +135,103 @@ impl Editor {
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    /// Which line each byte offset falls in, for a find bar that needs to point at one.
+    pub fn lines_for_offsets(&self, offsets: &[u32]) -> Vec<u32> {
+        offsets
+            .iter()
+            .map(|offset| self.line_of(*offset as usize) as u32)
+            .collect()
+    }
+
+    /// Select a byte range — how a find bar puts the caret on its match.
+    ///
+    /// Byte offsets, and safe from a search because the needle is a `str`: a match starts on a
+    /// character boundary and ends one needle-length later, which is another.
+    pub fn select_range(&mut self, start: usize, end: usize, cx: &mut Context<Self>) {
+        let end = end.min(self.content.len());
+        self.selection = start.min(end)..end;
+        self.selection_reversed = false;
+        self.scroll_caret_into_view();
+        cx.notify();
+    }
+
+    /// Scroll vertically so the caret's line is on screen.
+    ///
+    /// **The vertical half only.** Horizontal follows on its own, because prepaint drags
+    /// `h_offset` to the caret whenever the caret has moved — so a match far along a long line
+    /// comes into view without help. Nothing does the same downwards, which is why a match a
+    /// hundred lines down was found and then not shown.
+    ///
+    /// `last_line_height` comes from the previous paint, so before the first one this does
+    /// nothing — which is correct, since there is no viewport to be outside of yet.
+    fn scroll_caret_into_view(&self) {
+        let line_height = self.last_line_height;
+        let viewport = self.scroll.bounds().size.height;
+        if line_height <= px(0.) || viewport <= px(0.) {
+            return;
+        }
+
+        let top = line_height * self.line_of(self.cursor()) as f32;
+        let bottom = top + line_height;
+        let mut offset = self.scroll.offset();
+        // Offsets run negative as the view moves down, gpui's convention.
+        let scrolled = -offset.y;
+
+        if top < scrolled {
+            offset.y = -top;
+        } else if bottom > scrolled + viewport {
+            offset.y = -(bottom - viewport);
+        } else {
+            return;
+        }
+        self.scroll.set_offset(offset);
+    }
+
+    /// Replace several ranges as a single edit.
+    ///
+    /// **One undo entry for the whole batch**, which is the only reason this exists rather than
+    /// a loop over `replace_range`: a replace-all is one gesture, so it has to come back in one
+    /// press. Recording per splice left it unwinding a match at a time, and the test that was
+    /// supposed to catch that used `assert_ne` — true after *any* change, including one that
+    /// undid a single replacement.
+    ///
+    /// Ranges must be **descending**, since each splice invalidates every offset after it.
+    pub fn replace_ranges(
+        &mut self,
+        ranges: &[Range<usize>],
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if ranges.is_empty() {
+            return;
+        }
+
+        self.history.record(self.snapshot(), None, 0);
+        self.suppress_history = true;
+        for range in ranges {
+            self.selection = range.clone();
+            self.replace_text_in_range(None, text, window, cx);
+        }
+        self.suppress_history = false;
+    }
+
+    /// Replace a byte range, going through the ordinary edit path.
+    ///
+    /// Deliberately *not* a direct splice of `content`: `replace_text_in_range` is where undo is
+    /// recorded, the line index rescanned and `Changed` emitted, and a second way to mutate the
+    /// buffer is a second place for those to be forgotten.
+    pub fn replace_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selection = range;
+        self.replace_text_in_range(None, text, window, cx);
     }
 
     pub fn line_count(&self) -> usize {
@@ -748,11 +849,13 @@ impl EntityInputHandler for Editor {
         // character opens a run too, so select-all-then-type undoes in one press instead of
         // leaving the first character behind as its own entry.
         let typed_one_char = new_text.chars().count() == 1 && !new_text.contains('\n');
-        self.history.record(
-            self.snapshot(),
-            typed_one_char.then_some(range.start),
-            new_text.len(),
-        );
+        if !self.suppress_history {
+            self.history.record(
+                self.snapshot(),
+                typed_one_char.then_some(range.start),
+                new_text.len(),
+            );
+        }
 
         self.content
             .replace_range(range.clone(), new_text);

@@ -57,6 +57,14 @@ actions!(
         FindNext,
         FindPrev,
         CloseFind,
+        // The request body's own bar. Separate actions rather than shared ones, because both
+        // bars can be open at once and a shared `enter` would have to guess which is meant.
+        FindInBody,
+        BodyFindNext,
+        BodyFindPrev,
+        CloseBodyFind,
+        ReplaceNext,
+        ReplaceAll,
         FoldAll,
         UnfoldAll,
         ResponseRowNext,

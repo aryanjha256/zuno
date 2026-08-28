@@ -29,7 +29,9 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   undo/redo); row selection in the response viewer with copy-value and copy-path; a right-click
   context menu on response rows, built as a reusable primitive; horizontal scrolling, which had
   been missing from every body surface; and syntax highlighting for JSON in the request editor and
-  the raw response view, with per-character search highlighting alongside it.
+  the raw response view — plus per-character search highlighting in the raw view and the JSON
+  outline; and find-and-replace in the request body, which is what made `Ctrl+F` mean something
+  everywhere rather than everywhere except the surface you type into.
 
   This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
   and both absent from it — which is the rot the note at the top of this file predicts. Worth

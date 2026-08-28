@@ -26,7 +26,8 @@ use crate::actions::{
     OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
-    CloseFind, CopyAsCurl, FindInResponse, FindNext, FindPrev,
+    BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
+    FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
 };
 use crate::engine::ActiveEngine;
@@ -1246,6 +1247,55 @@ impl Workspace {
     /// Guarded by `modal_open` like every other opener: a find bar takes focus, and taking it
     /// from behind a modal's scrim is how the modal's leaf key context stops matching and its
     /// whole keymap — `Escape` included — silently dies.
+    fn find_in_body(&mut self, _: &FindInBody, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.open_body_search(window, cx));
+        }
+    }
+
+    fn body_find_next(&mut self, _: &BodyFindNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.step_body_search(1, cx));
+        }
+    }
+
+    fn body_find_prev(&mut self, _: &BodyFindPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.step_body_search(-1, cx));
+        }
+    }
+
+    fn close_body_find(&mut self, _: &CloseBodyFind, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.close_body_search(window, cx));
+        }
+    }
+
+    /// Replace the current match, and say what happened.
+    ///
+    /// A replace that matched nothing is silent otherwise, and indistinguishable from a
+    /// keystroke that did not register.
+    fn replace_next(&mut self, _: &ReplaceNext, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let replaced = view.update(cx, |view, cx| view.replace_current(window, cx));
+        if replaced == 0 {
+            self.set_status("Nothing to replace", cx);
+        }
+    }
+
+    fn replace_all(&mut self, _: &ReplaceAll, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let replaced = view.update(cx, |view, cx| view.replace_all(window, cx));
+        match replaced {
+            0 => self.set_status("Nothing to replace", cx),
+            1 => self.set_status("Replaced 1 match", cx),
+            n => self.set_status(&format!("Replaced {n} matches"), cx),
+        }
+    }
+
     fn find_in_response(&mut self, _: &FindInResponse, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
@@ -1793,6 +1843,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::toggle_response_view))
+            .on_action(cx.listener(Self::find_in_body))
+            .on_action(cx.listener(Self::body_find_next))
+            .on_action(cx.listener(Self::body_find_prev))
+            .on_action(cx.listener(Self::close_body_find))
+            .on_action(cx.listener(Self::replace_next))
+            .on_action(cx.listener(Self::replace_all))
             .on_action(cx.listener(Self::find_in_response))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_prev))

@@ -546,6 +546,47 @@ longer tab stops: `Tab` walks the active section instead of every row in the pan
 intended consequence, not a side effect — but it is the sort of change that silently alters focus
 order, which is why it's recorded here.
 
+### Find and replace in the request body
+
+`Ctrl+F` worked everywhere except the surface you type into. It now means "find in what you are
+looking at" — the body in the editor, the response anywhere else — which is the same shape as bare
+`enter` sending in the URL bar and inserting a newline in the editor.
+
+- **Two bars, not one made target-aware.** Both can be open at once, because what you are sending
+  and what came back are different questions. One bar would have to be told which it meant and
+  then moved between panes to sit beside it. They share `TextSearch` and `step_button`, which is
+  where duplication would actually have cost something.
+- **`ResponseSearch` became `TextSearch`**, and `rows` now means "which display line" in whichever
+  surface owns it — outline rows for the response, editor lines for the body. Leaving the old name
+  would have had every reader assume the request side kept its own copy of this logic.
+- **The body scan runs on the UI thread**, unlike the response's. A response can be 100MB and
+  invariant 3 is not conditional on today's being small; a request body is hand-authored, which is
+  the same argument §7 makes for dropping the rope. Spawning a task per keystroke to search a few
+  kilobytes costs more than the search.
+- **Stepping moves the caret**, which is what makes this an editor's find rather than a viewer's:
+  it is where typing resumes, it is what `ReplaceNext` acts on, and it drags the horizontal scroll
+  onto the match for free through the caret-following clamp.
+- **The first match is revealed as you type**, not on the first `Enter`. Only stepping revealed at
+  first, which the response's `apply_search` had never done — so a query selected nothing and
+  scrolled nowhere until you pressed Enter, and with a single match that meant pressing Enter to
+  travel to the match you were already on.
+- **Vertical scrolling had to be added; horizontal came free.** Prepaint drags `h_offset` to the
+  caret whenever the caret has moved, so a match far along a line arrives on its own. Nothing did
+  the same downwards, so a match a hundred lines down was reported and then left off screen.
+  `Editor::scroll_caret_into_view` is the missing half.
+- **Replace-all runs backwards.** Replacing front to back invalidates every offset after the one
+  just written the moment the replacement is a different length — the test that catches this uses
+  a *longer* replacement on purpose, because with equal lengths the bug cannot appear.
+- **A replace-all is one undo entry.** It is one gesture, so it has to come back in one press.
+  `Editor::replace_ranges` records a single snapshot and suppresses the per-splice ones, still
+  going through `replace_text_in_range` so the line rescan and the `Changed` emit are not
+  duplicated.
+
+> **The weak assertion that hid the undo bug is worth naming.** The test asserted `assert_ne!`
+> against the post-replace text — true after *any* change, including an undo that unwound a single
+> match and left the rest. It passed while a replace-all took one press per match. Asserting the
+> original text instead is what turned it load-bearing. Sixth of these now.
+
 ### Syntax highlighting — a lexer, not a parser
 
 The response outline was always coloured, which made this look done: `json_row` reads the `Row`'s

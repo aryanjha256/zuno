@@ -14,10 +14,12 @@ use gpui::{
 };
 
 use crate::actions::{
-    AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    CopyAsCurl, ImportCurl, OpenBodyType, OpenSettings, SaveRequest, SendRequest, ShowBodyTab,
-    ShowHeadersTab, ShowParamsTab,
+    AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext, BodyFindPrev,
+    CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl, OpenBodyType,
+    OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest, ShowBodyTab, ShowHeadersTab,
+    ShowParamsTab,
 };
+use crate::response_pane::step_button;
 use crate::ui::{Icon, icon_button};
 use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind};
 use crate::theme::Theme;
@@ -62,6 +64,13 @@ pub fn render(
             .child(rows_table(&view.query, RowKind::Query, theme, window, cx)),
         RequestTab::Body => pane
             .child(body_header(view, body_lines, theme))
+            // Above the editor, matching where the response pane puts its own bar — and above
+            // rather than below so it does not move as the body grows.
+            .children(
+                view.body_search
+                    .as_ref()
+                    .map(|search| body_find_bar(search, theme, cx)),
+            )
             .child(body_region(view, theme, body_focused, window, cx)),
     }
 }
@@ -669,6 +678,77 @@ fn body_region(
         ),
         BodyType::Raw => region.child(view.body_editor.clone()),
     }
+}
+
+/// Find and replace over the request body.
+///
+/// **A second bar rather than the response's made target-aware.** Both can be open at once —
+/// hunting for a field in what you are sending and in what came back are different questions —
+/// and one bar would have to be told which, then moved between panes to sit beside it. Two bars
+/// share `TextSearch` and `step_button`, which is where the duplication would actually have
+/// mattered.
+fn body_find_bar(
+    search: &crate::request_view::TextSearch,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    let query_is_empty = search.query.read(cx).text().is_empty();
+
+    let (status, status_color) = match search.position() {
+        Some((at, total)) => (
+            SharedString::from(format!("{at} of {total}")),
+            theme.text_muted,
+        ),
+        None if query_is_empty => (SharedString::from(""), theme.text_muted),
+        None => (SharedString::from("no matches"), theme.status_client_error),
+    };
+
+    let field = |input: &gpui::Entity<crate::input::TextInput>| {
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border)
+            .font_family(theme.mono.clone())
+            .text_color(theme.text)
+            .child(input.clone())
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .flex_none()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_elevated)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .child(field(&search.query))
+        .children(search.replace.as_ref().map(field))
+        .child(div().flex_none().text_color(status_color).child(status))
+        .children(search.truncated.then(|| {
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!(
+                    "first {} only",
+                    zuno_core::search::MAX_MATCHES
+                )))
+        }))
+        // Every button dispatches the action its keystroke does, so the two cannot drift.
+        .child(step_button("body-find-prev", "‹", BodyFindPrev, theme, cx))
+        .child(step_button("body-find-next", "›", BodyFindNext, theme, cx))
+        .child(step_button("body-replace", "Replace", ReplaceNext, theme, cx))
+        .child(step_button("body-replace-all", "All", ReplaceAll, theme, cx))
+        .child(step_button("body-find-close", "×", CloseBodyFind, theme, cx))
 }
 
 /// The chosen file, or a prompt to pick one.

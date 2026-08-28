@@ -79,6 +79,7 @@ pub fn palette() -> Vec<Command> {
         command("Show response history", ShowHistory),
         command("Switch between response body and headers", ToggleResponseView),
         command("Find in response", FindInResponse),
+        command("Find and replace in request body", FindInBody),
         command("Fold all", FoldAll),
         command("Unfold all", UnfoldAll),
         command("Copy selected row's value", CopyRowValue),
@@ -120,6 +121,14 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::FindNext", "only valid inside the find bar"),
     ("zuno::FindPrev", "only valid inside the find bar"),
     ("zuno::CloseFind", "only valid inside the find bar"),
+    // Same reasoning for the body's bar: "Find and replace in request body" is the entry point
+    // and it *is* offered, so a row for "next match" would be a command reachable only by first
+    // running another one. Replace is excluded on the same grounds — it needs a match to act on.
+    ("zuno::BodyFindNext", "only valid inside the body find bar"),
+    ("zuno::BodyFindPrev", "only valid inside the body find bar"),
+    ("zuno::CloseBodyFind", "only valid inside the body find bar"),
+    ("zuno::ReplaceNext", "only valid inside the body find bar"),
+    ("zuno::ReplaceAll", "only valid inside the body find bar"),
     // The menu is placed by a right-click, so it has no meaning without one — there is nowhere
     // to put it. Everything inside it is offered directly above, which is the point: the menu is
     // the *mouse* path to verbs the keyboard already reaches.

@@ -30,7 +30,7 @@ use crate::actions::{
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
-use crate::request_view::{InFlight, RequestView, ResponseSearch, ResponseView};
+use crate::request_view::{InFlight, RequestView, TextSearch, ResponseView};
 use crate::theme::Theme;
 
 /// Fixed row height. `uniform_list` measures one item and assumes the rest match, so
@@ -265,7 +265,7 @@ fn view_tab(
 ///   over what's drawn: structural whitespace is searchable, a key includes its quotes, and a
 ///   folded container's `{ … 3 items }` summary is not in the bytes at all.
 fn find_bar(
-    search: &ResponseSearch,
+    search: &TextSearch,
     is_json: bool,
     theme: &Theme,
     cx: &mut Context<RequestView>,
@@ -345,7 +345,7 @@ fn find_bar(
 /// `use<A>` rather than `use<>`: the return has to mention every type parameter in scope, and
 /// `A` is genuinely captured by the click closure. The empty form is only for helpers that
 /// borrow nothing *and* are non-generic.
-fn step_button<A: gpui::Action + Clone + 'static>(
+pub(crate) fn step_button<A: gpui::Action + Clone + 'static>(
     id: &'static str,
     glyph: &'static str,
     action: A,

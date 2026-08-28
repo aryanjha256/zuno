@@ -3569,7 +3569,7 @@ fn find_position(
 /// The `ctrl-a` is not decoration: `simulate_input` appends, so a second call without it types
 /// into whatever is already there and the probe below waits forever for a query that never
 /// appears. `ctrl-a` is `text_input::SelectAll`, which reaches this input because its key
-/// context is `"TextInput ResponseSearch"` — both identifiers in one string, per the leaf-only
+/// context is `"TextInput TextSearch"` — both identifiers in one string, per the leaf-only
 /// predicate rule.
 fn search_for(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext, query: &str) {
     cx.simulate_keystrokes("ctrl-a");
@@ -5242,6 +5242,258 @@ async fn folding_shrinks_the_scroll_region_and_pulls_the_view_back(cx: &mut Test
         body_h_offset(&view, &mut cx),
         0.,
         "and the view must come back, not stay parked past the end of the content"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Find and replace in the request body
+// ---------------------------------------------------------------------------
+
+fn body_find_position(
+    view: &gpui::Entity<RequestView>,
+    cx: &mut VisualTestContext,
+) -> Option<(usize, usize)> {
+    cx.update(|_, cx| view.read(cx).body_search.as_ref().and_then(|s| s.position()))
+}
+
+/// Open the body bar and type a query into it.
+fn find_in_body(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext, query: &str) {
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_keystrokes("ctrl-f");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_searching_body()),
+        "ctrl-f in the body editor must open the body's bar"
+    );
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input(query);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn ctrl_f_finds_in_whatever_you_are_looking_at(cx: &mut TestAppContext) {
+    // One key, two meanings, disambiguated by leaf key context — the same shape as bare `enter`
+    // sending in the URL bar and inserting a newline in the editor. Scoping it wrongly would
+    // either leave the body unsearchable or steal `ctrl-f` from the response everywhere.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-b ctrl-f");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_searching_body()),
+        "in the body editor, ctrl-f means the body"
+    );
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_searching()),
+        "and must not have opened the response's bar as well"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-l ctrl-f");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_searching()),
+        "anywhere else, it still means the response"
+    );
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_searching_body()),
+        "and the body's bar stays closed"
+    );
+
+    // Both open at once is a normal state, not a conflict: what you are sending and what came
+    // back are different questions.
+    assert!(cx.update(|_, cx| view.read(cx).is_searching()));
+}
+
+#[gpui::test]
+async fn the_first_body_match_is_selected_without_pressing_enter(cx: &mut TestAppContext) {
+    // Typing a query should land you *on* a match, not next to one. Without this, nothing is
+    // selected and nothing scrolls until you press Enter — and with a single match that means
+    // pressing Enter to travel to the match you are already on.
+    //
+    // Asserted by typing over it: the selection is where the next character lands.
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, r#"{"only":1}"#);
+
+    find_in_body(&view, &mut cx, "only");
+    assert_eq!(body_find_position(&view, &mut cx), Some((1, 1)));
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_input("X");
+    cx.run_until_parked();
+    assert_eq!(
+        body_text(&view, &mut cx),
+        r#"{"X":1}"#,
+        "the single match must already be selected"
+    );
+}
+
+#[gpui::test]
+async fn a_match_far_down_the_body_is_scrolled_to(cx: &mut TestAppContext) {
+    // The response viewer scrolls to its match; the editor did not, so a match a hundred lines
+    // down was reported and then left off screen. Horizontal comes free from the caret clamp in
+    // prepaint — this is the vertical half, which nothing else does.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    // Loaded from a spec, not typed: 200 lines through `simulate_input` is thirteen seconds.
+    let mut body = (0..200).map(|i| format!("\"line{i}\": 1,")).collect::<Vec<_>>();
+    body.push("\"needle\": 2".to_string());
+    let mut spec = RequestSpec::sample();
+    spec.body = Body::Raw {
+        text: format!("{{\n{}\n}}", body.join("\n")),
+        kind: RawKind::Json,
+    };
+    cx.update(|_, cx| view.update(cx, |view, cx| view.load(spec, cx)));
+    cx.run_until_parked();
+
+    // **Click to get back into the editor, not `ctrl-b`.** `load` rebuilds the URL input and the
+    // body editor, so focus is left on a dropped entity and every binding stops resolving —
+    // there is no path up the focus tree to `Workspace` any more. A keystroke cannot recover
+    // from that; a click can, because `track_focus` focuses on mouse-down. Only
+    // `RequestView::new` calls `load` in the app, where nothing is focused yet, so this hazard
+    // is the test's own.
+    let editor = cx.debug_bounds("body-editor").expect("the body editor");
+    cx.simulate_click(editor.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // Back to the top, so any scroll below is the search's doing.
+    cx.simulate_keystrokes("ctrl-home");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).vertical_offset())),
+        0.
+    );
+
+    find_in_body(&view, &mut cx, "needle");
+    assert_eq!(body_find_position(&view, &mut cx), Some((1, 1)));
+    assert!(
+        cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).vertical_offset())) < 0.,
+        "the view must follow the match down the document"
+    );
+}
+
+#[gpui::test]
+async fn stepping_a_body_match_selects_it(cx: &mut TestAppContext) {
+    // What makes this an *editor* find rather than a viewer's: the caret lands on the match, so
+    // typing continues there and `ReplaceNext` has something to act on.
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, r#"{"a":1,"b":2,"a":3}"#);
+
+    find_in_body(&view, &mut cx, r#""a""#);
+    assert_eq!(body_find_position(&view, &mut cx), Some((1, 2)));
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(body_find_position(&view, &mut cx), Some((2, 2)));
+
+    // Selecting the match is observable through the editor: replacing the selection is what
+    // typing does, so the caret must be sitting on the second `"a"` and not the first.
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_input("X");
+    cx.run_until_parked();
+    assert_eq!(
+        body_text(&view, &mut cx),
+        r#"{"a":1,"b":2,X:3}"#,
+        "the caret must be on the *second* match, which is where stepping left it"
+    );
+}
+
+#[gpui::test]
+async fn replace_rewrites_the_current_match_only(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, r#"{"host":"a","port":1,"host":"b"}"#);
+
+    find_in_body(&view, &mut cx, "host");
+    assert_eq!(body_find_position(&view, &mut cx), Some((1, 2)));
+
+    // Tab from the query into the replace box, which is the only way to reach it by keyboard.
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("server");
+    cx.simulate_keystrokes("ctrl-enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        body_text(&view, &mut cx),
+        r#"{"server":"a","port":1,"host":"b"}"#,
+        "only the current match changes"
+    );
+}
+
+#[gpui::test]
+async fn replace_all_rewrites_every_match_even_when_lengths_change(cx: &mut TestAppContext) {
+    // **The ordering test.** Replacing front-to-back invalidates every offset after the one just
+    // written as soon as the replacement is a different length, so the second splice lands in the
+    // wrong place and the text is quietly corrupted. Going backwards means each splice only moves
+    // text the loop has already passed.
+    //
+    // The replacement here is deliberately *longer* than the needle: with equal lengths the bug
+    // cannot appear and the test would pass against it.
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, r#"{"a":1,"a":2,"a":3}"#);
+
+    find_in_body(&view, &mut cx, r#""a""#);
+    assert_eq!(body_find_position(&view, &mut cx), Some((1, 3)));
+
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input(r#""alpha""#);
+    cx.simulate_keystrokes("ctrl-alt-enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        body_text(&view, &mut cx),
+        r#"{"alpha":1,"alpha":2,"alpha":3}"#
+    );
+}
+
+#[gpui::test]
+async fn a_replace_all_undoes_in_one_press(cx: &mut TestAppContext) {
+    // Three splices, one gesture — so it has to come back in one. `input::History` coalesces a
+    // run of typed characters and breaks on anything else, which is what makes a batch of
+    // programmatic edits collapse rather than unwinding one at a time.
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, r#"{"a":1,"a":2}"#);
+
+    find_in_body(&view, &mut cx, r#""a""#);
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input(r#""z""#);
+    cx.simulate_keystrokes("ctrl-alt-enter");
+    cx.run_until_parked();
+    assert_eq!(body_text(&view, &mut cx), r#"{"z":1,"z":2}"#);
+
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_keystrokes("ctrl-z");
+    cx.run_until_parked();
+    assert_eq!(
+        body_text(&view, &mut cx),
+        r#"{"a":1,"a":2}"#,
+        "one press must undo the whole replace-all, not one match of it"
+    );
+}
+
+#[gpui::test]
+async fn escape_closes_the_body_bar_without_cancelling_the_request(cx: &mut TestAppContext) {
+    // The fifth time this ordering has decided behaviour with no compile error to catch it: a
+    // context-less `escape` -> CancelRequest already exists, and the body bar's only wins because
+    // it is registered afterwards.
+    let (_, view, mut cx) = boot(cx, None, None);
+    author_body(&mut cx, r#"{"a":1}"#);
+    find_in_body(&view, &mut cx, "a");
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_searching_body()),
+        "escape must close the body bar"
+    );
+
+    // And typing goes back into the editor, which is where focus has to have landed.
+    cx.simulate_input("Z");
+    cx.run_until_parked();
+    assert!(
+        body_text(&view, &mut cx).contains('Z'),
+        "focus must return to the editor, not sit on the dropped input"
     );
 }
 

@@ -43,7 +43,8 @@ use crate::actions::{
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
-    CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue, FindInResponse, FindNext, FindPrev,
+    BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue,
+    FindInBody, FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
     ScrollRight, ScrollStart, ToggleFold,
 };
@@ -249,6 +250,17 @@ fn register_keymap(cx: &mut App) {
         // opens from anywhere; `enter` is scoped because it already means send in the URL bar
         // and newline in the body editor.
         KeyBinding::new("ctrl-f", FindInResponse, None),
+        // --- Find and replace in the request body ---
+        // `ctrl-f` means "find in what I am looking at", which in the body editor is the body.
+        // The same shape as bare `enter` sending in the URL bar and inserting a newline here:
+        // one key, disambiguated by leaf context. Registered after the global one, so the
+        // ordering rule is satisfied whichever way the tie-break falls.
+        KeyBinding::new("ctrl-f", FindInBody, Some("BodyEditor")),
+        KeyBinding::new("enter", BodyFindNext, Some("BodySearch")),
+        KeyBinding::new("shift-enter", BodyFindPrev, Some("BodySearch")),
+        KeyBinding::new("escape", CloseBodyFind, Some("BodySearch")),
+        KeyBinding::new("ctrl-enter", ReplaceNext, Some("BodySearch")),
+        KeyBinding::new("ctrl-alt-enter", ReplaceAll, Some("BodySearch")),
         KeyBinding::new("enter", FindNext, Some("ResponseSearch")),
         KeyBinding::new("shift-enter", FindPrev, Some("ResponseSearch")),
         KeyBinding::new("escape", CloseFind, Some("ResponseSearch")),

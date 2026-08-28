@@ -170,10 +170,17 @@ pub enum ResponseView {
 
 /// The find bar's state. Present only while the bar is open.
 ///
-/// An `Option<ResponseSearch>` rather than a `bool` plus fields on `RequestView`, so "closed"
+/// Shared by the response find bar and the request body's.
+///
+/// **`rows` means "which display line" in whichever surface owns this** — outline rows for the
+/// response, editor lines for the body. Same purpose either way: what to scroll to and what to
+/// highlight. Renamed from `ResponseSearch` when the body got a bar of its own; leaving the old
+/// name would have made every reader think the request side had its own copy of this logic.
+///
+/// An `Option<TextSearch>` rather than a `bool` plus fields on `RequestView`, so "closed"
 /// cannot carry stale matches — and so the query input and its subscription are created and
 /// dropped together.
-pub struct ResponseSearch {
+pub struct TextSearch {
     pub query: Entity<TextInput>,
     /// Byte offsets of every match, ascending. Empty means the query matched nothing, which is
     /// different from the bar being closed.
@@ -187,11 +194,15 @@ pub struct ResponseSearch {
     /// The current match sits past the raw view's per-line display cut, so its row is on
     /// screen but the match itself isn't. Says so rather than looking broken.
     pub current_clipped: bool,
+    /// The replacement text, for the body's bar. `None` on the response, which is read-only —
+    /// an `Option` rather than an unused input, so the read-only surface cannot grow a
+    /// replace box by accident.
+    pub replace: Option<Entity<TextInput>>,
     /// Held, not detached: dropping a `Subscription` unsubscribes.
     _query_changed: Subscription,
 }
 
-impl ResponseSearch {
+impl TextSearch {
     /// `1 of 47`, or nothing when there is no match to number.
     pub fn position(&self) -> Option<(usize, usize)> {
         (!self.offsets.is_empty()).then(|| (self.current + 1, self.offsets.len()))
@@ -278,7 +289,10 @@ pub struct RequestView {
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
     /// The find bar, when open.
-    pub search: Option<ResponseSearch>,
+    pub search: Option<TextSearch>,
+    /// The request body's own find bar. Separate from `search` because both can be open at
+    /// once — you can be hunting for a field in what you are sending *and* in what came back.
+    pub body_search: Option<TextSearch>,
     /// Holding it keeps it alive; replacing it cancels a superseded scan, the same contract as
     /// `diff_task`. Typing fast enough to outrun a 10MB scan is exactly when that matters.
     search_task: Option<Task<()>>,
@@ -333,6 +347,7 @@ impl RequestView {
             body_view: None,
             body_task: None,
             search: None,
+            body_search: None,
             search_task: None,
             body_scroll: UniformListScrollHandle::new(),
             headers_scroll: gpui::ScrollHandle::new(),
@@ -459,6 +474,7 @@ impl RequestView {
         // body that no longer exists. Its input entity goes with it, and `load` is not a focus
         // move — curl import lands in a new buffer — so there is nothing to restore focus to.
         self.search = None;
+        self.body_search = None;
         self.search_task = None;
 
         cx.notify();
@@ -970,6 +986,177 @@ impl RequestView {
         }));
     }
 
+    // ---- request body search and replace -------------------------------------
+
+    /// Open the body's find bar, or refocus it if it is already open.
+    ///
+    /// Reveals the Body tab first, for the same reason the response bar switches to the Body
+    /// view: a find bar that appears over a section you cannot see reads as doing nothing.
+    pub fn open_body_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_tab = RequestTab::Body;
+
+        if self.body_search.is_none() {
+            let query = cx.new(|cx| {
+                TextInput::new(String::new(), "Find in body…", "BodySearch", cx)
+            });
+            let replace = cx.new(|cx| {
+                TextInput::new(String::new(), "Replace with…", "BodySearch", cx)
+            });
+            let query_changed = cx.subscribe(&query, |this: &mut Self, _, _: &Changed, cx| {
+                this.run_body_search(cx);
+            });
+
+            self.body_search = Some(TextSearch {
+                query,
+                replace: Some(replace),
+                offsets: Vec::new(),
+                rows: Vec::new(),
+                current: 0,
+                truncated: false,
+                current_clipped: false,
+                _query_changed: query_changed,
+            });
+        }
+
+        if let Some(search) = &self.body_search {
+            let handle = search.query.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            search.query.update(cx, |input, cx| input.select_all_text(cx));
+        }
+        self.run_body_search(cx);
+        cx.notify();
+    }
+
+    /// Close it, putting focus back in the editor rather than leaving it on a dropped input.
+    pub fn close_body_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.body_search.take().is_some() {
+            let handle = self.body_editor.read(cx).focus_handle(cx);
+            window.focus(&handle);
+            cx.notify();
+        }
+    }
+
+    /// Test-only: the render path reads `body_search` itself, so nothing in the UI asks this.
+    /// `is_searching` has a real caller and so is not gated the same way.
+    #[cfg(test)]
+    pub fn is_searching_body(&self) -> bool {
+        self.body_search.is_some()
+    }
+
+    /// Re-scan the body for the current query.
+    ///
+    /// **On the UI thread, unlike the response scan**, and deliberately: the response can be
+    /// 100MB (invariant 3 is not conditional on today's body being small), while a request body
+    /// is hand-authored — the same argument §7 makes for dropping the rope. Spawning a task per
+    /// keystroke to search a few kilobytes would cost more than the search.
+    pub fn run_body_search(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = &self.body_search else { return };
+        let query = search.query.read(cx).text().to_string();
+        let content = self.body_editor.read(cx).text().to_string();
+
+        let hits = if query.is_empty() {
+            zuno_core::search::Hits::default()
+        } else {
+            zuno_core::search::find(content.as_bytes(), &query)
+        };
+
+        // Which line each match falls in, so the bar can scroll to it and the editor can paint
+        // it. `rows` means display lines here — see `TextSearch`.
+        let rows = self.body_editor.read(cx).lines_for_offsets(&hits.offsets);
+
+        let Some(search) = self.body_search.as_mut() else { return };
+        search.offsets = hits.offsets;
+        search.rows = rows;
+        search.truncated = hits.truncated;
+        search.current = 0;
+
+        // **Reveal immediately, the way the response's `apply_search` does.** Without this the
+        // first match is found but not shown: nothing is selected and nothing scrolls until you
+        // press Enter, which for a single match means pressing Enter to go to the match you are
+        // already on.
+        self.reveal_body_match(cx);
+        cx.notify();
+    }
+
+    /// Move to another match, wrapping, and put the caret on it.
+    ///
+    /// Moving the caret is what makes this an *editor* find rather than a viewer's: it is where
+    /// typing resumes, it is what `ReplaceNext` acts on, and it drags the horizontal scroll to
+    /// the match for free through the caret-following clamp.
+    pub fn step_body_search(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(search) = self.body_search.as_mut() else { return };
+        if search.offsets.is_empty() {
+            return;
+        }
+
+        let count = search.offsets.len() as isize;
+        search.current = (search.current as isize + delta).rem_euclid(count) as usize;
+        self.reveal_body_match(cx);
+    }
+
+    /// Select the current match in the editor.
+    fn reveal_body_match(&mut self, cx: &mut Context<Self>) {
+        let Some(search) = self.body_search.as_ref() else { return };
+        let Some(&start) = search.offsets.get(search.current) else { return };
+        let len = search.query.read(cx).text().len();
+
+        self.body_editor.update(cx, |editor, cx| {
+            editor.select_range(start as usize, start as usize + len, cx);
+        });
+        cx.notify();
+    }
+
+    /// Replace the current match and move to the next.
+    ///
+    /// Returns how many were replaced, so the caller can say so — silence after a replace is
+    /// indistinguishable from a replace that found nothing.
+    pub fn replace_current(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let Some(search) = self.body_search.as_ref() else { return 0 };
+        let Some(&start) = search.offsets.get(search.current) else { return 0 };
+        let Some(replace) = search.replace.as_ref() else { return 0 };
+
+        let with = replace.read(cx).text().to_string();
+        let len = search.query.read(cx).text().len();
+
+        self.body_editor.update(cx, |editor, cx| {
+            editor.replace_range(start as usize..start as usize + len, &with, window, cx);
+        });
+        // The offsets after this one have all shifted, so re-scan rather than patch them. A few
+        // kilobytes is cheaper than the bookkeeping to keep them correct.
+        self.run_body_search(cx);
+        self.reveal_body_match(cx);
+        1
+    }
+
+    /// Replace every match, last one first.
+    ///
+    /// **Backwards on purpose:** replacing from the front invalidates every offset after the one
+    /// just written the moment the replacement is a different length. Going from the end means
+    /// each splice only moves text the loop has already passed.
+    pub fn replace_all(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
+        let Some(search) = self.body_search.as_ref() else { return 0 };
+        let Some(replace) = search.replace.as_ref() else { return 0 };
+
+        let with = replace.read(cx).text().to_string();
+        let len = search.query.read(cx).text().len();
+        if len == 0 {
+            return 0;
+        }
+        let offsets = search.offsets.clone();
+
+        let ranges: Vec<_> = offsets
+            .iter()
+            .rev()
+            .map(|start| *start as usize..*start as usize + len)
+            .collect();
+        self.body_editor.update(cx, |editor, cx| {
+            editor.replace_ranges(&ranges, &with, window, cx);
+        });
+
+        self.run_body_search(cx);
+        offsets.len()
+    }
+
     // ---- response search ----------------------------------------------------
 
     /// Open the find bar, or refocus it if it's already open.
@@ -989,8 +1176,9 @@ impl RequestView {
                 this.run_search(cx);
             });
 
-            self.search = Some(ResponseSearch {
+            self.search = Some(TextSearch {
                 query,
+                replace: None,
                 offsets: Vec::new(),
                 rows: Vec::new(),
                 current: 0,
