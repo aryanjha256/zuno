@@ -272,9 +272,14 @@ A **visual-only** change — colour, spacing, size, alignment, hover, icon, a ch
 
 1. Make it.
 2. `cargo check --workspace --all-targets` (~0.5s). **Not the suite.**
-3. **Look at it.** That's the verification, and it's a better one than any test here could be —
-   nothing in the headless platform can observe a paint, so a human glance is the only instrument
-   that actually reads the pixels.
+3. **Hand it to the human to look at**, naming what changed. That glance is the verification —
+   nothing in the headless platform can observe a paint, so a person's eye is the only instrument
+   that reads the pixels.
+
+   **An agent must not try to do this itself.** No launching the app, no screenshot tooling, no
+   hunting for one. It does not work — GPUI runs natively on Wayland, so X11-era grabbers see
+   nothing and other routes have hit permission errors — and a launched window takes over the
+   user's desktop. This step ends with you saying which visual states are new, not with an image.
 
 No test, no doc edit, no break-it-on-purpose. Three triggers, and only these, promote a tweak to
 something heavier:
