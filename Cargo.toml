@@ -3,7 +3,7 @@ members = ["core", "app"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 # GPL-3.0-or-later rather than the bare `GPL-3.0`, which SPDX deprecated. gpui is
 # Apache-2.0, which is compatible with GPL **v3** and not with v2 — so this choice is
