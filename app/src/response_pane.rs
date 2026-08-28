@@ -884,6 +884,7 @@ fn body_region(
     // borrowing the view. They are separate on purpose: a match is where the *search* is, a
     // selection is where *you* are, and a row is routinely both.
     let hit = view.current_match_row();
+    let matched = view.current_match_bytes(cx);
     let selected = view.selected_body_row();
     let widest = body.widest_visible_ix();
     let content = content_width(view, theme, window);
@@ -900,6 +901,7 @@ fn body_region(
             outline.clone(),
             body.visible(),
             hit,
+            matched.clone(),
             selected,
             widest,
             content,
@@ -909,7 +911,18 @@ fn body_region(
         )
         .into_any_element(),
         BodyKind::Text(lines) => {
-            text_list(lines.clone(), hit, selected, widest, content, scroll, theme, cx).into_any_element()
+            text_list(
+                lines.clone(),
+                hit,
+                matched,
+                selected,
+                widest,
+                content,
+                body.raw_is_json(),
+                scroll,
+                theme,
+                cx,
+            ).into_any_element()
         }
     };
 
@@ -926,6 +939,7 @@ fn json_list(
     outline: Arc<JsonOutline>,
     visible: Arc<Vec<u32>>,
     hit: Option<u32>,
+    matched: Option<std::ops::Range<u32>>,
     selected: Option<u32>,
     widest: usize,
     content: Pixels,
@@ -955,6 +969,7 @@ fn json_list(
                     content,
                     folded,
                     hit == Some(row_ix as u32),
+                    (hit == Some(row_ix as u32)).then(|| matched.clone()).flatten(),
                     selected == Some(row_ix as u32),
                     &row_theme,
                     view.clone(),
@@ -994,6 +1009,7 @@ fn json_row(
     content: Pixels,
     folded: bool,
     is_hit: bool,
+    matched: Option<std::ops::Range<u32>>,
     is_selected: bool,
     theme: &Theme,
     view: gpui::WeakEntity<RequestView>,
@@ -1100,57 +1116,160 @@ fn json_row(
         line = line.child(div().flex_none().w(px(12.)));
     }
 
+    // **One `StyledText` rather than a div per token**, which is what lets a search highlight
+    // the matched *bytes* instead of tinting the whole row: `with_highlights` layers a colour
+    // and a background onto ranges of one shaped string, where separately styled elements can
+    // only be coloured whole. It also collapses up to five elements per row into one, on the
+    // surface that has 1.31M of them.
+    let mut painted = PaintedRow::default();
+
     if !row.key.is_none() {
-        line = line
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.syntax.key)
-                    .child(outline.text(row.key).to_string()),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(theme.syntax.punct)
-                    .child(": ".to_string()),
-            );
+        painted.push_from(outline.text(row.key), theme.syntax.key, row.key.start);
+        painted.push(": ", theme.syntax.punct);
     }
 
-    let (text, color) = match row.kind {
-        RowKind::Scalar(kind) => (
-            outline.text(row.value).to_string(),
+    match row.kind {
+        RowKind::Scalar(kind) => painted.push_from(
+            outline.text(row.value),
             match kind {
                 ScalarKind::String => theme.syntax.string,
                 ScalarKind::Number => theme.syntax.number,
                 ScalarKind::Bool | ScalarKind::Null => theme.syntax.literal,
             },
+            row.value.start,
         ),
-        RowKind::ObjectOpen if folded => (
-            format!("{{ … {} }}", plural(row.child_count)),
-            theme.syntax.punct,
-        ),
-        RowKind::ArrayOpen if folded => (
-            format!("[ … {} ]", plural(row.child_count)),
-            theme.syntax.punct,
-        ),
-        RowKind::ObjectOpen => ("{".to_string(), theme.syntax.punct),
-        RowKind::ArrayOpen => ("[".to_string(), theme.syntax.punct),
-        RowKind::ObjectClose => ("}".to_string(), theme.syntax.punct),
-        RowKind::ArrayClose => ("]".to_string(), theme.syntax.punct),
-    };
-
-    line = line.child(div().flex_none().text_color(color).child(text));
-
-    if row.trailing_comma {
-        line = line.child(
-            div()
-                .flex_none()
-                .text_color(theme.syntax.punct)
-                .child(",".to_string()),
-        );
+        RowKind::ObjectOpen if folded => {
+            painted.push(&format!("{{ … {} }}", plural(row.child_count)), theme.syntax.punct)
+        }
+        RowKind::ArrayOpen if folded => {
+            painted.push(&format!("[ … {} ]", plural(row.child_count)), theme.syntax.punct)
+        }
+        RowKind::ObjectOpen => painted.push("{", theme.syntax.punct),
+        RowKind::ArrayOpen => painted.push("[", theme.syntax.punct),
+        RowKind::ObjectClose => painted.push("}", theme.syntax.punct),
+        RowKind::ArrayClose => painted.push("]", theme.syntax.punct),
     }
 
-    line
+    if row.trailing_comma {
+        painted.push(",", theme.syntax.punct);
+    }
+
+    line.child(div().flex_none().child(painted.into_element(matched, theme)))
+}
+
+/// One line of the raw view, lexed if the body was meant to be JSON.
+///
+/// `StyledText` rather than a coloured div per token, for the same two reasons as `json_row`: a
+/// search can highlight the matched bytes within it, and a minified line stays one element
+/// instead of hundreds.
+fn raw_line(
+    text: &str,
+    highlight: bool,
+    matched: Option<std::ops::Range<usize>>,
+    theme: &Theme,
+) -> gpui::StyledText {
+    let colours: Vec<_> = if highlight {
+        zuno_core::highlight::lex_json(text)
+            .into_iter()
+            .map(|token| {
+                (
+                    token.range,
+                    crate::ui::syntax_colour(token.kind, &theme.syntax),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if colours.is_empty() && matched.is_none() {
+        return gpui::StyledText::new(text.to_string());
+    }
+
+    let highlights = crate::ui::split_spans(text.len(), &colours, matched)
+        .into_iter()
+        .map(|(range, colour, hit)| {
+            (
+                range,
+                gpui::HighlightStyle {
+                    color: Some(if hit {
+                        theme.text_on_accent
+                    } else {
+                        colour.unwrap_or(theme.text)
+                    }),
+                    background_color: hit.then_some(theme.accent),
+                    ..Default::default()
+                },
+            )
+        });
+
+    gpui::StyledText::new(text.to_string()).with_highlights(highlights)
+}
+
+/// A row's text and the colours over it, assembled token by token.
+///
+/// Exists so the caller can keep writing "push this token in this colour" while what comes out
+/// is a single string plus highlight ranges — the shape `StyledText` wants and the shape a
+/// per-character search highlight needs.
+#[derive(Default)]
+struct PaintedRow {
+    text: String,
+    colours: Vec<(std::ops::Range<usize>, gpui::Hsla)>,
+    /// Where each piece came from in the response source, for pieces that came from it at all.
+    /// A folded container's `{ … 3 items }` summary has no source, so a match can never be
+    /// located inside text that isn't the body's.
+    sources: Vec<(std::ops::Range<usize>, u32)>,
+}
+
+impl PaintedRow {
+    fn push(&mut self, piece: &str, colour: gpui::Hsla) {
+        let start = self.text.len();
+        self.text.push_str(piece);
+        self.colours.push((start..self.text.len(), colour));
+    }
+
+    /// As `push`, recording the source offset the piece was read from.
+    fn push_from(&mut self, piece: &str, colour: gpui::Hsla, source: u32) {
+        let start = self.text.len();
+        self.push(piece, colour);
+        self.sources.push((start..self.text.len(), source));
+    }
+
+    /// Translate a match's source range into this row's rendered text.
+    ///
+    /// `None` when the match falls in punctuation the row synthesises rather than reads — the
+    /// `": "` between a key and its value, or a fold summary. Those bytes are not in the source
+    /// at all, so there is nothing to point at.
+    fn locate(&self, source: std::ops::Range<u32>) -> Option<std::ops::Range<usize>> {
+        self.sources.iter().find_map(|(local, from)| {
+            let span = *from..*from + local.len() as u32;
+            (span.start <= source.start && span.end >= source.end).then(|| {
+                let offset = (source.start - span.start) as usize;
+                let start = local.start + offset;
+                start..(start + source.len()).min(local.end)
+            })
+        })
+    }
+
+    fn into_element(self, matched: Option<std::ops::Range<u32>>, theme: &Theme) -> gpui::StyledText {
+        let matched = matched.and_then(|range| self.locate(range));
+        let highlights = crate::ui::split_spans(self.text.len(), &self.colours, matched)
+            .into_iter()
+            .map(|(range, colour, hit)| {
+                (
+                    range,
+                    gpui::HighlightStyle {
+                        // The match wins the foreground too. A background alone against a
+                        // syntax colour is a contrast lottery this palette has no reason to run.
+                        color: Some(if hit { theme.text_on_accent } else { colour.unwrap_or(theme.text) }),
+                        background_color: hit.then_some(theme.accent),
+                        ..Default::default()
+                    },
+                )
+            });
+
+        gpui::StyledText::new(self.text).with_highlights(highlights)
+    }
 }
 
 fn plural(count: u32) -> String {
@@ -1163,12 +1282,15 @@ fn plural(count: u32) -> String {
 
 /// The virtualized raw-text view — the fallback for non-JSON, over-cap, and
 /// failed-to-parse bodies. Also virtualized: a 10MB text body has just as many rows.
+#[allow(clippy::too_many_arguments)]
 fn text_list(
     lines: Arc<LineIndex>,
     hit: Option<u32>,
+    matched: Option<std::ops::Range<u32>>,
     selected: Option<u32>,
     widest: usize,
     content: Pixels,
+    highlight: bool,
     scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<RequestView>,
@@ -1218,12 +1340,25 @@ fn text_list(
                             window.dispatch_action(OpenRowMenu.boxed_clone(), cx);
                         },
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_color(row_theme.text)
-                            .child(text.to_string()),
-                    );
+                    .child(div().flex_none().child(raw_line(
+                        text,
+                        highlight,
+                        // The match is a *source* offset; a line's text starts partway into the
+                        // body, so it has to be rebased before it means anything here. Clamped
+                        // to the drawn text, since a line past `MAX_DISPLAY_LINE` is cut and a
+                        // match beyond the cut has no character on screen to mark — the find
+                        // bar already says so.
+                        (hit == Some(ix as u32))
+                            .then(|| matched.clone())
+                            .flatten()
+                            .and_then(|range| {
+                                let start = lines.line_start(ix)?;
+                                let from = range.start.checked_sub(start)? as usize;
+                                (from < text.len())
+                                    .then(|| from..(from + range.len()).min(text.len()))
+                            }),
+                        &row_theme,
+                    )));
 
                 if hit == Some(ix as u32) {
                     row = row

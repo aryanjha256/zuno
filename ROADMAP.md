@@ -27,8 +27,9 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   tabs; the request pane split into Headers / Params / Body; the editing set the text inputs were
   missing (word movement and deletion, document ends, double- and triple-click, `PageUp`/`PageDown`,
   undo/redo); row selection in the response viewer with copy-value and copy-path; a right-click
-  context menu on response rows, built as a reusable primitive; and horizontal scrolling, which
-  had been missing from every body surface.
+  context menu on response rows, built as a reusable primitive; horizontal scrolling, which had
+  been missing from every body surface; and syntax highlighting for JSON in the request editor and
+  the raw response view, with per-character search highlighting alongside it.
 
   This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
   and both absent from it — which is the rot the note at the top of this file predicts. Worth
@@ -523,8 +524,22 @@ Both are testable *at the consequence* even though the paint isn't: a click in t
 WCAG ratio. That's the transferable lesson — when a rendering bug can't be observed, find the
 functional half of it and assert that instead. See architecture.md §12.
 
-**Syntax highlighting stays last** regardless (principle 4): expensive, isolated, and it improves
-nothing structural — it would only flatter a screenshot.
+**Syntax highlighting — done, and principle 4 mispriced it.** Kept rather than deleted, because
+the correction is the useful part.
+
+The principle read it as tree-sitter plus a highlight cache: expensive, isolated, improving nothing
+structural. Three of those four were wrong for JSON. It needs a **lexer, not a parser** — an
+editor's text is invalid on most keystrokes, and colour survives that where a parser cannot. It
+needs **no cache**, because JSON has no multi-line tokens, so each visible line is lexed
+independently. And it was **not isolated**: response search highlighted a whole row rather than the
+matched characters *precisely because* splitting a shaped run is the syntax-highlighting problem,
+so the two closed together.
+
+What stands up is the shape of the reasoning, not the verdict: it really is the most expensive
+thing left *for a general language*. The mistake was pricing the general case when only JSON was
+wanted. XML and HTML are still deferred on exactly the original argument.
+
+See architecture.md §6.
 
 ---
 

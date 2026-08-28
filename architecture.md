@@ -546,6 +546,60 @@ longer tab stops: `Tab` walks the active section instead of every row in the pan
 intended consequence, not a side effect — but it is the sort of change that silently alters focus
 order, which is why it's recorded here.
 
+### Syntax highlighting — a lexer, not a parser
+
+The response outline was always coloured, which made this look done: `json_row` reads the `Row`'s
+typed fields — the `key` span, `ScalarKind`, `RowKind` — and paints from `theme.syntax`. That is
+*structural colouring of an already-parsed outline*, and it only works because the body was
+flattened off-thread first. Two surfaces had no colour at all: the request body editor, and the
+raw view that non-JSON, over-cap and failed-to-parse bodies fall back to.
+
+**Principle 4 priced this as tree-sitter plus a highlight cache, and that was wrong for JSON.**
+Three things it did not account for:
+
+- **A lexer, not a parser.** `json::flatten` rejects structural errors, which is right for a
+  viewer and useless for an editor: text being edited is invalid on most keystrokes. Colour
+  survives that, because knowing a token is a string never requires knowing whether it nests.
+  `core/src/highlight.rs` is therefore tolerant by construction — an unterminated string runs to
+  the end of the line and is still a string, which is the state of every string between typing its
+  opening quote and its closing one.
+- **No cache, because JSON has no multi-line tokens.** Strings cannot contain a raw newline and
+  there are no block comments, so every line is lexed independently and only the visible ones are
+  lexed at all. The cache that made this expensive is a requirement of XML and HTML.
+- **Styled runs already existed.** The editor was building a three-run `Vec<TextRun>` for the IME
+  pre-edit underline. Colour is *more runs*, not new machinery.
+
+**Overlapping styles must be split, not layered**, and this is the one real trap.
+`StyledText::compute_runs` walks its highlights doing `range.start - ix`, so it needs them sorted
+and disjoint — a gap paints the wrong text and an overlap underflows a `usize`. A search match
+inside a coloured token cannot be pushed on top of it; the token has to be cut at the match's
+edges. `ui::split_spans` collects every boundary either rule cares about and asks, per segment,
+what applies. Nesting the two rules was the first attempt in the editor and it needs a branch per
+way one range can straddle another; this needs none. The editor turns those segments into
+`TextRun`s and the response into `HighlightStyle`s, which is the only part that differs.
+
+**One mechanism, two sources of tokens.** The outline already knows its tokens structurally and
+does not use the lexer; the editor and raw view have no structure and do. Both then go through the
+same splitter and the same palette — `ui::syntax_colour` is the single match from kind to colour,
+because a body authored in the editor and the response it comes back in reading as two different
+languages is the failure that matters here.
+
+Two consequences worth recording:
+
+- **`json_row` became one `StyledText` instead of up to five divs**, which is what makes a
+  per-character match highlight possible at all — and incidentally collapses five elements per row
+  into one on the surface that has 1.31M of them. §6's note that match highlighting is per-row is
+  retracted above.
+- **`body_kind` is private now.** The editor's colouring is derived from it and they live in
+  different entities, so a public field is how the two drift: assigning it directly still compiles
+  and leaves JSON painted flat, or XML painted as JSON. `set_body_kind` is the funnel, for the
+  reason `Workspace::activate` is one.
+
+*Still deliberately absent:* XML and HTML. The lexer is JSON-only, and the editor turns colour
+*off* for other kinds rather than mis-colouring them — lexing HTML as JSON tints a stray attribute
+green for no reason. Those need the cross-line state this design skipped, and they can have it
+when someone wants them.
+
 ### Horizontal scrolling — and the one-row measurement that decides it
 
 Soft-wrap is off (§7), so a long line runs off the right edge. Until this landed there was
@@ -708,9 +762,10 @@ goes to the background executor, because the transfer cap is 100MB and invariant
 conditional on today's body being small. Only the mapping runs on the UI thread, and it has to:
 it reads the live `BodyView`, which a background task can't borrow.
 
-**Match highlighting is per row, not per character.** A row is assembled from separately styled
-key, punctuation, and value elements, so highlighting the exact bytes means splitting a shaped
-text run — that's the syntax-highlighting problem, which principle 4 puts last.
+**Match highlighting was per row, and is now per character.** A row used to be assembled from
+separately styled key, punctuation and value *elements*, which can only be coloured whole — so a
+match tinted its entire row. Highlighting the bytes meant splitting a shaped run, which is the
+syntax-highlighting problem, which is why the two landed together. See §6's highlighting section.
 
 ### Selection — a row cursor, and the two verbs that need one
 

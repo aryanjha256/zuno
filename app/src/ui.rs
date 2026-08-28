@@ -338,6 +338,70 @@ impl gpui::UniformListDecoration for HScrollIndicator {
     }
 }
 
+/// Cut a line into segments, each carrying the colour that covers it and whether it is marked.
+///
+/// **Overlapping styles have to be split, not layered.** `StyledText::compute_runs` walks its
+/// highlights in order doing `range.start - ix`, so it requires them sorted and disjoint and
+/// underflows on anything else; `shape_line` likewise takes runs that tile the text exactly. So a
+/// search match sitting inside a coloured token cannot simply be pushed on top — the token has to
+/// be cut at the match's edges and the pieces styled separately.
+///
+/// Collecting every boundary either rule cares about and then asking, per segment, what applies
+/// avoids a case per overlap. Nesting the two rules was the first attempt in the editor and it
+/// needed one branch per way a range can straddle another.
+///
+/// Segments tile `0..len` in order, so callers can emit runs directly from them.
+pub fn split_spans(
+    len: usize,
+    colours: &[(std::ops::Range<usize>, gpui::Hsla)],
+    marked: Option<std::ops::Range<usize>>,
+) -> Vec<(std::ops::Range<usize>, Option<gpui::Hsla>, bool)> {
+    let mut cuts: Vec<usize> = Vec::with_capacity(colours.len() * 2 + 4);
+    cuts.push(0);
+    cuts.push(len);
+    for (range, _) in colours {
+        cuts.push(range.start.min(len));
+        cuts.push(range.end.min(len));
+    }
+    if let Some(marked) = &marked {
+        cuts.push(marked.start.min(len));
+        cuts.push(marked.end.min(len));
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    cuts.windows(2)
+        .map(|pair| {
+            let (from, to) = (pair[0], pair[1]);
+            let colour = colours
+                .iter()
+                .find(|(range, _)| range.start <= from && range.end >= to)
+                .map(|(_, colour)| *colour);
+            let marked = marked
+                .as_ref()
+                .is_some_and(|marked| marked.start <= from && marked.end >= to);
+            (from..to, colour, marked)
+        })
+        .filter(|(range, _, _)| !range.is_empty())
+        .collect()
+}
+
+/// The colour one JSON token is painted in.
+///
+/// One function, three callers — the request editor, the raw response view, and (indirectly) the
+/// JSON outline. The palette is the thing that must not drift: a body authored in the editor and
+/// the response it comes back in should read as the same language, and the surest way to break
+/// that is to write the match twice.
+pub fn syntax_colour(kind: zuno_core::TokenKind, syntax: &crate::theme::SyntaxTheme) -> gpui::Hsla {
+    match kind {
+        zuno_core::TokenKind::Key => syntax.key,
+        zuno_core::TokenKind::String => syntax.string,
+        zuno_core::TokenKind::Number => syntax.number,
+        zuno_core::TokenKind::Literal => syntax.literal,
+        zuno_core::TokenKind::Punct => syntax.punct,
+    }
+}
+
 /// A vertical rule drawn as a glyph, for separating items inside a single row.
 ///
 /// `theme.border` and not a text colour: this is a rule that happens to be a character, so being
@@ -377,4 +441,118 @@ pub fn text_action<A: gpui::Action + Clone + 'static>(
             },
         )
         .child(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::hsla;
+
+    fn colour(n: f32) -> gpui::Hsla {
+        hsla(n, 1., 0.5, 1.)
+    }
+
+    /// The contract every caller depends on: segments tile `0..len` exactly, in order, with no
+    /// gaps and no overlaps.
+    ///
+    /// Worth asserting as a property rather than case by case, because the failure is not a
+    /// wrong colour. `StyledText::compute_runs` walks highlights doing `range.start - ix`, so a
+    /// gap paints the wrong text and an overlap **underflows a `usize`**; `shape_line` requires
+    /// the same tiling. Getting this wrong panics rather than looking odd.
+    fn assert_tiles(segments: &[(std::ops::Range<usize>, Option<gpui::Hsla>, bool)], len: usize) {
+        let mut at = 0;
+        for (range, _, _) in segments {
+            assert_eq!(range.start, at, "gap or overlap at {at}: {segments:?}");
+            assert!(range.end > range.start, "empty segment: {segments:?}");
+            at = range.end;
+        }
+        assert_eq!(at, len, "segments must reach the end: {segments:?}");
+    }
+
+    #[test]
+    fn a_mark_inside_a_colour_splits_it_into_three() {
+        // The case the whole helper exists for: a search match landing inside a coloured token.
+        // Layering the two would leave overlapping ranges, which is the underflow above.
+        let colours = [(0..10, colour(0.5))];
+        let segments = split_spans(10, &colours, Some(3..6));
+        assert_tiles(&segments, 10);
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].0, 0..3);
+        assert_eq!(segments[1].0, 3..6);
+        assert!(segments.iter().all(|(_, c, _)| *c == Some(colour(0.5))));
+        assert_eq!(
+            segments.iter().map(|(_, _, hit)| *hit).collect::<Vec<_>>(),
+            vec![false, true, false]
+        );
+    }
+
+    #[test]
+    fn gaps_between_colours_still_produce_segments() {
+        // Uncoloured text — whitespace between JSON tokens, or anything the lexer declined to
+        // recognise — is not absent, it is default-coloured. Dropping it would leave a hole.
+        let colours = [(0..2, colour(0.1)), (5..7, colour(0.2))];
+        let segments = split_spans(9, &colours, None);
+        assert_tiles(&segments, 9);
+        assert_eq!(segments[1].0, 2..5);
+        assert_eq!(segments[1].1, None);
+    }
+
+    #[test]
+    fn a_mark_straddling_two_colours_is_cut_at_both() {
+        let colours = [(0..4, colour(0.1)), (4..8, colour(0.2))];
+        let segments = split_spans(8, &colours, Some(2..6));
+        assert_tiles(&segments, 8);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|(r, _, hit)| (r.clone(), *hit))
+                .collect::<Vec<_>>(),
+            vec![(0..2, false), (2..4, true), (4..6, true), (6..8, false)]
+        );
+    }
+
+    #[test]
+    fn ranges_past_the_end_are_clamped_rather_than_trusted() {
+        // A match can outrun the text it is being drawn into: the raw view cuts a line at
+        // `MAX_DISPLAY_LINE`, and a stale range can survive a frame while the body is reindexed.
+        // Clamping keeps the tiling valid; trusting the caller panics.
+        let colours = [(0..99, colour(0.3))];
+        assert_tiles(&split_spans(5, &colours, Some(2..99)), 5);
+        assert_tiles(&split_spans(5, &[], Some(7..9)), 5);
+    }
+
+    #[test]
+    fn nothing_to_split_is_one_segment_and_empty_text_is_none() {
+        assert_eq!(split_spans(4, &[], None).len(), 1);
+        assert!(split_spans(0, &[], None).is_empty());
+    }
+
+    #[test]
+    fn every_token_kind_has_a_colour_and_they_are_distinguishable() {
+        // A palette where two kinds collide is worse than no colour: it reads as a rendering
+        // fault rather than as a deliberate choice.
+        let theme = crate::theme::Theme::new(crate::theme::Appearance::Dark, "mono".into());
+        let kinds = [
+            zuno_core::TokenKind::Key,
+            zuno_core::TokenKind::String,
+            zuno_core::TokenKind::Number,
+            zuno_core::TokenKind::Literal,
+            zuno_core::TokenKind::Punct,
+        ];
+
+        let colours: Vec<_> = kinds
+            .iter()
+            .map(|kind| syntax_colour(*kind, &theme.syntax))
+            .collect();
+        for (ix, a) in colours.iter().enumerate() {
+            for b in &colours[ix + 1..] {
+                assert_ne!(
+                    (a.h, a.s, a.l),
+                    (b.h, b.s, b.l),
+                    "two token kinds share a colour: {colours:?}"
+                );
+            }
+        }
+    }
 }

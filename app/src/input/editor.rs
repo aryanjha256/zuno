@@ -67,6 +67,12 @@ pub struct Editor {
     /// The caret offset the last paint saw, so `h_offset` can follow the caret when it *moves*
     /// and leave a hand-scrolled view alone when it doesn't.
     last_cursor: Option<usize>,
+    /// Whether to colour the content as JSON.
+    ///
+    /// A plain `bool` rather than a language enum, because JSON is the only thing the lexer
+    /// knows — a second value would be a slot with nothing to put in it. The body pane sets it
+    /// from `RawKind`, so switching a body to XML turns colour off rather than mis-colouring it.
+    highlight_json: bool,
     is_selecting: bool,
 }
 
@@ -90,6 +96,7 @@ impl Editor {
             last_line_height: px(16.),
             h_offset: px(0.),
             last_cursor: None,
+            highlight_json: false,
             is_selecting: false,
         }
     }
@@ -99,6 +106,20 @@ impl Editor {
     #[cfg(test)]
     pub fn vertical_offset(&self) -> Pixels {
         self.scroll.offset().y
+    }
+
+    pub fn set_highlight_json(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.highlight_json != on {
+            self.highlight_json = on;
+            cx.notify();
+        }
+    }
+
+    /// Whether this editor is colouring its content as JSON, for the test that the flag follows
+    /// the body kind rather than being set once and forgotten.
+    #[cfg(test)]
+    pub fn highlights_json(&self) -> bool {
+        self.highlight_json
     }
 
     /// The horizontal scroll offset, for tests that assert a hand scroll survives the next
@@ -980,6 +1001,7 @@ impl Element for EditorElement {
         let last_line = (first_line + visible).min(editor.line_count());
 
         let is_empty = editor.content.is_empty();
+        let highlight = editor.highlight_json;
         let previous_h_offset = editor.h_offset;
         let selection = editor.selection.clone();
         let cursor_offset = editor.cursor();
@@ -1000,22 +1022,21 @@ impl Element for EditorElement {
             let line_start = editor.line_start(line_ix);
             let line_end = editor.line_end(line_ix);
 
-            // Underline the IME pre-edit region if it falls on this line.
-            let runs = match &editor.marked_range {
-                Some(marked) if marked.start < line_end && marked.end > line_start && !is_empty => {
-                    let local_start = marked.start.max(line_start) - line_start;
-                    let local_end = (marked.end.min(line_end)) - line_start;
-                    build_marked_runs(&text, &style, color, local_start, local_end)
-                }
-                _ => vec![TextRun {
-                    len: text.len(),
-                    font: style.font(),
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }],
+            // Colour, and the IME pre-edit underline, in one split. The placeholder is not JSON
+            // and must not be lexed as it — it is prose standing in for an empty buffer.
+            let spans = if highlight && !is_empty {
+                token_colours(&text, &theme)
+            } else {
+                Vec::new()
             };
+            let marked = editor.marked_range.as_ref().and_then(|marked| {
+                (marked.start < line_end && marked.end > line_start && !is_empty).then(|| {
+                    let from = marked.start.max(line_start) - line_start;
+                    let to = marked.end.min(line_end) - line_start;
+                    from..to
+                })
+            });
+            let runs = build_runs(&text, &style, color, &spans, marked);
 
             let layout = window
                 .text_system()
@@ -1177,44 +1198,50 @@ impl Element for EditorElement {
     }
 }
 
-fn build_marked_runs(
+/// Map one line's JSON tokens to colours from the theme's syntax palette.
+///
+/// The same palette the response viewer paints with, so a body authored here and the response it
+/// comes back in look like the same language rather than two.
+fn token_colours(line: &str, theme: &crate::theme::Theme) -> Vec<(Range<usize>, gpui::Hsla)> {
+    zuno_core::highlight::lex_json(line)
+        .into_iter()
+        .map(|token| {
+            (
+                token.range,
+                crate::ui::syntax_colour(token.kind, &theme.syntax),
+            )
+        })
+        .collect()
+}
+
+/// Split one line into styled runs: coloured by `spans`, underlined where the IME is composing.
+///
+/// The boundary splitting lives in `ui::split_spans`, shared with the response viewer — see
+/// there for why overlapping styles have to be cut rather than layered.
+fn build_runs(
     text: &SharedString,
     style: &gpui::TextStyle,
     color: gpui::Hsla,
-    start: usize,
-    end: usize,
+    spans: &[(Range<usize>, gpui::Hsla)],
+    marked: Option<Range<usize>>,
 ) -> Vec<TextRun> {
-    let base = TextRun {
-        len: 0,
-        font: style.font(),
-        color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
+    let underline = UnderlineStyle {
+        color: Some(color),
+        thickness: px(1.0),
+        wavy: false,
     };
 
-    vec![
-        TextRun {
-            len: start,
-            ..base.clone()
-        },
-        TextRun {
-            len: end.saturating_sub(start),
-            underline: Some(UnderlineStyle {
-                color: Some(color),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            ..base.clone()
-        },
-        TextRun {
-            len: text.len().saturating_sub(end),
-            ..base
-        },
-    ]
-    .into_iter()
-    .filter(|run| run.len > 0)
-    .collect()
+    crate::ui::split_spans(text.len(), spans, marked)
+        .into_iter()
+        .map(|(range, colour, composing)| TextRun {
+            len: range.len(),
+            font: style.font(),
+            color: colour.unwrap_or(color),
+            background_color: None,
+            underline: composing.then(|| underline.clone()),
+            strikethrough: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

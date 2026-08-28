@@ -201,6 +201,17 @@ impl BodyView {
         self.rebuild_visible(&outline);
     }
 
+    /// Whether a raw-text body was *meant* to be JSON.
+    ///
+    /// True exactly when a notice explains why it isn't rendered as an outline — over the
+    /// auto-parse cap, or failed to parse. Both are worth colouring: the first is ordinary JSON
+    /// too big to index, and on the second the colour is how you find where it went wrong. A
+    /// body with no notice is genuinely something else, and lexing HTML as JSON would tint a
+    /// stray attribute green for no reason.
+    pub fn raw_is_json(&self) -> bool {
+        matches!(self.kind, BodyKind::Text(_)) && self.notice.is_some()
+    }
+
     pub fn is_json(&self) -> bool {
         matches!(self.kind, BodyKind::Json(_))
     }

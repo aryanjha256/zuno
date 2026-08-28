@@ -15,6 +15,7 @@ pub mod diff;
 pub mod engine;
 pub mod environment;
 pub mod fuzzy;
+pub mod highlight;
 pub mod json;
 pub mod lines;
 pub mod request;
@@ -26,6 +27,7 @@ pub use environment::{Environment, EnvironmentError, Resolver};
 pub use curl::{CurlError, CurlImport};
 pub use diff::ResponseDiff;
 pub use engine::{Engine, EngineError, Event, JobId};
+pub use highlight::{Token, TokenKind};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;
 pub use request::{

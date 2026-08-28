@@ -5246,6 +5246,53 @@ async fn folding_shrinks_the_scroll_region_and_pulls_the_view_back(cx: &mut Test
 }
 
 #[gpui::test]
+async fn the_editors_colouring_follows_the_body_kind(cx: &mut TestAppContext) {
+    // Colour is the one thing a headless test cannot see, so this asserts the *decision* instead:
+    // that the editor is told to lex JSON exactly when the body is JSON. The lexer itself is
+    // covered exhaustively in core, where it is pure.
+    //
+    // `body_kind` used to be a public field assigned from two places. Two entities holding one
+    // fact is how they drift — assigning it directly still compiles and silently leaves JSON
+    // painted flat, or XML painted as JSON — so it goes through `set_body_kind` now, and this is
+    // what would fail if a third call site skipped the funnel.
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    let highlighting =
+        |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| -> bool {
+            cx.update(|_, cx| view.read(cx).body_editor.read(cx).highlights_json())
+        };
+
+    assert!(
+        highlighting(&view, &mut cx),
+        "the sample request has a JSON body, so it starts coloured"
+    );
+
+    // Switch to plain text through the real picker, the way a person would.
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("text");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_kind()),
+        RawKind::Text,
+        "the picker must have taken"
+    );
+    assert!(
+        !highlighting(&view, &mut cx),
+        "plain text is not JSON and must not be lexed as it"
+    );
+
+    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.simulate_input("json");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        highlighting(&view, &mut cx),
+        "and switching back turns it on again"
+    );
+}
+
+#[gpui::test]
 async fn the_widest_row_is_found_in_a_realistically_shaped_body(cx: &mut TestAppContext) {
     // The reported shape: one long `description` nested three levels down among many shallow
     // short rows. The extent feeds the pixel width the pane computes, so getting the wrong row
@@ -5666,7 +5713,7 @@ async fn clicking_the_body_chip_opens_the_type_picker(cx: &mut TestAppContext) {
     // The discriminating half: cycling would have moved the sample's JSON body to Text on this
     // very click. Opening a picker changes nothing until something is chosen.
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_kind),
+        cx.update(|_, cx| view.read(cx).body_kind()),
         RawKind::Json,
         "clicking must not mutate the body kind in place"
     );

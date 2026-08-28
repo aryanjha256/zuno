@@ -237,7 +237,10 @@ pub struct RequestView {
     /// different intentions that look identical in the data, so nothing else records the
     /// choice. Ignored while `preserved_body` is set — see there.
     pub body_type: BodyType,
-    pub body_kind: RawKind,
+    /// Private, and set only through `set_body_kind`. The editor's colouring is derived from it,
+    /// and a public field is how those two drift: assigning it directly compiles and silently
+    /// leaves JSON text painted as plain, or XML painted as JSON.
+    body_kind: RawKind,
     /// Fields of a form body. Same widget as the header and query tables, since
     /// `FormField` has the same shape as `Header`.
     pub form: Vec<KeyValueRow>,
@@ -434,7 +437,7 @@ impl RequestView {
         self.headers = headers;
         self.query = query;
         self.body_editor = body_editor;
-        self.body_kind = body_kind;
+        self.set_body_kind(body_kind, cx);
         self.body_type = body_type;
         self.form = form;
         self.binary_path = binary_path;
@@ -1116,6 +1119,18 @@ impl RequestView {
         cx.notify();
     }
 
+    /// The current match's byte range in the response *source*.
+    ///
+    /// The row alone was enough while a match tinted its whole row; highlighting the matched
+    /// characters needs to know which ones, and each surface maps this range into its own
+    /// rendered text.
+    pub fn current_match_bytes(&self, cx: &App) -> Option<std::ops::Range<u32>> {
+        let search = self.search.as_ref()?;
+        let start = *search.offsets.get(search.current)?;
+        let len = search.query.read(cx).text().len() as u32;
+        (len > 0).then(|| start..start + len)
+    }
+
     /// The row currently highlighted as the active match, if the bar is open.
     pub fn current_match_row(&self) -> Option<u32> {
         let search = self.search.as_ref()?;
@@ -1168,6 +1183,26 @@ impl RequestView {
             return;
         }
 
+        cx.notify();
+    }
+
+    /// Test-only, like `Workspace::tab_count`: nothing in the UI reads the kind directly, it
+    /// reads the label derived from it.
+    #[cfg(test)]
+    pub fn body_kind(&self) -> RawKind {
+        self.body_kind
+    }
+
+    /// Set the raw body's flavour, and the editor's colouring with it.
+    ///
+    /// One funnel, for the reason `Workspace::activate` is one: the two live in different
+    /// entities, so keeping them in step at each call site is a rule to remember rather than a
+    /// thing that cannot be got wrong.
+    pub fn set_body_kind(&mut self, kind: RawKind, cx: &mut Context<Self>) {
+        self.body_kind = kind;
+        let json = matches!(kind, RawKind::Json);
+        self.body_editor
+            .update(cx, |editor, cx| editor.set_highlight_json(json, cx));
         cx.notify();
     }
 

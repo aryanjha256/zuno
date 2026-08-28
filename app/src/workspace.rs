@@ -653,7 +653,7 @@ impl Workspace {
                 let Some(view) = self.active() else { return };
                 view.update(cx, |view, cx| {
                     if let Some(kind) = kind {
-                        view.body_kind = kind;
+                        view.set_body_kind(kind, cx);
                     }
                     view.set_body_type(body_type, cx);
                 });

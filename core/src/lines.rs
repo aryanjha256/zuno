@@ -129,6 +129,11 @@ impl LineIndex {
         best
     }
 
+    /// Where a line begins in the source, so a match offset can be made line-local.
+    pub fn line_start(&self, ix: usize) -> Option<u32> {
+        self.lines.get(ix).map(|span| span.start)
+    }
+
     /// A whole line, however long it is.
     ///
     /// The counterpart to `line`, and the distinction matters at exactly one call site:
