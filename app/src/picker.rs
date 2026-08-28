@@ -294,6 +294,20 @@ impl Render for Picker {
             .flex_col()
             .items_center()
             .bg(gpui::hsla(0., 0., 0., 0.4))
+            // **A modal owns the mouse, the same way `Workspace::modal_open` makes it own the
+            // keyboard.** Catching *clicks* on the scrim was never enough: a scroll handler
+            // gates on `hitbox.should_handle_scroll`, which consults the hit test rather than
+            // propagation, so the wheel went straight through to whatever was behind. `hit_test`
+            // walks topmost-first and stops at a `BlockMouse` hitbox, which is what takes the
+            // panes underneath out of it.
+            //
+            // **Not covered by a test, deliberately.** Nothing behind a modal moves in the
+            // headless platform whether this is here or not — the scrim's own handlers already
+            // absorb what a test can simulate — so an assertion here would pass against the bug
+            // and read as coverage. Found by using the window; verified against `hit_test` in
+            // the vendored source; left untested on purpose. `settings_panel` and `context_menu`
+            // carry the same call for the same reason.
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|_, _: &MouseDownEvent, _, cx| {

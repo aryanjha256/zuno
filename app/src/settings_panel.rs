@@ -278,6 +278,9 @@ impl Render for SettingsPanel {
             .flex_col()
             .items_center()
             .bg(gpui::hsla(0., 0., 0., 0.4))
+            // A modal owns the mouse, not just the keyboard — see `picker.rs` for why this is
+            // `occlude` and why it has no test.
+            .occlude()
             .track_focus(&self.focus_handle)
             .key_context("SettingsPanel")
             .on_mouse_down(

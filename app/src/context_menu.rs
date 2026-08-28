@@ -170,6 +170,9 @@ impl Render for ContextMenu {
         div()
             .absolute()
             .inset_0()
+            // A modal owns the mouse, not just the keyboard — see `picker.rs` for why this is
+            // `occlude` and why it has no test.
+            .occlude()
             .track_focus(&self.focus_handle)
             .key_context("ContextMenu")
             .on_mouse_down(

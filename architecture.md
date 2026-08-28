@@ -1491,6 +1491,14 @@ panel and closing it restored focus to the buffer behind, leaving the panel stra
 the same thing directly: the panes behind a modal are still painted, so their inputs are still tab
 stops and `focus_next` walks past the scrim into them.
 
+A fifth, and it is the mouse half of the same idea: **a modal occludes.** `modal_open` and the
+`Tab` guard make a modal own the *keyboard*; nothing made it own the *wheel*, so scrolling over an
+open picker scrolled the response body behind it. A scrim that catches clicks does not help,
+because scroll handlers gate on `hitbox.should_handle_scroll` — the hit test, not propagation.
+`.occlude()` marks the scrim `BlockMouse`, and `hit_test` stops there. All three overlays carry it
+now. Deliberately untested: nothing behind a modal moves in the headless platform either way, so
+an assertion would pass against the bug — see the note on `picker.rs`.
+
 *Rejected: scoping the `tab` binding with a context predicate.* GPUI matches only the **leaf**
 context, so "not inside a modal" cannot be written once — it has to be restated for every modal
 context that ever exists, and the failure mode when someone forgets is a dead keymap with nothing on
