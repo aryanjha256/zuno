@@ -3299,6 +3299,130 @@ async fn clicking_a_tab_in_the_strip_activates_that_buffer(cx: &mut TestAppConte
     );
 }
 
+#[gpui::test]
+async fn a_long_tab_label_is_ellipsised_before_it_reaches_the_strip(cx: &mut TestAppContext) {
+    // **The strip's label is shortened in Rust, not by `truncate()`**, because that helper
+    // depends on layout details several elements away and shipped twice doing nothing — with no
+    // error either time, just the hard cut it was meant to remove. Shaped text is not measurable
+    // in the headless platform, so the only assertion available is on the string handed to the
+    // element, which is exactly why the elision was moved somewhere a string can be read.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("https://example.test/shadcnschemaregistry.json");
+    cx.run_until_parked();
+
+    let labels = window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.tab_labels(cx).into_iter().map(|(_, label, _)| label).collect::<Vec<_>>()
+        })
+        .expect("window");
+
+    let active = labels.last().expect("two buffers are open");
+    assert!(
+        active.ends_with('…'),
+        "a 25-character label must reach the strip already shortened, not rely on the clip: \
+         {active:?}"
+    );
+    assert_eq!(
+        active.chars().count(),
+        22,
+        "and shortened to the budget the label region was sized for: {active:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_tabs_close_button_stays_inside_the_tab(cx: &mut TestAppContext) {
+    // **The label's width is hardcoded, so this is the assertion that keeps it honest.** It has
+    // to be hardcoded: `truncate()` only ellipsizes text handed a *definite* width, which flex
+    // never supplies in time. The cost is arithmetic that can drift from the padding around it —
+    // and the failure is invisible, because the tab is `overflow_hidden`, so a label one pixel
+    // too wide pushes the × out of the clip and it simply isn't there. No error, no panic, a
+    // control that silently stops existing.
+    //
+    // Layout, not paint, so the headless platform can answer it.
+    let (_, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    cx.run_until_parked();
+
+    let tab = cx.debug_bounds("tab-0").expect("the strip should be painted at two buffers");
+    let label = cx.debug_bounds("tab-label-0").expect("every tab carries a label");
+    let close = cx.debug_bounds("tab-close-0").expect("every tab carries a close button");
+
+    // **The load-bearing one.** Everything else here passed against both breaks tried while
+    // writing it — widening the label (`TAB_WIDTH` derives from it, so the sum stays consistent)
+    // and widening the padding without updating `TAB_CHROME_WIDTH`. The second is the real drift,
+    // and it does not push the × out: the label is a flex item with the default shrink of 1, so
+    // *it* gives up the pixels instead. The result is a label whose box is narrower than the
+    // width `truncate()` was told to ellipsize against — so the text is clipped by the box rather
+    // than shortened, and the hard cut this whole change removed comes silently back.
+    assert_eq!(
+        label.size.width,
+        gpui::px(crate::workspace::tab_label_width()),
+        "the label's real width has drifted from the one the ellipsis is computed against"
+    );
+
+    assert!(
+        close.origin.x >= tab.origin.x
+            && close.origin.x + close.size.width <= tab.origin.x + tab.size.width,
+        "the close button falls outside the tab's clip: tab {tab:?}, close {close:?}"
+    );
+}
+
+#[gpui::test]
+async fn clicking_a_tabs_close_button_closes_that_tab_and_not_the_active_one(
+    cx: &mut TestAppContext,
+) {
+    // **The assertion has to name which buffers survive, not which one ends up active.** After
+    // closing index 2 of three, `close_tab` activates `min(2, len - 1)` — and it lands on the
+    // same buffer whether the × closed the tab it was drawn on or the tab that happened to be
+    // active. An `active_view` check alone therefore passes against a handler that forgot to
+    // `activate(ix)` first, which is the whole bug this test exists for. Clicking the two
+    // remaining tabs pins the surviving pair exactly.
+    let (window, first, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    let second = active_view(&window, &mut cx);
+    cx.simulate_keystrokes("ctrl-t");
+    let third = active_view(&window, &mut cx);
+    cx.run_until_parked();
+    assert_ne!(second.entity_id(), third.entity_id(), "three distinct buffers");
+
+    // Stand somewhere other than the tab being closed, so "closes the active one" is wrong in a
+    // way the assertions below can see.
+    let first_tab = cx.debug_bounds("tab-0").expect("the strip should be painted at three buffers");
+    cx.simulate_click(first_tab.center(), gpui::Modifiers::default());
+    assert_eq!(active_view(&window, &mut cx).entity_id(), first.entity_id());
+
+    let close = cx
+        .debug_bounds("tab-close-2")
+        .expect("every tab carries a close button, painted whether or not the × is visible");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let count = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+    assert_eq!(count, 2, "closing the third tab leaves two");
+
+    let remaining_first = cx.debug_bounds("tab-0").expect("two buffers still show a strip");
+    cx.simulate_click(remaining_first.center(), gpui::Modifiers::default());
+    assert_eq!(
+        active_view(&window, &mut cx).entity_id(),
+        first.entity_id(),
+        "the buffer that was active must still be open — the × closed the tab it was drawn on"
+    );
+
+    let remaining_second = cx.debug_bounds("tab-1").expect("two buffers still show a strip");
+    cx.simulate_click(remaining_second.center(), gpui::Modifiers::default());
+    assert_eq!(
+        active_view(&window, &mut cx).entity_id(),
+        second.entity_id(),
+        "and the survivors are the first two, not the last two"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Response pane: body / headers tabs
 // ---------------------------------------------------------------------------

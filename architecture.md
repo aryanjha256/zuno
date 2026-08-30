@@ -1536,6 +1536,40 @@ Three decisions worth recording, since each had a plausible alternative:
   can't drift, and takes `&str`s rather than a `&RequestSpec` because the strip asks every buffer
   every frame and `spec()` clones every header. A rename action should later prefer a user-set
   `name`, which needs a way to distinguish "typed" from "guessed".
+- **Tabs are a fixed width, and the label is shortened in Rust rather than by the layout.**
+  `Ctrl+W` and middle-click were the only ways to close a tab; there is a `×` now, and with it the
+  label had to stop being hard-cut. A fixed tab width means a tab doesn't move under the cursor
+  when a URL is edited — but it is *not* what produces the ellipsis, and two attempts shipped
+  believing some arrangement of widths would. gpui's `truncate()` caches its first measurement and
+  only ellipsizes text handed a definite width, so whether it fires turns on layout several
+  elements away; neither `flex_1().min_w(0)` nor an explicit `.w()` made it fire here.
+  `zuno_core::request::elide` now shortens the label before it ever reaches an element, and
+  `truncate()` stays underneath purely as a backstop for pathologically wide glyphs.
+
+  **The deciding argument was testability, not elegance.** Shaped text has no width the headless
+  platform can read: a block wrapper stretches to its parent, and a flex wrapper hands the text
+  `MaxContent` and thereby breaks the very truncation it was added to measure. Two tests written
+  to catch the bug passed against it. A pure function over a string either shortened the label or
+  did not, and `elide`'s unit tests plus
+  `a_long_tab_label_is_ellipsised_before_it_reaches_the_strip` say which — the latter reaching
+  `Workspace::tab_labels`, which exists as a method for exactly that reason.
+
+- **The character budget and the label width are one decision in two constants.**
+  `TAB_LABEL_CHARS` is tuned to `TAB_LABEL_WIDTH` in the UI font at `text_xs`, and counting
+  characters rather than measuring pixels is deliberate: real widths need the shipping font, which
+  the test platform does not have. Erring short is invisible; overshooting puts the ellipsis back
+  under the clip where it cannot be seen at all.
+
+- **The close button closes the tab it is drawn on, not the active one** — so it activates first,
+  the same two steps middle-click already took. The test asserts which buffers *survive*, by
+  clicking the two remaining tabs, and it has to: after closing index 2 of three, `close_tab`
+  activates `min(2, len - 1)` and lands on the same buffer either way, so an `active_view`
+  assertion passes against a handler that forgot to activate. Verified by deleting the `activate`
+  and watching it fail.
+
+  The `cx.stop_propagation()` beside it is the opposite case and is commented as such: the suite
+  passes with it deleted, because `activate` early-returns on `views.get(ix)`. It stays as
+  convention, and a test for it would assert nothing while reading as coverage.
 
 Curl import now opens a **new** buffer. Replacing was only defensible while there was nowhere else
 to put the result; an import over unsaved work destroyed it with no undo. `RequestView::load`

@@ -1,1 +1,5 @@
 /target
+
+# Personal marketing workspace. Its own git repo (see marketing/README.md), so it is
+# version-controlled and backed up without ever entering this repo history.
+/marketing

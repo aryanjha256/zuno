@@ -101,7 +101,8 @@ in `app/src/session.rs` that still reads M1's single-spec file, because persiste
 part of tabs that could silently destroy work — the quit hook saved `active()` alone, so a strip
 landing first would have dropped every other open request on exit. Then the verbs and the strip:
 `NewTab`/`CloseTab`/`NextTab`/`PrevTab` on `ctrl-t`/`ctrl-w`/`ctrl-tab`/`ctrl-shift-tab`, a strip
-that hides itself at one buffer, click and middle-click, and curl import opening a new buffer
+that hides itself at one buffer, click, middle-click and a per-tab close button, and curl
+import opening a new buffer
 instead of replacing the active one.
 
 Worth correcting an earlier version of this file: "only the strip and the switching are missing"

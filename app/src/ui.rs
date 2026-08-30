@@ -51,6 +51,7 @@ pub enum Icon {
     Settings,
     Plus,
     Globe,
+    Close,
 }
 
 impl Icon {
@@ -66,6 +67,7 @@ impl Icon {
             Icon::Settings => "icons/settings.svg",
             Icon::Plus => "icons/plus.svg",
             Icon::Globe => "icons/globe.svg",
+            Icon::Close => "icons/close.svg",
         }
     }
 
@@ -81,6 +83,7 @@ impl Icon {
         Icon::Settings,
         Icon::Plus,
         Icon::Globe,
+        Icon::Close,
     ];
 }
 
@@ -97,6 +100,7 @@ impl AssetSource for Assets {
             "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
             "icons/plus.svg" => include_bytes!("../assets/icons/plus.svg"),
             "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
+            "icons/close.svg" => include_bytes!("../assets/icons/close.svg"),
             _ => return Ok(None),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))
@@ -165,11 +169,15 @@ impl Render for Tooltip {
     }
 }
 
-/// Ties a glyph's hover colour to its button's hover state.
+/// Ties a glyph's hover colour to the hover state of whatever surface owns it.
 ///
 /// One shared name is safe: `GroupHitboxes` keeps a *stack* per name and resolves to the innermost
-/// one currently painting, so each button matches itself rather than the first on screen.
-const ICON_GROUP: &str = "icon-button";
+/// one currently painting, so each glyph matches its own owner rather than the first on screen.
+///
+/// Usually that owner is the `icon_button` around it. The tab strip puts the group on the whole
+/// **tab** instead, because revealing a close button when the cursor is anywhere on the tab is the
+/// feature — see `workspace::tab_strip`.
+pub(crate) const ICON_GROUP: &str = "icon-button";
 
 /// One icon glyph, always carrying its own colour.
 ///
@@ -184,7 +192,7 @@ const ICON_GROUP: &str = "icon-button";
 /// applied to the wrapping `div` instead of to the glyph, so the comment was right and the code was
 /// wrong three lines below it. It is a signature now rather than a sentence: there is no way to
 /// build an icon without passing a colour.
-fn glyph(icon: Icon, color: Hsla, hovered: Hsla) -> Svg {
+pub(crate) fn glyph(icon: Icon, color: Hsla, hovered: Hsla) -> Svg {
     svg()
         .path(icon.path())
         .size(px(15.))

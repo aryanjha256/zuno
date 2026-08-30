@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 534 tests, ~20s
+cargo test --workspace                   # 541 tests, ~20s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -116,6 +116,7 @@ A `uniform_list` cannot be scrolled programmatically without `.track_scroll(hand
 A dropped `Subscription` unsubscribes | `cx.subscribe` returns one; store it in a field (or `.detach()`). Let it fall out of scope and the callback silently never fires again. |
 `impl Trait` with a generic parameter needs `use<A>`, not `use<>` | The return has to mention every type parameter in scope. `use<>` is only for helpers that are non-generic *and* borrow nothing. |
 `truncate()` does **not** clip custom-painted elements | Needs a real `overflow_hidden()`. And clipping alone strands the hidden text — pair it with a scroll offset. |
+`truncate()` is **not dependable** — shorten the string yourself | It resolves to `TextOverflow::Truncate(ELLIPSIS)`, but `TextState::layout` reads its width from `known_dimensions.width.or(available_space.width if Definite)` **and caches the first measurement**, so whether it fires depends on layout several elements away. It shipped twice not firing — once from `flex_1().min_w(0)`, once from an explicit `.w()` that should have worked by every reading of the source — and **each failure is silent**: no error, just the hard cut you were removing. Worse, it is **unobservable headlessly**: shaped text has no measurable width, a block wrapper stretches to its parent, and a flex wrapper feeds the text `MaxContent` and so *breaks* truncation. Two tests written to detect it passed against the bug. `zuno_core::request::elide` shortens the label in Rust instead — a pure function a unit test can check — with `truncate()` left underneath only as a backstop for pathologically wide glyphs. The lesson generalises: **when a gpui behaviour can't be observed in a test, don't build on it.**
 `WindowOptions::window_decorations` defaults to `None` | Leaves the window client-decorated with nothing drawn: no buttons, no resize. We set `Client` and draw our own in `chrome.rs`. |
 `TextSystem::shape_line` has a `debug_assert!` against newlines | Sanitize at the edit boundary, not just on paste. |
 `examples/input.rs` ships macOS `cmd-` bindings | Translate every one to `ctrl-`. It also has a latent `assert_eq!` panic when a placeholder is showing. |

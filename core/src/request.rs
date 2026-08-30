@@ -313,6 +313,43 @@ pub fn label_for<'a>(url: &'a str, name: &'a str) -> &'a str {
     }
 }
 
+/// Shorten a label to `max_chars`, ending it in `…` when anything was dropped.
+///
+/// **Done here rather than left to gpui's `truncate()`**, which shipped twice not working. That
+/// helper only ellipsizes text it has been handed a *definite* width and caches its first
+/// measurement, so whether it fires depends on layout details several elements away — and when it
+/// doesn't fire there is no error, just the hard cut it was supposed to remove. This is a pure
+/// function over a string: it either shortened the label or it didn't, and a unit test can say
+/// which without a window.
+///
+/// Counting characters rather than measuring pixels is the deliberate imprecision. Real widths
+/// need the shaping font, the test platform's font is not the one that ships, and a label region
+/// is a fixed size chosen by us — so the caller picks a budget for its own width and the ellipsis
+/// lands a little early on narrow glyphs. `truncate()` stays on the element underneath as the
+/// backstop for a label of pathologically wide characters.
+pub fn elide(label: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    if max_chars == 0 {
+        return std::borrow::Cow::Borrowed("");
+    }
+    // `chars().count()` walks the string, but a tab label is tens of bytes and this runs per tab
+    // per frame — the alternative is `char_indices` bookkeeping for no measurable gain.
+    if label.chars().count() <= max_chars {
+        return std::borrow::Cow::Borrowed(label);
+    }
+    // `max_chars - 1` because the ellipsis occupies one of the budgeted characters. Slicing by
+    // `char_indices` rather than by byte keeps this correct for multi-byte labels, which a URL
+    // path segment can certainly be.
+    let end = label
+        .char_indices()
+        .nth(max_chars - 1)
+        .map(|(ix, _)| ix)
+        .unwrap_or(label.len());
+    let mut out = String::with_capacity(end + 3);
+    out.push_str(&label[..end]);
+    out.push('…');
+    std::borrow::Cow::Owned(out)
+}
+
 /// The last meaningful piece of a URL — its final path segment, or the host when there
 /// isn't one. Empty when nothing usable is there.
 ///
@@ -343,6 +380,43 @@ fn label_from_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_label_shorter_than_the_budget_is_untouched() {
+        assert_eq!(elide("posts", 22), "posts");
+        // Exactly at the budget still fits — off-by-one here would ellipsize a label that
+        // needed no shortening, which is the visible half of getting this wrong.
+        assert_eq!(elide("abcde", 5), "abcde");
+    }
+
+    #[test]
+    fn a_long_label_is_ellipsised_within_its_budget() {
+        let out = elide("shadcnschemaregistry.json", 22);
+        assert!(out.ends_with('…'), "{out}");
+        assert_eq!(
+            out.chars().count(),
+            22,
+            "the ellipsis has to come out of the budget, not be added to it: {out}"
+        );
+        assert_eq!(out, "shadcnschemaregistry.…");
+    }
+
+    #[test]
+    fn eliding_splits_on_characters_and_never_inside_one() {
+        // A path segment can be multi-byte, and slicing by byte would panic rather than
+        // shorten. Each of these is 3 bytes, so a byte-based cut lands mid-character.
+        let out = elide("日本語のパス", 4);
+        assert_eq!(out, "日本語…");
+        assert_eq!(out.chars().count(), 4);
+    }
+
+    #[test]
+    fn a_budget_of_zero_yields_nothing_rather_than_panicking() {
+        assert_eq!(elide("anything", 0), "");
+        // One character of budget is all ellipsis — degenerate, but it must not underflow
+        // `max_chars - 1`.
+        assert_eq!(elide("anything", 1), "…");
+    }
     use super::*;
 
     #[test]
