@@ -27,35 +27,83 @@ const MIN_WIDTH: f32 = 200.;
 /// nesting — resolving early also means the string can't disagree with what dispatch will do.
 pub struct MenuItem {
     pub label: SharedString,
-    /// Read from the live keymap, so a rebinding can't leave the menu advertising a dead key.
-    /// Empty when the action has no binding, which draws as no column rather than as a gap.
-    pub keystroke: SharedString,
-    pub action: Box<dyn gpui::Action>,
+    /// The dimmed right-hand column. A keystroke read from the live keymap for an action row,
+    /// so a rebinding can't leave the menu advertising a dead key; any short string otherwise.
+    /// Empty draws as no column rather than as a gap.
+    pub detail: SharedString,
+    pub command: MenuCommand,
+}
+
+/// What choosing a row does.
+///
+/// The menu performs neither itself — both travel out through `Chose` so the opener can close
+/// first. That ordering is load-bearing for `Dispatch` (see `ContextMenuEvent`) and free for
+/// `OpenUrl`, and one path is easier to keep right than two.
+pub enum MenuCommand {
+    Dispatch(Box<dyn gpui::Action>),
+    OpenUrl(SharedString),
+}
+
+impl Clone for MenuCommand {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Dispatch(action) => Self::Dispatch(action.boxed_clone()),
+            Self::OpenUrl(url) => Self::OpenUrl(url.clone()),
+        }
+    }
+}
+
+/// A row, or the rule between two groups of them.
+pub enum MenuRow {
+    Item(MenuItem),
+    Separator,
 }
 
 impl MenuItem {
+    /// An action row, labelled with its own keystroke.
     pub fn new(label: impl Into<SharedString>, action: impl gpui::Action, window: &Window) -> Self {
-        let keystroke = crate::workspace::keybinding_label(&action, window);
+        let detail = crate::workspace::keybinding_label(&action, window);
         Self {
             label: label.into(),
-            keystroke: SharedString::from(keystroke),
-            action: action.boxed_clone(),
+            detail: SharedString::from(detail),
+            command: MenuCommand::Dispatch(action.boxed_clone()),
         }
+    }
+
+    /// A row that opens a link. `detail` is free text — the About row puts the version there,
+    /// which is why the column is not called `keystroke` any more.
+    pub fn url(
+        label: impl Into<SharedString>,
+        detail: impl Into<SharedString>,
+        url: impl Into<SharedString>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            detail: detail.into(),
+            command: MenuCommand::OpenUrl(url.into()),
+        }
+    }
+}
+
+impl From<MenuItem> for MenuRow {
+    fn from(item: MenuItem) -> Self {
+        MenuRow::Item(item)
     }
 }
 
 pub enum ContextMenuEvent {
     Dismissed,
-    /// Chosen, carrying the action to dispatch. The menu never dispatches it itself — the
-    /// opener closes first and then dispatches, so focus is back where it belongs before the
-    /// action resolves.
-    Chose(Box<dyn gpui::Action>),
+    /// Chosen, carrying what to do. The menu never performs it — the opener closes first and
+    /// then acts, so focus is back where it belongs before an action resolves.
+    Chose(MenuCommand),
 }
 
 impl gpui::EventEmitter<ContextMenuEvent> for ContextMenu {}
 
 pub struct ContextMenu {
-    items: Vec<MenuItem>,
+    rows: Vec<MenuRow>,
+    /// Always indexes an `Item`; `select` steps over separators and the constructor starts on
+    /// the first one, so nothing has to re-check before acting.
     selected: usize,
     /// Window coordinates, straight from the `MouseDownEvent` that opened it.
     at: Point<Pixels>,
@@ -68,14 +116,18 @@ pub struct ContextMenu {
 
 impl ContextMenu {
     pub fn new(
-        items: Vec<MenuItem>,
+        rows: Vec<MenuRow>,
         at: Point<Pixels>,
         restore_focus: Option<FocusHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let selected = rows
+            .iter()
+            .position(|row| matches!(row, MenuRow::Item(_)))
+            .unwrap_or(0);
         Self {
-            items,
-            selected: 0,
+            rows,
+            selected,
             at,
             // Left at gpui's default `tab_stop: false`: there is nothing to tab *to* inside a
             // menu, and a tab stop here would let Tab walk focus out through the scrim.
@@ -92,21 +144,36 @@ impl ContextMenu {
         self.restore_focus.clone()
     }
 
-    /// Move the selection, clamped. Unlike the picker this does not wrap: a menu is short
-    /// enough to see whole, so falling off the end and reappearing at the top is disorienting
-    /// rather than convenient.
+    /// Move the selection, clamped, stepping over separators.
+    ///
+    /// Clamped rather than wrapping, unlike the picker: a menu is short enough to see whole, so
+    /// falling off the end and reappearing at the top is disorienting rather than convenient.
+    /// Landing *on* a separator would be worse — a keypress that appears to do nothing — so the
+    /// step continues in the same direction until it finds a row or runs out.
     pub fn select(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.items.is_empty() {
+        let step = delta.signum();
+        if step == 0 {
             return;
         }
-        let last = self.items.len() as isize - 1;
-        self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
-        cx.notify();
+        let last = self.rows.len() as isize - 1;
+        let mut at = self.selected as isize;
+        loop {
+            let next = at + step;
+            if next < 0 || next > last {
+                break;
+            }
+            at = next;
+            if matches!(self.rows[at as usize], MenuRow::Item(_)) {
+                self.selected = at as usize;
+                cx.notify();
+                break;
+            }
+        }
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = self.items.get(self.selected) {
-            cx.emit(ContextMenuEvent::Chose(item.action.boxed_clone()));
+        if let Some(MenuRow::Item(item)) = self.rows.get(self.selected) {
+            cx.emit(ContextMenuEvent::Chose(item.command.clone()));
         }
     }
 
@@ -122,12 +189,23 @@ impl Render for ContextMenu {
         let selected = self.selected;
 
         let rows: Vec<_> = self
-            .items
+            .rows
             .iter()
             .enumerate()
-            .map(|(ix, item)| {
+            .map(|(ix, row)| {
+                let item = match row {
+                    MenuRow::Separator => {
+                        return div()
+                            .flex_none()
+                            .my_1()
+                            .h(px(1.))
+                            .bg(theme.border)
+                            .into_any_element();
+                    }
+                    MenuRow::Item(item) => item,
+                };
                 let label = item.label.clone();
-                let keystroke = item.keystroke.clone();
+                let keystroke = item.detail.clone();
 
                 let mut row = div()
                     .debug_selector(move || format!("menu-row-{ix}"))
@@ -172,6 +250,7 @@ impl Render for ContextMenu {
                             .text_color(theme.text_faint)
                             .child(keystroke),
                     )
+                    .into_any_element()
             })
             .collect();
 

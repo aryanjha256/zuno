@@ -24,6 +24,7 @@ actions!(
         SwitchEnvironment,
         ShowHistory,
         OpenPalette,
+        OpenAppMenu,
         PickerNext,
         PickerPrev,
         PickerConfirm,

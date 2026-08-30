@@ -108,6 +108,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::PickerDismiss", "only valid inside the picker"),
     // A palette that lists itself is noise; Ctrl+K is how you got here.
     ("zuno::OpenPalette", "this is the palette"),
+    // The application menu is a *discovery* surface for people who don't know the palette
+    // exists. Reaching it from the palette is the wrong way round, and everything inside it is
+    // either offered here already or a link.
+    ("zuno::OpenAppMenu", "a menu reached from the palette is backwards"),
     // Only valid inside the settings panel, where they're already bound.
     ("zuno::SettingNext", "only valid inside the settings panel"),
     ("zuno::SettingPrev", "only valid inside the settings panel"),

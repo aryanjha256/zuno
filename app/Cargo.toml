@@ -19,6 +19,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 unicode-segmentation.workspace = true
+# Percent-encoding for the "report an issue" link. Already resolved for `zuno-core`, so this
+# adds a name in scope rather than a dependency.
+url.workspace = true
 
 # GPUI's headless test platform, which is the only way to drive real keystrokes and
 # focus through the app without a display server. Dev-only, so `cargo build` keeps

@@ -39,7 +39,7 @@ use crate::actions::{
     CopyResponse, FocusBody, FocusNext,
     FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
     OpenBodyType, PrevRequestTab,
-    OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
+    OpenAppMenu, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
@@ -236,6 +236,9 @@ fn register_keymap(cx: &mut App) {
         // block above the Application section and Esc stops closing the picker.
         KeyBinding::new("ctrl-p", OpenRequest, None),
         KeyBinding::new("ctrl-k", OpenPalette, None),
+        // F10 is the desktop convention for "open this window's menu", so the menu has a
+        // keystroke to advertise rather than being mouse-only.
+        KeyBinding::new("f10", OpenAppMenu, None),
         KeyBinding::new("ctrl-e", SwitchEnvironment, None),
         KeyBinding::new("ctrl-h", ShowHistory, None),
         KeyBinding::new("down", PickerNext, Some("Picker")),

@@ -24,7 +24,7 @@ use crate::actions::{
     MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ScrollLeft, ScrollRight,
     ScrollStart, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
     OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
-    PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
+    OpenAppMenu, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
@@ -1426,18 +1426,78 @@ impl Workspace {
         }
 
         let restore = Some(view.read(cx).response_focus.clone());
-        let menu = cx.new(|cx| context_menu::ContextMenu::new(items, at, restore, cx));
+        self.show_menu(items.into_iter().map(Into::into).collect(), at, restore, window, cx);
+    }
+
+    /// The application menu: the things that have nowhere else to live.
+    ///
+    /// Deliberately **not** a mouse copy of `Ctrl+K`. Every verb in the app already has an icon
+    /// button or a palette row, so a menu repeating them would be a second command list to keep
+    /// in step with no drift test watching it. What it carries instead is what had no home at
+    /// all — the version, the links, and quitting — plus three ways *in* for someone who has
+    /// just opened Zuno and does not yet know the palette exists.
+    fn app_menu_rows(&self, window: &Window) -> Vec<context_menu::MenuRow> {
+        use context_menu::{MenuItem, MenuRow};
+
+        let repo = env!("CARGO_PKG_REPOSITORY");
+        vec![
+            MenuItem::new("Find request", OpenRequest, window).into(),
+            MenuItem::new("Command palette", OpenPalette, window).into(),
+            MenuItem::new("Request settings", OpenSettings, window).into(),
+            MenuRow::Separator,
+            MenuItem::url("Documentation", "", repo).into(),
+            // Prefilled with the version and platform, because the two facts every bug report
+            // needs are the two the reporter is least likely to include.
+            MenuItem::url("Report an issue", "", issue_url(repo)).into(),
+            MenuRow::Separator,
+            MenuItem::url("About Zuno", env!("CARGO_PKG_VERSION"), format!("{repo}/releases"))
+                .into(),
+            MenuRow::Separator,
+            // Last, and behind a rule: it is the one item here that loses work, and putting it
+            // next to a link is how a misclick happens.
+            MenuItem::new("Quit", Quit, window).into(),
+        ]
+    }
+
+    fn open_app_menu(&mut self, _: &OpenAppMenu, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        // A fixed point under the app name, not the cursor: this menu belongs to a button, and
+        // a menu that opens wherever you happened to click reads as a context menu instead.
+        let at = gpui::point(gpui::px(8.), gpui::px(crate::chrome::TITLEBAR_HEIGHT));
+        let rows = self.app_menu_rows(window);
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        self.show_menu(rows, at, restore, window, cx);
+    }
+
+    /// Put a menu on screen and wire it up. Shared by the row menu and the application menu,
+    /// which differ only in their rows and where they are anchored.
+    fn show_menu(
+        &mut self,
+        rows: Vec<context_menu::MenuRow>,
+        at: gpui::Point<gpui::Pixels>,
+        restore: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = cx.new(|cx| context_menu::ContextMenu::new(rows, at, restore, cx));
 
         let subscription =
             cx.subscribe_in(&menu, window, |workspace, _, event, window, cx| match event {
                 context_menu::ContextMenuEvent::Dismissed => workspace.close_row_menu(window, cx),
-                // Close *then* dispatch. `Window::dispatch_action` defers, so the two orders
-                // are indistinguishable for actions (§12) — but closing first is what puts
-                // focus back in the response pane before anything runs.
-                context_menu::ContextMenuEvent::Chose(action) => {
-                    let action = action.boxed_clone();
+                // Close *then* act. `Window::dispatch_action` defers, so the two orders are
+                // indistinguishable for actions (§12) — but closing first is what puts focus
+                // back where it was before anything runs.
+                context_menu::ContextMenuEvent::Chose(command) => {
+                    let command = command.clone();
                     workspace.close_row_menu(window, cx);
-                    window.dispatch_action(action, cx);
+                    match command {
+                        context_menu::MenuCommand::Dispatch(action) => {
+                            window.dispatch_action(action, cx)
+                        }
+                        context_menu::MenuCommand::OpenUrl(url) => cx.open_url(&url),
+                    }
                 }
             });
 
@@ -1874,6 +1934,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::scroll_right))
             .on_action(cx.listener(Self::scroll_start))
             .on_action(cx.listener(Self::open_row_menu))
+            .on_action(cx.listener(Self::open_app_menu))
             .on_action(cx.listener(Self::menu_next))
             .on_action(cx.listener(Self::menu_prev))
             .on_action(cx.listener(Self::menu_confirm))
@@ -2072,6 +2133,24 @@ fn tab_strip(
                     )
             })),
     )
+}
+
+/// A `new issue` link carrying the two facts a bug report almost never includes.
+///
+/// Pure and separate from the menu so it can be tested: the body has to survive
+/// percent-encoding, and a broken query string produces a GitHub page with an empty form
+/// rather than an error anyone would notice.
+pub(crate) fn issue_url(repo: &str) -> String {
+    let body = format!(
+        "**Zuno:** {}\n**Platform:** {} {}\n\n**What happened**\n\n\n**What you expected**\n\n\n**Steps to reproduce**\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    );
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("body", &body)
+        .finish();
+    format!("{repo}/issues/new?{query}")
 }
 
 /// A filename to offer in the save dialog: the request's name plus an extension matching

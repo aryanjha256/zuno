@@ -7662,6 +7662,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
+ "url",
  "zuno-core",
 ]
 

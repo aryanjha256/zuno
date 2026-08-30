@@ -4958,6 +4958,78 @@ async fn hovering_a_menu_row_makes_it_the_one_enter_chooses(cx: &mut TestAppCont
     );
 }
 
+#[test]
+fn the_issue_link_carries_the_version_and_platform_encoded() {
+    // The opened URL is not observable — the test platform records it privately — so the
+    // builder is asserted directly. A body that fails to encode does not error: GitHub just
+    // renders an empty form, which nobody would notice until the reports arrived blank.
+    let url = crate::workspace::issue_url("https://example.test/o/r");
+
+    assert!(url.starts_with("https://example.test/o/r/issues/new?"), "{url}");
+    assert!(url.contains("body="), "the prefill has to reach the query string: {url}");
+
+    let (_, query) = url.split_once('?').expect("a query string");
+    let body = url::form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == "body")
+        .map(|(_, value)| value.into_owned())
+        .expect("a body parameter");
+
+    // Round-tripped, so this proves the encoding survives rather than that it happened.
+    assert!(body.contains(env!("CARGO_PKG_VERSION")), "{body}");
+    assert!(body.contains(std::env::consts::OS), "{body}");
+    assert!(body.contains("What happened"), "{body}");
+    assert!(
+        !url.contains('\n'),
+        "a raw newline in a URL is what breaks the link silently: {url}"
+    );
+}
+
+#[gpui::test]
+async fn the_app_menu_opens_from_the_titlebar_and_from_f10(cx: &mut TestAppContext) {
+    let (window, _, mut cx) = boot(cx, None, None);
+    assert!(!menu_is_open(&window, &mut cx), "closed to begin with");
+
+    let button = cx.debug_bounds("app-menu-button").expect("the app name is the menu's button");
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(menu_is_open(&window, &mut cx), "clicking the app name opens the menu");
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!menu_is_open(&window, &mut cx), "escape closes it");
+
+    // The mouse path teaches a keystroke, so the keystroke has to exist.
+    cx.simulate_keystrokes("f10");
+    cx.run_until_parked();
+    assert!(menu_is_open(&window, &mut cx), "f10 opens it too");
+}
+
+#[gpui::test]
+async fn arrowing_through_the_app_menu_steps_over_its_separators(cx: &mut TestAppContext) {
+    // **The one thing here that can silently half-work.** Landing on a separator is a keypress
+    // that appears to do nothing, and `confirm` there emits nothing either — so the menu just
+    // sits open. That is the distinguishing symptom, and the assertion below is on it.
+    //
+    // Three `down`s from the first row reach the fourth *item* only if separators are skipped;
+    // without skipping they land on the rule after "Request settings". Walking to the end
+    // instead would clamp on the last row either way and prove nothing.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("f10");
+    cx.run_until_parked();
+    assert!(menu_is_open(&window, &mut cx));
+
+    cx.simulate_keystrokes("down down down");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        !menu_is_open(&window, &mut cx),
+        "confirming here must choose a row — a selection resting on a separator emits nothing \
+         and leaves the menu open"
+    );
+}
+
 #[gpui::test]
 async fn the_menu_offers_fold_only_on_a_container(cx: &mut TestAppContext) {
     // Adapt, don't disable. A greyed row that can never apply is noise in a menu this short,

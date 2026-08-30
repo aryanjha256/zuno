@@ -915,6 +915,24 @@ Double-click folds a container, the file-tree convention. Deliberately *not* the
 text inputs already use double-click for select-word and triple-click for select-line, and one
 gesture meaning two things across panes is worse than a menu nobody finds.
 
+**The application menu is the second consumer, and it is deliberately not a mouse palette.**
+Every verb already has an icon button and a palette row, so a menu repeating them would be a
+second command list with no drift test watching it. It carries what had no home instead — the
+version, the links, and quitting — plus three ways *in* for someone who does not yet know
+`Ctrl+K` exists. `F10` opens it, the desktop convention, so the button teaches a keystroke like
+every other. It is excluded from the palette with a reason: reaching a discovery menu from the
+palette is backwards.
+
+Three things the primitive grew for it. `MenuRow::Separator`, because Quit sitting next to a link
+is how a misclick happens — and `select` steps *over* separators, since landing on one is a
+keypress that appears to do nothing and `confirm` there emits nothing either. `MenuCommand`, so a
+row can open a URL instead of dispatching; both travel out through `Chose` so the opener still
+closes before acting, which is one ordering rule rather than two. And the detail column stopped
+being called `keystroke`, because the About row puts the version there.
+
+The menu anchors at a fixed point below the titlebar rather than at the cursor: it belongs to a
+button, and one that opens wherever you clicked reads as a context menu.
+
 `app/src/context_menu.rs` is a **primitive**, not a response-pane feature, for principle 2's
 reason — saved requests want delete/rename, the tab strip wants close/rename, header rows want
 toggle/remove. It is also the first genuine consumer of `anchored()`, a question §12 left open

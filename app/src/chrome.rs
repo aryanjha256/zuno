@@ -12,6 +12,7 @@
 
 use gpui::{
     CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    StatefulInteractiveElement,
     ParentElement, ResizeEdge, SharedString, Stateful, Styled, Window, div, px,
 };
 
@@ -28,6 +29,9 @@ const RESIZE_GRAB: f32 = 6.0;
 ///
 /// The whole bar is a drag handle (`start_window_move`) and double-click maximises, which
 /// is what people expect of a titlebar whether or not the OS drew it.
+/// The bar's height, which the application menu anchors itself below.
+pub const TITLEBAR_HEIGHT: f32 = 34.;
+
 pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl IntoElement {
     let controls = window.window_controls();
     let maximized = window.is_maximized();
@@ -39,7 +43,7 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
         .items_center()
         .justify_between()
         .flex_none()
-        .h(px(34.))
+        .h(px(TITLEBAR_HEIGHT))
         .pl_3()
         .bg(theme.bg_panel)
         .border_b_1()
@@ -59,15 +63,56 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                 .items_center()
                 .gap_2()
                 .min_w(px(0.))
-                // The app's own name, which a client-decorated window has to supply
-                // itself — there's no OS titlebar to put it in.
+                // The app's own name, which a client-decorated window has to supply itself —
+                // there's no OS titlebar to put it in — and also the application menu's button.
+                //
+                // Hand-rolled rather than `text_action`, which paints `text_muted`: this is the
+                // app's identity and stays accent and semibold. The chevron is what says it
+                // opens something.
                 .child(
                     div()
+                        .id("app-menu-button")
+                        .debug_selector(|| "app-menu-button".to_string())
+                        .group(crate::ui::ICON_GROUP)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .flex_none()
+                        .px_1()
+                        .rounded_sm()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.accent)
-                        .child("Zuno"),
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.bg_hover))
+                        .tooltip(move |window, cx| {
+                            crate::ui::Tooltip::for_action(
+                                "Application menu",
+                                &crate::actions::OpenAppMenu,
+                                window,
+                                cx,
+                            )
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |_: &MouseDownEvent, window, cx| {
+                                // Inside the drag-to-move region, so without this the click
+                                // also asks the compositor to start dragging the window.
+                                cx.stop_propagation();
+                                window.dispatch_action(
+                                    Box::new(crate::actions::OpenAppMenu),
+                                    cx,
+                                );
+                            },
+                        )
+                        .child("Zuno")
+                        .child(crate::ui::glyph(
+                            crate::ui::Icon::ChevronDown,
+                            theme.accent,
+                            theme.accent,
+                            crate::ui::GLYPH_INLINE,
+                        )),
                 )
                 .child(crate::ui::separator(&theme))
                 .child(
