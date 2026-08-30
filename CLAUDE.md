@@ -44,6 +44,9 @@ cargo test --release -p zuno-core --test json_perf -- --nocapture
 # Build the Debian package. Inspect before trusting it.
 cargo deb -p zuno
 dpkg-deb --info target/debian/*.deb && dpkg-deb --contents target/debian/*.deb
+
+# Cut a release: bump, refresh the lock, test, commit, tag. Pushes only with `--push`.
+scripts/release.sh minor          # or patch / major / an explicit 0.2.0
 ```
 
 Debug startup is ~4× slower than release; don't judge feel from a debug build.

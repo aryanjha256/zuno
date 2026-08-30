@@ -277,7 +277,7 @@ impl RequestSpec {
             headers: vec![
                 Header::new("Content-Type", "application/json"),
                 Header::new("Accept", "application/vnd.github+json"),
-                Header::new("User-Agent", "zuno/0.1.0"),
+                Header::new("User-Agent", concat!("zuno/", env!("CARGO_PKG_VERSION"))),
                 Header::disabled("Authorization", "Bearer {{token}}"),
             ],
             body: Body::Raw {

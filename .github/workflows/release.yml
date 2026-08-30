@@ -1,10 +1,13 @@
 name: Release
 
-# Push a tag, get a .deb attached to a GitHub Release:
+# Push a tag, get a .deb attached to a GitHub Release. `scripts/release.sh` does the local
+# half — bump, lock, test, commit, tag — and pushes only with `--push`:
 #
-#   cargo set-version 0.2.0   # or edit [workspace.package] version by hand
-#   git commit -am "release 0.2.0" && git push
-#   git tag v0.2.0 && git push origin v0.2.0
+#   scripts/release.sh minor          # 0.1.5 -> 0.2.0, stops before pushing
+#   scripts/release.sh 0.2.0 --push
+#
+# The tag is checked against Cargo.toml below, so a hand-made tag that disagrees fails here
+# rather than producing a .deb whose filename lies about its contents.
 #
 # `workflow_dispatch` builds the same package without tagging or publishing anything, so
 # the pipeline can be exercised before committing to a version number.
