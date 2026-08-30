@@ -933,6 +933,12 @@ Five decisions:
   `take`s it, so a stale anchor can never place a later menu.
 - **Items adapt rather than disable.** No path on a raw body, no fold on a scalar. A greyed row
   that can never apply is noise in a menu this short — the same rule the pane already followed.
+- **Hover moves the selection; it does not add a second highlight.** The rows had a selection
+  background and no mouse feedback at all, and the obvious fix — a `hover` style — would light
+  the pointed-at row while `selected` still lit another, so `Enter` fired the row you were *not*
+  pointing at. Moving the selection keeps one highlight that always says what Enter will do, and
+  it is testable at that consequence: hover the second item, press Enter, and the clipboard holds
+  the path rather than the value. The pointer cursor is the other half.
 - **Every item is an action**, with its keystroke read from the live keymap. So the menu teaches
   the shortcut instead of replacing it, and it cannot drift from what dispatch does.
 - **Fold became one verb on the selection.** `ToggleFold` acts on the selected row rather than

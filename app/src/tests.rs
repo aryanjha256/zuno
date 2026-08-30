@@ -4907,6 +4907,33 @@ async fn right_clicking_a_row_opens_a_menu_of_what_applies_to_it(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn hovering_a_menu_row_makes_it_the_one_enter_chooses(cx: &mut TestAppContext) {
+    // Hover moves the *selection* rather than painting a second highlight, so the lit row is
+    // always the one Enter fires. The paint is unobservable here; what is observable is which
+    // action ran — row 0 copies the value, row 1 copies the path, and they differ.
+    let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-2").expect("the inner row");
+    right_click(&mut cx, row.center());
+    cx.run_until_parked();
+    let _ = &view;
+
+    let second = cx.debug_bounds("menu-row-1").expect("copy path is the second item");
+    cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some("$.outer.inner"),
+        "Enter must fire the row under the pointer, not the one selection started on"
+    );
+}
+
+#[gpui::test]
 async fn the_menu_offers_fold_only_on_a_container(cx: &mut TestAppContext) {
     // Adapt, don't disable. A greyed row that can never apply is noise in a menu this short,
     // and it is the same rule the pane already followed for the raw view's missing path.

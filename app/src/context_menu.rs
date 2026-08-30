@@ -138,13 +138,25 @@ impl Render for ContextMenu {
                     .gap_4()
                     .w_full()
                     .h(px(ROW_HEIGHT))
-                    .px_2();
+                    .px_2()
+                    .cursor_pointer();
 
                 if ix == selected {
                     row = row.bg(theme.bg_hover);
                 }
 
-                row.on_mouse_down(
+                row
+                    // **Hover moves the selection rather than adding a second highlight.** A
+                    // `hover` style would light the pointed-at row while `selected` still lit
+                    // another, and `Enter` would fire the one you are not pointing at. Moving
+                    // the selection keeps a single highlight that always says what Enter does.
+                    .on_mouse_move(cx.listener(move |menu, _: &gpui::MouseMoveEvent, _, cx| {
+                        if menu.selected != ix {
+                            menu.selected = ix;
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |menu, _: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
