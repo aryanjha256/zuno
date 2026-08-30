@@ -226,11 +226,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// One `(index, label, is_active)` per open buffer, for the strip.
-    ///
-    /// A method rather than a closure inside `render` so a test can reach it: the elision is the
-    /// only thing making a long label readable, and nothing else can observe whether it ran —
-    /// gpui's `truncate()` is a backstop, and shaped text is not measurable headlessly.
+    /// One `(index, label, is_active)` per open buffer. A method, not a closure in `render`, so
+    /// a test can read the elided label — shaped text is not measurable headlessly.
     pub(crate) fn tab_labels(&self, cx: &App) -> Vec<(usize, SharedString, bool)> {
         self.views
             .iter()
@@ -1924,24 +1921,11 @@ impl Render for Workspace {
 }
 
 
-/// The label region of a tab, and the one measurement the ellipsis depends on.
-///
-/// `truncate()` only ellipsizes text that has been handed a **definite** width, so this cannot be
-/// left to flex. Everything else is derived *from* it — the reverse direction, deriving the label
-/// from the tab, is how the two drift until the close button is pushed out of the clip and
-/// silently disappears. `a_tabs_close_button_stays_inside_the_tab` holds the sum.
+/// Everything else derives from this; architecture.md §12 has why it is explicit.
 const TAB_LABEL_WIDTH: f32 = 131.;
-/// How many characters fit in `TAB_LABEL_WIDTH`, ellipsis included.
-///
-/// A count rather than a measurement, and tuned to *this* width in the UI font at `text_xs` —
-/// roughly 5.7px per character for the lowercase, digit and punctuation mix a URL path segment
-/// is made of. Deliberately a little conservative: landing the ellipsis one character early is
-/// invisible, and overshooting puts it back under the clip where it cannot be seen at all.
-/// Change one of these two constants and you have to revisit the other.
+/// What fits in `TAB_LABEL_WIDTH` in the UI font at `text_xs`. Change one, revisit the other.
 const TAB_LABEL_CHARS: usize = 22;
 
-/// So `a_tabs_close_button_stays_inside_the_tab` can assert the label really gets the width the
-/// ellipsis is computed against.
 #[cfg(test)]
 pub(crate) fn tab_label_width() -> f32 {
     TAB_LABEL_WIDTH
@@ -1988,16 +1972,11 @@ fn tab_strip(
                     // label sits in a child, and an ancestor's Bubble-phase handler does fire for
                     // a click on its child — but that is worth pinning rather than assuming.
                     .debug_selector(move || format!("tab-{ix}"))
-                    // The hover group is the **whole tab**, not the close button alone: revealing
-                    // the × when the cursor is anywhere on the tab is the point, and an `svg()`
-                    // cannot be reached by an ancestor's `hover` (see `ui::glyph`).
+                    // The group is the whole tab, not the button: hovering anywhere reveals the
+                    // ×, and an `svg()` cannot be reached by an ancestor's `hover`.
                     .group(crate::ui::ICON_GROUP)
                     .flex_none()
-                    // Fixed, not `max_w`. Stable widths mean a tab doesn't move under the
-                    // cursor when a URL is edited — and the label's ellipsis needs a definite
-                    // width to exist at all, which a `max_w` under `flex_none` never supplies.
-                    // Derived forward from the label rather than the label back from it, so the
-                    // arithmetic cannot silently disagree with itself.
+                    // Fixed, so a tab doesn't move under the cursor when a URL is edited.
                     .w(px(TAB_WIDTH))
                     // A long label must clip, not push its neighbours off the strip.
                     .overflow_hidden()
@@ -2046,25 +2025,10 @@ fn tab_strip(
                             .hover(|style| style.bg(theme.bg_hover))
                             .child(
                                 div()
-                                    // **An explicit width, not `flex_1().min_w(0)`.** That was
-                                    // the first attempt and it hard-cut: `truncate()` resolves
-                                    // to `TextOverflow::Truncate("…")`, but `TextState::layout`
-                                    // reads its truncation width from
-                                    // `known_dimensions.width.or(available_space.width if
-                                    // Definite)` and caches the first measurement — and a flex
-                                    // item is measured for its basis *before* the row resolves,
-                                    // when neither is definite. So the cached size is the full
-                                    // string and every later pass returns it. gpui's own
-                                    // `examples/data_table.rs` uses `.truncate().w(width)` for
-                                    // exactly this reason.
                                     .w(px(TAB_LABEL_WIDTH))
-                                    // The ellipsis is computed against this width, so a test has
-                                    // to be able to check the label actually *gets* it.
                                     .debug_selector(move || format!("tab-label-{ix}"))
-                                    // Kept as a backstop only: it fires for a label of
-                                    // pathologically wide characters that slips past the
-                                    // character budget. It is not what makes the ellipsis
-                                    // appear, and believing it was cost two rounds.
+                                    // Backstop for wide glyphs only; `elide` does the real work.
+                                    // `truncate()` alone cannot be relied on — see CLAUDE.md.
                                     .truncate()
                                     .child(label),
                             )
@@ -2072,9 +2036,7 @@ fn tab_strip(
                                 div()
                                     .id(("tab-close", ix))
                                     .debug_selector(move || format!("tab-close-{ix}"))
-                                    // The slot is always painted, so revealing the × never
-                                    // reflows the label or re-runs the ellipsis. Only the
-                                    // glyph's colour changes.
+                                    // Always painted, so revealing the × never reflows the label.
                                     .flex_none()
                                     .flex()
                                     .items_center()
@@ -2086,29 +2048,10 @@ fn tab_strip(
                                         MouseButton::Left,
                                         cx.listener(
                                             move |workspace, _: &MouseDownEvent, window, cx| {
-                                                // `on_mouse_down` is Bubble-phase, so the tab's
-                                                // own left-click handler fires after this one,
-                                                // reaching `activate` with an index the close
-                                                // has just shifted or removed.
-                                                //
-                                                // **Deliberately untested, because it is
-                                                // currently unobservable**, and that is worth
-                                                // saying rather than leaving to be rediscovered:
-                                                // `activate` early-returns on `views.get(ix)`,
-                                                // and where the index still resolves it names
-                                                // the buffer `close_tab` had already chosen. So
-                                                // the whole suite passes with this line deleted
-                                                // — checked. It stays because the convention is
-                                                // that a clickable inside a clickable stops
-                                                // propagation (§2, and the window-controls bug),
-                                                // and because relying on that guard makes this
-                                                // button's correctness depend on index
-                                                // arithmetic three functions away. A test here
-                                                // would assert nothing and read as coverage.
+                                                // A clickable inside a clickable. Currently
+                                                // unobservable — the suite passes without it.
                                                 cx.stop_propagation();
-                                                // Closes *that* tab, not the active one, so it
-                                                // activates first — the same two steps
-                                                // middle-click takes above.
+                                                // Closes *that* tab, not the active one.
                                                 workspace.activate(ix, window, cx);
                                                 workspace.close_tab(&CloseTab, window, cx);
                                             },
@@ -2116,9 +2059,7 @@ fn tab_strip(
                                     )
                                     .child(crate::ui::glyph(
                                         crate::ui::Icon::Close,
-                                        // Transparent rather than absent on an inactive tab: the
-                                        // × belongs to the tab you are on or the one you are
-                                        // pointing at, and a strip of ten × glyphs is noise.
+                                        // Transparent, not absent — the slot must keep its size.
                                         if active {
                                             theme.text_muted
                                         } else {

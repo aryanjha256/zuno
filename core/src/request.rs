@@ -315,30 +315,16 @@ pub fn label_for<'a>(url: &'a str, name: &'a str) -> &'a str {
 
 /// Shorten a label to `max_chars`, ending it in `…` when anything was dropped.
 ///
-/// **Done here rather than left to gpui's `truncate()`**, which shipped twice not working. That
-/// helper only ellipsizes text it has been handed a *definite* width and caches its first
-/// measurement, so whether it fires depends on layout details several elements away — and when it
-/// doesn't fire there is no error, just the hard cut it was supposed to remove. This is a pure
-/// function over a string: it either shortened the label or it didn't, and a unit test can say
-/// which without a window.
-///
-/// Counting characters rather than measuring pixels is the deliberate imprecision. Real widths
-/// need the shaping font, the test platform's font is not the one that ships, and a label region
-/// is a fixed size chosen by us — so the caller picks a budget for its own width and the ellipsis
-/// lands a little early on narrow glyphs. `truncate()` stays on the element underneath as the
-/// backstop for a label of pathologically wide characters.
+/// Characters, not pixels: real widths need the shipping font, which no test has. Done in Rust
+/// rather than by gpui's `truncate()`, which cannot be relied on — see CLAUDE.md.
 pub fn elide(label: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
     if max_chars == 0 {
         return std::borrow::Cow::Borrowed("");
     }
-    // `chars().count()` walks the string, but a tab label is tens of bytes and this runs per tab
-    // per frame — the alternative is `char_indices` bookkeeping for no measurable gain.
     if label.chars().count() <= max_chars {
         return std::borrow::Cow::Borrowed(label);
     }
-    // `max_chars - 1` because the ellipsis occupies one of the budgeted characters. Slicing by
-    // `char_indices` rather than by byte keeps this correct for multi-byte labels, which a URL
-    // path segment can certainly be.
+    // `- 1` for the ellipsis; by char, not byte, since a path segment can be multi-byte.
     let end = label
         .char_indices()
         .nth(max_chars - 1)

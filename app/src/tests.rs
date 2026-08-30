@@ -3301,11 +3301,8 @@ async fn clicking_a_tab_in_the_strip_activates_that_buffer(cx: &mut TestAppConte
 
 #[gpui::test]
 async fn a_long_tab_label_is_ellipsised_before_it_reaches_the_strip(cx: &mut TestAppContext) {
-    // **The strip's label is shortened in Rust, not by `truncate()`**, because that helper
-    // depends on layout details several elements away and shipped twice doing nothing — with no
-    // error either time, just the hard cut it was meant to remove. Shaped text is not measurable
-    // in the headless platform, so the only assertion available is on the string handed to the
-    // element, which is exactly why the elision was moved somewhere a string can be read.
+    // Shaped text is not measurable headlessly, so the only thing assertable is the string
+    // handed to the element — which is why the elision lives somewhere a string can be read.
     let (window, _, mut cx) = boot(cx, None, None);
     cx.simulate_keystrokes("ctrl-t");
     cx.simulate_keystrokes("ctrl-l");
@@ -3334,14 +3331,8 @@ async fn a_long_tab_label_is_ellipsised_before_it_reaches_the_strip(cx: &mut Tes
 
 #[gpui::test]
 async fn a_tabs_close_button_stays_inside_the_tab(cx: &mut TestAppContext) {
-    // **The label's width is hardcoded, so this is the assertion that keeps it honest.** It has
-    // to be hardcoded: `truncate()` only ellipsizes text handed a *definite* width, which flex
-    // never supplies in time. The cost is arithmetic that can drift from the padding around it —
-    // and the failure is invisible, because the tab is `overflow_hidden`, so a label one pixel
-    // too wide pushes the × out of the clip and it simply isn't there. No error, no panic, a
-    // control that silently stops existing.
-    //
-    // Layout, not paint, so the headless platform can answer it.
+    // The label width is hardcoded, so this keeps it honest. Widening the padding does not push
+    // the × out — the label shrinks instead, silently disagreeing with the elision budget.
     let (_, _, mut cx) = boot(cx, None, None);
     cx.simulate_keystrokes("ctrl-t");
     cx.run_until_parked();
@@ -3350,13 +3341,7 @@ async fn a_tabs_close_button_stays_inside_the_tab(cx: &mut TestAppContext) {
     let label = cx.debug_bounds("tab-label-0").expect("every tab carries a label");
     let close = cx.debug_bounds("tab-close-0").expect("every tab carries a close button");
 
-    // **The load-bearing one.** Everything else here passed against both breaks tried while
-    // writing it — widening the label (`TAB_WIDTH` derives from it, so the sum stays consistent)
-    // and widening the padding without updating `TAB_CHROME_WIDTH`. The second is the real drift,
-    // and it does not push the × out: the label is a flex item with the default shrink of 1, so
-    // *it* gives up the pixels instead. The result is a label whose box is narrower than the
-    // width `truncate()` was told to ellipsize against — so the text is clipped by the box rather
-    // than shortened, and the hard cut this whole change removed comes silently back.
+    // The load-bearing assertion: the bounds checks below passed against both breaks tried.
     assert_eq!(
         label.size.width,
         gpui::px(crate::workspace::tab_label_width()),
@@ -3374,12 +3359,9 @@ async fn a_tabs_close_button_stays_inside_the_tab(cx: &mut TestAppContext) {
 async fn clicking_a_tabs_close_button_closes_that_tab_and_not_the_active_one(
     cx: &mut TestAppContext,
 ) {
-    // **The assertion has to name which buffers survive, not which one ends up active.** After
-    // closing index 2 of three, `close_tab` activates `min(2, len - 1)` — and it lands on the
-    // same buffer whether the × closed the tab it was drawn on or the tab that happened to be
-    // active. An `active_view` check alone therefore passes against a handler that forgot to
-    // `activate(ix)` first, which is the whole bug this test exists for. Clicking the two
-    // remaining tabs pins the surviving pair exactly.
+    // Asserts which buffers *survive*, not which ends up active: `close_tab` activates
+    // `min(2, len - 1)` and lands on the same buffer either way, so an `active_view` check
+    // passes against a handler that forgot to `activate(ix)` first.
     let (window, first, mut cx) = boot(cx, None, None);
 
     cx.simulate_keystrokes("ctrl-t");
