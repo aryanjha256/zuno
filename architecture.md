@@ -1492,6 +1492,18 @@ Two things the settings panel turned up that are worth knowing before touching e
   added to remove, and `Engine::clear_cookies` (drop the cached clients; the next request builds a
   fresh jar) shipped with it. reqwest owns the store behind `cookie_store(true)` and exposes no way
   to empty it, which is why eviction rather than clearing.
+- **A clicked setting did not reach the request, and only the mouse path was wrong.** The row's
+  click handler called `panel.confirm` directly and dropped the `bool` it returns — and that `bool`
+  is the whole mechanism: only `Workspace::setting_confirm` reads it, and only it calls
+  `commit_settings`. So a click updated the panel's own copy, redrew the new value, and left the
+  request unchanged, while `Enter` on the same row worked.
+
+  Fourth occurrence of "actions, not direct calls" after the body-kind chip, the fold-all buttons
+  and the fold chevron — and the first where the direct call was **not** a visible no-op, which is
+  why it survived. The panel showed exactly what you asked for. The keyboard test asserts against
+  `spec(cx)` precisely because "a panel that edits a copy nothing reads would look identical on
+  screen", and then no equivalent test was written for the click. That asymmetry is the lesson:
+  **a convention checked only on the path that already worked proves nothing about the other one.**
 - **Settings are per-request, and stay that way for now.** `RequestSettings` lives on `RequestSpec`,
   so it already persists per collection file. A global-defaults layer needs a scope model
   (global → environment → request) — the same one environments has to build in M3 — and doing it

@@ -2795,6 +2795,31 @@ async fn toggling_a_setting_reaches_the_spec_that_gets_sent(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+async fn clicking_a_setting_reaches_the_request_not_just_the_panel(cx: &mut TestAppContext) {
+    // The keyboard path had this assertion and the mouse path did not, so the click shipped
+    // calling `panel.confirm` directly and discarding the `bool` only `Workspace` reads. The
+    // panel showed the new value and the request kept the old one — invisible to a test that
+    // asks the panel what it thinks, which is why this asks `spec(cx)` instead.
+    let (window, view, mut cx) = boot(cx, None, None);
+    assert!(spec_of(&view, &mut cx).settings.verify_tls, "on by default");
+
+    cx.simulate_keystrokes("ctrl-,");
+    cx.run_until_parked();
+
+    // Row 1 is TLS verification, and deliberately *not* row 0: clicking the row the keyboard
+    // already sits on would pass even if the click never moved the selection.
+    let row = cx.debug_bounds("setting-1").expect("the TLS verification row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(
+        !spec_of(&view, &mut cx).settings.verify_tls,
+        "a clicked toggle must reach the request that gets sent, not only the panel"
+    );
+    assert_eq!(setting_value(&window, &mut cx, "Verify TLS certificates"), "off");
+}
+
+#[gpui::test]
 async fn an_edit_survives_dismissing_the_panel(cx: &mut TestAppContext) {
     // There is no OK/Cancel here, so Esc must not silently discard what you changed.
     let (window, view, mut cx) = boot(cx, None, None);

@@ -350,6 +350,7 @@ fn setting_row(
 
     div()
         .id(("setting", index))
+        .debug_selector(move || format!("setting-{index}"))
         .flex()
         .flex_row()
         .items_center()
@@ -364,11 +365,17 @@ fn setting_row(
         .hover(|style| style.bg(theme.bg_hover))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |panel, _: &MouseDownEvent, _, cx| {
-                // Clicking selects *that* row and acts on it, rather than acting on
-                // whatever the keyboard had selected.
+            cx.listener(move |panel, _: &MouseDownEvent, window, cx| {
+                // Selects *that* row, then dispatches the action Enter dispatches — the click
+                // and the keystroke are one verb.
+                //
+                // Calling `panel.confirm` here instead is what shipped, and it discarded the
+                // `bool` that says whether anything changed. Only `Workspace::setting_confirm`
+                // reads it, and only it calls `commit_settings` — so a clicked setting updated
+                // the panel's own copy, showed the new value, and never reached the request.
                 panel.selected = index;
-                panel.confirm(cx);
+                cx.notify();
+                window.dispatch_action(Box::new(crate::actions::SettingConfirm), cx);
             }),
         )
         .child(

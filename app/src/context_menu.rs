@@ -138,8 +138,7 @@ impl Render for ContextMenu {
                     .gap_4()
                     .w_full()
                     .h(px(ROW_HEIGHT))
-                    .px_2()
-                    .cursor_pointer();
+                    .px_2();
 
                 if ix == selected {
                     row = row.bg(theme.bg_hover);
