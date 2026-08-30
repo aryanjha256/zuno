@@ -10,7 +10,7 @@
 
 use gpui::{
     Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    SharedString, Styled, Window, div, px,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 
 use crate::actions::{
@@ -19,7 +19,6 @@ use crate::actions::{
     OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest, ShowBodyTab, ShowHeadersTab,
     ShowParamsTab,
 };
-use crate::response_pane::step_button;
 use crate::ui::{Icon, icon_button};
 use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind};
 use crate::theme::Theme;
@@ -57,10 +56,10 @@ pub fn render(
 
     match view.request_tab {
         RequestTab::Headers => pane
-            .child(section_header("Headers", header_detail, RowKind::Header, theme, cx))
+            .child(section_header("Headers", header_detail, RowKind::Header, theme))
             .child(rows_table(&view.headers, RowKind::Header, theme, window, cx)),
         RequestTab::Query => pane
-            .child(section_header("Params", query_detail, RowKind::Query, theme, cx))
+            .child(section_header("Params", query_detail, RowKind::Query, theme))
             .child(rows_table(&view.query, RowKind::Query, theme, window, cx)),
         RequestTab::Body => pane
             .child(body_header(view, body_lines, theme))
@@ -206,6 +205,15 @@ fn body_header(view: &RequestView, lines: usize, theme: &Theme) -> Div {
                 .items_center()
                 .gap_2()
                 .child(format!("{lines} lines"))
+                // Form and multipart bodies are row tables, and until this landed the *only* way
+                // to add a row to one was `Ctrl+Shift+F` / `Ctrl+Shift+M` — no button anywhere,
+                // because the Body tab draws this header rather than `section_header`. The other
+                // body types have nothing to add to.
+                .children(match view.body_type {
+                    BodyType::Form => Some(add_control(RowKind::Form, theme)),
+                    BodyType::Multipart => Some(add_control(RowKind::Multipart, theme)),
+                    _ => None,
+                })
                 .child(
                     div()
                         .id("body-kind")
@@ -406,19 +414,59 @@ fn count_label(enabled: usize, total: usize) -> SharedString {
 }
 
 /// Section header with an "+ Add" affordance on the right.
-fn section_header(
-    title: &str,
-    detail: SharedString,
-    kind: RowKind,
-    theme: &Theme,
-    cx: &mut gpui::Context<RequestView>,
-) -> Div {
-    let add_id: &'static str = match kind {
-        RowKind::Header => "add-header",
-        RowKind::Query => "add-query",
-        RowKind::Form => "add-form-field",
-        RowKind::Multipart => "add-part",
-    };
+/// The `+ Add` control for a row table.
+///
+/// Dispatches the action its keystroke does rather than calling `add_row` — the convention the
+/// body-kind chip and the fold-all buttons were both caught breaking. Four action types, so the
+/// arms erase to `AnyElement`.
+fn add_control(kind: RowKind, theme: &Theme) -> gpui::AnyElement {
+    match kind {
+        RowKind::Header => crate::ui::icon_text_action(
+            "add-header",
+            Icon::Plus,
+            "Add".into(),
+            "Add header",
+            AddHeader,
+            theme.accent,
+            theme,
+        )
+        .into_any_element(),
+        RowKind::Query => crate::ui::icon_text_action(
+            "add-query",
+            Icon::Plus,
+            "Add".into(),
+            "Add query parameter",
+            AddQuery,
+            theme.accent,
+            theme,
+        )
+        .into_any_element(),
+        RowKind::Form => crate::ui::icon_text_action(
+            "add-form-field",
+            Icon::Plus,
+            "Add".into(),
+            "Add form field",
+            AddFormField,
+            theme.accent,
+            theme,
+        )
+        .into_any_element(),
+        RowKind::Multipart => crate::ui::icon_text_action(
+            "add-part",
+            Icon::Plus,
+            "Add".into(),
+            "Add multipart field",
+            AddMultipartField,
+            theme.accent,
+            theme,
+        )
+        .into_any_element(),
+    }
+}
+
+/// No `cx`: the add control dispatches an action rather than calling `add_row` through a
+/// listener, so nothing here needs the view.
+fn section_header(title: &str, detail: SharedString, kind: RowKind, theme: &Theme) -> Div {
 
     div()
         .flex()
@@ -440,22 +488,7 @@ fn section_header(
                 .items_center()
                 .gap_2()
                 .child(detail)
-                .child(
-                    div()
-                        .id(add_id)
-                        .px_1()
-                        .rounded_sm()
-                        .text_color(theme.accent)
-                        .cursor_pointer()
-                        .hover(|style| style.bg(theme.bg_hover))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |view, _: &MouseDownEvent, window, cx| {
-                                view.add_row(kind, window, cx)
-                            }),
-                        )
-                        .child("+ add".to_string()),
-                ),
+                .child(add_control(kind, theme)),
         )
 }
 
@@ -619,19 +652,36 @@ fn render_row(
         .child(
             div()
                 .id(SharedString::from(format!("{prefix}-remove-{ix}")))
+                .debug_selector(move || format!("{prefix}-remove-{ix}"))
+                // The glyph takes its colour from this group; an `svg()` never inherits hover.
+                .group(crate::ui::ICON_GROUP)
                 .flex_none()
                 .px_1()
                 .rounded_sm()
-                .text_color(theme.text_muted)
                 .cursor_pointer()
-                .hover(|style| style.bg(theme.bg_hover).text_color(theme.status_server_error))
+                .hover(|style| style.bg(theme.bg_hover))
+                // Names the keystroke for the same verb, even though the click carries a row
+                // index the action resolves from focus.
+                .tooltip(move |window, cx| {
+                    crate::ui::Tooltip::for_action(
+                        "Remove row",
+                        &crate::actions::RemoveRow,
+                        window,
+                        cx,
+                    )
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, _: &MouseDownEvent, _, cx| {
                         view.remove_row_at(kind, ix, cx)
                     }),
                 )
-                .child("×".to_string()),
+                .child(crate::ui::glyph(
+                    crate::ui::Icon::Close,
+                    theme.text_muted,
+                    theme.status_server_error,
+                    crate::ui::GLYPH,
+                )),
         )
 }
 
@@ -744,11 +794,41 @@ fn body_find_bar(
                 )))
         }))
         // Every button dispatches the action its keystroke does, so the two cannot drift.
-        .child(step_button("body-find-prev", "‹", BodyFindPrev, theme, cx))
-        .child(step_button("body-find-next", "›", BodyFindNext, theme, cx))
-        .child(step_button("body-replace", "Replace", ReplaceNext, theme, cx))
-        .child(step_button("body-replace-all", "All", ReplaceAll, theme, cx))
-        .child(step_button("body-find-close", "×", CloseBodyFind, theme, cx))
+        .child(crate::ui::icon_button(
+            "body-find-prev",
+            crate::ui::Icon::ChevronLeft,
+            "Previous match",
+            BodyFindPrev,
+            theme,
+        ))
+        .child(crate::ui::icon_button(
+            "body-find-next",
+            crate::ui::Icon::ChevronRight,
+            "Next match",
+            BodyFindNext,
+            theme,
+        ))
+        .child(crate::ui::icon_button(
+            "body-replace",
+            crate::ui::Icon::Replace,
+            "Replace",
+            ReplaceNext,
+            theme,
+        ))
+        .child(crate::ui::icon_button(
+            "body-replace-all",
+            crate::ui::Icon::ReplaceAll,
+            "Replace all",
+            ReplaceAll,
+            theme,
+        ))
+        .child(crate::ui::icon_button(
+            "body-find-close",
+            crate::ui::Icon::Close,
+            "Close find",
+            CloseBodyFind,
+            theme,
+        ))
 }
 
 /// The chosen file, or a prompt to pick one.

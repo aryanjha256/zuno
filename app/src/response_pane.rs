@@ -334,40 +334,29 @@ fn find_bar(
                 .text_color(theme.text_muted)
                 .child(note)
         }))
-        // Both step through the same action a keystroke does, so the buttons and Enter can't
-        // drift. Rendered as text rather than icons for the same reason the rest of this pane
-        // is: there is no icon set.
-        .child(step_button("find-prev", "‹", crate::actions::FindPrev, theme, cx))
-        .child(step_button("find-next", "›", crate::actions::FindNext, theme, cx))
-        .child(step_button("find-close", "×", crate::actions::CloseFind, theme, cx))
-}
-
-/// `use<A>` rather than `use<>`: the return has to mention every type parameter in scope, and
-/// `A` is genuinely captured by the click closure. The empty form is only for helpers that
-/// borrow nothing *and* are non-generic.
-pub(crate) fn step_button<A: gpui::Action + Clone + 'static>(
-    id: &'static str,
-    glyph: &'static str,
-    action: A,
-    theme: &Theme,
-    cx: &mut Context<RequestView>,
-) -> impl IntoElement + use<A> {
-    div()
-        .id(id)
-        .debug_selector(move || id.to_string())
-        .flex_none()
-        .px_1()
-        .rounded_sm()
-        .text_color(theme.text_muted)
-        .cursor_pointer()
-        .hover(|style| style.bg(theme.bg_hover).text_color(theme.text))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(move |_, _: &MouseDownEvent, window, cx| {
-                window.dispatch_action(Box::new(action.clone()), cx);
-            }),
-        )
-        .child(glyph.to_string())
+        // Each dispatches the action its keystroke does, so the buttons and Enter can't drift,
+        // and each tooltip names that keystroke from the live keymap.
+        .child(crate::ui::icon_button(
+            "find-prev",
+            crate::ui::Icon::ChevronLeft,
+            "Previous match",
+            crate::actions::FindPrev,
+            theme,
+        ))
+        .child(crate::ui::icon_button(
+            "find-next",
+            crate::ui::Icon::ChevronRight,
+            "Next match",
+            crate::actions::FindNext,
+            theme,
+        ))
+        .child(crate::ui::icon_button(
+            "find-close",
+            crate::ui::Icon::Close,
+            "Close find",
+            crate::actions::CloseFind,
+            theme,
+        ))
 }
 
 /// The headers, in their own scrollable region.

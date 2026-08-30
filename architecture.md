@@ -137,6 +137,31 @@ decisions worth keeping:
   the bug the window controls shipped with for several milestones. Unconditional rather than
   per-site: harmless where no ancestor handles clicks, and impossible to forget when a button is
   later moved somewhere one does.
+- **Form and multipart bodies had no add affordance at all**, which the icon work only found by
+  accident: the four-way match written for the add control had two arms that nothing reached.
+  `section_header` is drawn for Headers and Params; the Body tab draws `body_header`, so
+  `Ctrl+Shift+F` and `Ctrl+Shift+M` were the *only* way to add a field or a part and nothing on
+  screen said so. `add_control` is shared by both headers now. This is the discoverability audit's
+  finding recurring a third time, and worth noting how it surfaced — not by looking for missing
+  buttons, but because unreachable code in a `match` is visible where a missing element is not.
+- **`ui::icon_text_action` is the third member of the family**, for a control where the icon
+  carries the verb but a word says which table it acts on — a bare `+` in a section header would
+  not. The add control was `"+ add"`, a glyph and a word hand-rolled together with no tooltip,
+  and it called `add_row` directly rather than dispatching; it now names its keystroke and goes
+  through `AddHeader`/`AddQuery`/`AddFormField`/`AddMultipartField`. The four arms differ only in
+  which action they name, so the test asserts the *other* table stayed put — that is what catches
+  a wrong one being wired in, and an assertion on the target table alone does not.
+- **The window controls and the row-delete `×` are icons too.** They were `–`, `□`/`▣`, `✕` and
+  `×` — characters, so a font missing a codepoint rendered tofu with no error, and `▣` for
+  restore-vs-maximize is a distinction nobody reads. The row `×` also gained the tooltip naming
+  `RemoveRow`'s keystroke, and a test: it acts on *its own* row index while the action resolves
+  from focus, so the two paths can disagree in a way the action's own test cannot see.
+- **The find bars use the same buttons as everything else.** Their step/replace/close controls
+  were literal characters (`‹`, `›`, `×`) in a local `step_button` helper with no tooltip — so
+  eight controls sat outside the rule this section exists for, and a missing codepoint would have
+  rendered tofu with no error. `step_button` is gone and they are `icon_button`s; the two `×`
+  buttons reuse the tab strip's `Close`. Conditional rendering keeps them out of `affordances()`,
+  so `every_find_bar_button_is_painted_once_its_bar_is_open` covers them instead.
 - **The `+` for a new tab lives in the titlebar, not the tab strip.** The conventional place is the
   end of the strip, but the strip hides itself at one buffer — so a button there would be missing in
   exactly the state where you want a second tab.

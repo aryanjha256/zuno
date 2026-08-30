@@ -2066,6 +2066,7 @@ fn tab_strip(
                                             gpui::transparent_black()
                                         },
                                         theme.text,
+                                        crate::ui::GLYPH,
                                     )),
                             ),
                     )

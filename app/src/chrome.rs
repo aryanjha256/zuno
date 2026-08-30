@@ -16,6 +16,7 @@ use gpui::{
 };
 
 use crate::theme::Theme;
+use crate::ui::Icon;
 
 /// Width of the invisible strips along each edge that start a resize.
 ///
@@ -107,18 +108,18 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                     )),
                 )
                 .children(controls.minimize.then(|| {
-                    control_button("minimize", "–", theme, false, |window| {
+                    control_button("minimize", Icon::Minimize, theme, false, |window| {
                         window.minimize_window()
                     })
                 }))
                 .children(controls.maximize.then(|| {
-                    // The glyph reflects what the button will *do*, not the current state.
-                    let glyph = if maximized { "▣" } else { "□" };
-                    control_button("maximize", glyph, theme, false, |window| {
+                    // The icon reflects what the button will *do*, not the current state.
+                    let icon = if maximized { Icon::Restore } else { Icon::Maximize };
+                    control_button("maximize", icon, theme, false, |window| {
                         window.zoom_window()
                     })
                 }))
-                .child(control_button("close", "✕", theme, true, |window| {
+                .child(control_button("close", Icon::Close, theme, true, |window| {
                     window.remove_window()
                 })),
         )
@@ -126,7 +127,7 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
 
 fn control_button(
     id: &'static str,
-    glyph: &'static str,
+    icon: Icon,
     theme: &Theme,
     danger: bool,
     action: impl Fn(&mut Window) + 'static,
@@ -142,14 +143,15 @@ fn control_button(
         // A no-op outside test builds. It's what lets a test click these buttons, which is the
         // only way to cover the propagation rule below — the bug was *in* the click path.
         .debug_selector(|| id.to_string())
+        // The glyph takes its colour from this group, since an `svg()` cannot be reached by an
+        // ancestor's `hover`.
+        .group(crate::ui::ICON_GROUP)
         .flex()
         .items_center()
         .justify_center()
         .flex_none()
         .w(px(44.))
         .h(px(34.))
-        .text_xs()
-        .text_color(theme.text_muted)
         .cursor_pointer()
         .hover(|style| style.bg(hover_bg).text_color(theme.text))
         // **`stop_propagation` is load-bearing, and for a while this comment described a call
@@ -163,7 +165,7 @@ fn control_button(
             cx.stop_propagation();
             action(window);
         })
-        .child(glyph.to_string())
+        .child(crate::ui::glyph(icon, theme.text_muted, theme.text, crate::ui::GLYPH))
 }
 
 /// The eight invisible strips that let the window be resized.

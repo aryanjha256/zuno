@@ -736,6 +736,111 @@ async fn rows_can_be_added_and_removed(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn clicking_add_in_a_section_header_adds_a_row_to_that_section(cx: &mut TestAppContext) {
+    // The control dispatches `AddHeader` now instead of calling `add_row` directly, and the four
+    // sections differ only in which action they name — so asserting the *other* table stayed put
+    // is what catches a wrong one being wired in.
+    let (view, mut cx) = open_workspace(cx);
+    cx.simulate_keystrokes("alt-q");
+    cx.run_until_parked();
+
+    let headers_before = spec_of(&view, &mut cx).headers.len();
+    let query_before = spec_of(&view, &mut cx).query.len();
+
+    let add = cx.debug_bounds("add-header").expect("the Headers section header carries an add");
+    cx.simulate_click(add.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let after = spec_of(&view, &mut cx);
+    assert_eq!(after.headers.len(), headers_before + 1, "clicking add must add a header");
+    assert_eq!(after.query.len(), query_before, "and must not touch the query table");
+}
+
+#[gpui::test]
+async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
+    // Until this landed there was none: the Body tab draws `body_header`, not `section_header`,
+    // so `Ctrl+Shift+F` was the only way to add a field and nothing on screen said so.
+    let (view, mut cx) = open_workspace(cx);
+    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.run_until_parked();
+
+    let before = spec_of(&view, &mut cx);
+    let fields_before = match &before.body {
+        zuno_core::Body::Form(fields) => fields.len(),
+        other => panic!("ctrl-shift-f should switch the body to a form, got {other:?}"),
+    };
+
+    let add = cx.debug_bounds("add-form-field").expect("a form body needs a visible add control");
+    cx.simulate_click(add.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    match &spec_of(&view, &mut cx).body {
+        zuno_core::Body::Form(fields) => {
+            assert_eq!(fields.len(), fields_before + 1, "clicking add must add a field")
+        }
+        other => panic!("the body stopped being a form: {other:?}"),
+    }
+
+    // The other new arm. Asserted positively on purpose — `debug_bounds` reads the last rendered
+    // frame, so `is_none()` could not tell "not offered on a raw body" from "not repainted yet".
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.run_until_parked();
+    let add_part = cx.debug_bounds("add-part").expect("a multipart body needs one too");
+    cx.simulate_click(add_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    match &spec_of(&view, &mut cx).body {
+        zuno_core::Body::Multipart(parts) => {
+            assert!(parts.len() >= 2, "ctrl-shift-m added one, the click added another: {parts:?}")
+        }
+        other => panic!("expected a multipart body: {other:?}"),
+    }
+}
+
+#[gpui::test]
+async fn clicking_a_rows_remove_button_deletes_that_row(cx: &mut TestAppContext) {
+    // The keyboard path above was covered; the button was not, and it is the destructive one.
+    // It also acts on *its own* row index rather than the focused row, so the two paths can
+    // disagree in a way the action's own test cannot see.
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("X-First");
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("X-Second");
+    cx.run_until_parked();
+
+    let before = spec_of(&view, &mut cx).headers;
+    assert!(before.iter().any(|h| h.name == "X-First"), "{before:?}");
+    assert!(before.iter().any(|h| h.name == "X-Second"), "{before:?}");
+
+    // Focus is on the *second* row's cell, so removing the first by click proves the button
+    // uses its own index — a handler that fell back to the focused row would delete X-Second.
+    let first = before.iter().position(|h| h.name == "X-First").expect("X-First is present");
+    // Literals, because `debug_bounds` takes `&'static str` — the sample request supplies four
+    // headers of its own, so the index is not knowable at the call site.
+    let remove = match first {
+        0 => cx.debug_bounds("hdr-remove-0"),
+        1 => cx.debug_bounds("hdr-remove-1"),
+        2 => cx.debug_bounds("hdr-remove-2"),
+        3 => cx.debug_bounds("hdr-remove-3"),
+        4 => cx.debug_bounds("hdr-remove-4"),
+        5 => cx.debug_bounds("hdr-remove-5"),
+        _ => panic!("the sample request grew past this table: X-First landed at row {first}"),
+    }
+    .expect("the row's remove button should be painted");
+    cx.simulate_click(remove.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let after = spec_of(&view, &mut cx).headers;
+    assert!(!after.iter().any(|h| h.name == "X-First"), "clicked row still present: {after:?}");
+    assert!(
+        after.iter().any(|h| h.name == "X-Second"),
+        "the focused row was deleted instead of the clicked one: {after:?}"
+    );
+}
+
+#[gpui::test]
 async fn query_params_are_editable_independently_of_headers(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
@@ -4125,6 +4230,39 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
 /// The row menu's mouse path is a *gesture*, not a standing control, so it cannot be in the
 /// table above — nothing is painted until you right-click. `right_clicking_a_row_opens_a_menu_
 /// of_what_applies_to_it` covers it instead.
+///
+/// The find bars' buttons are the same shape of exception — nothing is painted until a bar is
+/// open — and `every_find_bar_button_is_painted_once_its_bar_is_open` covers them.
+
+#[gpui::test]
+async fn every_find_bar_button_is_painted_once_its_bar_is_open(cx: &mut TestAppContext) {
+    // Catches a button that vanished or was renamed, not a wrong icon — which glyph is on which
+    // button is paint, and nothing headless sees paint.
+    let (view, mut cx) = respond_with_json(cx, r#"{"a":1}"#);
+    let _ = &view;
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-f");
+    cx.run_until_parked();
+    for selector in ["find-prev", "find-next", "find-close"] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is not painted");
+    }
+
+    // `ctrl-f` means the body when the editor holds focus and the response otherwise — so this
+    // reaches the *other* bar, and both can be open at once.
+    cx.simulate_keystrokes("ctrl-b");
+    cx.simulate_keystrokes("ctrl-f");
+    cx.run_until_parked();
+    for selector in [
+        "body-find-prev",
+        "body-find-next",
+        "body-replace",
+        "body-replace-all",
+        "body-find-close",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "{selector} is not painted");
+    }
+}
 
 #[gpui::test]
 async fn every_affordance_is_painted_once_a_response_has_landed(cx: &mut TestAppContext) {

@@ -52,6 +52,13 @@ pub enum Icon {
     Plus,
     Globe,
     Close,
+    ChevronLeft,
+    ChevronRight,
+    Replace,
+    ReplaceAll,
+    Minimize,
+    Maximize,
+    Restore,
 }
 
 impl Icon {
@@ -68,6 +75,13 @@ impl Icon {
             Icon::Plus => "icons/plus.svg",
             Icon::Globe => "icons/globe.svg",
             Icon::Close => "icons/close.svg",
+            Icon::ChevronLeft => "icons/chevron-left.svg",
+            Icon::ChevronRight => "icons/chevron-right.svg",
+            Icon::Replace => "icons/replace.svg",
+            Icon::ReplaceAll => "icons/replace-all.svg",
+            Icon::Minimize => "icons/minimize.svg",
+            Icon::Maximize => "icons/maximize.svg",
+            Icon::Restore => "icons/restore.svg",
         }
     }
 
@@ -84,6 +98,13 @@ impl Icon {
         Icon::Plus,
         Icon::Globe,
         Icon::Close,
+        Icon::ChevronLeft,
+        Icon::ChevronRight,
+        Icon::Replace,
+        Icon::ReplaceAll,
+        Icon::Minimize,
+        Icon::Maximize,
+        Icon::Restore,
     ];
 }
 
@@ -101,6 +122,13 @@ impl AssetSource for Assets {
             "icons/plus.svg" => include_bytes!("../assets/icons/plus.svg"),
             "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
             "icons/close.svg" => include_bytes!("../assets/icons/close.svg"),
+            "icons/chevron-left.svg" => include_bytes!("../assets/icons/chevron-left.svg"),
+            "icons/chevron-right.svg" => include_bytes!("../assets/icons/chevron-right.svg"),
+            "icons/replace.svg" => include_bytes!("../assets/icons/replace.svg"),
+            "icons/replace-all.svg" => include_bytes!("../assets/icons/replace-all.svg"),
+            "icons/minimize.svg" => include_bytes!("../assets/icons/minimize.svg"),
+            "icons/maximize.svg" => include_bytes!("../assets/icons/maximize.svg"),
+            "icons/restore.svg" => include_bytes!("../assets/icons/restore.svg"),
             _ => return Ok(None),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))
@@ -169,6 +197,12 @@ impl Render for Tooltip {
     }
 }
 
+/// A glyph standing on its own, in a button sized around it.
+pub(crate) const GLYPH: f32 = 15.;
+/// A glyph set beside text, which is `text_xs` — `rems(0.75)` against gpui's `px(16.)` rem, so
+/// 12px. Matching it matters: at `GLYPH` the icon is 25% taller than the word next to it.
+pub(crate) const GLYPH_INLINE: f32 = 12.;
+
 /// Ties a glyph's hover colour to the hover state of whatever surface owns it.
 ///
 /// One shared name is safe: `GroupHitboxes` keeps a *stack* per name and resolves to the innermost
@@ -192,10 +226,10 @@ pub(crate) const ICON_GROUP: &str = "icon-button";
 /// applied to the wrapping `div` instead of to the glyph, so the comment was right and the code was
 /// wrong three lines below it. It is a signature now rather than a sentence: there is no way to
 /// build an icon without passing a colour.
-pub(crate) fn glyph(icon: Icon, color: Hsla, hovered: Hsla) -> Svg {
+pub(crate) fn glyph(icon: Icon, color: Hsla, hovered: Hsla, size: f32) -> Svg {
     svg()
         .path(icon.path())
-        .size(px(15.))
+        .size(px(size))
         .text_color(color)
         // `hover` on the parent cannot reach here either, for the same reason — hence the group.
         .group_hover(ICON_GROUP, move |style| style.text_color(hovered))
@@ -247,7 +281,7 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
                 window.dispatch_action(action.boxed_clone(), cx);
             },
         )
-        .child(glyph(icon, theme.text_muted, theme.text))
+        .child(glyph(icon, theme.text_muted, theme.text, GLYPH))
 }
 
 /// A thin bar showing how far a horizontally scrollable list is scrolled, and how much it hides.
@@ -417,6 +451,51 @@ pub fn syntax_colour(kind: zuno_core::TokenKind, syntax: &crate::theme::SyntaxTh
 /// `theme::tests::border_is_too_dim_to_read_as_text` names this function as that exception.
 pub fn separator(theme: &Theme) -> impl IntoElement + use<> {
     div().flex_none().text_xs().text_color(theme.border).child("│")
+}
+
+/// An icon *and* a word, dispatching one action.
+///
+/// For a control where the icon carries the verb but the word says which table it acts on — a
+/// bare `+` in a section header would not. `tint` is the resting colour for both halves and is
+/// passed rather than fixed: the add control is the one affirmative action in a header of muted
+/// text, and hover changes only the background so that stays true.
+pub fn icon_text_action<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    icon: Icon,
+    text: SharedString,
+    label: &'static str,
+    action: A,
+    tint: Hsla,
+    theme: &Theme,
+) -> impl IntoElement + use<A> {
+    let tooltip_action = action.clone();
+
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        // The glyph reads its colour from this group; an `svg()` never inherits one.
+        .group(ICON_GROUP)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .text_color(tint)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.bg_hover))
+        .tooltip(move |window, cx| Tooltip::for_action(label, &tooltip_action, window, cx))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_: &MouseDownEvent, window, cx| {
+                // See `icon_button`: Bubble phase means an ancestor handler runs too.
+                cx.stop_propagation();
+                window.dispatch_action(action.boxed_clone(), cx);
+            },
+        )
+        .child(glyph(icon, tint, tint, GLYPH_INLINE))
+        .child(text)
 }
 
 /// A text label that dispatches an action — for places where a word carries information an icon
