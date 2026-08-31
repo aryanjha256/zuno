@@ -31,7 +31,7 @@ url.workspace = true
 # icon test rasterizes the way gpui does, so matching its renderer is the whole point. A newer
 # resvg could parse an icon that gpui's cannot, and the test would pass while the button is blank.
 # It also reuses the already-resolved copy instead of compiling a second one.
-resvg = "0.45"
+resvg = "0.48"
 
 gpui = { workspace = true, features = ["test-support"] }
 
