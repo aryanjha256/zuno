@@ -20,3 +20,6 @@ futures-util.workspace = true
 # lives here rather than in `app` precisely so a future CLI can read and write it, and
 # that means the core has to serialize, not just model.
 serde_json.workspace = true
+# Trashing a request is a collection-file operation, so it lives beside `remove` rather than
+# in the app — a future CLI deleting a request wants the same choice a person does.
+trash.workspace = true

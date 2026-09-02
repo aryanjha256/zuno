@@ -67,6 +67,7 @@ zuno/
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
 │       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
 │       ├── fuzzy.rs        ✅ subsequence scoring for the picker
+│       ├── highlight.rs    ✅ JSON lexer for syntax colouring — tolerant, no cache
 │       └── search.rs       ✅ substring search over a response body
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
@@ -79,6 +80,8 @@ zuno/
         ├── session.rs      ✅ window-session envelope, versioned + migrating
         ├── collections.rs  ✅ where collections live (a global, for tests)
         ├── picker.rs        ✅ the modal picker: filter + ranked list
+        ├── context_menu.rs  ✅ the anchored menu primitive: rows, separators, commands
+        ├── collection_panel.rs ✅ the collection tree — the browser beside Ctrl+P's finder
         ├── commands.rs      ✅ the command palette's curated action table
         ├── settings_panel.rs ✅ per-request engine settings, as a modal
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
@@ -90,6 +93,7 @@ zuno/
         ├── response_pane.rs✅ status line, timing, body/headers tabs, body viewer
         ├── tests.rs        ✅ headless end-to-end tests (GPUI test platform)
         └── input/
+            ├── mod.rs        ✅ word boundaries + undo history, shared by both
             ├── text_input.rs ✅ single-line input primitive
             └── editor.rs     ✅ multi-line body editor
 ```
@@ -959,6 +963,22 @@ Five decisions:
   the path rather than the value. The pointer cursor is the other half.
 - **Every item is an action**, with its keystroke read from the live keymap. So the menu teaches
   the shortcut instead of replacing it, and it cannot drift from what dispatch does.
+
+  > **This sentence was true of the intent and false of the code, from the day it shipped until
+  > the collection panel's menu made it obvious.** `MenuItem::new` called `keybinding_label`,
+  > which asks `Window::bindings_for_action` — and that matches against
+  > `rendered_frame.dispatch_tree.context_stack`, a **build-time** stack that `pop_node` empties
+  > as the frame finishes. An empty stack matches only `None`-context bindings, and all three
+  > verbs here are scoped to `ResponsePane`, so all three drew a blank column. The fix is
+  > `bindings_for_action_in`, which rebuilds the stack from a focus handle — so `MenuItem::new`
+  > now takes the handle the menu restores focus to, which is the pane the verbs act on and
+  > therefore the same question.
+  >
+  > Fourth of the "code drifted from a correct comment" family, and the most durable: the
+  > failure is a *missing* string, so the menu looked deliberate rather than broken. The test
+  > that should have caught it, `keybinding_label_matches_the_keymap`, asserts over
+  > `advertised_actions` — every one of them globally bound. It pins the formatter and could
+  > never see the lookup. `the_response_row_menu_names_its_keystrokes_too` asserts a scoped one.
 - **Fold became one verb on the selection.** `ToggleFold` acts on the selected row rather than
   taking an index, because all three surfaces that reach it — chevron, double-click, menu — select
   first. The chevron used to call `toggle_fold` directly; three surfaces is where "actions, not
@@ -996,6 +1016,188 @@ the two methods that mutate content — which between them are every edit path, 
 delete, paste and cut all route through `replace_text_in_range` and the IME through
 `replace_and_mark_text_in_range`. The picker was migrated onto it in the same slice, so there is
 one mechanism rather than two.
+
+---
+
+## 6a. The collection panel — a browser, not a second finder
+
+`Ctrl+P` was the only thing in the app that read a collection: `collection::scan` had **exactly
+one caller**, the picker. A fuzzy finder answers *"take me to the thing I am thinking of"* and
+needs you to know its name; nothing could answer *"what have I got in here"*, which is the
+question you open a collection to ask after a week away. That is a browsing gap, not a search
+gap, and no amount of ranking closes it.
+
+So the two surfaces stay separate rather than one growing a mode. `Ctrl+P` ranks open buffers
+first so it doubles as a tab switcher from the first press (ROADMAP), and folding a tree into
+that makes it worse at both jobs. Every editor ships a file finder *and* a file tree.
+
+**The tree is built in core and folded in the app**, the same split `JsonOutline` makes between
+`rows` and `visible`. `collection::tree` turns `scan`'s entries into a flat, depth-tagged
+`Vec<Node>`; which directories are collapsed is window state and never reaches core. Flat rather
+than nested because the panel renders through `uniform_list`, which needs "what is row 40"
+answered in O(1) — the same constraint §6 is built on, at hundreds of rows instead of 1.31M.
+
+Decisions worth keeping:
+
+- **Directories sort before files at each level, and that ordering has to be rebuilt.** `scan`
+  returns entries sorted by relative path, which interleaves the two: `alpha.json` precedes
+  `beta/x.json` because `.` sorts before `/`. Inheriting that order puts a root-level request
+  above a directory, which no file tree does. `tree` builds a nested `BTreeMap` and flattens it,
+  so each level is ordered as it is filled and no comparator has to know which kind it is
+  looking at.
+- **`Node::path` is a path, not a display name.** It is the fold key and the identity a later
+  delete or rename will act on, and two directories at different depths can share a name — a
+  `HashSet<String>` of collapsed names would fold both. `two_directories_sharing_a_name_get_
+  distinct_paths` pins it.
+- **`NodeKind::Request` carries the method and URL, not the `RequestSpec`.** The panel draws
+  both; a spec carries the body, which for a large request would be cloned on every scan and
+  held for as long as the panel is open.
+- **The selection is restored by *path* across a rescan, not by index.** This is the one that
+  bites. `panel_selection` indexes into `tree`, and `refresh_tree` replaces `tree` wholesale, so
+  saving a request whose name sorts earlier shifts every row after it and the same index
+  silently means a **different request** — with nothing on screen saying so. The test uses an
+  alphabetically-first new name on purpose: with a later one the index survives by luck and the
+  test passes either way.
+- **No selection clamp on fold, and a guard for it was written and deleted.** The response
+  viewer needs one because a fold can hide the row its cursor is on. This cannot: both fold
+  paths — the click and `CollectionCollapse` — select the directory *before* folding it.
+  Breaking the guard on purpose changed no test, which is what proved it unreachable; four other
+  guards in §6 went the same way. A new fold path must select first, and `rebuild_tree_visible`
+  says so.
+- **Opening a request leaves focus in the panel**, on both paths, and the explicit re-focus is
+  what makes them agree. `open_collection_file` routes through `activate`, which focuses the URL
+  bar; on a *click* the panel's own `track_focus` listener fires afterwards and takes focus
+  back, so without the explicit call `Enter` and click would land focus in different places —
+  the "click and keybinding are different verbs" failure, from a direction no convention
+  catches. Staying is also the better of the two: browsing means opening several in a row, and
+  that needs the arrow keys to keep working.
+- **The rows had to be `w_full`.** Third time. `uniform_list` hands a row the list's width as
+  *available space*, and taffy only stretches a root node to fill it for `display: block`; a
+  `.flex()` row sizes to its content. The picker (§12) and the response body (§6) both shipped
+  this. The test clicks the far right of the row and measures against the **list's** bounds,
+  because the row's own bounds agree with the bug.
+- **Visible by default, and persisted.** A browser nobody discovers is the discoverability
+  failure §2 is mostly about, so it starts on; a panel you dismissed reappearing every launch is
+  the kind of small disobedience that makes an app feel like it is not listening, so the flag
+  rides in the session envelope (v4). Spelled out as its own `SessionV3` rather than given a
+  serde default, per invariant 8 — a default cannot tell "written by an older Zuno" from
+  "written by this one, with the panel hidden", and those two want opposite answers.
+- **Not a tab stop**, unlike `response_focus`. `Tab` walks the active request's inputs, and a
+  pane-level stop painted before all of them would turn the first `Tab` from "url → method" into
+  "panel → url" for every existing user. It has a binding and a click target and loses nothing.
+- **Fixed width, no drag handle.** A resizable panel means a stored width, a minimum, and a
+  pointer mode, to serve a preference nobody has expressed. Recorded as a limitation rather than
+  an oversight.
+
+**The panel is a full-height column, and the tab strip belongs to the editor area beside it.**
+It shipped the other way for a slice — the strip spanning the whole window, above both — which
+drew a row of open *buffers* across the top of a tree of saved *files*, describing something the
+panel has nothing to do with. The status bar still spans the width, and that is the same
+convention rather than an inconsistency: a status bar describes the application, a tab strip
+describes one pane.
+
+Two consequences, and the second is the one worth holding:
+
+- The editor column carries `min_w(0)`. The panel is a fixed width, so the panes are what must
+  give when the window narrows; without it the column's content sets a floor and the two
+  together overflow instead.
+- **The panel no longer moves when the strip appears.** The strip hides itself at one buffer, so
+  under the old layout opening a second one pushed the whole panel down — which is exactly what
+  made `clicking_a_request_twice_activates_it_rather_than_opening_a_second_copy` read stale
+  bounds between its two clicks and pass against the bug it was written for. A layout where a
+  sidebar jumps on an unrelated event is a source of that class of defect, not just an eyesore,
+  which is why `the_tab_strip_belongs_to_the_editor_area_not_the_window` asserts the position
+  *and* the stability as two separate claims — each fails on its own.
+
+**Opening a request already open activates it** rather than opening a second buffer. `Ctrl+P`
+gets this by filtering open paths out of its list; the panel cannot, because a tree that hid the
+requests you have open would be worse than the duplicate. So the rule lives in
+`open_collection_file`, where both paths inherit it — and the picker gains the case its filter
+cannot cover, since that filter is only as fresh as the scan behind it. Two buffers over one file
+also means two `path`s pointing at it and a last-write-wins race on `Ctrl+S`.
+
+### Delete — two actions, because a file has no undo
+
+`DeleteRequest` only *asks*; `ConfirmDeleteRequest` is the only thing that removes anything.
+Splitting the verb is what lets the confirmation be an ordinary second menu rather than a modal
+of its own — it inherits the primitive's keyboard handling, its `Escape`, and its occlusion, and
+the destructive row names the file, because "are you sure?" without a subject is how the wrong
+thing gets deleted confidently. `MenuCommand::Dismiss` is the way *out*: `Escape` already works,
+but a menu asking to delete a file with no visible answer except the destructive one reads as
+having no way back.
+
+- **`collection::remove` takes one file and refuses a directory.** `remove_dir_all` on a path
+  derived from a UI selection has no undo, and a folder can hold work the panel never showed —
+  an unreadable request is skipped by `scan`, so it has no row, and would be destroyed anyway.
+- **A file already gone is not an error.** The tree is a snapshot of the last scan, so a request
+  deleted in a terminal a moment ago is still drawn; failing for reaching the state the caller
+  asked for is noise.
+- **The panel refuses a directory too, and that guard is separate from core's.** Core's refusal
+  makes the *outcome* identical either way, so a test asserting "the directory survived" passes
+  against a UI that offers the verb — the first version of that test did. What the UI guard adds
+  is not offering a control that can only fail, so it is asserted on `menu_open`.
+- **Any buffer open on the deleted file forgets its `path`.** `save_request` writes to a
+  remembered path with **no existence check**, so leaving it set means the next `Ctrl+S` silently
+  recreates the file you just deleted. The buffer itself stays open, which is right: the request
+  is still in front of you, it simply has no file any more.
+- **`delete` is bound in the panel; `ConfirmDeleteRequest` is bound nowhere.** A destructive verb
+  one keystroke away is what the confirmation exists to prevent. Neither is offered in the
+  palette — `DeleteRequest` would aim at a selection the palette cannot show you.
+
+### The rest of the row menu
+
+Eight verbs now, grouped by consequence — leave Zuno, make a copy, read something out, change or
+remove the file. The two destructive rows sit last and together, so the pointer never crosses
+them on the way to something harmless, and only one of them stops to ask.
+
+- **Rename is inline, not a modal**, which is what let it land at all. A `TextInput` is drawn in
+  the name's own place carrying its own key context (`"TextInput CollectionRename"`), so `Enter`
+  and `Escape` mean commit and cancel *there* without touching what they mean anywhere else —
+  and the binding for each sits **after** its global twin in `register_keymap`, because a
+  leaf-matching predicate ties with a context-less one and the tie goes to later registration.
+  Sixth time that ordering has decided behaviour. An earlier plan had rename waiting on a
+  "type a new name" modal; the tree row *is* the text box, so no modal was needed.
+- **Cancel on blur, not commit.** VS Code commits when a rename box loses focus. A rename here is
+  a file operation, so the safe reading of "clicked somewhere else" is that it was not meant.
+  `cancel_rename` `take`s the state, which also makes it idempotent — committing drops the state
+  and then moves focus, which fires the blur listener, which dispatches a cancel that must find
+  nothing to do.
+- **The buffer follows a rename and forgets a delete.** Both act on an open buffer's `path`, in
+  opposite directions, and for one reason: `save_request` writes to a remembered path with no
+  existence check. After a rename the request still exists, so `path` is *updated* — left stale,
+  the next Ctrl+S recreates the file under its pre-rename name and you have both. After a delete
+  or a trash there is nothing to point at, so it is cleared.
+- **`rename` takes a label, not a path.** It goes through `slug`, so a typed `../../evil` cannot
+  walk out of the directory — the same boundary `allocate` relies on, and the reason the
+  signature refuses a caller-built `PathBuf`. It never overwrites: a name already taken is an
+  error, because the request being clobbered may be one the renamer has never seen. Renaming to
+  the name it already has is a no-op rather than a collision, or opening the box and pressing
+  Enter reports "already exists" about the file being renamed.
+- **Duplicate copies bytes, and opens no tab.** Re-serializing a `RequestSpec` would normalize
+  the file — rewriting anything a future field or a hand edit put there — and a duplicate that
+  differs from its original is a bad duplicate. It does not open the copy: duplicating is how
+  you take a backup before a risky change as often as it is how you start a variant, and a tab
+  you did not ask for is the worse of those two failures.
+- **Trash asks nothing and delete asks.** The asymmetry *is* the design: the confirmation exists
+  because a delete cannot be undone, and a dialog in front of a recoverable action only trains
+  people to dismiss dialogs. `trash` refuses a directory for `remove`'s reason — the path comes
+  from a UI selection and `trash::delete` would take the whole folder.
+- **Reveal and Open-in-default-app are one call each, and untestable.** `reveal_path` and
+  `open_with_system` are both `unimplemented!()` in gpui's test platform, so nothing can drive
+  them headlessly — the same shape as `prompt_for_paths`. The handlers are kept to a single call
+  so the untestable part is as small as possible, and what *is* asserted is that the menu offers
+  the row, which is where a mistake would actually be.
+
+> **Trashing is deliberately not driven in any test, and that leaves a real gap.** The XDG trash
+> is redirectable — `trash` reads `XDG_DATA_HOME` per call — but only through a process-wide env
+> var, which is unsafe under edition 2024 and racy across parallel tests; the harness uses
+> explicit globals (`install_at`) precisely to avoid env-based redirection, and trashing scratch
+> files into the developer's own trash is invariant 6's territory. So `trash_request`'s
+> bookkeeping is covered only indirectly: `forget_path` and `refresh_tree` are shared with
+> delete, which *is* tested end to end. What nothing catches is `trash_request` failing to call
+> one of them. Written down rather than papered over.
+
+*Still absent:* new-folder, and moving a request between directories. `mkdir` and `mv` still work.
 
 ---
 
@@ -1134,8 +1336,13 @@ Either way: measure per-stage, not end-to-end. An end-to-end number would have h
 that our own code is 0.75ms and told us to optimize the wrong thing.
 
 Instrument these from the first commit — a `ZUNO_TIMING=1` env var that prints stage timings
-to stderr, plus criterion benches on `zuno-core` for parse/flatten. A budget you don't measure
-is a budget you've already blown.
+to stderr, plus a perf floor on `zuno-core` for parse/flatten. A budget you don't measure is a
+budget you've already blown.
+
+That floor shipped as ordinary `#[test]`s asserting wall-clock bounds (`core/tests/json_perf.rs`)
+rather than the criterion benches this line originally named — criterion was never added. Run
+them in **release**, as CLAUDE.md says: in a debug build they are slow enough to fail under load,
+which is noise rather than signal.
 
 ---
 
@@ -1164,7 +1371,15 @@ http         = "1"
 url          = "2"
 serde        = { version = "1", features = ["derive"] }
 thiserror    = "2"
-# M1.3+: serde_json, ropey, criterion
+serde_json   = "1"          # promoted from dev-dep when the collection format landed
+# Moving a request to the desktop trash. Default features off: they pull `chrono`, and every
+# `coinit_*` flag is Windows COM configuration. Hand-rolling the XDG spec was rejected — the
+# same-filesystem case is easy and the cases that decide whether a restore works are not.
+trash        = { version = "5", default-features = false }
+
+# `ropey` and `criterion` were listed here for a long time and neither is a dependency.
+# The rope was dropped deliberately (§7); the perf floor is an ordinary `#[test]` asserting
+# wall-clock bounds (`core/tests/json_perf.rs`), which needs no bench harness.
 
 # app/Cargo.toml
 gpui         = "0.2.2"
@@ -1571,9 +1786,12 @@ Two consequences worth knowing before touching either:
 lives in core precisely so a future CLI can read and write collections, which means core has to
 serialize rather than only model.
 
-Still open: **nothing about the format.** What's missing is *reach* — there is no way to open a
-saved request back into a buffer, which is the picker's job (principle 2), and no folder authoring
-beyond nesting a directory by hand. See §12's remaining entry.
+Still open: **nothing about the format.** Reach is mostly closed now — `Ctrl+P` opens a saved
+request into a buffer, and §6a's panel browses the tree — but the collection is still
+*read-mostly* from Zuno's side: no delete, no rename, no folder authoring beyond `mkdir`. And
+the root itself is a single XDG path with no runtime setter (`collections.rs` sets it at startup
+and in a test-only override), so the git argument this format is built on is not reachable from
+inside the app: a collection you can commit lives in `~/.local/share`, not in your repo.
 
 **Tabs — decided and built.** `Workspace` owns `Vec<Entity<RequestView>>` with an `active_ix`,
 restores every saved buffer, and persists all of them on quit and on send.

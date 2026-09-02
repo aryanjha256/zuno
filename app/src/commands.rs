@@ -48,6 +48,7 @@ pub fn palette() -> Vec<Command> {
         command("Import request from curl on the clipboard", ImportCurl),
         // Navigation.
         command("Find request", OpenRequest),
+        command("Show or hide the collection panel", ToggleCollectionPanel),
         command("Switch environment", SwitchEnvironment),
         command("New tab", NewTab),
         command("Close tab", CloseTab),
@@ -133,6 +134,45 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::CloseBodyFind", "only valid inside the body find bar"),
     ("zuno::ReplaceNext", "only valid inside the body find bar"),
     ("zuno::ReplaceAll", "only valid inside the body find bar"),
+    // Placed by a right-click or by `delete` on a selected row, so it has no meaning without
+    // one — there is nowhere to put it and nothing for it to act on.
+    ("zuno::OpenCollectionMenu", "needs a selected row in the collection panel"),
+    // Deliberately **not** offered. It only asks, but a palette row reading "Delete request"
+    // acts on whatever the panel happens to have selected, which the palette does not show you
+    // — a destructive verb aimed at a target off screen.
+    ("zuno::DeleteRequest", "acts on the panel's selection, which the palette cannot show"),
+    // The half that actually removes a file. Reachable only by choosing it in the confirmation
+    // menu, which is the entire point: a palette row would be the one-keystroke delete the
+    // confirmation exists to prevent.
+    ("zuno::ConfirmDeleteRequest", "only valid inside the delete confirmation"),
+    // The rest of the panel's row verbs, all for `DeleteRequest`'s reason: they act on whatever
+    // the collection panel has selected, and the palette covers that selection while asking you
+    // to choose. A palette row aimed at a target you cannot see is worse than no row.
+    ("zuno::TrashRequest", "acts on the panel's selection, which the palette cannot show"),
+    ("zuno::DuplicateRequest", "acts on the panel's selection, which the palette cannot show"),
+    ("zuno::RevealRequest", "acts on the panel's selection, which the palette cannot show"),
+    (
+        "zuno::OpenRequestExternally",
+        "acts on the panel's selection, which the palette cannot show",
+    ),
+    ("zuno::CopyRequestPath", "acts on the panel's selection, which the palette cannot show"),
+    (
+        "zuno::CopyRequestRelativePath",
+        "acts on the panel's selection, which the palette cannot show",
+    ),
+    ("zuno::RenameRequest", "acts on the panel's selection, which the palette cannot show"),
+    // The two halves of an open rename box. Neither means anything without one on screen.
+    ("zuno::CommitRename", "only valid while renaming a row"),
+    ("zuno::CancelRename", "only valid while renaming a row"),
+    // Only valid while the panel has focus, where they're already bound. "Show or hide the
+    // collection panel" is the entry point and it *is* offered; a row for "next row in the
+    // tree" would be a command reachable only by first running another one — the same
+    // reasoning as the find bars and the settings panel above.
+    ("zuno::CollectionNext", "only valid inside the collection panel"),
+    ("zuno::CollectionPrev", "only valid inside the collection panel"),
+    ("zuno::CollectionConfirm", "only valid inside the collection panel"),
+    ("zuno::CollectionCollapse", "only valid inside the collection panel"),
+    ("zuno::CollectionExpand", "only valid inside the collection panel"),
     // The menu is placed by a right-click, so it has no meaning without one — there is nowhere
     // to put it. Everything inside it is offered directly above, which is the point: the menu is
     // the *mouse* path to verbs the keyboard already reaches.

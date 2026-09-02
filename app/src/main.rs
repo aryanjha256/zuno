@@ -10,6 +10,7 @@ mod timing;
 mod actions;
 mod body_view;
 mod chrome;
+mod collection_panel;
 mod collections;
 mod commands;
 mod context_menu;
@@ -47,6 +48,8 @@ use crate::actions::{
     FindInBody, FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
     ScrollRight, ScrollStart, ToggleFold,
+    CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
+    CancelRename, CommitRename, DeleteRequest, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -157,6 +160,29 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-r", FocusResponse, None),
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrev, None),
+        // --- The collection panel ---
+        //
+        // `ctrl-shift-e` is VS Code's explorer binding, which is the closest existing
+        // convention for "show me the tree of what I have". `ctrl-b` would be the other
+        // candidate and is already `FocusBody`.
+        KeyBinding::new("ctrl-shift-e", ToggleCollectionPanel, None),
+        // Scoped to the panel's own leaf context. `up`/`down` mean something different in
+        // every pane, which is exactly what a context predicate is for.
+        KeyBinding::new("down", CollectionNext, Some("CollectionPanel")),
+        KeyBinding::new("up", CollectionPrev, Some("CollectionPanel")),
+        KeyBinding::new("enter", CollectionConfirm, Some("CollectionPanel")),
+        // The file-tree convention: left closes a directory or steps out to its parent,
+        // right opens one. Both are no-ops on a request row rather than errors.
+        KeyBinding::new("left", CollectionCollapse, Some("CollectionPanel")),
+        KeyBinding::new("right", CollectionExpand, Some("CollectionPanel")),
+        // Keyboard-first is not keyboard-only, and the reverse holds too: right-click is the
+        // discoverable path, and this is the one that keeps the panel usable without a mouse.
+        // It only *asks* — `ConfirmDeleteRequest` is what removes anything, and it has no
+        // binding at all, because a destructive verb one keystroke away is the thing the
+        // confirmation exists to prevent.
+        KeyBinding::new("delete", DeleteRequest, Some("CollectionPanel")),
+        // The desktop convention for rename, in every file manager and in VS Code.
+        KeyBinding::new("f2", RenameRequest, Some("CollectionPanel")),
         // --- Buffers (global) ---
         //
         // `ctrl-tab` is a distinct keystroke from bare `tab` above, so tab-cycling focus
@@ -286,6 +312,14 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("left", SettingDecrease, Some("SettingsPanel")),
         KeyBinding::new("enter", SettingConfirm, Some("SettingsPanel")),
         KeyBinding::new("escape", SettingsDismiss, Some("SettingsPanel")),
+        // **After the global `escape`, and that is not stylistic.** A leaf-matching predicate
+        // scores the same depth as a context-less binding, so the tie falls through to "later
+        // registration wins". Registered above `escape` -> CancelRequest, renaming could not be
+        // cancelled and nothing would fail to compile. Sixth time this ordering has decided
+        // behaviour. The input's own leaf context is `"TextInput CollectionRename"`, which is
+        // why `CollectionRename` matches without any nesting.
+        KeyBinding::new("enter", CommitRename, Some("CollectionRename")),
+        KeyBinding::new("escape", CancelRename, Some("CollectionRename")),
         // --- Text editing, scoped to any focused TextInput ---
         KeyBinding::new("backspace", text_input::Backspace, Some("TextInput")),
         KeyBinding::new("delete", text_input::Delete, Some("TextInput")),

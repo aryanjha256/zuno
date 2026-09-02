@@ -31,7 +31,9 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   been missing from every body surface; and syntax highlighting for JSON in the request editor and
   the raw response view — plus per-character search highlighting in the raw view and the JSON
   outline; and find-and-replace in the request body, which is what made `Ctrl+F` mean something
-  everywhere rather than everywhere except the surface you type into.
+  everywhere rather than everywhere except the surface you type into. Most recently the
+  **collection panel** — a browsable tree of what you have saved, which until now nothing in the
+  app could show you.
 
   This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
   and both absent from it — which is the rot the note at the top of this file predicts. Worth
@@ -42,11 +44,21 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
 Measured (release): **189 ms** cold start, **48 ms** to flatten 10 MB of JSON into 1.31 M rows
 off-thread, **6.9 ms** to search that body end to end, 60 fps scrolling at any size.
 
-**So what is the frontier?** Not a milestone — the audit's item 4. The loop is excellent, the
-navigation thesis is built, and nothing about using Zuno for real REST work is *blocked*. What
-remains is a short list of asymmetries and conveniences, and then the two named-not-planned items
-(scripting, request chaining) that would decide the product's ceiling. Read the audit, not the
-milestone headings.
+**So what is the frontier?** Not a milestone, and no longer "a short list of conveniences" —
+that framing survived two slices past being true. The loop is excellent and the navigation thesis
+is built, but the audit's own item 4 now names two structural gaps that outrank everything else on
+it, and **both were invisible to the audit because it only ever looked inward**:
+
+1. **The collection root cannot be changed.** One XDG path, no runtime setter. The git argument
+   this whole format is built on — commit your requests, review them in a pull request — is
+   unreachable from inside the app, because the collection lives in `~/.local/share` rather than
+   in your repo. Nothing is *blocked* by this, and it is still the largest thing missing.
+2. **The collection is read-mostly from Zuno's side.** You can now see it (the panel) and open
+   from it, but not delete, rename, or make a folder.
+
+Then the two named-not-planned items (scripting, request chaining) that would decide the ceiling,
+and the three capabilities item 4 now names that these documents had never mentioned at all —
+OpenAPI import, GraphQL, a collection runner. Read the audit, not the milestone headings.
 
 > **Test counts, once and not repeated.** `CLAUDE.md` carries the live total. Where a number appears
 > below it describes that milestone as shipped and is deliberately not updated — the same rule
@@ -475,8 +487,75 @@ cursors stayed separate, because a match and where you are standing are differen
   architecture.md §6 lists the four traps; the transferable one is that **a green assertion about
   a scroll offset says nothing about whether the content can be reached.**
 
-- **No delete or rename of a saved request** from inside the app. Mild, because files are the
-  interface and `rm` works, but it means the collection is read-mostly from Zuno's side.
+- **The collection panel — done, and it was the largest gap on this list.** `Ctrl+Shift+E`
+  shows a tree of the collection: directories fold, a click or `Enter` opens a request,
+  `up`/`down`/`left`/`right` walk it. See architecture.md §6a.
+
+  Found by using the app rather than by reading it, like the layout bugs below — and the
+  measurement that named it is worth keeping: **`collection::scan` had exactly one caller in
+  the whole app**, the picker. So the only way to look at a saved request was to fuzzy-search
+  for it, which needs you to already know its name. "What have I got in here" was a question
+  Zuno could not answer at all, which is a *browsing* gap that no amount of ranking closes.
+
+  It is the same blind-spot shape §11 has, one level out again. This audit was taken from
+  inside the app — what is built but unreachable, what did I trip over — so a capability that
+  was never started casts no shadow in it. Two more like it, found by comparing against what
+  an API client is expected to do rather than against what Zuno has: **OpenAPI import**,
+  **GraphQL**, and a **collection runner with assertions** appear nowhere in these documents —
+  not in this audit, not in "named, not planned", not in the non-goals.
+
+- **Delete — done**, in the slice after the panel. Right-click a request or press `delete`, and
+  a second menu names the file before anything is removed. `context_menu.rs` finally has the
+  consumer it was built as a primitive for, and it cost only a `Dismiss` row.
+
+  Two things it turned out not to be. Not a file operation with a refresh: `save_request` writes
+  to a remembered `path` with no existence check, so a buffer open on the deleted file would
+  have recreated it on the next `Ctrl+S` — the panel then showing a request you had just
+  deleted. And not one guard but two: core refuses a directory *and* the panel declines to offer
+  the verb on one, because core's refusal makes the outcome identical either way and a test
+  asserting the outcome passes against a UI offering a control that can only fail.
+
+- **The rest of the row menu — done**, in the slice after delete. Reveal in file manager, open
+  in default app, duplicate, copy path, copy relative path, rename, move to trash, delete.
+
+  The estimate above was wrong and worth correcting rather than deleting: rename was held back
+  twice for wanting a "type a new name" modal, and it needs no modal at all. **The tree row is
+  the text box** — a `TextInput` drawn in the name's own place with its own key context, which
+  is what every file tree does and what this one should have done first. The thing that actually
+  cost something was the pair of opposite rules underneath: a renamed request's buffer must
+  *follow* the file while a deleted one must *forget* it, both because `save_request` writes to
+  a remembered path with no existence check.
+
+  Trash took the `trash` crate rather than ~80 hand-rolled lines of XDG spec — the
+  same-filesystem case is the easy one, and the cases that decide whether a restore actually
+  works are not. It is also the one verb here with **no end-to-end test**, deliberately:
+  driving it would write into the developer's own trash. architecture.md §6a says what that
+  leaves uncovered.
+
+  Building it also surfaced a bug both row menus had shipped with: **every keystroke column was
+  blank**, because `Window::bindings_for_action` matches an empty context stack on a finished
+  frame and so finds only globally-bound actions — and every verb in a row menu is scoped to the
+  pane it acts on. A menu whose stated purpose is teaching the shortcut had never shown one.
+  architecture.md §6 has the mechanism; the transferable part is that the failure was a *missing*
+  string, so it looked deliberate, and the test that should have caught it only ever exercised
+  global bindings.
+
+- **And the panel's own layout was wrong for a slice**, found the way §5's layout bugs were —
+  by looking at the window, not by reading code or running tests. The tab strip spanned the whole
+  width, so a row of open *buffers* was drawn across the top of a tree of saved *files*. The
+  panel is a full-height column now with the strip in the editor area beside it.
+
+  Worth recording because it was not only cosmetic: the strip hides itself at one buffer, so
+  opening a second one used to push the panel down — and that is precisely what made the
+  duplicate-open test read stale bounds between its two clicks and pass against the bug it was
+  written for. A sidebar that jumps on an unrelated event *manufactures* flaky tests.
+
+- **No folder authoring beyond `mkdir`**, and no way to move a request between directories.
+- **The collection root cannot be changed.** One XDG path, set at startup, with no runtime
+  setter. So the git argument the one-file-per-request format is *built on* — commit it, review
+  it in a pull request — is unreachable from inside the app, because the collection lives in
+  `~/.local/share` rather than in your repo. Bigger than anything else left on this list, and it
+  appears nowhere above because the audit only ever looked inward.
 - **No body prettify.** Paste minified JSON and you live with it.
 
 **6. Discoverability — done, and it should not have taken this long.** Only six of ~40 actions were

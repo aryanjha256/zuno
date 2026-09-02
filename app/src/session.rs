@@ -16,6 +16,7 @@
 //! | `{version: 1, active, tabs: [RequestSpec]}` | tabs, first slice | tabs with no collection path |
 //! | `{version: 2, active, tabs: [{spec, path}]}` | collections | tabs, no environment |
 //! | `{version: 3, …, environment}` | environments | current |
+//! | `{version: 4, …, collection_panel}` | the collection panel | current |
 //!
 //! Those migrations are the reason the version exists, and each one is covered by a test —
 //! there is no separate migration step to forget to run.
@@ -32,7 +33,7 @@ use zuno_core::RequestSpec;
 
 /// Bumped when the on-disk shape changes. A file claiming a *newer* version is refused
 /// rather than guessed at — see `parse`.
-const CURRENT_VERSION: u32 = 3;
+const CURRENT_VERSION: u32 = 4;
 
 /// One open buffer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -70,21 +71,33 @@ pub struct Session {
     /// and two people sharing a collection through git should not fight over whose turn it
     /// is to be pointed at prod.
     pub environment: Option<String>,
+    /// Whether the collection panel is showing.
+    ///
+    /// Window state for the same reason as `environment`, and persisted rather than
+    /// defaulted because a panel you dismissed reappearing on every launch is the kind of
+    /// small disobedience that makes an app feel like it isn't listening.
+    pub collection_panel: bool,
 }
 
 impl Session {
-    pub fn new(tabs: Vec<Tab>, active: usize, environment: Option<String>) -> Self {
+    pub fn new(
+        tabs: Vec<Tab>,
+        active: usize,
+        environment: Option<String>,
+        collection_panel: bool,
+    ) -> Self {
         Self {
             version: CURRENT_VERSION,
             active,
             tabs,
             environment,
+            collection_panel,
         }
     }
 
     /// The shape M1 persisted, expressed in the current format.
     pub fn single(spec: RequestSpec) -> Self {
-        Self::new(vec![Tab::scratch(spec)], 0, None)
+        Self::new(vec![Tab::scratch(spec)], 0, None, DEFAULT_PANEL)
     }
 }
 
@@ -115,6 +128,24 @@ struct SessionV2 {
     active: usize,
     tabs: Vec<Tab>,
 }
+
+/// `{version: 3, active, tabs, environment}` — before the collection panel existed, so no
+/// window had one to remember. Spelled out rather than given a serde default, per invariant 8:
+/// a defaulted field cannot tell "written by an older Zuno" from "written by this one, with the
+/// panel hidden", and those two want *opposite* answers — an older file should adopt today's
+/// default, a current one should be obeyed.
+#[derive(Deserialize)]
+struct SessionV3 {
+    active: usize,
+    tabs: Vec<Tab>,
+    environment: Option<String>,
+}
+
+/// What a session written before the panel existed adopts, and what a fresh window starts with.
+///
+/// Visible: the panel is the only thing in Zuno that answers "what have I saved", and a browser
+/// nobody discovers is the discoverability failure architecture.md §2 is mostly about.
+const DEFAULT_PANEL: bool = true;
 
 /// Where the session lives. `None` disables persistence entirely.
 pub struct SessionFile(Option<PathBuf>);
@@ -176,11 +207,16 @@ pub fn load(cx: &App) -> Option<Session> {
 fn parse(bytes: &[u8]) -> Result<Session, String> {
     let mut session = match serde_json::from_slice::<VersionProbe>(bytes) {
         Ok(probe) => match probe.version {
-            3 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            4 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            3 => {
+                let v3 =
+                    serde_json::from_slice::<SessionV3>(bytes).map_err(|error| error.to_string())?;
+                Session::new(v3.tabs, v3.active, v3.environment, DEFAULT_PANEL)
+            }
             2 => {
                 let v2 =
                     serde_json::from_slice::<SessionV2>(bytes).map_err(|error| error.to_string())?;
-                Session::new(v2.tabs, v2.active, None)
+                Session::new(v2.tabs, v2.active, None, DEFAULT_PANEL)
             }
             1 => {
                 let v1 =
@@ -189,6 +225,7 @@ fn parse(bytes: &[u8]) -> Result<Session, String> {
                     v1.tabs.into_iter().map(Tab::scratch).collect(),
                     v1.active,
                     None,
+                    DEFAULT_PANEL,
                 )
             }
             newer => {
@@ -321,6 +358,7 @@ mod tests {
             ],
             2,
             Some("dev".to_string()),
+            false,
         );
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
@@ -375,10 +413,51 @@ mod tests {
     }
 
     #[test]
+    fn a_v3_envelope_migrates_and_adopts_the_default_panel() {
+        // Written before the collection panel existed, so the file has no opinion about it and
+        // must adopt today's default rather than a bare `false` — which is what a
+        // `#[serde(default)]` would have produced, and is invariant 8's whole argument.
+        let json = format!(
+            r#"{{"version":3,"active":1,"tabs":[{{"spec":{},"path":null}},{{"spec":{},"path":"/c/two.json"}}],"environment":"dev"}}"#,
+            serde_json::to_string(&named("one")).expect("serialize"),
+            serde_json::to_string(&named("two")).expect("serialize"),
+        );
+
+        let session = parse(json.as_bytes()).expect("a v3 envelope must still load");
+        assert_eq!(session.tabs.len(), 2, "both buffers must survive");
+        assert_eq!(session.active, 1);
+        assert_eq!(session.environment.as_deref(), Some("dev"));
+        assert_eq!(
+            session.tabs[1].path,
+            Some(PathBuf::from("/c/two.json")),
+            "the collection file each buffer came from must survive"
+        );
+        assert_eq!(
+            session.collection_panel, DEFAULT_PANEL,
+            "an older file has no stored preference and must take the default"
+        );
+    }
+
+    #[test]
+    fn a_hidden_panel_stays_hidden_across_a_restart() {
+        // The half a defaulted field could not express: v4 says `false` because the reader
+        // dismissed it, and that has to be obeyed rather than overwritten by the default the
+        // migration above applies.
+        let session = Session::new(vec![Tab::scratch(named("only"))], 0, None, false);
+        let json = serde_json::to_vec_pretty(&session).expect("serialize");
+
+        let parsed = parse(&json).expect("a v4 envelope must load");
+        assert!(
+            !parsed.collection_panel,
+            "a dismissed panel must not reappear on the next launch"
+        );
+    }
+
+    #[test]
     fn an_active_index_past_the_end_is_clamped_rather_than_panicking() {
         // A truncated or hand-edited file. Left alone, this indexes out of bounds at the
         // first render.
-        let session = Session::new(vec![Tab::scratch(named("only"))], 7, None);
+        let session = Session::new(vec![Tab::scratch(named("only"))], 7, None, DEFAULT_PANEL);
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
         let back = parse(&json).expect("parse");

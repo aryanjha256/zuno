@@ -29,6 +29,32 @@ actions!(
         PickerPrev,
         PickerConfirm,
         PickerDismiss,
+        // The collection panel. `Ctrl+P` is a *finder* — it needs you to know the name of the
+        // thing you want. The panel is the *browser*, and until it existed nothing in Zuno could
+        // answer "what have I saved", since `collection::scan` had exactly one caller.
+        ToggleCollectionPanel,
+        CollectionNext,
+        CollectionPrev,
+        CollectionConfirm,
+        CollectionCollapse,
+        CollectionExpand,
+        OpenCollectionMenu,
+        // Two actions, because deleting a file has no undo: `DeleteRequest` only *asks*, and
+        // `ConfirmDeleteRequest` is the one that removes anything. Splitting them is what lets
+        // the confirmation be an ordinary menu row rather than a modal of its own.
+        DeleteRequest,
+        ConfirmDeleteRequest,
+        TrashRequest,
+        DuplicateRequest,
+        RevealRequest,
+        OpenRequestExternally,
+        CopyRequestPath,
+        CopyRequestRelativePath,
+        // Rename is inline in the tree rather than a modal, so it needs a start, a commit and
+        // a cancel — the three states an editable row has.
+        RenameRequest,
+        CommitRename,
+        CancelRename,
         // Buffers
         NewTab,
         CloseTab,

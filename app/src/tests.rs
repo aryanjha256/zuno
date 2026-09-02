@@ -2054,6 +2054,7 @@ async fn every_saved_buffer_is_restored_not_just_the_active_one(cx: &mut TestApp
             .collect(),
         1, // not 0, so ignoring `active` fails the test rather than passing by luck
         None,
+        true,
     );
     std::fs::write(&path, serde_json::to_vec(&session).expect("serialize")).expect("write");
 
@@ -4249,6 +4250,7 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("theme-toggle", "zuno::ToggleTheme"),
         ("fold-all", "zuno::FoldAll"),
         ("unfold-all", "zuno::UnfoldAll"),
+        ("collection-hide", "zuno::ToggleCollectionPanel"),
     ]
 }
 
@@ -6923,4 +6925,1006 @@ async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     assert_eq!(marks, [false, true], "the text/file marks must survive");
 
     remove_scratch(&mut cx, &session);
+}
+
+// ---------------------------------------------------------------------------
+// The collection panel
+//
+// `Ctrl+P` is a finder and needs you to know the name of what you want; this is the browser.
+// Until it existed `collection::scan` had one caller in the whole app, so "what have I saved"
+// was a question Zuno could not answer. See `collection_panel.rs`.
+// ---------------------------------------------------------------------------
+
+/// Write a request into a collection directory without going through the UI.
+fn seed_request(root: &std::path::Path, relative: &str, url: &str) {
+    let path = root.join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    zuno_core::collection::write(
+        &path,
+        &RequestSpec {
+            url: url.to_string(),
+            ..RequestSpec::sample()
+        },
+    )
+    .expect("write");
+}
+
+fn tree_rows(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> Vec<(u16, String, bool)> {
+    window
+        .update(cx, |workspace, _, _| workspace.tree_rows())
+        .expect("window")
+}
+
+#[gpui::test]
+async fn the_panel_shows_the_collection_as_a_tree(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-tree");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    // Directory first, then its request indented, then the root-level one — the ordering
+    // `collection::tree` imposes and `scan` cannot supply.
+    assert_eq!(
+        tree_rows(&window, &mut cx),
+        [
+            (0, "billing".to_string(), true),
+            (1, "invoices".to_string(), false),
+            (0, "posts".to_string(), false),
+        ]
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn clicking_a_request_in_the_panel_opens_it_as_a_buffer(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-open");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let before = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let after = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+    assert_eq!(after, before + 1, "clicking a request must open a buffer");
+
+    let opened = active_view(&window, &mut cx);
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).url.read(cx).text().to_string()),
+        "https://a.test/posts"
+    );
+    // The path travels with it, which is what makes a later Ctrl+S overwrite the file rather
+    // than breed `posts-2.json`.
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).path.clone()),
+        Some(root.join("posts.json"))
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn clicking_a_request_twice_activates_it_rather_than_opening_a_second_copy(
+    cx: &mut TestAppContext,
+) {
+    // `Ctrl+P` gets this by filtering open paths out of its list, which a tree cannot do — a
+    // panel that hid the requests you have open would be worse than the duplicate. So the rule
+    // lives in `open_collection_file` and both paths inherit it. Two buffers over one file also
+    // means two `path`s pointing at it and a last-write-wins race between them on Ctrl+S.
+    let dir = scratch_dir("panel-reopen");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let before = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+
+    // **The bounds must be re-read between the clicks.** Opening the second buffer makes the
+    // tab strip appear — it hides itself at one buffer — which shifts the panel down by its
+    // height, so a position captured before the first click lands on a different row after it.
+    // Reusing the stale point made this test pass against the bug it was written for.
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let after = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+    assert_eq!(
+        after,
+        before + 1,
+        "clicking the same request twice must activate the buffer, not open a second one"
+    );
+
+    // And it is the *right* buffer that ends up in front, not merely the right count.
+    let active = active_view(&window, &mut cx);
+    assert_eq!(
+        cx.update(|_, cx| active.read(cx).path.clone()),
+        Some(root.join("posts.json"))
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_collection_row_spans_the_full_width_of_the_panel(cx: &mut TestAppContext) {
+    // The dead-hitbox bug, which has now shipped twice: `uniform_list` hands a row the list's
+    // width as *available space*, and taffy only stretches a root node to fill it when the node
+    // is `display: block`. A `.flex()` row sizes to its content instead, so without `w_full`
+    // the row is as wide as its label and the rest of it silently swallows clicks.
+    //
+    // Measured against the **list**, deliberately. The row's own bounds agree with the bug, so
+    // anything derived from them passes against it.
+    let dir = scratch_dir("panel-hitbox");
+    let root = dir.join("collections");
+    seed_request(&root, "a.json", "https://a.test/a");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let list = cx.debug_bounds("collection-tree").expect("the tree list");
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+
+    let before = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+
+    // Far right of the list, well past where a content-sized row would end.
+    let far_right = gpui::point(list.right() - gpui::px(6.), row.center().y);
+    cx.simulate_click(far_right, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let after = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+    assert_eq!(
+        after,
+        before + 1,
+        "a click at the right edge of the row must open it — the row is a hitbox, not a label"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn collapsing_a_directory_hides_its_requests(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-fold");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+    assert_eq!(tree_rows(&window, &mut cx).len(), 3);
+
+    // Click the directory row.
+    let row = cx.debug_bounds("collection-row-0").expect("the directory row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // The request inside it is gone; the sibling at the root is not.
+    assert_eq!(
+        tree_rows(&window, &mut cx),
+        [
+            (0, "billing".to_string(), true),
+            (0, "posts".to_string(), false),
+        ],
+        "collapsing must hide only the subtree"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn left_steps_out_of_a_directory_before_folding_it(cx: &mut TestAppContext) {
+    // `left` has to mean something on a request row, where there is nothing to close, or the
+    // key is dead on every leaf — which reads as broken. Stepping to the parent is the file
+    // tree convention, and it is also *why* the fold path never leaves the selection inside a
+    // subtree that disappears (see `rebuild_tree_visible`).
+    let dir = scratch_dir("panel-fold-selection");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e");
+    // billing → invoices, so the selection is inside the directory about to be folded.
+    cx.simulate_keystrokes("down down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("invoices".to_string())
+    );
+
+    // `left` on a request steps out to its parent; `left` again folds it.
+    cx.simulate_keystrokes("left left");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("billing".to_string()),
+        "the selection must land on the row that is still drawn"
+    );
+
+    // And stepping from there goes to the *next visible* row, not back into the folded subtree.
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("posts".to_string())
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_rescan_keeps_the_selection_on_the_same_request(cx: &mut TestAppContext) {
+    // `panel_selection` is an index into `tree`, and a rescan rebuilds `tree` from scratch. A
+    // request saved with a name that sorts *earlier* shifts every row after it, so restoring
+    // the selection by index would leave it pointing at a different request with nothing on
+    // screen saying so. The new name is deliberately alphabetically first, because with a
+    // later one the index happens to survive and the test would pass either way.
+    let dir = scratch_dir("panel-rescan-selection");
+    let root = dir.join("collections");
+    seed_request(&root, "zebra.json", "https://a.test/zebra");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("zebra".to_string())
+    );
+
+    // Saving rescans, and this row lands above the selected one.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://a.test/alpha");
+    cx.simulate_keystrokes("ctrl-s");
+    wait_for(&mut cx, "the new request in the tree", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("zebra".to_string()),
+        "the selection must still name the request it was on, not the row that took its index"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn opening_a_request_from_the_panel_leaves_the_keymap_alive(cx: &mut TestAppContext) {
+    // Asserted through a *later keystroke*, never by asking which handle has focus — the
+    // buggy version of a focus bug focuses exactly what it intended to. `open_collection_file`
+    // routes through `activate`, which focuses the URL bar, so without the deliberate
+    // re-focus in `choose_collection_row` the panel's bindings would stop resolving here.
+    let dir = scratch_dir("panel-keymap");
+    let root = dir.join("collections");
+    seed_request(&root, "alpha.json", "https://a.test/alpha");
+    seed_request(&root, "beta.json", "https://a.test/beta");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+
+    let opened = active_view(&window, &mut cx);
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).url.read(cx).text().to_string()),
+        "https://a.test/alpha"
+    );
+
+    // The panel still owns the keyboard: `down` moves its selection rather than doing nothing.
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("beta".to_string()),
+        "the panel's bindings must still resolve after opening a request"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn hiding_the_panel_leaves_typing_somewhere_to_land(cx: &mut TestAppContext) {
+    // Hiding the panel while it holds focus has to move focus with it, or focus is left on an
+    // element that is no longer painted.
+    //
+    // **Asserted on typing, and the first version of this test was decoration.** It asserted
+    // that a global binding (`ctrl-shift-h`) still dispatched, and that passed against the bug:
+    // `window.rs`'s dispatch falls back to `dispatch_tree.root_node_id()` when the focused
+    // handle has no node in the rendered frame, and `Workspace`'s handlers are reachable from
+    // the root — so globally-bound actions keep working. What actually breaks is anything
+    // needing a live *input*, because no `TextInput` holds focus. Verified by deleting the
+    // `activate` call and watching this fail.
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-shift-e"); // focus the panel
+    cx.simulate_keystrokes("ctrl-shift-e"); // hide it
+    cx.run_until_parked();
+
+    // Typing must land somewhere. This is the observable half: with focus left on the
+    // now-unpainted panel there is no input to receive it and the keystrokes vanish.
+    cx.simulate_input("XYZ");
+    let url = cx.update(|_, cx| view.read(cx).url.read(cx).text().to_string());
+    assert!(
+        url.ends_with("XYZ"),
+        "typing went nowhere after hiding the panel — focus was left on an unpainted \
+         element, so no input receives it. URL was {url:?}"
+    );
+}
+
+#[gpui::test]
+async fn a_dismissed_panel_stays_dismissed_after_a_restart(cx: &mut TestAppContext) {
+    // `session.rs` covers the format; this covers the wiring on either side of it —
+    // `Workspace::session` writing the flag and `Workspace::new` reading it back. A round-trip
+    // test on the envelope alone would pass with both ends unconnected.
+    let (session, root) = scratch_collection("panel-restart");
+
+    {
+        let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+        cx.simulate_keystrokes("ctrl-shift-e"); // focus
+        cx.simulate_keystrokes("ctrl-shift-e"); // hide
+        assert!(
+            !window
+                .update(&mut cx, |workspace, _, _| workspace.panel_is_visible())
+                .expect("window"),
+            "the panel must actually be hidden before we test that it stays that way"
+        );
+
+        // A send is the save point that writes the session envelope.
+        let served = serve_once(OK_JSON);
+        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.simulate_input(&served);
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+    }
+
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    assert!(
+        !window
+            .update(&mut cx, |workspace, _, _| workspace.panel_is_visible())
+            .expect("window"),
+        "a dismissed panel must not reappear on the next launch"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn saving_a_request_makes_it_appear_in_the_panel(cx: &mut TestAppContext) {
+    // A request you just saved and cannot see in the tree reads as a save that failed.
+    let dir = scratch_dir("panel-after-save");
+    let root = dir.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
+    assert!(tree_rows(&window, &mut cx).is_empty(), "nothing saved yet");
+
+    cx.simulate_keystrokes("ctrl-l");
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("https://a.test/fresh");
+    cx.simulate_keystrokes("ctrl-s");
+
+    wait_for(&mut cx, "the saved request in the tree", |cx| {
+        tree_rows(&window, cx)
+            .iter()
+            .any(|(_, name, _)| name == "fresh")
+            .then_some(())
+    });
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn deleting_a_request_asks_before_it_removes_anything(cx: &mut TestAppContext) {
+    // The confirmation is the feature, so the test that matters is that the *first* step
+    // removes nothing. Asserted on the file system, not on which menu is open: a menu that
+    // appeared correctly and deleted anyway would look identical on screen.
+    let dir = scratch_dir("panel-delete-asks");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down");
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+    assert!(
+        root.join("posts.json").is_file(),
+        "asking must not delete — the confirmation would be decoration"
+    );
+
+    // Escaping out of the confirmation must leave it alone too.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(root.join("posts.json").is_file(), "escape must keep the file");
+    assert_eq!(tree_rows(&window, &mut cx).len(), 1);
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn confirming_the_delete_removes_the_file_and_the_row(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-delete-confirms");
+    let root = dir.join("collections");
+    seed_request(&root, "doomed.json", "https://a.test/doomed");
+    seed_request(&root, "keep.json", "https://a.test/keep");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    // First row is `doomed`, since the tree is alphabetical within a level.
+    cx.simulate_keystrokes("ctrl-shift-e down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("doomed".to_string())
+    );
+
+    // `delete` asks; `enter` takes the first row of the confirmation, which is the destructive
+    // one. The "Keep it" row below it is what makes that safe to be the default.
+    cx.simulate_keystrokes("delete enter");
+    wait_for(&mut cx, "the row to disappear", |cx| {
+        (tree_rows(&window, cx).len() == 1).then_some(())
+    });
+
+    assert!(!root.join("doomed.json").exists(), "the file must be gone");
+    assert!(
+        root.join("keep.json").is_file(),
+        "and only that file — a delete that took the sibling would pass a weaker assertion"
+    );
+    assert_eq!(
+        tree_rows(&window, &mut cx),
+        [(0, "keep".to_string(), false)]
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn deleting_a_request_that_is_open_stops_ctrl_s_from_recreating_it(
+    cx: &mut TestAppContext,
+) {
+    // The invisible half, and the reason this could not ship as "delete the file and refresh".
+    // `save_request` writes to a remembered `path` with **no existence check**, so a buffer
+    // still holding the deleted file's path silently recreates it on the next save — and the
+    // panel would then show a request the user had just deleted, with no explanation.
+    let dir = scratch_dir("panel-delete-open");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    // Open it, so a buffer is holding the path.
+    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.run_until_parked();
+    let opened = active_view(&window, &mut cx);
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).path.clone()),
+        Some(root.join("posts.json"))
+    );
+
+    cx.simulate_keystrokes("delete enter");
+    wait_for(&mut cx, "the row to disappear", |cx| {
+        tree_rows(&window, cx).is_empty().then_some(())
+    });
+    assert!(!root.join("posts.json").exists());
+
+    // The buffer stays open — the request is still in front of you, it just has no file now.
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).path.clone()),
+        None,
+        "the buffer must forget the file it no longer has"
+    );
+
+    // And saving writes a *fresh* file rather than resurrecting the deleted one at its old path.
+    // Both land on `posts.json` here because the name derives from the URL, so the assertion
+    // that distinguishes them is `path` above, not the filename.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://a.test/rewritten");
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+    assert!(
+        !root.join("posts.json").exists(),
+        "Ctrl+S resurrected the deleted file at its old path"
+    );
+    assert!(root.join("rewritten.json").is_file());
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_directory_offers_no_delete(cx: &mut TestAppContext) {
+    // `collection::remove` refuses a directory by design, so offering the verb there would be a
+    // control that always fails — the dead-control shape this codebase keeps finding. Asserted
+    // at the consequence: pressing the key must leave the tree exactly as it was.
+    let dir = scratch_dir("panel-delete-dir");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("billing".to_string()),
+        "the directory must be the selected row for this to test anything"
+    );
+
+    cx.simulate_keystrokes("delete");
+    cx.run_until_parked();
+
+    // **Asserted on the menu, not on the outcome.** `collection::remove` refuses a directory
+    // anyway, so "the directory survived" is true whether or not the verb was offered — that
+    // version of this test passed against a `selected_request` that returned directories too.
+    // What is actually wrong there is offering a control that can only ever fail. Read from
+    // real state rather than `debug_bounds`, whose `is_none` reports the last painted frame.
+    assert!(
+        !window
+            .update(&mut cx, |workspace, _, _| workspace.menu_open())
+            .expect("window"),
+        "a directory must not offer a delete that can only fail"
+    );
+
+    // And the safety property itself, which core holds independently.
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(root.join("billing").is_dir(), "the directory must survive");
+    assert!(
+        root.join("billing").join("invoices.json").is_file(),
+        "and so must the request inside it"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn the_row_menu_offers_every_verb_in_its_intended_order(cx: &mut TestAppContext) {
+    // The bulk of this slice's surface is *which rows exist*, so this is the test that catches
+    // a verb wired up and never offered — the §11 failure shape, one level down. Order is
+    // asserted too: the two destructive rows sit last and together on purpose, so the pointer
+    // never crosses them on the way to something harmless.
+    let dir = scratch_dir("panel-menu-rows");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    right_click(&mut cx, row.center());
+
+    let labels = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_labels(cx))
+        .expect("window");
+    assert_eq!(
+        labels,
+        [
+            "Reveal in file manager",
+            "Open in default app",
+            "---",
+            "Duplicate",
+            "---",
+            "Copy path",
+            "Copy relative path",
+            "---",
+            "Rename",
+            "Move to trash",
+            // The ellipsis is the difference between the two: this row asks, the one above acts.
+            "Delete…",
+        ]
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn renaming_moves_the_file_and_the_open_buffer_follows_it(cx: &mut TestAppContext) {
+    // The buffer following is the invisible half. Unlike a delete the request still exists, so
+    // `path` has to be *updated* rather than cleared — left pointing at the old name, the next
+    // Ctrl+S recreates the file under its pre-rename name and you end up with both.
+    let dir = scratch_dir("panel-rename");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    // Open it first, so a buffer is holding the path.
+    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.run_until_parked();
+    let opened = active_view(&window, &mut cx);
+
+    cx.simulate_keystrokes("f2");
+    // The box opens with the name selected, so typing replaces it rather than appending.
+    cx.simulate_input("articles");
+    cx.simulate_keystrokes("enter");
+    wait_for(&mut cx, "the renamed row", |cx| {
+        tree_rows(&window, cx)
+            .iter()
+            .any(|(_, name, _)| name == "articles")
+            .then_some(())
+    });
+
+    assert!(root.join("articles.json").is_file());
+    assert!(!root.join("posts.json").exists(), "the old name must be gone");
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).path.clone()),
+        Some(root.join("articles.json")),
+        "the buffer must follow the file it is open on"
+    );
+
+    // And saving overwrites the renamed file rather than recreating the old one beside it.
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+    assert!(!root.join("posts.json").exists(), "Ctrl+S recreated the pre-rename file");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn escape_abandons_a_rename_and_leaves_the_file_alone(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-rename-escape");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down f2");
+    cx.simulate_input("articles");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    assert!(root.join("posts.json").is_file(), "escape must not rename");
+    assert!(!root.join("articles.json").exists());
+    assert_eq!(
+        tree_rows(&window, &mut cx),
+        [(0, "posts".to_string(), false)]
+    );
+
+    // The panel has the keyboard back — asserted through a later keystroke, since the rename
+    // box owned it and focus must return when the box goes away.
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("posts".to_string())
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn renaming_to_nothing_is_refused_rather_than_leaving_a_nameless_file(
+    cx: &mut TestAppContext,
+) {
+    // `slug` turns an empty label into a placeholder rather than failing, so without the guard
+    // this renames the request to something the user never typed.
+    let dir = scratch_dir("panel-rename-empty");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down f2");
+    // The name arrives selected, so one backspace clears it.
+    cx.simulate_keystrokes("backspace enter");
+    cx.run_until_parked();
+
+    assert!(root.join("posts.json").is_file(), "the file must keep its name");
+    assert_eq!(collection_files(&root), ["posts.json"]);
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn duplicating_adds_a_row_without_opening_a_tab(cx: &mut TestAppContext) {
+    // Duplicating is how you take a backup before a risky change as often as it is how you
+    // start a variant, and a tab you did not ask for is the worse of the two failures.
+    let dir = scratch_dir("panel-duplicate");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let before = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    right_click(&mut cx, row.center());
+    // Reveal, Open, ---, Duplicate: two steps down past the separator, which `select` skips.
+    cx.simulate_keystrokes("down down enter");
+    wait_for(&mut cx, "the duplicate", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    assert_eq!(
+        collection_files(&root),
+        ["posts-2.json", "posts.json"],
+        "the copy takes the next free name rather than overwriting"
+    );
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tab_count())
+            .expect("window"),
+        before,
+        "duplicating must not open a buffer"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn the_two_copy_verbs_give_absolute_and_collection_relative_paths(cx: &mut TestAppContext) {
+    // Two rows one below the other, differing only in what they yield — exactly the pair where
+    // wiring the same handler to both would look right on screen.
+    let dir = scratch_dir("panel-copy-path");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    // Row 1 is the request inside `billing`.
+    let row = cx.debug_bounds("collection-row-1").expect("the request row");
+    right_click(&mut cx, row.center());
+    // Reveal, Open, ---, Duplicate, ---, Copy path.
+    cx.simulate_keystrokes("down down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(root.join("billing").join("invoices.json").display().to_string())
+    );
+
+    let row = cx.debug_bounds("collection-row-1").expect("the request row");
+    right_click(&mut cx, row.center());
+    cx.simulate_keystrokes("down down down down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("billing/invoices.json".to_string()),
+        "the relative path is relative to the collection root, with / separators"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_menu_row_names_its_keystroke_even_when_the_binding_is_scoped(cx: &mut TestAppContext) {
+    // **This is the bug the menus shipped with, in both of them.**
+    // `Window::bindings_for_action` matches against `rendered_frame.dispatch_tree.context_stack`,
+    // which is a *build-time* stack — pushed by `push_node`, popped by `pop_node` — so it is
+    // empty once a frame is finished, and an empty stack matches only `None`-context bindings.
+    // Every verb in a row menu is scoped to the pane it acts on, so every keystroke column was
+    // blank in a primitive whose stated purpose is to teach the shortcut.
+    //
+    // `keybinding_label_matches_the_keymap` could never have caught it: every action in
+    // `advertised_actions` is bound globally, so it proves the *formatter* and says nothing
+    // about the lookup. Asserting a scoped binding is the whole point of this test.
+    let dir = scratch_dir("menu-keystrokes");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    right_click(&mut cx, row.center());
+
+    let details: Vec<(String, String)> = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_details(cx))
+        .expect("window");
+    let detail = |label: &str| {
+        details
+            .iter()
+            .find(|(name, _)| name == label)
+            .map(|(_, key)| key.clone())
+            .unwrap_or_default()
+    };
+
+    // `f2` and `delete` are both registered `Some("CollectionPanel")`.
+    assert_eq!(detail("Rename"), "F2");
+    assert_eq!(detail("Delete…"), "Delete");
+    // And a verb with no binding still draws no column, rather than inventing one.
+    assert_eq!(detail("Copy relative path"), "");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn the_response_row_menu_names_its_keystrokes_too(cx: &mut TestAppContext) {
+    // The other menu with the same bug, and the one that has had it longest — architecture.md
+    // §6 has claimed since it shipped that "every item is an action, with its keystroke read
+    // from the live keymap". `ctrl-c` and `alt-c` are both scoped to `ResponsePane`.
+    let (window, _view, mut cx) = respond_with_json_in_window(cx, r#"{"outer":{"inner":1}}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-1").expect("a row");
+    right_click(&mut cx, row.center());
+
+    let details = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_details(cx))
+        .expect("window");
+    // Row 1 is the `outer` container, so Fold applies and is offered — all three scoped.
+    assert_eq!(
+        details,
+        [
+            ("Copy value".to_string(), "Ctrl+C".to_string()),
+            ("Copy path".to_string(), "Alt+C".to_string()),
+            ("Fold".to_string(), "Space".to_string()),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn a_menu_row_spans_the_full_width_of_the_menu(cx: &mut TestAppContext) {
+    // The styling half of this is that a keystroke should sit at the right edge rather than
+    // beside its label. The half you cannot see is that a content-width row leaves the rest of
+    // the menu answering neither hover nor clicks — the picker's dead-hitbox bug (§12) in a
+    // third place, and the reason a paint tweak got a test.
+    //
+    // **Measured against the menu, not the row.** With the bug the row's own bounds are the
+    // narrow box, so anything derived from them agrees with it and passes.
+    let dir = scratch_dir("menu-row-width");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let row = cx.debug_bounds("collection-row-0").expect("the request row");
+    right_click(&mut cx, row.center());
+
+    let menu = cx.debug_bounds("context-menu").expect("the menu");
+    // Index 5 is "Copy path" — a row whose effect lands somewhere a test can read.
+    let copy_path = cx.debug_bounds("menu-row-5").expect("the copy-path row");
+
+    let far_right = gpui::point(menu.right() - gpui::px(6.), copy_path.center().y);
+    cx.simulate_click(far_right, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(root.join("posts.json").display().to_string()),
+        "a click at the right edge of the menu must choose the row under it"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn the_tab_strip_belongs_to_the_editor_area_not_the_window(cx: &mut TestAppContext) {
+    // The strip spanned the full width for one slice, which drew tabs of open *buffers* above a
+    // tree of saved *files*. Two assertions, because the visual half and the functional half are
+    // different claims and only the second would ever be noticed as a bug.
+    let dir = scratch_dir("layout-strip");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    // The panel's vertical position *before* any tab strip exists — it hides itself at one
+    // buffer, so there is none yet.
+    let before = cx.debug_bounds("collection-panel").expect("the panel");
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.run_until_parked();
+
+    let after = cx.debug_bounds("collection-panel").expect("the panel");
+    let tab = cx.debug_bounds("tab-0").expect("the strip appeared");
+
+    // 1. The strip starts to the *right* of the panel rather than over it.
+    assert!(
+        tab.left() >= after.right(),
+        "the tab strip overlaps the collection panel: tab starts at {:?}, panel ends at {:?}",
+        tab.left(),
+        after.right()
+    );
+
+    // 2. And the panel does not move when the strip appears. This is the half worth holding: a
+    // sidebar that jumps down the moment a second buffer opens is the fragility that made
+    // `clicking_a_request_twice_...` read stale bounds between its two clicks.
+    assert_eq!(
+        after.origin.y, before.origin.y,
+        "the panel shifted when the tab strip appeared"
+    );
+    assert_eq!(
+        after.size.height, before.size.height,
+        "and it must not have been shortened either"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
 }

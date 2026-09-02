@@ -42,6 +42,12 @@ pub struct MenuItem {
 pub enum MenuCommand {
     Dispatch(Box<dyn gpui::Action>),
     OpenUrl(SharedString),
+    /// Close and do nothing.
+    ///
+    /// Exists for the way *out* of a destructive confirmation. `Escape` already dismisses, but
+    /// a menu asking "delete this file?" with no visible answer other than the destructive one
+    /// reads as having no way back — and a row that says so costs nothing.
+    Dismiss,
 }
 
 impl Clone for MenuCommand {
@@ -49,6 +55,7 @@ impl Clone for MenuCommand {
         match self {
             Self::Dispatch(action) => Self::Dispatch(action.boxed_clone()),
             Self::OpenUrl(url) => Self::OpenUrl(url.clone()),
+            Self::Dismiss => Self::Dismiss,
         }
     }
 }
@@ -60,9 +67,22 @@ pub enum MenuRow {
 }
 
 impl MenuItem {
-    /// An action row, labelled with its own keystroke.
-    pub fn new(label: impl Into<SharedString>, action: impl gpui::Action, window: &Window) -> Self {
-        let detail = crate::workspace::keybinding_label(&action, window);
+    /// An action row, labelled with the keystroke it has **in `focus`'s context**.
+    ///
+    /// The handle is not decoration. A menu's verbs belong to a pane, and most of their bindings
+    /// are scoped to that pane's key context — `ctrl-c` in `ResponsePane`, `f2` in
+    /// `CollectionPanel`. `keybinding_label` asks the *rendered frame*, whose context stack is
+    /// empty once the frame is built, so it can only ever find globally-bound actions: every
+    /// row here rendered a blank column from the day the menu shipped, in a primitive whose
+    /// stated purpose is to teach the keystroke. Pass the handle the menu restores focus to —
+    /// it is the pane these verbs act on, which is the same question.
+    pub fn new(
+        label: impl Into<SharedString>,
+        action: impl gpui::Action,
+        focus: &FocusHandle,
+        window: &Window,
+    ) -> Self {
+        let detail = crate::workspace::keybinding_label_in(&action, focus, window);
         Self {
             label: label.into(),
             detail: SharedString::from(detail),
@@ -83,11 +103,61 @@ impl MenuItem {
             command: MenuCommand::OpenUrl(url.into()),
         }
     }
+
+    /// A row that just closes the menu. See `MenuCommand::Dismiss`.
+    pub fn dismiss(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+            detail: SharedString::new_static(""),
+            command: MenuCommand::Dismiss,
+        }
+    }
+
+    /// A row spelling out a consequence, with no keystroke of its own.
+    ///
+    /// Confirmation rows are reached by choosing the row above them, never by a shortcut, so
+    /// `MenuItem::new`'s keymap lookup would draw an empty column and imply one exists.
+    pub fn plain(label: impl Into<SharedString>, action: impl gpui::Action) -> Self {
+        Self {
+            label: label.into(),
+            detail: SharedString::new_static(""),
+            command: MenuCommand::Dispatch(action.boxed_clone()),
+        }
+    }
 }
 
 impl From<MenuItem> for MenuRow {
     fn from(item: MenuItem) -> Self {
         MenuRow::Item(item)
+    }
+}
+
+impl ContextMenu {
+    /// The rows as drawn, with separators as `"---"`, for tests.
+    ///
+    /// Reads real state rather than painted bounds: `cx.debug_bounds` reports the previous
+    /// frame, so it can confirm a menu is *there* and never that a particular row is.
+    #[cfg(test)]
+    pub(crate) fn row_labels(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .map(|row| match row {
+                MenuRow::Item(item) => item.label.to_string(),
+                MenuRow::Separator => "---".to_string(),
+            })
+            .collect()
+    }
+
+    /// The rows as `(label, detail)`, for asserting which ones name a keystroke.
+    #[cfg(test)]
+    pub(crate) fn row_details(&self) -> Vec<(String, String)> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                MenuRow::Item(item) => Some((item.label.to_string(), item.detail.to_string())),
+                MenuRow::Separator => None,
+            })
+            .collect()
     }
 }
 

@@ -21,7 +21,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{RequestId, RequestSpec};
+use crate::{Method, RequestId, RequestSpec};
 
 /// Requests are `.json` so editors, `jq`, and GitHub all treat them as what they are.
 pub const EXTENSION: &str = "json";
@@ -63,6 +63,22 @@ pub enum CollectionError {
     },
     #[error("could not serialize the request: {0}")]
     Serialize(#[source] serde_json::Error),
+    #[error("could not delete {}: {source}", path.display())]
+    Delete {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not move {} to the trash: {source}", path.display())]
+    Trash {
+        path: PathBuf,
+        #[source]
+        source: trash::Error,
+    },
+    #[error("{0:?} already exists")]
+    NameTaken(String),
+    #[error("{} is not a request file", path.display())]
+    NotAFile { path: PathBuf },
     #[error("no free filename like {stem:?} in {}", root.display())]
     NoFreeName { root: PathBuf, stem: String },
 }
@@ -310,6 +326,206 @@ pub fn write(path: &Path, spec: &RequestSpec) -> Result<(), CollectionError> {
     })
 }
 
+/// Delete a request file.
+///
+/// **Deliberately narrow: one file, never a directory.** `remove_dir_all` on a path derived
+/// from a UI selection is the shape of a mistake that has no undo, and a collection folder can
+/// hold work that was never visible in the panel — an unreadable request is skipped by `scan`
+/// (so it has no row) and would be destroyed anyway. Removing a folder is its own decision.
+///
+/// A file that is already gone is **not** an error. The panel's tree is a snapshot of the last
+/// scan, so a request deleted in a terminal a moment ago is still on screen, and reporting a
+/// failure for reaching the state the caller asked for would be noise.
+pub fn remove(path: &Path) -> Result<(), CollectionError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CollectionError::Delete {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Move a request file to the desktop trash.
+///
+/// The recoverable sibling of `remove`, and the one a person reaches for by default — the XDG
+/// trash keeps the original path in a `.trashinfo` file, so the desktop's "restore" puts it
+/// back where it was. Hand-rolling that was rejected: the same-filesystem case is easy and the
+/// cases that decide whether a restore works — a collection on another mount, a name already in
+/// the trash — are the ones a hand-rolled version gets wrong quietly.
+///
+/// **Refuses anything that is not a regular file**, for `remove`'s reason: the path comes from
+/// a UI selection, and `trash::delete` would happily take a whole directory with it.
+pub fn trash(path: &Path) -> Result<(), CollectionError> {
+    if !path.is_file() {
+        return Err(CollectionError::NotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    trash::delete(path).map_err(|source| CollectionError::Trash {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Rename a request file in place, returning its new path.
+///
+/// `label` is a display name, not a filename: it goes through `slug`, so a typed `../../evil`
+/// cannot walk out of the directory — the same boundary `allocate` relies on, and the reason
+/// this takes a label rather than a caller-built `PathBuf`. The extension is added here for the
+/// same reason the panel strips it: the user is naming a request, not a file.
+///
+/// **Never overwrites.** A name already taken is an error rather than a silent replacement,
+/// because the request being clobbered may be one the renamer has never seen.
+pub fn rename(path: &Path, label: &str) -> Result<PathBuf, CollectionError> {
+    let stem = slug(label);
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let target = parent.join(format!("{stem}.{EXTENSION}"));
+
+    // Renaming to the name it already has, or to one differing only in what `slug` strips.
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(CollectionError::NameTaken(stem));
+    }
+
+    std::fs::rename(path, &target).map_err(|source| CollectionError::Write {
+        path: target.clone(),
+        source,
+    })?;
+    Ok(target)
+}
+
+/// Copy a request to a fresh name beside it, returning the new path.
+///
+/// Copies the **bytes**, not a re-serialized `RequestSpec`. Reading and writing would normalize
+/// the file — reordering nothing today, but silently rewriting anything a future field or a
+/// hand edit put there — and a duplicate that differs from its original is a bad duplicate.
+/// `allocate` picks the name, so this inherits the collision rule the rest of the format uses:
+/// `posts.json` becomes `posts-2.json`, never an overwrite.
+pub fn duplicate(path: &Path) -> Result<PathBuf, CollectionError> {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| CollectionError::NotAFile {
+            path: path.to_path_buf(),
+        })?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+
+    let target = allocate(parent, stem)?;
+    std::fs::copy(path, &target).map_err(|source| CollectionError::Write {
+        path: target.clone(),
+        source,
+    })?;
+    Ok(target)
+}
+
+/// One row of the collection tree, as the panel draws it.
+///
+/// **Flat with a depth, not nested**, for the same reason `json::Row` is: the panel renders
+/// through `uniform_list`, which demands an O(1)-indexable list of fixed-height rows. A nested
+/// structure would have to be walked to answer "what is row 40", which is the question the
+/// renderer asks on every frame.
+///
+/// Folding is deliberately *not* represented here. Which directories are collapsed is view
+/// state that belongs to the window, so this is always the whole tree and the app computes
+/// which rows are visible — the same split `JsonOutline` makes between `rows` and `visible`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Node {
+    pub depth: u16,
+    /// What to draw: a directory's name, or a request's filename with `.json` removed.
+    ///
+    /// The extension is stripped because it is the same on every row and therefore carries no
+    /// information — the panel is a list of requests, not a file manager.
+    pub name: String,
+    /// The directory, or the request file.
+    ///
+    /// Doubles as the fold key and as the identity a later delete or rename acts on, which is
+    /// why it is a full path rather than the display name: two directories at different depths
+    /// can share a name, and a `HashSet<String>` of collapsed names would fold both.
+    pub path: PathBuf,
+    pub kind: NodeKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NodeKind {
+    Directory,
+    /// Carries the method and URL rather than the whole `RequestSpec`: the panel draws both,
+    /// and a spec holds the body, which for a large request would be cloned per scan and held
+    /// for as long as the panel is open.
+    Request { method: Method, url: String },
+}
+
+/// Arrange scanned entries into a flat, depth-tagged tree.
+///
+/// **Directories sort before files at each level**, then alphabetically within each group —
+/// the file-tree convention every editor shares. `scan` returns entries sorted by their
+/// relative path, which interleaves the two (`a.json` sorts before `a/b.json` because `.`
+/// precedes `/`), so the ordering has to be rebuilt here rather than inherited.
+///
+/// Recursive, like `walk` above and unlike `json::flatten`: the input comes from `scan`, which
+/// enforces `MAX_DEPTH`, so the nesting is bounded before it reaches this function. The
+/// flattener has no such guarantee about a server's JSON, which is why it is iterative.
+pub fn tree(root: &Path, entries: &[Entry]) -> Vec<Node> {
+    let mut branch = Branch::default();
+    for entry in entries {
+        let mut components: Vec<&str> = entry.relative.split('/').collect();
+        // A relative label always ends in a filename; anything else is not an entry `scan`
+        // produced, and there is no row to draw for it.
+        let Some(file) = components.pop() else { continue };
+
+        let mut here = &mut branch;
+        for component in components {
+            here = here.dirs.entry(component).or_default();
+        }
+        here.files.insert(file, entry);
+    }
+
+    let mut out = Vec::new();
+    flatten_branch(&branch, root, 0, &mut out);
+    out
+}
+
+/// The nested form, built only to be flattened. `BTreeMap` rather than sorting afterwards
+/// because it keeps each level ordered as it is filled, and the two maps are what puts every
+/// directory ahead of every file without a comparator that has to know which is which.
+#[derive(Default)]
+struct Branch<'a> {
+    dirs: std::collections::BTreeMap<&'a str, Branch<'a>>,
+    files: std::collections::BTreeMap<&'a str, &'a Entry>,
+}
+
+fn flatten_branch(branch: &Branch<'_>, parent: &Path, depth: u16, out: &mut Vec<Node>) {
+    for (name, sub) in &branch.dirs {
+        let path = parent.join(name);
+        out.push(Node {
+            depth,
+            name: (*name).to_string(),
+            path: path.clone(),
+            kind: NodeKind::Directory,
+        });
+        flatten_branch(sub, &path, depth + 1, out);
+    }
+
+    for (name, entry) in &branch.files {
+        out.push(Node {
+            depth,
+            name: name
+                .strip_suffix(&format!(".{EXTENSION}"))
+                .unwrap_or(name)
+                .to_string(),
+            path: entry.path.clone(),
+            kind: NodeKind::Request {
+                method: entry.spec.method.clone(),
+                url: entry.spec.url.clone(),
+            },
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +725,279 @@ mod scan_tests {
         assert_eq!(found[0].spec.url, "https://a.test/alpha");
         // And nested entries carry a usable absolute path.
         assert_eq!(found[1].path, root.join("billing").join("invoices.json"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A row as the panel would read it, for assertions that don't care about paths.
+    fn shape(nodes: &[Node]) -> Vec<(u16, &str, bool)> {
+        nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.depth,
+                    node.name.as_str(),
+                    matches!(node.kind, NodeKind::Directory),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn renaming_moves_the_file_and_leaves_its_contents_alone() {
+        let root = scratch("rename-basic");
+        let path = save(&root, "posts", "https://a.test/posts");
+        let before = std::fs::read(&path).expect("read");
+
+        let renamed = rename(&path, "articles").expect("rename");
+
+        assert_eq!(renamed, root.join("articles.json"));
+        assert!(!path.exists(), "the old name must be gone");
+        assert_eq!(
+            std::fs::read(&renamed).expect("read"),
+            before,
+            "renaming must not rewrite the request"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn renaming_goes_through_slug_so_a_typed_name_cannot_escape_the_directory() {
+        // The label comes from a text box the user types into, which makes this the same
+        // security boundary `allocate` relies on — and the reason `rename` takes a label
+        // rather than a caller-built path.
+        let root = scratch("rename-escape");
+        std::fs::create_dir_all(root.join("nested")).expect("mkdir");
+        let path = save(&root.join("nested"), "posts", "https://a.test/posts");
+
+        let renamed = rename(&path, "../../evil").expect("rename");
+
+        assert_eq!(
+            renamed.parent(),
+            Some(root.join("nested").as_path()),
+            "the file must stay in its own directory: {renamed:?}"
+        );
+        assert!(!root.join("evil.json").exists());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn renaming_onto_an_existing_name_is_refused_rather_than_overwriting() {
+        // The request being clobbered may be one the renamer has never seen.
+        let root = scratch("rename-collide");
+        let path = save(&root, "posts", "https://a.test/posts");
+        let other = save(&root, "articles", "https://a.test/articles");
+        let untouched = std::fs::read(&other).expect("read");
+
+        assert!(rename(&path, "articles").is_err());
+        assert!(path.is_file(), "the source must survive a refused rename");
+        assert_eq!(std::fs::read(&other).expect("read"), untouched);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_is_a_no_op_rather_than_a_collision() {
+        // Otherwise opening the rename box and pressing Enter reports "already exists" about
+        // the file being renamed.
+        let root = scratch("rename-noop");
+        let path = save(&root, "posts", "https://a.test/posts");
+
+        assert_eq!(rename(&path, "posts").expect("rename"), path);
+        assert!(path.is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn duplicating_copies_the_bytes_to_a_free_name_beside_it() {
+        let root = scratch("duplicate");
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        let path = save(&root.join("billing"), "invoices", "https://a.test/invoices");
+        let original = std::fs::read(&path).expect("read");
+
+        let copy = duplicate(&path).expect("duplicate");
+
+        assert_eq!(copy, root.join("billing").join("invoices-2.json"));
+        assert!(path.is_file(), "the original must survive");
+        assert_eq!(
+            std::fs::read(&copy).expect("read"),
+            original,
+            "a duplicate that differs from its original is a bad duplicate"
+        );
+
+        // And again, to prove the collision rule keeps stepping rather than overwriting.
+        assert_eq!(
+            duplicate(&path).expect("duplicate"),
+            root.join("billing").join("invoices-3.json")
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn trashing_refuses_a_directory() {
+        // `trash::delete` would take the whole folder. The path comes from a UI selection, so
+        // this is `remove`'s guard for the same reason.
+        let root = scratch("trash-dir");
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        save(&root.join("billing"), "invoices", "https://a.test/invoices");
+
+        assert!(trash(&root.join("billing")).is_err());
+        assert!(root.join("billing").join("invoices.json").is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn deleting_a_request_removes_only_that_file() {
+        let root = scratch("remove-one");
+        save(&root, "keep", "https://a.test/keep");
+        let doomed = save(&root, "doomed", "https://a.test/doomed");
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        save(&root.join("billing"), "invoices", "https://a.test/invoices");
+
+        remove(&doomed).expect("delete");
+
+        let entries = scan(&root);
+        let left: Vec<&str> = entries.iter().map(|e| e.relative.as_str()).collect();
+        // Asserted as the *whole* listing rather than "doomed is absent": a delete that took
+        // the sibling or the directory with it would pass the weaker check.
+        assert_eq!(left, ["billing/invoices.json", "keep.json"]);
+        assert!(root.join("billing").is_dir(), "the directory must survive");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn deleting_a_request_that_is_already_gone_is_not_an_error() {
+        // The panel's tree is a snapshot of the last scan, so a request removed in a terminal
+        // a moment ago is still drawn. Reporting a failure for reaching the state the caller
+        // asked for would be noise.
+        let root = scratch("remove-missing");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        assert!(remove(&root.join("never-existed.json")).is_ok());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn deleting_refuses_a_directory_rather_than_taking_its_contents() {
+        // `remove_file` on a directory is an error on every platform Zuno targets, and that is
+        // the property being pinned: nothing here can escalate into `remove_dir_all`.
+        let root = scratch("remove-dir");
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        save(&root.join("billing"), "invoices", "https://a.test/invoices");
+
+        assert!(remove(&root.join("billing")).is_err());
+        assert!(
+            root.join("billing").join("invoices.json").is_file(),
+            "the request inside it must be untouched"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_flat_collection_is_one_row_per_request() {
+        let root = scratch("tree-flat");
+        save(&root, "zebra", "https://a.test/zebra");
+        save(&root, "alpha", "https://a.test/alpha");
+
+        let nodes = tree(&root, &scan(&root));
+        assert_eq!(shape(&nodes), [(0, "alpha", false), (0, "zebra", false)]);
+
+        // The extension is dropped: it is identical on every row, so it says nothing.
+        assert!(nodes.iter().all(|node| !node.name.ends_with(".json")));
+        // And the method comes through, since the panel draws it.
+        match &nodes[0].kind {
+            NodeKind::Request { method, url } => {
+                assert_eq!(method, &RequestSpec::sample().method);
+                assert_eq!(url, "https://a.test/alpha");
+            }
+            other => panic!("expected a request, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_directory_becomes_a_row_and_its_requests_are_indented() {
+        let root = scratch("tree-nested");
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        save(&root.join("billing"), "invoices", "https://a.test/invoices");
+
+        let nodes = tree(&root, &scan(&root));
+        assert_eq!(shape(&nodes), [(0, "billing", true), (1, "invoices", false)]);
+
+        // A directory row carries the directory's own path, which is what a fold key and a
+        // later rename both act on. Deriving it from the child would give the file instead.
+        assert_eq!(nodes[0].path, root.join("billing"));
+        assert_eq!(nodes[1].path, root.join("billing").join("invoices.json"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn directories_sort_before_requests_at_the_same_level() {
+        // The one ordering `scan` cannot supply. It sorts by relative path, where `alpha.json`
+        // precedes `beta/x.json` because `.` sorts before `/` — so inheriting its order puts a
+        // root-level request above a directory, which no file tree does.
+        let root = scratch("tree-order");
+        save(&root, "alpha", "https://a.test/alpha");
+        std::fs::create_dir_all(root.join("beta")).expect("mkdir");
+        save(&root.join("beta"), "nested", "https://a.test/nested");
+
+        let entries = scan(&root);
+        // The interleaving this test exists to correct, asserted so the premise is visible.
+        let relatives: Vec<&str> = entries.iter().map(|e| e.relative.as_str()).collect();
+        assert_eq!(relatives, ["alpha.json", "beta/nested.json"]);
+
+        let nodes = tree(&root, &entries);
+        assert_eq!(
+            shape(&nodes),
+            [(0, "beta", true), (1, "nested", false), (0, "alpha", false)]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nesting_several_deep_keeps_one_row_per_level() {
+        let root = scratch("tree-deep");
+        let deep = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        save(&deep, "leaf", "https://a.test/leaf");
+
+        let nodes = tree(&root, &scan(&root));
+        assert_eq!(
+            shape(&nodes),
+            [
+                (0, "a", true),
+                (1, "b", true),
+                (2, "c", true),
+                (3, "leaf", false)
+            ]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_directories_sharing_a_name_get_distinct_paths() {
+        // The reason `Node::path` is a path rather than the display name: the panel folds by
+        // this value, so equal names at different depths would collapse together.
+        let root = scratch("tree-samename");
+        std::fs::create_dir_all(root.join("v1").join("users")).expect("mkdir");
+        std::fs::create_dir_all(root.join("v2").join("users")).expect("mkdir");
+        save(&root.join("v1").join("users"), "list", "https://a.test/v1");
+        save(&root.join("v2").join("users"), "list", "https://a.test/v2");
+
+        let nodes = tree(&root, &scan(&root));
+        let users: Vec<&Node> = nodes.iter().filter(|node| node.name == "users").collect();
+        assert_eq!(users.len(), 2);
+        assert_ne!(users[0].path, users[1].path);
 
         std::fs::remove_dir_all(&root).ok();
     }

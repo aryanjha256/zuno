@@ -57,6 +57,12 @@ url = "2"
 # Runtime-agnostic channel: written from tokio tasks, awaited on gpui's smol executor.
 async-channel = "2"
 futures-util = "0.3"
+# Moving a request to the desktop trash rather than deleting it. Hand-rolling the XDG spec
+# (~/.local/share/Trash/files plus a .trashinfo naming the original path, with a
+# cross-filesystem fallback and collision handling) is the kind of "80 lines" that is wrong in
+# the cases nobody tests. Default features off: they pull `chrono`, and every one of the
+# `coinit_*` flags is Windows COM configuration.
+trash = { version = "5", default-features = false }
 # Grapheme-aware cursor movement. Already in the tree via gpui, so this pins the
 # same version rather than adding a second copy.
 unicode-segmentation = "1.13"

@@ -7,16 +7,18 @@
 //! `TextInput` nested two levels down. Handlers that need buffer state reach into the
 //! active `RequestView` through its entity.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    ClipboardItem, Styled, Subscription, Task, Window, div, px,
+    ClipboardItem, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px,
 };
 use zuno_core::{
     Environment, RawKind, RequestId, RequestSpec, Resolver, collection, curl, environment,
 };
+use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -29,6 +31,10 @@ use crate::actions::{
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
+    CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
+    ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
+    CancelRename, CommitRename, CopyRequestPath, CopyRequestRelativePath, DuplicateRequest,
+    OpenRequestExternally, RenameRequest, RevealRequest, TrashRequest,
 };
 use crate::engine::ActiveEngine;
 use crate::context_menu;
@@ -70,6 +76,60 @@ pub struct Workspace {
     /// `dev.json` in another window takes effect on the next request rather than on the next
     /// restart — the files are the interface, so they have to stay authoritative.
     environment: Option<String>,
+
+    // --- The collection panel. See `collection_panel.rs`.
+    /// Every row in the collection, whatever is folded. Rebuilt by `refresh_tree`.
+    pub(crate) tree: Vec<Node>,
+    /// Indices into `tree` that are currently drawn. The `JsonOutline::visible` split, for
+    /// the same reason: folding is view state, so the tree itself stays whole.
+    pub(crate) tree_visible: Vec<usize>,
+    /// Directories the reader has collapsed, by path rather than by name — two directories
+    /// at different depths can share a name and must fold independently.
+    pub(crate) collapsed: HashSet<PathBuf>,
+    /// Whether a scan has completed. Distinguishes "nothing saved" from "still reading",
+    /// which are the same empty list and want different words on screen.
+    pub(crate) tree_scanned: bool,
+    pub(crate) panel_visible: bool,
+    /// **An index into `tree`, not into `tree_visible`.** Folding rewrites `tree_visible`
+    /// underneath the selection, so a visible index would silently retarget it at whatever
+    /// row slid into that slot — the lesson the response viewer's row cursor already records
+    /// (architecture.md §6). Translation happens at render and scroll, nowhere else.
+    pub(crate) panel_selection: Option<usize>,
+    pub(crate) panel_scroll: UniformListScrollHandle,
+    /// Deliberately **not** a tab stop, unlike `response_focus`. `Tab` currently walks the
+    /// active request's inputs, and a pane-level stop painted before all of them would turn
+    /// the first `Tab` from "url → method" into "panel → url" for every existing user. The
+    /// panel has its own binding and a click target, so it loses nothing by staying out.
+    pub(crate) panel_focus: FocusHandle,
+    /// Holding the task is what keeps the scan alive; dropping it cancels.
+    tree_scan: Option<Task<()>>,
+    /// The row being renamed in place, while it is being renamed.
+    ///
+    /// Inline rather than a modal, because that is what a tree does everywhere else — and it
+    /// meant no new primitive: a `TextInput` drawn in the row's own place, carrying its own key
+    /// context so `Enter` and `Escape` mean commit and cancel *there* without touching what they
+    /// mean anywhere else.
+    renaming: Option<RenameState>,
+    /// Where the panel was right-clicked, in window coordinates.
+    ///
+    /// Kept rather than taken when the first menu opens, because the confirmation is a *second*
+    /// menu that has to appear in the same place — a "delete this?" that jumps across the
+    /// window reads as a different question about something else.
+    collection_menu_at: Option<gpui::Point<gpui::Pixels>>,
+}
+
+/// An in-progress inline rename.
+struct RenameState {
+    /// Index into `tree`, so the row can be found again after a repaint. The *path* is what the
+    /// rename acts on, because a rescan can land between opening the box and committing.
+    row_ix: usize,
+    path: PathBuf,
+    input: Entity<crate::input::TextInput>,
+    /// Cancel-on-blur. Clicking elsewhere has to end the rename, or the box stays on screen
+    /// with nothing focused and the next `Enter` commits an edit the user had walked away from.
+    /// Cancel rather than commit, unlike VS Code: a rename is a file operation, and the safe
+    /// reading of "clicked somewhere else" is that it was not meant.
+    _blur: Subscription,
 }
 
 /// The settings panel and the subscription that lets it close, for the same reason
@@ -101,6 +161,7 @@ impl Workspace {
             .unwrap_or_else(|| crate::session::Session::single(RequestSpec::sample()));
         let active_ix = session.active;
         let environment = session.environment.clone();
+        let session_panel = session.collection_panel;
         let views: Vec<_> = session
             .tabs
             .into_iter()
@@ -135,7 +196,7 @@ impl Workspace {
             async {}
         });
 
-        Self {
+        let mut workspace = Self {
             focus_handle: cx.focus_handle(),
             window_title: String::new(),
             _quit_subscription: quit_subscription,
@@ -149,7 +210,23 @@ impl Workspace {
             session_save: None,
             body_file_prompt: None,
             environment,
-        }
+            tree: Vec::new(),
+            tree_visible: Vec::new(),
+            collapsed: HashSet::new(),
+            tree_scanned: false,
+            panel_visible: session_panel,
+            panel_selection: None,
+            panel_scroll: UniformListScrollHandle::new(),
+            panel_focus: cx.focus_handle(),
+            tree_scan: None,
+            renaming: None,
+            collection_menu_at: None,
+        };
+
+        // Off-thread and non-blocking, so a large collection cannot delay the first frame —
+        // the panel opens empty and fills in, the same bargain the picker's scan makes.
+        workspace.refresh_tree(cx);
+        workspace
     }
 
     pub fn active(&self) -> Option<Entity<RequestView>> {
@@ -224,6 +301,55 @@ impl Workspace {
         // Unlike `focus_region`, this needs the notify: the strip and the title change
         // even when `window.focus` finds the handle already focused.
         cx.notify();
+    }
+
+    /// The panel's rows as `(depth, name, is_directory)`, for tests.
+    ///
+    /// Reads the real state rather than the last painted frame: `cx.debug_bounds` reports what
+    /// was drawn *previously*, so `is_none()` proves nothing about a row that has just been
+    /// folded away — four context-menu tests already made that mistake.
+    #[cfg(test)]
+    pub(crate) fn tree_rows(&self) -> Vec<(u16, String, bool)> {
+        self.tree_visible
+            .iter()
+            .filter_map(|&ix| self.tree.get(ix))
+            .map(|node| {
+                (
+                    node.depth,
+                    node.name.clone(),
+                    matches!(node.kind, NodeKind::Directory),
+                )
+            })
+            .collect()
+    }
+
+    /// The selected row's name, for tests. `None` when nothing is selected.
+    #[cfg(test)]
+    pub(crate) fn tree_selection(&self) -> Option<String> {
+        self.tree.get(self.panel_selection?).map(|node| node.name.clone())
+    }
+
+    /// The open menu's rows as `(label, keystroke)`, for tests.
+    #[cfg(test)]
+    pub(crate) fn menu_details(&self, cx: &App) -> Vec<(String, String)> {
+        self.menu
+            .as_ref()
+            .map(|state| state.menu.read(cx).row_details())
+            .unwrap_or_default()
+    }
+
+    /// The open context menu's rows, for tests.
+    #[cfg(test)]
+    pub(crate) fn menu_labels(&self, cx: &App) -> Vec<String> {
+        self.menu
+            .as_ref()
+            .map(|state| state.menu.read(cx).row_labels())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panel_is_visible(&self) -> bool {
+        self.panel_visible
     }
 
     /// One `(index, label, is_active)` per open buffer. A method, not a closure in `render`, so
@@ -397,6 +523,648 @@ impl Workspace {
                 );
             });
         }));
+    }
+
+    // --- The collection panel -------------------------------------------------------------
+
+    /// The collection root's own directory name, for the panel's title strip.
+    pub(crate) fn collection_name(&self, cx: &App) -> Option<SharedString> {
+        let root = crate::collections::root(cx)?;
+        root.file_name()
+            .map(|name| SharedString::from(name.to_string_lossy().to_string()))
+    }
+
+    /// Re-read the collection into `tree`.
+    ///
+    /// Scans and builds off-thread (invariant 3): `scan` reads and parses every request file,
+    /// which for a large collection is real work and must never sit on the UI thread. Called
+    /// at startup, when the panel is shown, and after a save — a request you just wrote and
+    /// cannot see in the tree reads as a save that failed.
+    pub(crate) fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.tree.clear();
+            self.tree_scanned = true;
+            self.rebuild_tree_visible();
+            return;
+        };
+
+        let scan = cx.background_executor().spawn(async move {
+            let entries = collection::scan(&root);
+            collection::tree(&root, &entries)
+        });
+
+        // **The selection is restored by path, not by index**, and that distinction is the
+        // whole point of capturing it here. `panel_selection` indexes into `tree`, and a rescan
+        // replaces `tree` wholesale — so saving a request that happens to sort earlier shifts
+        // every row after it and the same index silently means a *different* request. Nothing
+        // on screen would say so.
+        let selected = self
+            .panel_selection
+            .and_then(|ix| self.tree.get(ix))
+            .map(|node| node.path.clone());
+
+        self.tree_scan = Some(cx.spawn(async move |this, cx| {
+            let nodes = scan.await;
+            this.update(cx, |this, cx| {
+                this.tree = nodes;
+                this.tree_scanned = true;
+                // Gone from disk since the last scan means gone from the panel: no selection
+                // rather than a neighbouring row nobody asked for.
+                this.panel_selection = selected
+                    .and_then(|path| this.tree.iter().position(|node| node.path == path));
+                this.rebuild_tree_visible();
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Recompute which rows are drawn, and drop a selection that is no longer one of them.
+    ///
+    /// **The one funnel**, like `BodyView::rebuild_visible`: every mutation of `tree` or
+    /// `collapsed` comes through here, so the check cannot be forgotten by one caller.
+    fn rebuild_tree_visible(&mut self) {
+        let mut visible = Vec::with_capacity(self.tree.len());
+        // While set, every row deeper than this belongs to a collapsed subtree.
+        let mut hidden_below: Option<u16> = None;
+
+        for (ix, node) in self.tree.iter().enumerate() {
+            if let Some(depth) = hidden_below {
+                if node.depth > depth {
+                    continue;
+                }
+                hidden_below = None;
+            }
+            visible.push(ix);
+            if matches!(node.kind, NodeKind::Directory) && self.collapsed.contains(&node.path) {
+                hidden_below = Some(node.depth);
+            }
+        }
+        self.tree_visible = visible;
+
+        // **No clamp here, deliberately.** The response viewer needs one because a fold can
+        // hide the row its cursor is on; this cannot. Both fold paths — the click and
+        // `CollectionCollapse` — select the directory *before* folding it, and `refresh_tree`
+        // re-resolves the selection by path and yields `None` when it is gone. A guard was
+        // written for it and deleted, because breaking it on purpose changed no test: it was
+        // unreachable. Four other guards in this codebase went the same way (architecture.md
+        // §6). **A new fold path must select the directory first**, or this comment is what
+        // it was supposed to warn you about.
+    }
+
+    /// Show or hide the panel.
+    ///
+    /// Three states rather than a bare toggle, matching every editor's sidebar binding: hidden
+    /// shows and focuses, visible-but-elsewhere focuses, and visible-and-focused hides. A bare
+    /// toggle would make the binding *dismiss* the panel whenever you wanted to reach it.
+    fn toggle_collection_panel(
+        &mut self,
+        _: &ToggleCollectionPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.panel_visible {
+            self.panel_visible = true;
+            // Cheap, and a collection edited outside Zuno is the normal case — it is a git
+            // directory, so it changes under us on every pull.
+            self.refresh_tree(cx);
+            window.focus(&self.panel_focus);
+            cx.notify();
+            return;
+        }
+
+        if !self.panel_focus.is_focused(window) {
+            window.focus(&self.panel_focus);
+            cx.notify();
+            return;
+        }
+
+        self.panel_visible = false;
+        // **Focus has to leave with it.** A `FocusHandle` stays focusable whether or not its
+        // element is painted, but action dispatch walks *up the focus tree* — so leaving focus
+        // on an unpainted panel means no path reaches `Workspace` and every binding in the app
+        // silently stops resolving. Same failure as switching `active_ix` without moving focus.
+        self.activate(self.active_ix, window, cx);
+        cx.notify();
+    }
+
+    /// Step the selection by one visible row. `None` starts at the top.
+    fn step_collection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.tree_visible.is_empty() {
+            return;
+        }
+
+        let current = self
+            .panel_selection
+            .and_then(|ix| self.tree_visible.iter().position(|&v| v == ix));
+
+        let next = match current {
+            None if delta > 0 => 0,
+            None => self.tree_visible.len() - 1,
+            Some(pos) => pos.saturating_add_signed(delta).min(self.tree_visible.len() - 1),
+        };
+
+        self.panel_selection = self.tree_visible.get(next).copied();
+        if let Some(pos) = self.panel_selection.and_then(|ix| {
+            self.tree_visible.iter().position(|&v| v == ix)
+        }) {
+            // `uniform_list` addresses items by *visible* index, so the row index has to be
+            // translated — with anything folded above the target the two diverge.
+            self.panel_scroll.scroll_to_item(pos, gpui::ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn collection_next(&mut self, _: &CollectionNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_collection(1, cx);
+    }
+
+    fn collection_prev(&mut self, _: &CollectionPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_collection(-1, cx);
+    }
+
+    fn collection_confirm(
+        &mut self,
+        _: &CollectionConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.panel_selection else { return };
+        self.choose_collection_row(ix, window, cx);
+    }
+
+    /// `left`: close the directory you are on, or step out to the parent of the row you are on.
+    ///
+    /// The second half is what makes `left` useful on a request row, where there is nothing to
+    /// close — without it the key is dead on every leaf, which reads as broken.
+    fn collection_collapse(
+        &mut self,
+        _: &CollectionCollapse,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self.panel_selection else { return };
+        let Some(node) = self.tree.get(ix) else { return };
+
+        let open_directory = matches!(node.kind, NodeKind::Directory)
+            && !self.collapsed.contains(&node.path);
+
+        if open_directory {
+            self.collapsed.insert(node.path.clone());
+            self.rebuild_tree_visible();
+            cx.notify();
+            return;
+        }
+
+        // Step to the parent: the nearest earlier row one level shallower.
+        let depth = node.depth;
+        if depth == 0 {
+            return;
+        }
+        if let Some(parent) = self.tree[..ix]
+            .iter()
+            .rposition(|candidate| candidate.depth == depth - 1)
+        {
+            self.panel_selection = Some(parent);
+            cx.notify();
+        }
+    }
+
+    /// `right`: open the directory you are on, or step into it if it is already open.
+    fn collection_expand(&mut self, _: &CollectionExpand, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.panel_selection else { return };
+        let Some(node) = self.tree.get(ix) else { return };
+        if !matches!(node.kind, NodeKind::Directory) {
+            return;
+        }
+
+        if self.collapsed.remove(&node.path) {
+            self.rebuild_tree_visible();
+        } else if self.tree.get(ix + 1).is_some_and(|next| next.depth > node.depth) {
+            self.panel_selection = Some(ix + 1);
+        }
+        cx.notify();
+    }
+
+    /// Select a row and act on it: a directory folds, a request opens.
+    ///
+    /// Shared by the click and by `CollectionConfirm`, so the mouse path and the keyboard path
+    /// cannot become different verbs — the mistake "actions, not direct calls" exists to
+    /// prevent, caught four times already in this codebase.
+    pub(crate) fn choose_collection_row(
+        &mut self,
+        row_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.tree.get(row_ix) else { return };
+        let path = node.path.clone();
+        let is_directory = matches!(node.kind, NodeKind::Directory);
+        self.panel_selection = Some(row_ix);
+
+        if is_directory {
+            if !self.collapsed.remove(&path) {
+                self.collapsed.insert(path);
+            }
+            self.rebuild_tree_visible();
+            cx.notify();
+            return;
+        }
+
+        self.open_collection_file(path, window, cx);
+        // **Focus stays in the panel**, deliberately, and this line is what makes the keyboard
+        // path agree with the mouse one. `open_collection_file` routes through `activate`,
+        // which focuses the URL bar; on a click the panel's own `track_focus` listener fires
+        // afterwards and takes it back, so without this Enter and click would leave focus in
+        // different places. Staying is also the more useful of the two — browsing a collection
+        // means opening several in a row, and that needs the arrow keys to keep working.
+        window.focus(&self.panel_focus);
+        cx.notify();
+    }
+
+    /// Place the selection without acting on the row. The right-click path needs this so
+    /// `DeleteRequest` can carry no index and still be unambiguous.
+    pub(crate) fn select_collection_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
+        if row_ix < self.tree.len() {
+            self.panel_selection = Some(row_ix);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn set_collection_menu_anchor(&mut self, at: gpui::Point<gpui::Pixels>) {
+        self.collection_menu_at = Some(at);
+    }
+
+    /// Where a menu for the panel should appear.
+    ///
+    /// A right-click supplies the point. The `delete` key does not, so it falls back to a spot
+    /// inside the panel — near enough to the tree to read as belonging to it, and `anchored()`
+    /// flips the corner near a window edge on its own.
+    fn collection_menu_anchor(&self) -> gpui::Point<gpui::Pixels> {
+        self.collection_menu_at
+            .unwrap_or_else(|| gpui::point(px(crate::collection_panel::WIDTH * 0.5), px(160.)))
+    }
+
+    /// The selected row, when it is a request. Directories are excluded deliberately:
+    /// `collection::remove` refuses a directory, and offering a verb that always fails is worse
+    /// than not offering it.
+    fn selected_request(&self) -> Option<&Node> {
+        let node = self.tree.get(self.panel_selection?)?;
+        matches!(node.kind, NodeKind::Request { .. }).then_some(node)
+    }
+
+    fn open_collection_menu(
+        &mut self,
+        _: &OpenCollectionMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() || self.selected_request().is_none() {
+            return;
+        }
+        let at = self.collection_menu_anchor();
+        let focus = self.panel_focus.clone();
+        let restore = Some(focus.clone());
+
+        // Grouped by consequence, which is also roughly by risk: leaving Zuno, then making a
+        // copy, then reading something out, then changing or removing the file. The two
+        // destructive rows sit last and together, so the pointer never passes over them on the
+        // way to something harmless.
+        use context_menu::{MenuItem, MenuRow};
+        let rows = vec![
+            MenuItem::new("Reveal in file manager", RevealRequest, &focus, window).into(),
+            MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("Duplicate", DuplicateRequest, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
+            MenuItem::new("Copy relative path", CopyRequestRelativePath, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("Rename", RenameRequest, &focus, window).into(),
+            MenuItem::new("Move to trash", TrashRequest, &focus, window).into(),
+            // The ellipsis is load-bearing: this row asks, the one above it acts. Trash is
+            // recoverable and delete is not, which is the whole reason only one of them stops
+            // to check.
+            MenuItem::new("Delete…", DeleteRequest, &focus, window).into(),
+        ];
+        self.show_menu(rows, at, restore, window, cx);
+    }
+
+    /// Ask. **This removes nothing** — `ConfirmDeleteRequest` is the only thing that does.
+    ///
+    /// The confirmation is a second menu rather than a modal of its own, which is what keeps it
+    /// cheap: it inherits the primitive's keyboard handling, its `Escape`, and its occlusion.
+    /// The destructive row names the file, because "are you sure?" without a subject is how the
+    /// wrong thing gets deleted confidently.
+    fn delete_request(&mut self, _: &DeleteRequest, window: &mut Window, cx: &mut Context<Self>) {
+        // Reachable from the `delete` key with a menu already open, and from the menu row that
+        // opened one — where `show_menu` would otherwise refuse as a stacked modal.
+        self.close_row_menu(window, cx);
+
+        let Some(node) = self.selected_request() else { return };
+        let name = node.name.clone();
+        let at = self.collection_menu_anchor();
+        let restore = Some(self.panel_focus.clone());
+
+        let rows = vec![
+            // Not `MenuItem::new`: this row is reached by choosing the one above it, never by a
+            // keystroke, so a keymap lookup would draw an empty column implying one exists.
+            context_menu::MenuItem::plain(format!("Delete {name}"), ConfirmDeleteRequest).into(),
+            context_menu::MenuItem::dismiss("Keep it").into(),
+        ];
+        self.show_menu(rows, at, restore, window, cx);
+    }
+
+    /// Delete the selected request's file.
+    fn confirm_delete_request(
+        &mut self,
+        _: &ConfirmDeleteRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.collection_menu_at = None;
+        let Some(node) = self.selected_request() else { return };
+        let (path, name) = (node.path.clone(), node.name.clone());
+
+        if let Err(error) = collection::remove(&path) {
+            self.set_status(&format!("Could not delete: {error}"), cx);
+            return;
+        }
+
+        // **Any buffer open on that file forgets it.** `save_request` writes to a remembered
+        // `path` with no existence check, so leaving it set means the next Ctrl+S silently
+        // recreates the file you just deleted — and the buffer stays open, which is right: the
+        // request is still in front of you, it simply has no file any more.
+        for view in &self.views {
+            if view.read(cx).path.as_deref() == Some(path.as_path()) {
+                view.update(cx, |view, cx| {
+                    view.path = None;
+                    cx.notify();
+                });
+            }
+        }
+
+        self.refresh_tree(cx);
+        // Focus goes back to the panel: `close_menu` restored it there, and `refresh_tree` does
+        // not move it, but a delete that leaves the tree unfocused would strand the next key.
+        window.focus(&self.panel_focus);
+        self.set_status(&format!("Deleted {name}"), cx);
+    }
+
+    /// The selected request's path relative to the collection root, with `/` separators.
+    ///
+    /// Derived rather than stored on `Node`: it is wanted by exactly one verb, and a second
+    /// copy of the string on every row of a large collection is memory spent on a menu item.
+    fn selected_relative(&self, cx: &App) -> Option<String> {
+        let path = self.selected_request()?.path.clone();
+        let root = crate::collections::root(cx)?;
+        Some(
+            path.strip_prefix(root)
+                .unwrap_or(&path)
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    }
+
+    /// Hand the file to the desktop's file manager, selecting it.
+    ///
+    /// One call, deliberately: `reveal_path` is `unimplemented!()` in gpui's test platform, so
+    /// nothing here can be driven headlessly. What *is* testable is that the menu offers the
+    /// row against the right selection, which is where the mistake would be.
+    fn reveal_request(&mut self, _: &RevealRequest, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.selected_request() else { return };
+        let path = node.path.clone();
+        cx.reveal_path(&path);
+    }
+
+    /// Open the file in whatever the desktop associates with `.json`. Same testability note as
+    /// `reveal_request` — `open_with_system` is `unimplemented!()` headlessly.
+    fn open_request_externally(
+        &mut self,
+        _: &OpenRequestExternally,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.selected_request() else { return };
+        let path = node.path.clone();
+        cx.open_with_system(&path);
+    }
+
+    fn copy_request_path(&mut self, _: &CopyRequestPath, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.selected_request() else { return };
+        let path = node.path.display().to_string();
+        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+        self.set_status(&format!("Copied {path}"), cx);
+    }
+
+    fn copy_request_relative_path(
+        &mut self,
+        _: &CopyRequestRelativePath,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(relative) = self.selected_relative(cx) else { return };
+        cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
+        self.set_status(&format!("Copied {relative}"), cx);
+    }
+
+    /// Copy the selected request to a fresh name beside it.
+    ///
+    /// The copy is **not** opened as a buffer. Duplicating is how you start a variant of a
+    /// request you are about to edit, so landing on it would be defensible — but it is also how
+    /// you take a backup before a risky change, and opening a tab you did not ask for is the
+    /// worse failure of the two. The status bar names what appeared instead.
+    fn duplicate_request(&mut self, _: &DuplicateRequest, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.selected_request() else { return };
+        let path = node.path.clone();
+        match collection::duplicate(&path) {
+            Ok(copy) => {
+                let name = copy
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.refresh_tree(cx);
+                self.set_status(&format!("Duplicated as {name}"), cx);
+            }
+            Err(error) => self.set_status(&format!("Could not duplicate: {error}"), cx),
+        }
+    }
+
+    /// Move the selected request to the desktop trash.
+    ///
+    /// Unlike `Delete` this asks nothing, and that asymmetry is the point: the confirmation on
+    /// delete exists because it cannot be undone, and trashing can. A dialog in front of a
+    /// recoverable action trains people to dismiss dialogs.
+    fn trash_request(&mut self, _: &TrashRequest, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.selected_request() else { return };
+        let (path, name) = (node.path.clone(), node.name.clone());
+
+        if let Err(error) = collection::trash(&path) {
+            self.set_status(&format!("Could not trash: {error}"), cx);
+            return;
+        }
+
+        self.forget_path(&path, cx);
+        self.refresh_tree(cx);
+        window.focus(&self.panel_focus);
+        self.set_status(&format!("Moved {name} to the trash"), cx);
+    }
+
+    /// Any buffer open on `path` forgets it, keeping its contents.
+    ///
+    /// `save_request` writes to a remembered `path` with **no existence check**, so a buffer
+    /// still holding a deleted or trashed file's path silently recreates it on the next Ctrl+S.
+    /// The buffer stays open on purpose: the request is still in front of you, it simply has no
+    /// file any more.
+    fn forget_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        for view in &self.views {
+            if view.read(cx).path.as_deref() == Some(path) {
+                view.update(cx, |view, cx| {
+                    view.path = None;
+                    cx.notify();
+                });
+            }
+        }
+    }
+
+    /// Open the rename box on the selected request.
+    fn rename_request(&mut self, _: &RenameRequest, window: &mut Window, cx: &mut Context<Self>) {
+        // A menu row dispatched this, and it is still open until closed.
+        self.close_row_menu(window, cx);
+
+        let Some(node) = self.selected_request() else { return };
+        let row_ix = self.panel_selection.unwrap_or_default();
+        let (path, name) = (node.path.clone(), node.name.clone());
+
+        // Seeded with the current name and fully selected, so typing replaces it while `End`
+        // keeps it — what every rename box does.
+        let input = cx.new(|cx| {
+            let mut input = crate::input::TextInput::new(name, "name", "CollectionRename", cx);
+            input.select_all_text(cx);
+            input
+        });
+        let handle = input.read(cx).focus_handle(cx);
+
+        // **Cancel on blur.** Clicking elsewhere has to end the rename, or the box stays on
+        // screen unfocused and a later `Enter` commits an edit the user walked away from.
+        // Cancel rather than commit, unlike VS Code: a rename is a file operation, and the safe
+        // reading of "clicked somewhere else" is that it was not meant.
+        let blur = window.on_focus_out(&handle, cx, |_, window, cx| {
+            window.dispatch_action(Box::new(CancelRename), cx);
+        });
+
+        self.renaming = Some(RenameState {
+            row_ix,
+            path,
+            input,
+            _blur: blur,
+        });
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, _: &CancelRename, window: &mut Window, cx: &mut Context<Self>) {
+        // Idempotent: committing drops the state and then moves focus, which fires the blur
+        // listener, which dispatches this. Without the `take` that would be a second cancel
+        // racing the commit it followed.
+        if self.renaming.take().is_some() {
+            window.focus(&self.panel_focus);
+            cx.notify();
+        }
+    }
+
+    fn commit_rename(&mut self, _: &CommitRename, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.renaming.take() else { return };
+        let typed = state.input.read(cx).text().to_string();
+        // Focus first: the box is gone from the next frame either way, and leaving focus on a
+        // dropped entity is the "keymap goes dead with nothing on screen" failure.
+        window.focus(&self.panel_focus);
+
+        if typed.trim().is_empty() {
+            self.set_status("A request needs a name", cx);
+            cx.notify();
+            return;
+        }
+
+        match collection::rename(&state.path, &typed) {
+            Ok(renamed) => {
+                // The buffer follows the file rather than forgetting it: unlike a delete, the
+                // request still exists and Ctrl+S should still overwrite *it*.
+                for view in &self.views {
+                    if view.read(cx).path.as_deref() == Some(state.path.as_path()) {
+                        let renamed = renamed.clone();
+                        view.update(cx, |view, cx| {
+                            view.path = Some(renamed);
+                            cx.notify();
+                        });
+                    }
+                }
+                self.refresh_tree(cx);
+            }
+            Err(error) => self.set_status(&format!("Could not rename: {error}"), cx),
+        }
+        cx.notify();
+    }
+
+    /// The row being renamed and its input, if one is.
+    pub(crate) fn renaming_row(&self) -> Option<(usize, Entity<crate::input::TextInput>)> {
+        let state = self.renaming.as_ref()?;
+        Some((state.row_ix, state.input.clone()))
+    }
+
+    /// Open a request file as a buffer, remembering where it came from.
+    ///
+    /// **A file already open is activated, not opened again.** `Ctrl+P` gets this by filtering
+    /// open paths out of its list, which the panel cannot do — a tree that hides the requests
+    /// you have open would be worse than the duplicate. So the rule lives here instead, where
+    /// both paths inherit it, and the picker gains the case its filter cannot cover: the filter
+    /// is only as fresh as the scan behind it.
+    ///
+    /// Shared by the panel and by the picker's `Target::File`. **The caller decides focus**:
+    /// the picker leaves it in the new buffer (`choosing_a_buffer_leaves_focus_in_that_buffer`),
+    /// the panel keeps it in the tree.
+    fn open_collection_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ix) = self
+            .views
+            .iter()
+            .position(|view| view.read(cx).path.as_deref() == Some(path.as_path()))
+        {
+            self.activate(ix, window, cx);
+            return;
+        }
+
+        // The file may have been deleted or broken since the scan; report rather than
+        // opening an empty buffer.
+        let spec = match collection::read(&path) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.set_status(&format!("Could not open: {error}"), cx);
+                return;
+            }
+        };
+
+        // Stored ids are always 0 (see `collection`), so a live one is assigned here — the
+        // workspace is the only thing that knows which are taken.
+        let spec = RequestSpec {
+            id: self.next_id(cx),
+            ..spec
+        };
+        self.open(spec, window, cx);
+        // Remembering the file is what makes a later Ctrl+S overwrite it rather than derive a
+        // fresh name beside it.
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| {
+                view.path = Some(path);
+                cx.notify();
+            });
+        }
     }
 
     /// Open the command palette: every verb in `commands::palette`, with its keybinding.
@@ -695,31 +1463,10 @@ impl Workspace {
                 }
             }
             picker::Target::File(path) => {
-                // The file may have been deleted or broken since the scan; report rather
-                // than opening an empty buffer.
-                let spec = match zuno_core::collection::read(&path) {
-                    Ok(spec) => spec,
-                    Err(error) => {
-                        self.set_status(&format!("Could not open: {error}"), cx);
-                        return;
-                    }
-                };
-
-                // Stored ids are always 0 (see `collection`), so a live one is assigned
-                // here — the workspace is the only thing that knows which are taken.
-                let spec = RequestSpec {
-                    id: self.next_id(cx),
-                    ..spec
-                };
-                self.open(spec, window, cx);
-                // Remembering the file is what makes a later Ctrl+S overwrite it rather
-                // than derive a fresh name beside it.
-                if let Some(view) = self.active() {
-                    view.update(cx, |view, cx| {
-                        view.path = Some(path);
-                        cx.notify();
-                    });
-                }
+                // Focus is left where `activate` put it — inside the new buffer. The panel
+                // shares this method and re-focuses itself afterwards; see
+                // `choose_collection_row`.
+                self.open_collection_file(path, window, cx);
             }
         }
     }
@@ -908,7 +1655,12 @@ impl Workspace {
                 }
             })
             .collect();
-        crate::session::Session::new(tabs, self.active_ix, self.environment.clone())
+        crate::session::Session::new(
+            tabs,
+            self.active_ix,
+            self.environment.clone(),
+            self.panel_visible,
+        )
     }
 
     /// `Window::focus` refreshes the whole window internally, so there's no
@@ -1408,13 +2160,17 @@ impl Workspace {
             return;
         }
 
+        // The verbs act on the response pane, so their keystrokes are the ones that mean
+        // something *there* — all three are scoped to it.
+        let focus = view.read(cx).response_focus.clone();
         let mut items = vec![context_menu::MenuItem::new(
             "Copy value",
             CopyRowValue,
+            &focus,
             window,
         )];
         if view.read(cx).selected_body_path().is_some() {
-            items.push(context_menu::MenuItem::new("Copy path", CopyRowPath, window));
+            items.push(context_menu::MenuItem::new("Copy path", CopyRowPath, &focus, window));
         }
         if view.read(cx).selected_is_container() {
             let label = if view.read(cx).selected_is_folded() {
@@ -1422,10 +2178,10 @@ impl Workspace {
             } else {
                 "Fold"
             };
-            items.push(context_menu::MenuItem::new(label, ToggleFold, window));
+            items.push(context_menu::MenuItem::new(label, ToggleFold, &focus, window));
         }
 
-        let restore = Some(view.read(cx).response_focus.clone());
+        let restore = Some(focus);
         self.show_menu(items.into_iter().map(Into::into).collect(), at, restore, window, cx);
     }
 
@@ -1439,11 +2195,15 @@ impl Workspace {
     fn app_menu_rows(&self, window: &Window) -> Vec<context_menu::MenuRow> {
         use context_menu::{MenuItem, MenuRow};
 
+        // Every verb here is bound globally, so the context this resolves against does not
+        // matter — but it still has to be *a* handle, and `Workspace`'s is the honest one: the
+        // app menu belongs to the window rather than to any pane.
+        let focus = self.focus_handle.clone();
         let repo = env!("CARGO_PKG_REPOSITORY");
         vec![
-            MenuItem::new("Find request", OpenRequest, window).into(),
-            MenuItem::new("Command palette", OpenPalette, window).into(),
-            MenuItem::new("Request settings", OpenSettings, window).into(),
+            MenuItem::new("Find request", OpenRequest, &focus, window).into(),
+            MenuItem::new("Command palette", OpenPalette, &focus, window).into(),
+            MenuItem::new("Request settings", OpenSettings, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::url("Documentation", "", repo).into(),
             // Prefilled with the version and platform, because the two facts every bug report
@@ -1455,7 +2215,7 @@ impl Workspace {
             MenuRow::Separator,
             // Last, and behind a rule: it is the one item here that loses work, and putting it
             // next to a link is how a misclick happens.
-            MenuItem::new("Quit", Quit, window).into(),
+            MenuItem::new("Quit", Quit, &focus, window).into(),
         ]
     }
 
@@ -1497,6 +2257,8 @@ impl Workspace {
                             window.dispatch_action(action, cx)
                         }
                         context_menu::MenuCommand::OpenUrl(url) => cx.open_url(&url),
+                        // The opener has already closed the menu, which is the whole effect.
+                        context_menu::MenuCommand::Dismiss => {}
                     }
                 }
             });
@@ -1781,6 +2543,11 @@ impl Workspace {
             view.path = Some(path);
             cx.notify();
         });
+        // A request you just saved and cannot find in the tree reads as a save that failed.
+        // Rescans on every save rather than splicing the one row in: a save can also *move*
+        // a request into a directory that doesn't exist yet, and a splice would have to
+        // reproduce `tree`'s ordering rules to put it in the right place.
+        self.refresh_tree(cx);
         self.set_status(&format!("Saved to {shown}"), cx);
     }
 
@@ -1884,6 +2651,24 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::focus_next))
             .on_action(cx.listener(Self::focus_prev))
             .on_action(cx.listener(Self::open_request))
+            .on_action(cx.listener(Self::toggle_collection_panel))
+            .on_action(cx.listener(Self::collection_next))
+            .on_action(cx.listener(Self::collection_prev))
+            .on_action(cx.listener(Self::collection_confirm))
+            .on_action(cx.listener(Self::collection_collapse))
+            .on_action(cx.listener(Self::collection_expand))
+            .on_action(cx.listener(Self::open_collection_menu))
+            .on_action(cx.listener(Self::delete_request))
+            .on_action(cx.listener(Self::confirm_delete_request))
+            .on_action(cx.listener(Self::trash_request))
+            .on_action(cx.listener(Self::duplicate_request))
+            .on_action(cx.listener(Self::reveal_request))
+            .on_action(cx.listener(Self::open_request_externally))
+            .on_action(cx.listener(Self::copy_request_path))
+            .on_action(cx.listener(Self::copy_request_relative_path))
+            .on_action(cx.listener(Self::rename_request))
+            .on_action(cx.listener(Self::commit_rename))
+            .on_action(cx.listener(Self::cancel_rename))
             .on_action(cx.listener(Self::switch_environment))
             .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::open_palette))
@@ -1961,8 +2746,41 @@ impl Render for Workspace {
             .text_sm()
             .relative()
             .child(crate::chrome::titlebar(title, &theme, window))
-            .children(tab_strip(tabs, &theme, cx))
-            .children(self.active())
+            // **The tab strip belongs to the editor area, not to the window.** It spanned the
+            // full width for one slice, which put tabs above the collection panel — a strip of
+            // open *buffers* drawn over a tree of saved *files*, describing something the panel
+            // has nothing to do with. So the panel is a full-height column between the titlebar
+            // and the status bar, and the strip sits inside the column to its right, the layout
+            // every editor with a sidebar uses.
+            //
+            // The status bar still spans the window, which is the same convention rather than an
+            // inconsistency: it describes the application, the strip describes one pane.
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    // Panel first: it is leftmost, and paint order decides hit-testing between
+                    // siblings.
+                    .children(
+                        self.panel_visible
+                            .then(|| crate::collection_panel::render(self, &theme, window, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            // The panel is a fixed width, so the panes are what must give when
+                            // the window narrows. Without this the column's content sets a floor
+                            // and the two together overflow instead.
+                            .min_w(px(0.))
+                            .overflow_hidden()
+                            .children(tab_strip(tabs, &theme, cx))
+                            .children(self.active()),
+                    ),
+            )
             .child(status_bar(
                 focused_region,
                 status_message,
@@ -2269,12 +3087,41 @@ pub fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
 ///
 /// Empty when the action is unbound, and **callers must check** — a sentence with a hole where the
 /// key should be is worse than one that never offered a key. See `request_pane::hint_row`.
-pub fn keybinding_label(action: &dyn gpui::Action, window: &Window) -> String {
-    let bindings = window.bindings_for_action(action);
-    let Some(binding) = bindings.first() else {
-        return String::new();
-    };
+/// The keystroke for an action *as reached from `focus`*, spelled for display.
+///
+/// **`keybinding_label` cannot answer this, and the difference is not a nuance.**
+/// `Window::bindings_for_action` matches against `rendered_frame.dispatch_tree.context_stack`,
+/// which is a **build-time stack**: `push_node` pushes a context and `pop_node` pops it, so by
+/// the time a frame is finished it is empty. An empty stack matches only bindings registered
+/// with `None` context — so every *scoped* binding looks unbound.
+///
+/// That is why the row menus have advertised nothing since they shipped. `Copy value` is
+/// `ctrl-c` in `ResponsePane`, `Copy path` is `alt-c`, `Rename` is `f2` in `CollectionPanel`:
+/// all scoped, all resolving to an empty column, in a menu whose stated purpose is to teach the
+/// keystroke. `bindings_for_action_in` rebuilds the stack from a focus handle instead, which is
+/// exactly the question a menu is asking — "what does this key mean *in the pane these verbs
+/// act on*". A global binding still resolves, because a `None` predicate matches any stack, so
+/// this is one path rather than a special case.
+pub fn keybinding_label_in(
+    action: &dyn gpui::Action,
+    focus: &FocusHandle,
+    window: &Window,
+) -> String {
+    match window.bindings_for_action_in(action, focus).first() {
+        Some(binding) => spell(binding),
+        None => String::new(),
+    }
+}
 
+pub fn keybinding_label(action: &dyn gpui::Action, window: &Window) -> String {
+    match window.bindings_for_action(action).first() {
+        Some(binding) => spell(binding),
+        None => String::new(),
+    }
+}
+
+/// Spell one binding the way UI copy does — `Ctrl+Shift+H`, not gpui's `ctrl-shift-h`.
+fn spell(binding: &gpui::KeyBinding) -> String {
     binding
         .keystrokes()
         .iter()
