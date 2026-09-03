@@ -172,7 +172,7 @@ fn header(
                 // The toggle sits in the titlebar, where it stays reachable in both states.
                 .child(icon_button(
                     "collection-new-folder",
-                    Icon::Plus,
+                    Icon::FolderPlus,
                     "New folder",
                     NewFolder,
                     theme,

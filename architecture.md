@@ -1236,9 +1236,11 @@ by hand in a terminal, which made the panel a viewer of a structure the app coul
   key — the invisible-state failure this codebase keeps paying for. Save, then move: two steps,
   both predictable, and it is what a file manager would make you do too.
 - **New folder follows the selection**, the file-tree convention: inside a selected directory,
-  beside a selected request, at the root when nothing is selected. It has a `+` in the panel
+  beside a selected request, at the root when nothing is selected. It has a button in the panel
   header as well as `Ctrl+Shift+N` and a menu row, because a verb reachable only by right-click
-  is the discoverability gap §2 exists for.
+  is the discoverability gap §2 exists for. The button is `FolderPlus` rather than a bare `+`:
+  the header holds one control now, so the glyph has to say *what* it adds on its own, and it
+  shares the silhouette of the `Folder` rows it creates.
 - **The name box is a row in the tree, as the *first* child of its parent.** It shipped as a strip
   under the header naming its destination (`billing` beside the box), on the reasoning that a
   phantom row would have to be threaded through the fold walk, the selection clamp and every
