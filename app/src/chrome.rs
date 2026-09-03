@@ -32,7 +32,12 @@ const RESIZE_GRAB: f32 = 6.0;
 /// The bar's height, which the application menu anchors itself below.
 pub const TITLEBAR_HEIGHT: f32 = 34.;
 
-pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl IntoElement {
+pub fn titlebar(
+    title: SharedString,
+    panel_visible: bool,
+    theme: &Theme,
+    window: &Window,
+) -> impl IntoElement {
     let controls = window.window_controls();
     let maximized = window.is_maximized();
 
@@ -114,6 +119,31 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                             crate::ui::GLYPH_INLINE,
                         )),
                 )
+                // **The panel's toggle lives here, not in the panel.** It was a `×` in the
+                // panel's own header, which could only ever hide: pressing it took the button
+                // away with the panel, leaving no mouse path back at all — `Ctrl+Shift+E` or the
+                // command palette were the only ways to recover it. A control that can perform
+                // half of a toggle has to sit outside the thing it toggles.
+                //
+                // The `×` was wrong twice over. It is the same glyph the window close, the tab
+                // close and the row delete use, all of which destroy something, while this only
+                // changes what is on screen — and the panel's visibility is persisted, so it is
+                // a view preference rather than a dismissal.
+                //
+                // The icon names what the click will *do*, like the theme toggle beside it and
+                // the maximize button: the chevron points in the direction the panel is about
+                // to move.
+                .child(crate::ui::icon_button(
+                    "collection-toggle",
+                    if panel_visible {
+                        Icon::PanelLeftClose
+                    } else {
+                        Icon::PanelLeftOpen
+                    },
+                    "Show or hide the collection panel",
+                    crate::actions::ToggleCollectionPanel,
+                    theme,
+                ))
                 .child(crate::ui::separator(&theme))
                 .child(
                     div()

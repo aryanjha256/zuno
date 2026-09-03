@@ -3169,7 +3169,12 @@ impl Render for Workspace {
             .text_color(theme.text)
             .text_sm()
             .relative()
-            .child(crate::chrome::titlebar(title, &theme, window))
+            .child(crate::chrome::titlebar(
+                title,
+                self.panel_visible,
+                &theme,
+                window,
+            ))
             // **The tab strip belongs to the editor area, not to the window.** It spanned the
             // full width for one slice, which put tabs above the collection panel — a strip of
             // open *buffers* drawn over a tree of saved *files*, describing something the panel

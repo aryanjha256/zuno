@@ -23,7 +23,7 @@ use gpui::{
 };
 use zuno_core::collection::{Node, NodeKind};
 
-use crate::actions::{NewFolder, OpenCollectionMenu, ToggleCollectionPanel};
+use crate::actions::{NewFolder, OpenCollectionMenu};
 use gpui::Action as _;
 use crate::theme::Theme;
 use crate::ui::{Icon, glyph, icon_button};
@@ -167,18 +167,14 @@ fn header(
                 .flex_row()
                 .items_center()
                 .flex_none()
+                // No hide button here. It was a `×`, and a control that can only *hide* the
+                // panel it lives in takes itself away with it — there was no mouse path back.
+                // The toggle sits in the titlebar, where it stays reachable in both states.
                 .child(icon_button(
                     "collection-new-folder",
                     Icon::Plus,
                     "New folder",
                     NewFolder,
-                    theme,
-                ))
-                .child(icon_button(
-                    "collection-hide",
-                    Icon::Close,
-                    "Hide the collection panel",
-                    ToggleCollectionPanel,
                     theme,
                 )),
         )

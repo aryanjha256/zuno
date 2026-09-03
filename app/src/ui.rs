@@ -64,6 +64,8 @@ pub enum Icon {
     Restore,
     Sun,
     Moon,
+    PanelLeftOpen,
+    PanelLeftClose,
 }
 
 impl Icon {
@@ -92,6 +94,8 @@ impl Icon {
             Icon::Restore => "icons/restore.svg",
             Icon::Sun => "icons/sun.svg",
             Icon::Moon => "icons/moon.svg",
+            Icon::PanelLeftOpen => "icons/panel-left-open.svg",
+            Icon::PanelLeftClose => "icons/panel-left-close.svg",
         }
     }
 
@@ -120,6 +124,8 @@ impl Icon {
         Icon::Restore,
         Icon::Sun,
         Icon::Moon,
+        Icon::PanelLeftOpen,
+        Icon::PanelLeftClose,
     ];
 }
 
@@ -149,6 +155,8 @@ impl AssetSource for Assets {
             "icons/restore.svg" => include_bytes!("../assets/icons/restore.svg"),
             "icons/sun.svg" => include_bytes!("../assets/icons/sun.svg"),
             "icons/moon.svg" => include_bytes!("../assets/icons/moon.svg"),
+            "icons/panel-left-open.svg" => include_bytes!("../assets/icons/panel-left-open.svg"),
+            "icons/panel-left-close.svg" => include_bytes!("../assets/icons/panel-left-close.svg"),
             _ => return Ok(None),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))

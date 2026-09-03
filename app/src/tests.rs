@@ -4250,7 +4250,7 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("theme-toggle", "zuno::ToggleTheme"),
         ("fold-all", "zuno::FoldAll"),
         ("unfold-all", "zuno::UnfoldAll"),
-        ("collection-hide", "zuno::ToggleCollectionPanel"),
+        ("collection-toggle", "zuno::ToggleCollectionPanel"),
     ]
 }
 
@@ -4346,6 +4346,47 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
         "clicking fold-all must fold"
     );
 
+}
+
+#[gpui::test]
+async fn the_panel_toggle_is_still_there_once_the_panel_is_hidden(cx: &mut TestAppContext) {
+    // The reason this button moved out of the panel. As a `×` in the panel's own header it took
+    // itself away with the panel, so the only ways back were `Ctrl+Shift+E` and the palette —
+    // neither of which is on screen. `affordances()` cannot catch that: it renders the default
+    // state, where the panel is visible and the button is present either way.
+    let (window, _, mut cx) = boot(cx, None, None);
+    cx.run_until_parked();
+
+    let visible = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, _| workspace.panel_is_visible())
+            .expect("window")
+    };
+
+    // Two presses: the first focuses the panel, the second hides it. That middle step is
+    // `toggle_collection_panel`'s deliberate three-state behaviour, not an accident here.
+    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.run_until_parked();
+    assert!(!visible(&mut cx), "the panel must be hidden before the real assertion");
+
+    // **The click is the assertion, not the lookup.** `debug_bounds` reads the last rendered
+    // frame and a removed element keeps its entry until another one is drawn, so this `expect`
+    // cannot tell "still painted" from "stale" — it is here to name the button, not to prove it
+    // exists. Breaking this on purpose (rendering the toggle only while the panel is visible)
+    // returns stale bounds, the click lands on bare titlebar, and gpui panics in
+    // `start_window_move`. Failing either way is the point; the line below is the one that
+    // says what went wrong.
+    let toggle = cx.debug_bounds("collection-toggle").expect("toggle button");
+
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        visible(&mut cx),
+        "clicking the titlebar toggle must bring the panel back — with no working control here \
+         the only ways to recover a hidden panel are Ctrl+Shift+E and the command palette, \
+         neither of which is on screen"
+    );
 }
 
 #[gpui::test]

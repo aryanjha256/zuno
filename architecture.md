@@ -1084,6 +1084,31 @@ Decisions worth keeping:
   rides in the session envelope (v4). Spelled out as its own `SessionV3` rather than given a
   serde default, per invariant 8 — a default cannot tell "written by an older Zuno" from
   "written by this one, with the panel hidden", and those two want opposite answers.
+- **The toggle lives in the titlebar, not in the panel.** It shipped as a `×` in the panel's
+  own header, which can only ever perform *half* of a toggle: pressing it took the button away
+  along with the panel, and since `panel_visible` gates the whole render there is no rail or stub
+  left behind — so the only ways back were `Ctrl+Shift+E` and the palette, neither of which is on
+  screen. That is §2's discoverability gap inverted: the window taught you how to lose the panel
+  and nothing taught you how to recover it.
+
+  The glyph was wrong independently of where it sat. `Icon::Close` is the same `×` used by the
+  window close, the tab close and the row delete, all of which destroy something; this only
+  changes what is drawn, and the state is persisted, which makes it a view preference rather than
+  a dismissal. `PanelLeftOpen`/`PanelLeftClose` name what the click will *do*, the rule the
+  maximize button and the theme toggle beside it already follow.
+
+  `ToggleCollectionPanel` is unchanged, and deliberately so — its three-state behaviour (hidden →
+  show and focus, visible-but-elsewhere → focus, visible-and-focused → hide) is right for the
+  binding, and a button that is always on screen no longer needs a verb of its own. The cost is
+  known and accepted: clicking the toggle while the panel is open but *unfocused* focuses it
+  rather than hiding it, so that case takes two clicks.
+
+  **The test asserts the click, not the button's presence.** `debug_bounds` reads the last
+  rendered frame and a removed element keeps its entry until another is drawn, so a lookup cannot
+  distinguish "still painted" from "stale". `the_panel_toggle_is_still_there_once_the_panel_is_
+  hidden` hides the panel and clicks the toggle, asserting the panel comes *back*;
+  `affordances()` cannot cover this, because it renders the default state where the panel is
+  visible and the button is present either way.
 - **Not a tab stop**, unlike `response_focus`. `Tab` walks the active request's inputs, and a
   pane-level stop painted before all of them would turn the first `Tab` from "url → method" into
   "panel → url" for every existing user. It has a binding and a click target and loses nothing.
