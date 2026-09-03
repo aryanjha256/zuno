@@ -336,6 +336,36 @@ pub fn elide(label: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Shorten a label by dropping its **head**, keeping the tail.
+///
+/// The mirror of `elide`, and which one a column wants depends on where its information sits.
+/// A path's head names the collection and its tail is one more request, so it keeps the head.
+/// A URL's head is the `http://host:port` every row in a list repeats and its tail is the
+/// endpoint that tells them apart, so it keeps the tail — trimmed the other way, every row in a
+/// collection reads `http://localhost:8080/api/notif…`.
+pub fn elide_front(label: &str, max_chars: usize) -> std::borrow::Cow<'_, str> {
+    let count = label.chars().count();
+    if max_chars == 0 {
+        return std::borrow::Cow::Borrowed("");
+    }
+    if count <= max_chars {
+        return std::borrow::Cow::Borrowed(label);
+    }
+
+    // `- 1` for the ellipsis; by char, not byte, since a path segment can be multi-byte.
+    let keep = max_chars - 1;
+    let start = label
+        .char_indices()
+        .nth(count - keep)
+        .map(|(ix, _)| ix)
+        .unwrap_or(label.len());
+
+    let mut out = String::with_capacity(3 + (label.len() - start));
+    out.push('…');
+    out.push_str(&label[start..]);
+    std::borrow::Cow::Owned(out)
+}
+
 /// The last meaningful piece of a URL — its final path segment, or the host when there
 /// isn't one. Empty when nothing usable is there.
 ///
@@ -366,6 +396,7 @@ fn label_from_url(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     #[test]
     fn a_label_shorter_than_the_budget_is_untouched() {
@@ -399,11 +430,39 @@ mod tests {
     #[test]
     fn a_budget_of_zero_yields_nothing_rather_than_panicking() {
         assert_eq!(elide("anything", 0), "");
-        // One character of budget is all ellipsis — degenerate, but it must not underflow
-        // `max_chars - 1`.
-        assert_eq!(elide("anything", 1), "…");
     }
-    use super::*;
+
+    #[test]
+    fn eliding_the_front_keeps_the_end_of_a_url() {
+        let url = "http://localhost:8080/api/notification/v1/blob/internal/presigned-url";
+
+        let short = elide_front(url, 50);
+        // The endpoint is what tells one row from another; `http://localhost:8080` is the same
+        // on every row in the collection, so trimming the *end* would leave them identical.
+        assert!(short.starts_with('…'), "{short}");
+        assert!(short.ends_with("presigned-url"), "{short}");
+        assert_eq!(short.chars().count(), 50, "the budget is a budget: {short}");
+
+        assert_eq!(elide_front("short", 20), "short");
+        assert!(matches!(elide_front("short", 20), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(elide_front("anything", 0), "");
+    }
+
+    #[test]
+    fn eliding_the_front_never_splits_a_character() {
+        let path = "日本語のフォルダー/コントローラー/リクエストの名前";
+        for budget in 0..path.chars().count() + 2 {
+            let out = elide_front(path, budget);
+            assert!(out.chars().count() <= budget.max(1), "budget {budget}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_budget_of_one_is_all_ellipsis_rather_than_an_underflow() {
+        // Degenerate, but both directions compute `max_chars - 1` and neither may underflow.
+        assert_eq!(elide("anything", 1), "…");
+        assert_eq!(elide_front("anything", 1), "…");
+    }
 
     #[test]
     fn a_label_comes_from_the_last_path_segment() {

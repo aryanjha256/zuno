@@ -18,6 +18,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod json;
 pub mod lines;
+pub mod openapi;
 pub mod request;
 pub mod response;
 pub mod search;

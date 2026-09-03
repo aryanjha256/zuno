@@ -29,7 +29,8 @@ use std::path::PathBuf;
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, ScrollStrategy, SharedString, Styled,
-    Subscription, UniformListScrollHandle, Window, div, px, uniform_list,
+    StatefulInteractiveElement, Subscription, UniformListScrollHandle, Window, div, px,
+    uniform_list,
 };
 
 use crate::input::TextInput;
@@ -39,6 +40,38 @@ use crate::theme::{ActiveTheme, Theme};
 /// Row height, and the unit `uniform_list` measures in. Must match the row's real height
 /// or scrolling drifts.
 const ROW_HEIGHT: f32 = 26.;
+/// How many characters of the two columns together fit across a row.
+///
+/// The modal is 620px with `px_3` either side and a `gap_2` between, leaving 588px. At `text_xs`
+/// the UI font runs about 5.95px per character — the advance `TAB_LABEL_CHARS` is tuned to — so
+/// 98, less a margin because erring short is invisible and overshooting brings the clip back.
+///
+/// Counted rather than measured, for the reason `elide` is: real widths need the shipping font,
+/// which the test platform does not have, and a pure function over a string is something a test
+/// can check. `whitespace_nowrap` plus `overflow_hidden` stay underneath as the backstop.
+const ROW_CHARS: usize = 94;
+
+/// How to split `ROW_CHARS` between a row's label and its detail.
+///
+/// **Whichever column is short donates its slack to the other**, and only when both want more
+/// than half do they take half each. A fixed half-and-half was the first version: it reserved
+/// half the row for a six-character label and then elided a URL that would have fit in the space
+/// going spare beside it.
+///
+/// Pure, so the rule is a unit test rather than something you check by looking at a screenshot.
+fn split_budget(label: usize, detail: usize) -> (usize, usize) {
+    if label + detail <= ROW_CHARS {
+        return (label, detail);
+    }
+    let half = ROW_CHARS / 2;
+    if label <= half {
+        (label, ROW_CHARS - label)
+    } else if detail <= half {
+        (ROW_CHARS - detail, detail)
+    } else {
+        (half, ROW_CHARS - half)
+    }
+}
 /// How many rows are visible before the list scrolls.
 const VISIBLE_ROWS: f32 = 12.;
 
@@ -61,6 +94,11 @@ pub enum Target {
     Run(usize),
     /// Set the request's body type, and its raw sub-kind when it has one.
     BodyType(crate::request_view::BodyType, Option<zuno_core::RawKind>),
+    /// A directory to move the selected request into.
+    ///
+    /// The eighth consumer, and still no `PickerDelegate` trait: it draws as label plus dimmed
+    /// detail like the other seven, which is the bar §12 sets for reconsidering.
+    Folder(PathBuf),
 }
 
 // Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
@@ -75,6 +113,7 @@ impl Clone for Target {
             Self::Environment(name) => Self::Environment(name.clone()),
             Self::Run(offset) => Self::Run(*offset),
             Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),
+            Self::Folder(path) => Self::Folder(path.clone()),
         }
     }
 }
@@ -272,6 +311,43 @@ impl Picker {
     }
 }
 
+/// One of a row's two columns: a single line, already shortened, with both strings on hover.
+///
+/// A function rather than an inline chain because the tooltip is conditional, and
+/// `gpui::util::FluentBuilder::when` — which would read better — is behind a private module.
+///
+/// **Both columns get the same share of the row**, `flex_1` with `min_w(0)`, which is what makes
+/// the character budget mean anything: shorten to a budget wider than the column and the string
+/// is elided *and* clipped, with an ellipsis in the middle and a hard cut at the end.
+fn column(
+    id: (&'static str, usize),
+    shown: SharedString,
+    tooltip: Option<(SharedString, SharedString)>,
+    color: gpui::Hsla,
+) -> gpui::Stateful<gpui::Div> {
+    let mut cell = div()
+        .id(id)
+        // **Sized to its content, not `flex_1`.** `flex_1` is `flex: 1 1 0%` — a zero basis, so
+        // both columns take half the row whatever they hold, and a six-character label reserved
+        // half a 620px modal while the URL beside it was elided into the gap. The default
+        // `flex: 0 1 auto` sizes each to its text and shrinks only when the pair overflows.
+        .min_w(px(0.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_xs()
+        .text_color(color)
+        .child(shown);
+
+    // Only when something was actually dropped, and then it carries *both* strings — whichever
+    // one was cut, the row as a whole is what you are trying to read.
+    if let Some((label, detail)) = tooltip {
+        cell = cell.tooltip(move |_window, cx| {
+            crate::ui::Tooltip::lines([label.clone(), detail.clone()], cx)
+        });
+    }
+    cell
+}
+
 impl Render for Picker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.query(cx);
@@ -398,6 +474,24 @@ fn result_list(
         range
             .map(|ix| {
                 let (label, detail) = rows[ix].clone();
+                // **The two columns elide in opposite directions**, because their information
+                // sits at opposite ends. A path's head names the collection and its tail is one
+                // more request; a URL's head is the `http://host:port` every row repeats and its
+                // tail is the endpoint that tells them apart. Trim both the same way and one of
+                // them says nothing.
+                //
+                // **At render, never in `Item::label`.** `refilter` ranks the stored string, so
+                // shortening at construction would mean typing the part that was dropped stops
+                // finding the row — searching against an ellipsis.
+                let (label_budget, detail_budget) =
+                    split_budget(label.chars().count(), detail.chars().count());
+                let shown_label = zuno_core::request::elide(&label, label_budget);
+                let shown_detail = zuno_core::request::elide_front(&detail, detail_budget);
+                let elided = matches!(shown_label, std::borrow::Cow::Owned(_))
+                    || matches!(shown_detail, std::borrow::Cow::Owned(_));
+                let shown_label = SharedString::from(shown_label.into_owned());
+                let shown_detail = SharedString::from(shown_detail.into_owned());
+                let full = (label.clone(), detail.clone());
                 let active = ix == selected;
                 let picker = picker.clone();
 
@@ -437,28 +531,31 @@ fn result_list(
                             cx.emit(PickerEvent::Confirmed);
                         });
                     })
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(if active { theme.text } else { theme.text_muted })
-                            .child(label),
-                    )
-                    .child(
-                        // The detail is what gets clipped when space runs out, never the
-                        // name — the name is what you searched for.
-                        div()
-                            .min_w(px(0.))
-                            .overflow_hidden()
-                            .text_xs()
-                            // Not `theme.border`, which is what this was. In the dark theme
-                            // `border` *equals* `bg_hover`, so the detail — which for the
-                            // command palette is the keybinding — was invisible on the selected
-                            // row. That defeats the palette's stated purpose: the row exists to
-                            // teach the keystroke. See `Theme::text_faint`.
-                            .text_color(theme.text_faint)
-                            .child(detail),
-                    )
+
+                    // **`whitespace_nowrap` on both, and `flex_none` gone from the label.** Two
+                    // faults, one symptom. gpui's default is `WhiteSpace::Normal`, so a long
+                    // label *wrapped*, and the row is a fixed `ROW_HEIGHT` — as `uniform_list`
+                    // demands — so the second line was sliced through. And `flex_none` meant the
+                    // label could not shrink at all, so it pushed the detail out of the row on
+                    // the way. Neither is visible in a short label, which is every label this
+                    // picker had until requests started arriving from an OpenAPI spec named
+                    // `TheGameYou-Misc-API-Notification-Blob/…`.
+                    .child(column(
+                        ("picker-label", ix),
+                        shown_label,
+                        elided.then(|| (full.0.clone(), full.1.clone())),
+                        if active { theme.text } else { theme.text_muted },
+                    ))
+                    .child(column(
+                        ("picker-detail", ix),
+                        shown_detail,
+                        elided.then(|| (full.0.clone(), full.1.clone())),
+                        // Not `theme.border`, which is what this was. In the dark theme `border`
+                        // *equals* `bg_hover`, so the detail — which for the command palette is
+                        // the keybinding — was invisible on the selected row. See
+                        // `Theme::text_faint`.
+                        theme.text_faint,
+                    ))
             })
             .collect()
     })
@@ -466,4 +563,52 @@ fn result_list(
     // A definite height, or `uniform_list` has no viewport to scroll within. Shrinks to
     // fit when there are fewer results than fit on screen.
     .h(px(ROW_HEIGHT * VISIBLE_ROWS.min(count as f32)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_column_donates_its_slack_to_the_long_one() {
+        // The rule that replaced a fixed half-and-half. Both failure modes are silent on screen:
+        // too small a budget elides a string that would have fitted, too large a one brings back
+        // the clip the elision exists to remove.
+
+        // Both fit: neither is touched, and the row does not reserve half for a short label.
+        assert_eq!(split_budget(10, 20), (10, 20));
+        assert_eq!(split_budget(0, 0), (0, 0));
+
+        // A short label, a long detail: the detail gets everything the label did not want.
+        let (label, detail) = split_budget(12, 400);
+        assert_eq!(label, 12, "a short label must not be padded out to half a row");
+        assert_eq!(label + detail, ROW_CHARS);
+        assert!(detail > ROW_CHARS / 2, "the slack has to go somewhere: {detail}");
+
+        // And the mirror — a long label beside a short detail.
+        let (label, detail) = split_budget(400, 12);
+        assert_eq!(detail, 12);
+        assert_eq!(label + detail, ROW_CHARS);
+
+        // Both long: half each, since neither has slack to give.
+        let (label, detail) = split_budget(400, 400);
+        assert_eq!(label, ROW_CHARS / 2);
+        assert_eq!(label + detail, ROW_CHARS);
+    }
+
+    #[test]
+    fn a_split_never_exceeds_the_row() {
+        // Swept, because the arms overlap at the boundary and an off-by-one there would clip
+        // every row in the list rather than one.
+        for label in 0..140 {
+            for detail in 0..140 {
+                let (l, d) = split_budget(label, detail);
+                assert!(l <= label && d <= detail, "{label}/{detail} -> {l}/{d}");
+                assert!(
+                    l + d <= ROW_CHARS.max(label + detail),
+                    "{label}/{detail} -> {l}/{d}"
+                );
+            }
+        }
+    }
 }

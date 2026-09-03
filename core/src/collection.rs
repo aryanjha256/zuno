@@ -399,6 +399,122 @@ pub fn rename(path: &Path, label: &str) -> Result<PathBuf, CollectionError> {
     Ok(target)
 }
 
+/// Create a folder inside `parent`, returning its path.
+///
+/// `label` is typed by a person, so it goes through `slug` for the reason `rename` does — the
+/// panel's text box is a path-traversal vector otherwise. Refuses a name already in use rather
+/// than silently adopting an existing folder: "created" and "there was already one there" are
+/// different answers and the caller says different things about them.
+pub fn create_folder(parent: &Path, label: &str) -> Result<PathBuf, CollectionError> {
+    let name = slug(label);
+    let target = parent.join(&name);
+
+    if target.exists() {
+        return Err(CollectionError::NameTaken(name));
+    }
+
+    std::fs::create_dir_all(&target).map_err(|source| CollectionError::Directory {
+        path: target.clone(),
+        source,
+    })?;
+    Ok(target)
+}
+
+/// Move a request into `directory`, returning its new path.
+///
+/// **Keeps the filename.** A move is about *where* a request lives; renaming it at the same time
+/// would make one gesture do two things and leave no way to do either alone. `rename` is the
+/// other verb.
+///
+/// Refuses rather than overwriting, like `rename` — the request being clobbered may be one the
+/// mover has never seen — and refuses a destination that is not a directory, so a path arriving
+/// from the wrong picker row cannot turn a request into a directory entry.
+pub fn move_to(path: &Path, directory: &Path) -> Result<PathBuf, CollectionError> {
+    if !directory.is_dir() {
+        return Err(CollectionError::NotAFile {
+            path: directory.to_path_buf(),
+        });
+    }
+
+    let name = path.file_name().ok_or_else(|| CollectionError::NotAFile {
+        path: path.to_path_buf(),
+    })?;
+    let target = directory.join(name);
+
+    // Already where it was asked to go. Not an error: the picker lists every directory, and
+    // choosing the one a request is already in is a reasonable thing to do by accident.
+    if target == path {
+        return Ok(target.clone());
+    }
+    if target.exists() {
+        return Err(CollectionError::NameTaken(
+            name.to_string_lossy().to_string(),
+        ));
+    }
+
+    std::fs::rename(path, &target).map_err(|source| CollectionError::Write {
+        path: target.clone(),
+        source,
+    })?;
+    Ok(target)
+}
+
+/// Every directory in the collection, relative to `root`, with `/` separators and sorted.
+///
+/// Walks the tree rather than deriving from `scan`'s entries, and that distinction is the whole
+/// point: a directory exists whether or not it holds a request. Same skip rules as `walk` —
+/// dotfiles, the reserved `environments/`, and `MAX_DEPTH` — so the two agree about what is part
+/// of a collection.
+pub fn folders(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_folders(root, root, 0, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_folders(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in listing.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || name == crate::environment::DIRECTORY {
+            continue;
+        }
+        // `file_type` does not follow symlinks, so a symlinked directory reports as a symlink
+        // and is skipped — the cycle guard `walk` relies on, for the same reason.
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+
+        out.push(relative_label(root, &path));
+        collect_folders(root, &path, depth + 1, out);
+    }
+}
+
+/// Every place a request can be moved to, as `(absolute path, displayed label)`.
+///
+/// The root comes first, labelled `/`, because "move it back to the top" has to be reachable and
+/// it is the one directory with no relative path to show.
+pub fn destinations(root: &Path, folders: &[String]) -> Vec<(PathBuf, String)> {
+    let mut out = vec![(root.to_path_buf(), "/".to_string())];
+    out.extend(folders.iter().map(|relative| {
+        let mut path = root.to_path_buf();
+        for part in relative.split('/') {
+            path.push(part);
+        }
+        (path, relative.clone())
+    }));
+    out
+}
+
 /// Copy a request to a fresh name beside it, returning the new path.
 ///
 /// Copies the **bytes**, not a re-serialized `RequestSpec`. Reading and writing would normalize
@@ -469,8 +585,22 @@ pub enum NodeKind {
 /// Recursive, like `walk` above and unlike `json::flatten`: the input comes from `scan`, which
 /// enforces `MAX_DEPTH`, so the nesting is bounded before it reaches this function. The
 /// flattener has no such guarantee about a server's JSON, which is why it is iterative.
-pub fn tree(root: &Path, entries: &[Entry]) -> Vec<Node> {
+pub fn tree(root: &Path, entries: &[Entry], folders: &[String]) -> Vec<Node> {
     let mut branch = Branch::default();
+
+    // **Folders first, and they come from the filesystem rather than from the entries.** A
+    // directory earns a row by existing, not by holding a request — derive them from `entries`
+    // and a folder you just created is invisible until you put something in it, which is also
+    // the one thing you cannot do while it has no row to move onto. New folder and Move stopped
+    // composing entirely, and the status message admitting it ("appears once a request is in
+    // it") was the design flaw wearing a notice.
+    for relative in folders {
+        let mut here = &mut branch;
+        for component in relative.split('/') {
+            here = here.dirs.entry(component).or_default();
+        }
+    }
+
     for entry in entries {
         let mut components: Vec<&str> = entry.relative.split('/').collect();
         // A relative label always ends in a filename; anything else is not an entry `scan`
@@ -744,6 +874,98 @@ mod scan_tests {
     }
 
     #[test]
+    fn creating_a_folder_slugs_the_name_and_refuses_a_collision() {
+        let root = scratch("folder-create");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let made = create_folder(&root, "Billing API").expect("create");
+        assert_eq!(made, root.join("Billing-API"));
+        assert!(made.is_dir());
+
+        // The name comes from a text box, so it is the same traversal boundary as `rename`.
+        let escaped = create_folder(&root, "../evil").expect("create");
+        assert_eq!(escaped.parent(), Some(root.as_path()), "{escaped:?}");
+        assert!(!root.parent().map(|p| p.join("evil").exists()).unwrap_or(false));
+
+        // Refused rather than silently adopting the folder that is already there.
+        assert!(create_folder(&root, "Billing API").is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn moving_a_request_keeps_its_filename_and_its_contents() {
+        let root = scratch("move-basic");
+        let path = save(&root, "invoices", "https://a.test/invoices");
+        let before = std::fs::read(&path).expect("read");
+        let billing = create_folder(&root, "billing").expect("create");
+
+        let moved = move_to(&path, &billing).expect("move");
+
+        assert_eq!(moved, billing.join("invoices.json"), "the filename travels with it");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&moved).expect("read"), before);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn moving_onto_an_existing_name_is_refused_rather_than_overwriting() {
+        let root = scratch("move-collide");
+        let billing = create_folder(&root, "billing").expect("create");
+        let source = save(&root, "invoices", "https://a.test/root-one");
+        let target = save(&billing, "invoices", "https://a.test/billing-one");
+        let untouched = std::fs::read(&target).expect("read");
+
+        assert!(move_to(&source, &billing).is_err());
+        assert!(source.is_file(), "the source must survive a refused move");
+        assert_eq!(
+            std::fs::read(&target).expect("read"),
+            untouched,
+            "and the request it would have replaced must be untouched"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn moving_into_the_directory_it_is_already_in_is_a_no_op() {
+        // The picker lists every directory including the one the request is in, and choosing it
+        // is a reasonable accident. Reporting "already exists" about the file being moved is the
+        // same mistake `rename` avoids.
+        let root = scratch("move-noop");
+        let path = save(&root, "invoices", "https://a.test/invoices");
+
+        assert_eq!(move_to(&path, &root).expect("move"), path);
+        assert!(path.is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_move_destinations_are_the_root_and_every_directory_including_empty_ones() {
+        let root = scratch("move-destinations");
+        save(&root, "top", "https://a.test/top");
+        let deep = root.join("billing").join("eu");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        save(&deep, "vat", "https://a.test/vat");
+        // A directory with nothing in it — the case this test exists for.
+        std::fs::create_dir_all(root.join("empty")).expect("mkdir");
+
+        let found = destinations(&root, &folders(&root));
+        let labels: Vec<&str> = found.iter().map(|(_, label)| label.as_str()).collect();
+
+        // **`empty` is offered**, and that is the fix rather than an oversight: moving a request
+        // into a folder is what fills it, so refusing to offer an empty one made New folder and
+        // Move unable to compose at all.
+        assert_eq!(labels, ["/", "billing", "billing/eu", "empty"]);
+        assert_eq!(found[0].0, root, "the root has to be reachable to move back to");
+        assert_eq!(found[2].0, deep, "and an intermediate directory carries a real path");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn renaming_moves_the_file_and_leaves_its_contents_alone() {
         let root = scratch("rename-basic");
         let path = save(&root, "posts", "https://a.test/posts");
@@ -905,7 +1127,7 @@ mod scan_tests {
         save(&root, "zebra", "https://a.test/zebra");
         save(&root, "alpha", "https://a.test/alpha");
 
-        let nodes = tree(&root, &scan(&root));
+        let nodes = tree(&root, &scan(&root), &folders(&root));
         assert_eq!(shape(&nodes), [(0, "alpha", false), (0, "zebra", false)]);
 
         // The extension is dropped: it is identical on every row, so it says nothing.
@@ -923,12 +1145,47 @@ mod scan_tests {
     }
 
     #[test]
+    fn an_empty_directory_still_gets_a_row() {
+        // A directory earns a row by existing. Deriving the tree from `scan`'s entries meant a
+        // folder you had just created was invisible until you put a request in it — and the one
+        // verb that could put a request in it, Move, only offered folders that already had rows.
+        // New folder and Move could not compose at all.
+        let root = scratch("tree-empty-dir");
+        std::fs::create_dir_all(root.join("drafts")).expect("mkdir");
+        save(&root, "posts", "https://a.test/posts");
+
+        let nodes = tree(&root, &scan(&root), &folders(&root));
+        assert_eq!(
+            shape(&nodes),
+            [(0, "drafts", true), (0, "posts", false)],
+            "an empty directory must be drawn, above the requests as usual"
+        );
+        assert_eq!(nodes[0].path, root.join("drafts"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_folder_walk_skips_what_the_request_walk_skips() {
+        // The two have to agree about what is part of a collection, or `environments/` becomes a
+        // move destination and `.git` becomes a folder tree.
+        let root = scratch("folders-skips");
+        std::fs::create_dir_all(root.join("billing")).expect("mkdir");
+        std::fs::create_dir_all(root.join(".git").join("objects")).expect("mkdir");
+        std::fs::create_dir_all(crate::environment::directory(&root)).expect("mkdir");
+
+        assert_eq!(folders(&root), ["billing"]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_directory_becomes_a_row_and_its_requests_are_indented() {
         let root = scratch("tree-nested");
         std::fs::create_dir_all(root.join("billing")).expect("mkdir");
         save(&root.join("billing"), "invoices", "https://a.test/invoices");
 
-        let nodes = tree(&root, &scan(&root));
+        let nodes = tree(&root, &scan(&root), &folders(&root));
         assert_eq!(shape(&nodes), [(0, "billing", true), (1, "invoices", false)]);
 
         // A directory row carries the directory's own path, which is what a fold key and a
@@ -954,7 +1211,7 @@ mod scan_tests {
         let relatives: Vec<&str> = entries.iter().map(|e| e.relative.as_str()).collect();
         assert_eq!(relatives, ["alpha.json", "beta/nested.json"]);
 
-        let nodes = tree(&root, &entries);
+        let nodes = tree(&root, &entries, &folders(&root));
         assert_eq!(
             shape(&nodes),
             [(0, "beta", true), (1, "nested", false), (0, "alpha", false)]
@@ -970,7 +1227,7 @@ mod scan_tests {
         std::fs::create_dir_all(&deep).expect("mkdir");
         save(&deep, "leaf", "https://a.test/leaf");
 
-        let nodes = tree(&root, &scan(&root));
+        let nodes = tree(&root, &scan(&root), &folders(&root));
         assert_eq!(
             shape(&nodes),
             [
@@ -994,7 +1251,7 @@ mod scan_tests {
         save(&root.join("v1").join("users"), "list", "https://a.test/v1");
         save(&root.join("v2").join("users"), "list", "https://a.test/v2");
 
-        let nodes = tree(&root, &scan(&root));
+        let nodes = tree(&root, &scan(&root), &folders(&root));
         let users: Vec<&Node> = nodes.iter().filter(|node| node.name == "users").collect();
         assert_eq!(users.len(), 2);
         assert_ne!(users[0].path, users[1].path);

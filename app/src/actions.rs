@@ -55,6 +55,15 @@ actions!(
         RenameRequest,
         CommitRename,
         CancelRename,
+        // Organising, as distinct from editing. Until these existed every `Ctrl+S` landed flat
+        // at the collection root and nothing could put a request anywhere else.
+        NewFolder,
+        MoveRequest,
+        // Import a whole API at once. `ImportCurl` is one request per paste; this is the way a
+        // collection gets filled from what a team already has.
+        ImportOpenApi,
+        ImportConfirm,
+        ImportDismiss,
         // Buffers
         NewTab,
         CloseTab,

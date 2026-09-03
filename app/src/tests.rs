@@ -7575,11 +7575,15 @@ async fn the_row_menu_offers_every_verb_in_its_intended_order(cx: &mut TestAppCo
             "Open in default app",
             "---",
             "Duplicate",
+            "New folder",
             "---",
             "Copy path",
             "Copy relative path",
             "---",
             "Rename",
+            // With Rename rather than with Duplicate: both answer "what and where is this
+            // request", and neither changes what it sends.
+            "Move to…",
             "Move to trash",
             // The ellipsis is the difference between the two: this row asks, the one above acts.
             "Delete…",
@@ -7716,8 +7720,9 @@ async fn duplicating_adds_a_row_without_opening_a_tab(cx: &mut TestAppContext) {
 
     let row = cx.debug_bounds("collection-row-0").expect("the request row");
     right_click(&mut cx, row.center());
-    // Reveal, Open, ---, Duplicate: two steps down past the separator, which `select` skips.
-    cx.simulate_keystrokes("down down enter");
+    let steps = menu_steps_to(&window, &mut cx, "Duplicate");
+    cx.simulate_keystrokes(&"down ".repeat(steps));
+    cx.simulate_keystrokes("enter");
     wait_for(&mut cx, "the duplicate", |cx| {
         (tree_rows(&window, cx).len() == 2).then_some(())
     });
@@ -7754,8 +7759,9 @@ async fn the_two_copy_verbs_give_absolute_and_collection_relative_paths(cx: &mut
     // Row 1 is the request inside `billing`.
     let row = cx.debug_bounds("collection-row-1").expect("the request row");
     right_click(&mut cx, row.center());
-    // Reveal, Open, ---, Duplicate, ---, Copy path.
-    cx.simulate_keystrokes("down down down enter");
+    let steps = menu_steps_to(&window, &mut cx, "Copy path");
+    cx.simulate_keystrokes(&"down ".repeat(steps));
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
@@ -7764,7 +7770,9 @@ async fn the_two_copy_verbs_give_absolute_and_collection_relative_paths(cx: &mut
 
     let row = cx.debug_bounds("collection-row-1").expect("the request row");
     right_click(&mut cx, row.center());
-    cx.simulate_keystrokes("down down down down enter");
+    let steps = menu_steps_to(&window, &mut cx, "Copy relative path");
+    cx.simulate_keystrokes(&"down ".repeat(steps));
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
@@ -7773,6 +7781,44 @@ async fn the_two_copy_verbs_give_absolute_and_collection_relative_paths(cx: &mut
     );
 
     remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+/// Where a labelled row sits in the open menu, separators included — `menu-row-N`'s numbering.
+///
+/// Looked up rather than hardcoded: three tests broke at once when two rows were added to the
+/// middle of the menu, and not one of them was asserting anything about the order.
+fn menu_row_index(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+    label: &str,
+) -> usize {
+    window
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .menu_labels(cx)
+                .iter()
+                .position(|row| row == label)
+                .unwrap_or_else(|| panic!("no {label:?} row in the menu"))
+        })
+        .expect("window")
+}
+
+/// How many `down` presses reach a labelled row, given `select` steps over separators.
+fn menu_steps_to(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+    label: &str,
+) -> usize {
+    window
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .menu_labels(cx)
+                .iter()
+                .filter(|row| *row != "---")
+                .position(|row| row == label)
+                .unwrap_or_else(|| panic!("no {label:?} row in the menu"))
+        })
+        .expect("window")
 }
 
 #[gpui::test]
@@ -7866,8 +7912,13 @@ async fn a_menu_row_spans_the_full_width_of_the_menu(cx: &mut TestAppContext) {
     right_click(&mut cx, row.center());
 
     let menu = cx.debug_bounds("context-menu").expect("the menu");
-    // Index 5 is "Copy path" — a row whose effect lands somewhere a test can read.
-    let copy_path = cx.debug_bounds("menu-row-5").expect("the copy-path row");
+    // "Copy path" — a row whose effect lands somewhere a test can read.
+    let ix = menu_row_index(&window, &mut cx, "Copy path");
+    // `debug_bounds` takes `&'static str`, and the index is only known at runtime. Leaking a
+    // short string once per test run is the cheap way in; the alternative is hardcoding the
+    // index, which is exactly what this lookup exists to stop doing.
+    let selector: &'static str = Box::leak(format!("menu-row-{ix}").into_boxed_str());
+    let copy_path = cx.debug_bounds(selector).expect("the copy-path row");
 
     let far_right = gpui::point(menu.right() - gpui::px(6.), copy_path.center().y);
     cx.simulate_click(far_right, gpui::Modifiers::default());
@@ -7924,6 +7975,489 @@ async fn the_tab_strip_belongs_to_the_editor_area_not_the_window(cx: &mut TestAp
     assert_eq!(
         after.size.height, before.size.height,
         "and it must not have been shortened either"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_new_folder_is_created_where_the_selection_points(cx: &mut TestAppContext) {
+    // Until this existed every Ctrl+S landed flat at the collection root and nothing could make
+    // a directory — so the tree could only ever show a flat list to anyone who had not built
+    // folders by hand in a terminal.
+    let dir = scratch_dir("panel-new-folder");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    // With the `billing` directory selected, the folder lands *inside* it.
+    cx.simulate_keystrokes("ctrl-shift-e down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("billing".to_string())
+    );
+    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.simulate_input("EU VAT");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // Slugged, like every other name that reaches the filesystem from a text box.
+    assert!(root.join("billing").join("EU-VAT").is_dir());
+
+    // **And it has a row immediately**, which is the whole point: a directory earns one by
+    // existing. Deriving the tree from the requests inside it meant a folder you had just made
+    // was invisible until you filled it — and Move, the only verb that could fill it, offered
+    // only folders that already had rows.
+    assert_eq!(
+        tree_rows(&window, &mut cx),
+        [
+            (0, "billing".to_string(), true),
+            (1, "EU-VAT".to_string(), true),
+            (1, "invoices".to_string(), false),
+        ],
+        "the new folder must appear at once, and sort above the requests beside it"
+    );
+
+    // With a *request* selected it lands beside it, in the request's own parent.
+    cx.simulate_keystrokes("down down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("invoices".to_string())
+    );
+    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.simulate_input("drafts");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        root.join("billing").join("drafts").is_dir(),
+        "a folder made on a request must land beside it, not inside it"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-new-folder-escape");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e ctrl-shift-n");
+    cx.simulate_input("nope");
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    assert!(!root.join("nope").exists(), "escape must not create the folder");
+
+    // And the panel has the keyboard back — asserted through a later keystroke, since the name
+    // box owned it.
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("posts".to_string())
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn moving_a_request_relocates_its_file_and_the_open_buffer(cx: &mut TestAppContext) {
+    // The organising verb. Ctrl+S always writes to the collection root, so this is the only way
+    // a saved request ends up anywhere else.
+    let dir = scratch_dir("panel-move");
+    let root = dir.join("collections");
+    seed_request(&root, "invoices.json", "https://a.test/invoices");
+    // A second request inside `billing`, so the directory exists *and* is visible to `scan`.
+    seed_request(&root, "billing/eu.json", "https://a.test/eu");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 3).then_some(())
+    });
+
+    // Rows: billing(0), eu(1), invoices(2). Open the root-level one so a buffer holds its path.
+    cx.simulate_keystrokes("ctrl-shift-e down down down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("invoices".to_string())
+    );
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let opened = active_view(&window, &mut cx);
+
+    let row = cx.debug_bounds("collection-row-2").expect("the request row");
+    right_click(&mut cx, row.center());
+    let steps = menu_steps_to(&window, &mut cx, "Move to…");
+    cx.simulate_keystrokes(&"down ".repeat(steps));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // The picker lists `/` first, then `billing`. `visible_rows` is a test helper that always
+    // joins label and detail with an em dash, so the trailing one on `billing` is formatting
+    // here rather than something drawn.
+    assert_eq!(
+        picker_rows(&window, &mut cx),
+        ["/ — current folder", "billing — "],
+        "the root must be offered, and the request's own folder marked rather than hidden"
+    );
+    cx.simulate_keystrokes("down enter");
+    // Polls the filesystem rather than app state, so the probe needs no context.
+    wait_for(&mut cx, "the moved request", |_cx| {
+        root.join("billing").join("invoices.json").is_file().then_some(())
+    });
+
+    assert!(!root.join("invoices.json").exists(), "the old location must be empty");
+    assert_eq!(
+        cx.update(|_, cx| opened.read(cx).path.clone()),
+        Some(root.join("billing").join("invoices.json")),
+        "the buffer must follow the file it is open on"
+    );
+
+    // And saving writes to the new location rather than recreating it at the root.
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+    assert!(
+        !root.join("invoices.json").exists(),
+        "Ctrl+S recreated the request where it used to live"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_folder_you_just_created_can_be_moved_into(cx: &mut TestAppContext) {
+    // **The two verbs have to compose, and for one slice they did not.** The tree was derived
+    // from the requests inside each directory, so a new folder had no row; the move picker
+    // offered only directories with rows; so the only way to fill a folder refused to see the
+    // folder you had just made. Neither verb was broken on its own, which is exactly why a test
+    // of each separately said nothing.
+    let dir = scratch_dir("panel-compose");
+    let root = dir.join("collections");
+    seed_request(&root, "invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e ctrl-shift-n");
+    cx.simulate_input("billing");
+    cx.simulate_keystrokes("enter");
+    wait_for(&mut cx, "the new folder's row", |cx| {
+        tree_rows(&window, cx)
+            .iter()
+            .any(|(_, name, is_dir)| name == "billing" && *is_dir)
+            .then_some(())
+    });
+
+    // Select the request — rows are billing(0), invoices(1).
+    cx.simulate_keystrokes("down down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("invoices".to_string())
+    );
+
+    let row = cx.debug_bounds("collection-row-1").expect("the request row");
+    right_click(&mut cx, row.center());
+    let steps = menu_steps_to(&window, &mut cx, "Move to…");
+    cx.simulate_keystrokes(&"down ".repeat(steps));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        picker_rows(&window, &mut cx),
+        ["/ — current folder", "billing — "],
+        "the empty folder must be offered — moving a request in is what fills it"
+    );
+
+    cx.simulate_keystrokes("down enter");
+    wait_for(&mut cx, "the moved request", |_cx| {
+        root.join("billing").join("invoices.json").is_file().then_some(())
+    });
+    assert!(!root.join("invoices.json").exists());
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI import
+// ---------------------------------------------------------------------------
+
+const SMALL_SPEC: &str = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Billing API" },
+  "servers": [{ "url": "https://api.test/v1" }],
+  "paths": {
+    "/invoices": {
+      "get": { "operationId": "listInvoices", "tags": ["invoices"] },
+      "post": { "operationId": "createInvoice", "tags": ["invoices"] }
+    },
+    "/health": { "get": { "operationId": "health" } }
+  }
+}"#;
+
+#[gpui::test]
+async fn importing_a_spec_from_a_file_fills_the_collection(cx: &mut TestAppContext) {
+    // `ImportCurl` is one request per paste; this is how a collection gets filled from what a
+    // team already has, which is the answer to a first run that feels empty.
+    let dir = scratch_dir("import-file");
+    let root = dir.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let spec = dir.join("billing.json");
+    std::fs::write(&spec, SMALL_SPEC).expect("write");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    assert!(cx.debug_bounds("import-panel").is_some(), "the modal must open");
+    cx.simulate_input(&spec.display().to_string());
+    cx.simulate_keystrokes("enter");
+
+    wait_for(&mut cx, "the imported requests", |cx| {
+        (tree_rows(&window, cx).len() >= 5).then_some(())
+    });
+
+    // Everything under one folder named for the spec, and each operation's tag inside it — so
+    // an import is a thing you can find, and a thing you can delete.
+    assert_eq!(
+        tree_rows(&window, &mut cx),
+        [
+            (0, "Billing-API".to_string(), true),
+            (1, "invoices".to_string(), true),
+            (2, "createInvoice".to_string(), false),
+            (2, "listInvoices".to_string(), false),
+            // No tag, so it sits directly under the spec's folder.
+            (1, "health".to_string(), false),
+        ]
+    );
+
+    // And the requests are real: base URL joined to path, method preserved.
+    let created: RequestSpec = serde_json::from_slice(
+        &std::fs::read(root.join("Billing-API").join("invoices").join("createInvoice.json"))
+            .expect("read"),
+    )
+    .expect("parse");
+    assert_eq!(created.url, "https://api.test/v1/invoices");
+    assert_eq!(created.method, zuno_core::Method::Post);
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn importing_a_spec_from_a_url_goes_through_the_engine(cx: &mut TestAppContext) {
+    // A URL fetch reuses `Engine::send` rather than a second HTTP client, so it inherits the
+    // TLS, redirect and timeout behaviour every other request uses. Asserted over a real socket:
+    // a mock would prove the parse and say nothing about the fetch.
+    let dir = scratch_dir("import-url");
+    let root = dir.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    let body = SMALL_SPEC;
+    let response: &'static str = Box::leak(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_boxed_str(),
+    );
+    let served = serve_once(response);
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.simulate_input(&served);
+    cx.simulate_keystrokes("enter");
+
+    wait_for(&mut cx, "the fetched spec's requests", |cx| {
+        (tree_rows(&window, cx).len() >= 5).then_some(())
+    });
+    assert!(root.join("Billing-API").join("invoices").join("listInvoices.json").is_file());
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_bad_spec_reports_in_the_dialog_and_leaves_it_open(cx: &mut TestAppContext) {
+    // The fix for a wrong path or a non-spec URL is usually a character or two, so closing the
+    // modal and making you retype it would be the wrong answer to every failure it can have.
+    let dir = scratch_dir("import-bad");
+    let root = dir.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let not_a_spec = dir.join("plain.json");
+    std::fs::write(&not_a_spec, br#"{"hello":"world"}"#).expect("write");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.simulate_input(&not_a_spec.display().to_string());
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("import-panel").is_some(),
+        "a failed import must leave the dialog open"
+    );
+    assert!(
+        tree_rows(&window, &mut cx).is_empty(),
+        "and must not have written anything"
+    );
+
+    // Escape still closes it — the binding is scoped to the field, which is what holds focus.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    // Asserted through a later keystroke rather than through `debug_bounds`, whose `is_none`
+    // reports the previous frame: typing must reach the URL bar again, which it can only do if
+    // dismissing restored focus there.
+    let view = active_view(&window, &mut cx);
+    cx.simulate_input("X");
+    let url = cx.update(|_, cx| view.read(cx).url.read(cx).text().to_string());
+    assert!(
+        url.ends_with('X'),
+        "dismissing must put focus back in the buffer; URL was {url:?}"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn the_new_folder_box_lands_as_the_first_row_inside_its_parent(cx: &mut TestAppContext) {
+    // The box is a real row in the list, so every row at or past it shifts down by one. Get the
+    // index wrong and the rows below render the wrong nodes — which `tree_rows` cannot see,
+    // because it reads workspace state rather than the rendered list.
+    let dir = scratch_dir("new-folder-position");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/eu.json", "https://a.test/eu");
+    seed_request(&root, "billing/us.json", "https://a.test/us");
+    seed_request(&root, "zebra.json", "https://a.test/zebra");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 4).then_some(())
+    });
+    // billing(0) eu(1) us(2) zebra(3)
+    assert_eq!(
+        tree_rows(&window, &mut cx)
+            .iter()
+            .map(|(depth, name, _)| (*depth, name.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (0, "billing".to_string()),
+            (1, "eu".to_string()),
+            (1, "us".to_string()),
+            (0, "zebra".to_string()),
+        ]
+    );
+
+    let position = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, _| {
+                workspace.new_folder_row().map(|(at, depth, _)| (at, depth))
+            })
+            .expect("window")
+    };
+
+    // Nothing selected: the root, so the box goes at the very top, flush left.
+    cx.simulate_keystrokes("ctrl-shift-e ctrl-shift-n");
+    assert_eq!(position(&mut cx), Some((0, 0)));
+    cx.simulate_keystrokes("escape");
+
+    // On `billing`, which has two children: past both of them, indented one level in.
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("billing".to_string())
+    );
+    cx.simulate_keystrokes("ctrl-shift-n");
+    assert_eq!(
+        position(&mut cx),
+        Some((1, 1)),
+        "the box belongs immediately under billing, not after its children — a folder with a \
+         screenful of requests would otherwise open the box off screen"
+    );
+    cx.simulate_keystrokes("escape");
+
+    // On a *request* inside billing: beside it, so the same place and the same indent.
+    cx.simulate_keystrokes("down down");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("us".to_string())
+    );
+    cx.simulate_keystrokes("ctrl-shift-n");
+    assert_eq!(
+        position(&mut cx),
+        Some((1, 1)),
+        "a request's parent is billing, so the box lands in the same place as above"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_long_label_is_shortened_on_screen_but_still_matches_in_full(cx: &mut TestAppContext) {
+    // The elision happens at *render*, never in `Item::label`, because `refilter` ranks the
+    // stored string. Shortening it at construction would mean typing the part that got dropped
+    // stops finding the row — searching against an ellipsis. Asserted on the middle of the path,
+    // since the middle is exactly what middle-elision removes.
+    let dir = scratch_dir("picker-elide");
+    let root = dir.join("collections");
+    seed_request(
+        &root,
+        "TheGameYou-Misc-API-Notification-Blob/notification-controller/getPreSignedUrlInternal.json",
+        "https://a.test/presign",
+    );
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-p");
+    wait_for(&mut cx, "the scanned request", |cx| {
+        picker_rows(&window, cx)
+            .iter()
+            .any(|row| row.contains("getPreSignedUrlInternal"))
+            .then_some(())
+    });
+
+    // `notification-controller` sits in the middle of the path — the part the display drops.
+    cx.simulate_input("notification-controller");
+    cx.run_until_parked();
+    let rows = picker_rows(&window, &mut cx);
+    assert!(
+        rows.iter().any(|row| row.contains("getPreSignedUrlInternal")),
+        "typing the middle of a path must still find the request: {rows:?}"
+    );
+
+    // And the stored label is the full path, not the elided one — that is what makes it match.
+    assert!(
+        rows[0].starts_with("TheGameYou-Misc-API-Notification-Blob/notification-controller/"),
+        "the item must hold the whole path: {:?}",
+        rows[0]
     );
 
     remove_scratch(&mut cx, &dir.join("session.json"));

@@ -46,9 +46,14 @@ pub fn palette() -> Vec<Command> {
         command("Cancel request", CancelRequest),
         command("Save request to collection", SaveRequest),
         command("Import request from curl on the clipboard", ImportCurl),
+        command("Import from an OpenAPI spec", ImportOpenApi),
         // Navigation.
         command("Find request", OpenRequest),
         command("Show or hide the collection panel", ToggleCollectionPanel),
+        // Unlike the panel's other verbs this one needs no selection — with nothing selected it
+        // makes a folder at the collection root — so it is a real palette row rather than an
+        // exclusion.
+        command("New folder in collection", NewFolder),
         command("Switch environment", SwitchEnvironment),
         command("New tab", NewTab),
         command("Close tab", CloseTab),
@@ -161,8 +166,12 @@ const EXCLUDED: &[(&str, &str)] = &[
         "acts on the panel's selection, which the palette cannot show",
     ),
     ("zuno::RenameRequest", "acts on the panel's selection, which the palette cannot show"),
+    ("zuno::MoveRequest", "acts on the panel's selection, which the palette cannot show"),
     // The two halves of an open rename box. Neither means anything without one on screen.
     ("zuno::CommitRename", "only valid while renaming a row"),
+    // The two halves of the import modal, meaningless without one on screen.
+    ("zuno::ImportConfirm", "only valid inside the import dialog"),
+    ("zuno::ImportDismiss", "only valid inside the import dialog"),
     ("zuno::CancelRename", "only valid while renaming a row"),
     // Only valid while the panel has focus, where they're already bound. "Show or hide the
     // collection panel" is the entry point and it *is* offered; a row for "next row in the

@@ -499,10 +499,23 @@ cursors stayed separate, because a match and where you are standing are differen
 
   It is the same blind-spot shape §11 has, one level out again. This audit was taken from
   inside the app — what is built but unreachable, what did I trip over — so a capability that
-  was never started casts no shadow in it. Two more like it, found by comparing against what
-  an API client is expected to do rather than against what Zuno has: **OpenAPI import**,
-  **GraphQL**, and a **collection runner with assertions** appear nowhere in these documents —
-  not in this audit, not in "named, not planned", not in the non-goals.
+  was never started casts no shadow in it. Three were found by comparing against what an API
+  client is expected to do rather than against what Zuno has: **OpenAPI import**, **GraphQL**,
+  and a **collection runner with assertions** appeared nowhere in these documents — not in the
+  audit, not in "named, not planned", not in the non-goals. The first of them has since landed.
+
+- **OpenAPI import — done.** `Ctrl+Shift+I` takes a spec URL or a file path and fills the
+  collection: one folder named for the spec, each operation's tag a folder inside it. This is
+  the answer to a first run that feels empty, and it is why it came before the project root —
+  a project you can choose is worth less than a project with something in it.
+
+  The parser is hand-written over `serde_json::Value` rather than the `openapiv3` crate, which
+  covers 3.0 only and says so; the parts Zuno reads did not change in 3.1. See architecture.md
+  §6b — that section is also where the first **form modal** is recorded, built concrete for one
+  consumer the way the picker was.
+
+  JSON only. Most published specs are YAML and the YAML crate landscape is a graveyard, so that
+  is a limitation written down rather than hidden.
 
 - **Delete — done**, in the slice after the panel. Right-click a request or press `delete`, and
   a second menu names the file before anything is removed. `context_menu.rs` finally has the
@@ -550,7 +563,27 @@ cursors stayed separate, because a match and where you are standing are differen
   duplicate-open test read stale bounds between its two clicks and pass against the bug it was
   written for. A sidebar that jumps on an unrelated event *manufactures* flaky tests.
 
-- **No folder authoring beyond `mkdir`**, and no way to move a request between directories.
+- **New folder and Move — done**, and this is the one that made the panel worth having. Until
+  it landed the collection could only be **flat**: `save_request` writes to the collection root,
+  nothing created a directory, and nothing put a request in one. The tree was a viewer of a
+  structure the app had no way to produce.
+
+  It also settles something this file spent several sessions stuck on. The project/workspace
+  naming argument gated **none** of this — new folder, move and save behave identically whatever
+  the top level is called — so the decision that felt blocking never was. Worth remembering the
+  next time a naming question stalls a slice.
+
+  `Ctrl+S` still writes to the root on purpose: saving into whatever the panel happens to have
+  selected depends on state you are not looking at when you press the key. Save, then move.
+
+  **It shipped broken and the two verbs did not compose**, which is worth keeping. The tree took
+  its directories from the requests inside them, so a folder you had just created had no row —
+  and the move picker, deriving destinations the same way, would not offer it. Creating a folder
+  and filling it was impossible, while every test of either verb alone passed. A directory earns
+  a row by existing now. The lesson is not about folders: **two features that are each correct
+  can still fail to meet**, and nothing in a per-feature test suite looks at the seam.
+
+- **No renaming or deleting a *folder***, and `Ctrl+S` cannot target one.
 - **The collection root cannot be changed.** One XDG path, set at startup, with no runtime
   setter. So the git argument the one-file-per-request format is *built on* — commit it, review
   it in a pull request — is unreachable from inside the app, because the collection lives in

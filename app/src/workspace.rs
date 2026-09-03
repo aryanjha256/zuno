@@ -34,7 +34,8 @@ use crate::actions::{
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelRename, CommitRename, CopyRequestPath, CopyRequestRelativePath, DuplicateRequest,
-    OpenRequestExternally, RenameRequest, RevealRequest, TrashRequest,
+    ImportConfirm, ImportDismiss, ImportOpenApi, MoveRequest, NewFolder, OpenRequestExternally,
+    RenameRequest, RevealRequest, TrashRequest,
 };
 use crate::engine::ActiveEngine;
 use crate::context_menu;
@@ -110,6 +111,12 @@ pub struct Workspace {
     /// context so `Enter` and `Escape` mean commit and cancel *there* without touching what they
     /// mean anywhere else.
     renaming: Option<RenameState>,
+    /// The pending new folder, while its name is being typed.
+    new_folder: Option<NewFolderState>,
+    /// The OpenAPI import modal, while it's open.
+    import: Option<ImportState>,
+    /// Holding the task is what keeps a spec fetch alive; dropping it cancels.
+    import_task: Option<Task<()>>,
     /// Where the panel was right-clicked, in window coordinates.
     ///
     /// Kept rather than taken when the first menu opens, because the confirmation is a *second*
@@ -129,6 +136,30 @@ struct RenameState {
     /// with nothing focused and the next `Enter` commits an edit the user had walked away from.
     /// Cancel rather than commit, unlike VS Code: a rename is a file operation, and the safe
     /// reading of "clicked somewhere else" is that it was not meant.
+    _blur: Subscription,
+}
+
+/// The import modal and the subscription that lets it report and close, paired for the reason
+/// `PickerState` pairs them: either alone leaves a modal nothing can dismiss.
+struct ImportState {
+    panel: Entity<crate::import_panel::ImportPanel>,
+    _subscription: Subscription,
+}
+
+/// A folder being named.
+///
+/// Deliberately **not** a phantom row spliced into the tree. `tree_visible` indexes into `tree`,
+/// so a row that exists only in the UI would have to be threaded through the fold walk, the
+/// selection clamp and every index translation to serve one transient input. This is a single
+/// input drawn under the panel's header, labelled with where the folder will land — which also
+/// says the destination outright instead of asking the reader to count indent levels.
+struct NewFolderState {
+    parent: PathBuf,
+    /// Where the box sits in the list, as a *visible* index — the row it displaces.
+    insert_at: usize,
+    /// One level deeper than its parent, so it lines up with the folder's future contents.
+    depth: u16,
+    input: Entity<crate::input::TextInput>,
     _blur: Subscription,
 }
 
@@ -220,6 +251,9 @@ impl Workspace {
             panel_focus: cx.focus_handle(),
             tree_scan: None,
             renaming: None,
+            new_folder: None,
+            import: None,
+            import_task: None,
             collection_menu_at: None,
         };
 
@@ -243,7 +277,7 @@ impl Workspace {
     ///
     /// Everything that opens a modal, and everything that moves focus, has to consult this.
     fn modal_open(&self) -> bool {
-        self.picker.is_some() || self.settings.is_some() || self.menu.is_some()
+        self.picker.is_some() || self.settings.is_some() || self.menu.is_some() || self.import.is_some()
     }
 
     #[cfg(test)]
@@ -550,7 +584,11 @@ impl Workspace {
 
         let scan = cx.background_executor().spawn(async move {
             let entries = collection::scan(&root);
-            collection::tree(&root, &entries)
+            // Two walks rather than one, and worth the second: a directory earns a row by
+            // existing, so an empty folder has to come from the filesystem rather than be
+            // inferred from the requests inside it.
+            let folders = collection::folders(&root);
+            collection::tree(&root, &entries, &folders)
         });
 
         // **The selection is restored by path, not by index**, and that distinction is the
@@ -836,11 +874,15 @@ impl Workspace {
             MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Duplicate", DuplicateRequest, &focus, window).into(),
+            MenuItem::new("New folder", NewFolder, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
             MenuItem::new("Copy relative path", CopyRequestRelativePath, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Rename", RenameRequest, &focus, window).into(),
+            // With Rename rather than with Duplicate: both answer "what and where is this
+            // request", and neither changes what it sends.
+            MenuItem::new("Move to…", MoveRequest, &focus, window).into(),
             MenuItem::new("Move to trash", TrashRequest, &focus, window).into(),
             // The ellipsis is load-bearing: this row asks, the one above it acts. Trash is
             // recoverable and delete is not, which is the whole reason only one of them stops
@@ -1029,6 +1071,355 @@ impl Workspace {
         }
     }
 
+    /// Open the picker over every directory a request can be moved into.
+    ///
+    /// A picker rather than drag-and-drop, deliberately. Drag is a gesture nothing else in Zuno
+    /// uses, the headless platform cannot observe it, and it needs a drop-target hit test per
+    /// row; the picker is keyboard-first, already built, and is how every other "choose one of
+    /// these" in the app works.
+    fn move_request(&mut self, _: &MoveRequest, window: &mut Window, cx: &mut Context<Self>) {
+        // A menu row dispatched this and is still open; `show_picker` refuses to stack.
+        self.close_row_menu(window, cx);
+
+        if self.modal_open() || self.selected_request().is_none() {
+            return;
+        }
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+
+        // The request's own directory is offered and marked rather than filtered out. Removing
+        // it would renumber the list depending on where the request happens to live, so the same
+        // collection would present a different set of rows for each request in it.
+        let current = self
+            .selected_request()
+            .and_then(|node| node.path.parent().map(Path::to_path_buf));
+
+        let items: Vec<picker::Item> = collection::destinations(&root, &collection::folders(&root))
+            .into_iter()
+            .map(|(path, label)| {
+                let is_current = Some(path.as_path()) == current.as_deref();
+                picker::Item {
+                    label: SharedString::from(label),
+                    detail: SharedString::from(if is_current { "current folder" } else { "" }),
+                    target: picker::Target::Folder(path),
+                }
+            })
+            .collect();
+
+        self.show_picker(items, "No folders yet — add one with New folder", window, cx);
+    }
+
+    /// Move the selected request into `directory`.
+    fn move_selected_into(
+        &mut self,
+        directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.selected_request() else { return };
+        let (path, name) = (node.path.clone(), node.name.clone());
+
+        let moved = match collection::move_to(&path, &directory) {
+            Ok(moved) => moved,
+            Err(error) => {
+                self.set_status(&format!("Could not move: {error}"), cx);
+                return;
+            }
+        };
+
+        // The buffer follows, as it does for a rename and for the same reason: the request still
+        // exists, so `Ctrl+S` must still overwrite *it* rather than recreate it where it was.
+        for view in &self.views {
+            if view.read(cx).path.as_deref() == Some(path.as_path()) {
+                let moved = moved.clone();
+                view.update(cx, |view, cx| {
+                    view.path = Some(moved);
+                    cx.notify();
+                });
+            }
+        }
+
+        self.refresh_tree(cx);
+        window.focus(&self.panel_focus);
+        let shown = moved
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "the collection".to_string());
+        self.set_status(&format!("Moved {name} to {shown}"), cx);
+    }
+
+    /// Open the new-folder box.
+    ///
+    /// The parent follows the selection, the file-tree convention: inside a selected directory,
+    /// beside a selected request, at the root when nothing is selected.
+    fn new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_row_menu(window, cx);
+
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.set_status("No collection directory — nowhere to put a folder", cx);
+            return;
+        };
+
+        let parent = match self.panel_selection.and_then(|ix| self.tree.get(ix)) {
+            Some(node) if matches!(node.kind, NodeKind::Directory) => node.path.clone(),
+            Some(node) => node.path.parent().unwrap_or(&root).to_path_buf(),
+            None => root.clone(),
+        };
+
+        // A collapsed parent has no visible children, so the box would have nowhere to appear.
+        // Expanding first is also what the reader means by "new folder in here".
+        if self.collapsed.remove(&parent) {
+            self.rebuild_tree_visible();
+        }
+        let (insert_at, depth) = self.new_folder_position(&parent, &root);
+
+        let input = cx.new(|cx| {
+            crate::input::TextInput::new("", "folder name", "CollectionRename", cx)
+        });
+        let handle = input.read(cx).focus_handle(cx);
+        let blur = window.on_focus_out(&handle, cx, |_, window, cx| {
+            window.dispatch_action(Box::new(CancelRename), cx);
+        });
+
+        self.new_folder = Some(NewFolderState {
+            parent,
+            insert_at,
+            depth,
+            input,
+            _blur: blur,
+        });
+        // The box is a row in the list now, so it can be off screen. Nothing else scrolls it.
+        self.panel_scroll
+            .scroll_to_item(insert_at, gpui::ScrollStrategy::Center);
+        window.focus(&handle);
+        cx.notify();
+    }
+
+    /// Where the new-folder box goes, as a *visible* index, and how deep to indent it.
+    ///
+    /// **First child of its parent**, so the box appears immediately under the row you invoked it
+    /// on rather than after however many requests that folder already holds. Last-child was the
+    /// first version and put the box off screen in any folder with a screenful of requests, which
+    /// is precisely the folder you are most likely to be reorganising.
+    ///
+    /// Sorted position is the third option and is worse than both: the row would jump as you
+    /// typed, and the name is not final until Enter anyway. The tree re-sorts on the rescan that
+    /// follows, which is the moment the name *is* final.
+    fn new_folder_position(&self, parent: &Path, root: &Path) -> (usize, u16) {
+        if parent == root {
+            return (0, 0);
+        }
+
+        let Some(parent_visible) = self
+            .tree_visible
+            .iter()
+            .position(|&ix| self.tree.get(ix).is_some_and(|node| node.path == parent))
+        else {
+            // The parent is not drawn — it has just been created, or a rescan lost it. The top of
+            // the list is somewhere the box can at least be seen.
+            return (0, 0);
+        };
+
+        let depth = self
+            .tree_visible
+            .get(parent_visible)
+            .and_then(|&ix| self.tree.get(ix))
+            .map(|node| node.depth)
+            .unwrap_or(0);
+
+        (parent_visible + 1, depth + 1)
+    }
+
+    /// The pending new folder's position, indent and input, if one is open.
+    pub(crate) fn new_folder_row(&self) -> Option<(usize, u16, Entity<crate::input::TextInput>)> {
+        let state = self.new_folder.as_ref()?;
+        Some((state.insert_at, state.depth, state.input.clone()))
+    }
+
+    /// Open the OpenAPI import modal.
+    fn import_openapi(&mut self, _: &ImportOpenApi, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let panel = cx.new(|cx| crate::import_panel::ImportPanel::new(restore, window, cx));
+
+        let subscription = cx.subscribe_in(&panel, window, |workspace, panel, event, window, cx| {
+            match event {
+                crate::import_panel::ImportEvent::Dismissed => {
+                    workspace.import = None;
+                    cx.notify();
+                }
+                crate::import_panel::ImportEvent::Confirmed(source) => {
+                    workspace.run_import(panel.clone(), source.clone(), window, cx);
+                }
+            }
+        });
+
+        self.import = Some(ImportState {
+            panel,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn import_confirm(&mut self, _: &ImportConfirm, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.import.as_ref() else { return };
+        state.panel.clone().update(cx, |panel, cx| panel.confirm(cx));
+    }
+
+    fn import_dismiss(&mut self, _: &ImportDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.import.as_ref() else { return };
+        state.panel.clone().update(cx, |panel, cx| panel.dismiss(window, cx));
+    }
+
+    /// Read the source, parse it, and write what it yields into the collection.
+    ///
+    /// **A URL goes through the engine rather than a fresh HTTP client.** Zuno already owns one
+    /// on a tokio thread, with the TLS, redirect and timeout behaviour the rest of the app uses —
+    /// a second client would be a second set of those decisions, silently different.
+    fn run_import(
+        &mut self,
+        panel: Entity<crate::import_panel::ImportPanel>,
+        source: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            panel.update(cx, |panel, cx| {
+                panel.report("No collection directory — nowhere to import into", cx)
+            });
+            return;
+        };
+
+        let source = source.trim().to_string();
+        // The one distinction between the two sources, made from the text rather than from a
+        // mode the user has to choose first.
+        let is_url = source.starts_with("http://") || source.starts_with("https://");
+
+        if !is_url {
+            let bytes = match std::fs::read(&source) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    panel.update(cx, |panel, cx| {
+                        panel.report(format!("Could not read {source}: {error}"), cx)
+                    });
+                    return;
+                }
+            };
+            self.finish_import(&panel, &root, &bytes, cx);
+            return;
+        }
+
+        let Some(engine) = cx.engine() else {
+            panel.update(cx, |panel, cx| {
+                panel.report("The HTTP engine failed to start — restart Zuno", cx)
+            });
+            return;
+        };
+
+        let spec = RequestSpec {
+            id: RequestId(0),
+            url: source.clone(),
+            method: zuno_core::Method::Get,
+            ..RequestSpec::default()
+        };
+        let (_job, events) = engine.send(spec);
+
+        self.import_task = Some(cx.spawn(async move |this, cx| {
+            let mut fetched: Option<Result<bytes::Bytes, String>> = None;
+            while let Ok(event) = events.recv().await {
+                match event {
+                    zuno_core::engine::Event::Done { response, .. } => {
+                        fetched = Some(Ok(response.body));
+                        break;
+                    }
+                    zuno_core::engine::Event::Failed { error, .. } => {
+                        fetched = Some(Err(error.to_string()));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            let _ = this.update(cx, |workspace, cx| match fetched {
+                Some(Ok(body)) => workspace.finish_import(&panel, &root, &body, cx),
+                Some(Err(error)) => {
+                    panel.update(cx, |panel, cx| panel.report(format!("Could not fetch: {error}"), cx))
+                }
+                // The channel closed with neither a body nor an error, which means the engine
+                // thread went away mid-fetch.
+                None => panel.update(cx, |panel, cx| panel.report("The fetch was interrupted", cx)),
+            });
+        }));
+    }
+
+    /// Parse a fetched or read spec and write its requests into the collection.
+    fn finish_import(
+        &mut self,
+        panel: &Entity<crate::import_panel::ImportPanel>,
+        root: &Path,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) {
+        let import = match zuno_core::openapi::parse(bytes) {
+            Ok(import) => import,
+            Err(error) => {
+                panel.update(cx, |panel, cx| panel.report(error.to_string(), cx));
+                return;
+            }
+        };
+        if import.requests.is_empty() {
+            panel.update(cx, |panel, cx| {
+                panel.report("The document has no operations to import", cx)
+            });
+            return;
+        }
+
+        // Everything lands under one folder named for the spec, so an import is a thing you can
+        // find and a thing you can delete. Without it a hundred requests scatter through a
+        // collection someone had already organised.
+        let title = import.title.clone().unwrap_or_else(|| "imported".to_string());
+        let base = root.join(collection::slug(&title));
+
+        let mut written = 0usize;
+        let mut failures = 0usize;
+        for request in &import.requests {
+            // The operation's tag becomes a folder inside the spec's own, so an API arrives
+            // grouped the way its author grouped it.
+            let directory = match &request.folder {
+                Some(tag) => base.join(collection::slug(tag)),
+                None => base.clone(),
+            };
+            // `allocate` creates the directory and picks a free name, so re-importing the same
+            // spec adds `-2` files rather than overwriting a request someone has since edited.
+            match collection::allocate(&directory, &request.spec.name)
+                .and_then(|path| collection::write(&path, &request.spec).map(|()| path))
+            {
+                Ok(_) => written += 1,
+                Err(_) => failures += 1,
+            }
+        }
+
+        self.refresh_tree(cx);
+        self.import = None;
+
+        let mut message = format!("Imported {written} requests into {}", collection::slug(&title));
+        if failures > 0 {
+            message.push_str(&format!(" — {failures} could not be written"));
+        }
+        if !import.skipped.is_empty() {
+            message.push_str(&format!(" — {} skipped", import.skipped.len()));
+            for note in &import.skipped {
+                eprintln!("[zuno] import: {note}");
+            }
+        }
+        self.set_status(&message, cx);
+        cx.notify();
+    }
+
     /// Open the rename box on the selected request.
     fn rename_request(&mut self, _: &RenameRequest, window: &mut Window, cx: &mut Context<Self>) {
         // A menu row dispatched this, and it is still open until closed.
@@ -1065,17 +1456,42 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Close whichever naming box is open. Shared, because `Escape` and a blur mean the same
+    /// thing to both and a second action would be two ways to say one word.
     fn cancel_rename(&mut self, _: &CancelRename, window: &mut Window, cx: &mut Context<Self>) {
         // Idempotent: committing drops the state and then moves focus, which fires the blur
         // listener, which dispatches this. Without the `take` that would be a second cancel
         // racing the commit it followed.
-        if self.renaming.take().is_some() {
+        let closed = self.renaming.take().is_some() | self.new_folder.take().is_some();
+        if closed {
             window.focus(&self.panel_focus);
             cx.notify();
         }
     }
 
     fn commit_rename(&mut self, _: &CommitRename, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.new_folder.take() {
+            let typed = state.input.read(cx).text().to_string();
+            window.focus(&self.panel_focus);
+            if typed.trim().is_empty() {
+                self.set_status("A folder needs a name", cx);
+            } else {
+                match collection::create_folder(&state.parent, &typed) {
+                    Ok(made) => {
+                        let name = made
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        self.refresh_tree(cx);
+                        self.set_status(&format!("Created {name}"), cx);
+                    }
+                    Err(error) => self.set_status(&format!("Could not create: {error}"), cx),
+                }
+            }
+            cx.notify();
+            return;
+        }
+
         let Some(state) = self.renaming.take() else { return };
         let typed = state.input.read(cx).text().to_string();
         // Focus first: the box is gone from the next frame either way, and leaving focus on a
@@ -1461,6 +1877,9 @@ impl Workspace {
                         cx.notify();
                     });
                 }
+            }
+            picker::Target::Folder(directory) => {
+                self.move_selected_into(directory, window, cx);
             }
             picker::Target::File(path) => {
                 // Focus is left where `activate` put it — inside the new buffer. The panel
@@ -2669,6 +3088,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::rename_request))
             .on_action(cx.listener(Self::commit_rename))
             .on_action(cx.listener(Self::cancel_rename))
+            .on_action(cx.listener(Self::new_folder))
+            .on_action(cx.listener(Self::move_request))
+            .on_action(cx.listener(Self::import_openapi))
+            .on_action(cx.listener(Self::import_confirm))
+            .on_action(cx.listener(Self::import_dismiss))
             .on_action(cx.listener(Self::switch_environment))
             .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::open_palette))
@@ -2792,6 +3216,7 @@ impl Render for Workspace {
             // Above the panes, below the resize edges.
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
+            .children(self.import.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))

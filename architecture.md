@@ -62,6 +62,7 @@ zuno/
 │       │   ├── mod.rs      ✅ JsonOutline, Row, Span, visible_rows
 │       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
+│       ├── openapi.rs      ✅ OpenAPI 3.x -> requests, over serde_json::Value
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
@@ -82,6 +83,7 @@ zuno/
         ├── picker.rs        ✅ the modal picker: filter + ranked list
         ├── context_menu.rs  ✅ the anchored menu primitive: rows, separators, commands
         ├── collection_panel.rs ✅ the collection tree — the browser beside Ctrl+P's finder
+        ├── import_panel.rs  ✅ the OpenAPI import dialog: one field, URL or path
         ├── commands.rs      ✅ the command palette's curated action table
         ├── settings_panel.rs ✅ per-request engine settings, as a modal
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
@@ -1197,7 +1199,171 @@ them on the way to something harmless, and only one of them stops to ask.
 > delete, which *is* tested end to end. What nothing catches is `trash_request` failing to call
 > one of them. Written down rather than papered over.
 
-*Still absent:* new-folder, and moving a request between directories. `mkdir` and `mv` still work.
+### Organising — new folder, and move
+
+Until these landed the collection could only ever be **flat**. `save_request` calls
+`allocate(&root, …)`, so every `Ctrl+S` writes to the collection root; nothing made a directory,
+and nothing put a request in one. The tree showed a flat list to anyone who had not built folders
+by hand in a terminal, which made the panel a viewer of a structure the app could not produce.
+
+- **`Ctrl+S` still writes to the root, deliberately.** Saving into whatever the panel happens to
+  have selected is faster and depends on state the user is not looking at when they press the
+  key — the invisible-state failure this codebase keeps paying for. Save, then move: two steps,
+  both predictable, and it is what a file manager would make you do too.
+- **New folder follows the selection**, the file-tree convention: inside a selected directory,
+  beside a selected request, at the root when nothing is selected. It has a `+` in the panel
+  header as well as `Ctrl+Shift+N` and a menu row, because a verb reachable only by right-click
+  is the discoverability gap §2 exists for.
+- **The name box is a row in the tree, as the *first* child of its parent.** It shipped as a strip
+  under the header naming its destination (`billing` beside the box), on the reasoning that a
+  phantom row would have to be threaded through the fold walk, the selection clamp and every
+  index translation. That reasoning was about the cost, not the result, and the result was worse:
+  a box that *says* `billing` describes the destination, while a box sitting one indent inside
+  `billing` **is** the destination, which is what every editor does and what a reader already
+  knows how to read.
+
+  The cost turned out to be one index translation in the list closure and nothing else.
+  `tree_visible` is left alone — no placeholder spliced into it — so the index the selection, the
+  fold walk and `scroll_to_item` all address still means exactly one thing; the list is simply one
+  row longer while the box is open, and rows at or past the insertion point shift down by one.
+  Get that shift wrong and the rows below render the *wrong nodes*, which `tree_rows` cannot see
+  because it reads workspace state rather than the rendered list — hence a test on the position
+  itself.
+
+  **First child, not last** — last was the first attempt, and in a folder holding a screenful of
+  requests it opened the box off screen, which is exactly the folder you are most likely to be
+  reorganising. Sorted position is the third option and is worse than both: the row would jump as
+  you type, and the name is not final until Enter. The rescan that follows re-sorts it, which is
+  the moment it *is* final.
+
+  The box reserves **both** of a row's leading columns at their real widths. The first version put
+  the folder glyph in the chevron column and shrank the next one to compensate, which started the
+  input 14px left of where a folder name starts — the box did not line up with the row it was
+  about to become. The chevron slot is reserved and empty: nothing to expand yet, and a chevron
+  that toggles nothing is a dead control.
+
+  Two more things follow from being in the tree: a collapsed parent is expanded first, or the box
+  has nowhere to appear; and the list scrolls to it, since nothing else would. It shares
+  `CommitRename`/`CancelRename` with rename, because `Enter` and `Escape` mean the same thing to
+  both and a second pair of actions would be two ways to say one word.
+- **A directory earns a row by existing, not by holding a request** — and this shipped wrong
+  first, so the correction is the useful part. `tree` derived its directories from `scan`'s
+  entries, which meant a folder you had just created was **invisible** until you put a request in
+  it, and the move picker (deriving destinations the same way) offered only folders that already
+  had rows. So **New folder and Move could not compose**: the one verb that fills a folder
+  refused to see the folder you had just made. Neither was broken alone, which is why a test of
+  each said nothing; `a_folder_you_just_created_can_be_moved_into` is the one that would have.
+
+  The reasoning written down for it was the actual defect: *"offering a destination that will not
+  appear afterwards is worse than not offering it."* Backwards — moving a request in is exactly
+  what makes it appear. `collection::folders` walks the real tree now, with `walk`'s skip rules
+  so the two agree about what a collection contains, and `tree` takes it alongside the entries.
+  The status line's apology ("appears once a request is in it") went with it: a notice explaining
+  a design flaw is not a fix.
+- **Move is a picker, not drag-and-drop.** Drag is a gesture nothing else in Zuno uses, the
+  headless platform cannot observe it, and it needs a drop-target hit test per row. The picker is
+  the eighth `Target` variant and needed no new interaction — still no `PickerDelegate` trait,
+  since it draws as label plus dimmed detail like the other seven.
+- **The request's own folder is offered and marked, not filtered out.** Removing it would
+  renumber the list depending on where the request happens to live, so the same collection would
+  present a different set of rows for each request in it. `move_to` treats it as a no-op rather
+  than reporting "already exists" about the file being moved — the same rule `rename` follows.
+- **The buffer follows a move**, as it does a rename and for the same reason — the request still
+  exists, so `Ctrl+S` must overwrite it where it now lives rather than recreate it where it was.
+
+**A row's name is one line, clipped, with the full text on hover.** It shipped *wrapping*, which
+is not the same failure and does not look like one: gpui's default is `WhiteSpace::Normal`, so a
+long name reflowed onto a second line, and the row is a fixed `ROW_HEIGHT` because `uniform_list`
+demands it — so the second line was sliced through the middle. That reads as a rendering fault
+rather than as a name too long for a 232px panel, which is exactly how it got misdiagnosed as
+horizontal clipping. `whitespace_nowrap()` is the fix, and it is the *dependable* half of
+`truncate()`: a flag the shaper reads, with none of the cached-measurement fragility that makes
+the ellipsis unreliable (CLAUDE.md).
+
+The tooltip is attached **only when the name is over budget**, because one repeating a name you
+can already read is noise on every row. `name_budget` computes that from the panel's width, the
+row's chrome and the depth's indent, against the same `5.95px` advance `TAB_LABEL_CHARS` is tuned
+to — computed rather than measured for the reason `elide` is: the test platform has no shipping
+font, and a pure function over a string is something a unit test can check. Both its failure modes
+are silent — zero puts a tooltip on every row, an enormous value on none — so the test asserts a
+bounded range rather than a value.
+
+**Directories carry a folder icon, in the method column's slot.** Not a column of its own: give
+it one and a folder name and the request name below it indent differently for no reason a reader
+could name. It opens with the row — redundant against the chevron, and conventional enough that
+the redundancy reads as polish rather than noise. Requests have no icon, because the method is
+more informative than a document glyph and 232px does not have room for both.
+
+*Still absent:* renaming or deleting a *folder*, and nesting a new folder deeper than the
+selection allows. `mv` and `rmdir` still work.
+
+---
+
+## 6b. OpenAPI import — and the first real modal
+
+The answer to a first run that feels empty. `ImportCurl` is one request per paste; a team with a
+spec has its whole API in one document, and until this landed Zuno had no way to consume the
+artifact that describes it. `Ctrl+Shift+I` takes a URL or a path.
+
+**A hand-written walk over `serde_json::Value`, not a typed model.** `openapiv3` is small and
+well-tested and was rejected on its own README: it covers 3.0.x and "does not cover OpenAPI v3.1
+which was an incompatible change". Everything this reads — `servers`, `paths`, a method, a name,
+parameters, a JSON request body — is *identical* across the two; the incompatibility is in schema
+semantics, which is validation Zuno never performs. So the typed model would buy a dependency,
+lock out every 3.1 spec, and still leave `$ref` resolution to be written by hand, which is the
+only awkward part. `a_3_1_document_imports_the_same_as_a_3_0_one` is that argument as a test.
+
+Decisions worth keeping:
+
+- **Permissive like `curl.rs`.** An operation Zuno cannot read is skipped and *named* in
+  `Import::skipped`, never fatal. A spec is written for many tools; refusing ninety requests over
+  one unreadable body would break the feature where it is most useful.
+- **A path template keeps its braces.** `{id}` is left literal rather than rewritten to Zuno's
+  `{{id}}`, and that is the opposite of the obvious move: an unresolved `{{…}}` is *refused* at
+  the send boundary, so the tidier version would import a collection where nothing can be sent
+  until every path parameter is defined as a variable. A literal brace is a URL you can edit.
+- **Only *required* parameters arrive enabled.** An optional one still imports — it documents
+  what the endpoint takes — but sending every filter a spec mentions is not what anyone means by
+  "import this API".
+- **A body's shape is invented; a parameter's value is not.** A generated body is obviously a
+  draft, and opening the editor on the right keys nested correctly beats an empty buffer. A
+  pre-filled parameter row looks like a decision someone made, and a wrong value *sent* is worse
+  than an empty one you have to fill.
+- **`$ref` is local-only, and cycles end at a depth cap.** A remote `$ref` is an HTTP fetch in
+  the middle of parsing — IO, a runtime, and failures a document cannot express. A cap rather
+  than a visited-set because a `User` whose `manager` is a `User` is legal and common, and one
+  rule covers that *and* the merely enormous.
+- **A URL fetch goes through `Engine::send`.** A second HTTP client would be a second set of TLS,
+  redirect and timeout decisions, silently different from every other request Zuno makes.
+- **Everything lands under one folder named for the spec**, with each operation's tag as a folder
+  inside it. Without the outer folder a hundred requests scatter through a collection someone had
+  already organised; with it, an import is a thing you can find and a thing you can delete.
+  `allocate` picks the filenames, so re-importing adds `-2` files rather than overwriting a
+  request that has since been edited.
+
+**And it is the first modal that is a form.** Rename got away with an inline box because a tree
+row *is* a text field's worth of space; an import needs a field, a hint, and somewhere to report
+what happened. `import_panel.rs` is deliberately **concrete, not a form framework** — one
+consumer, one file, the bet `picker.rs` made and won by staying a `Vec<Item>` and a `Target`
+instead of becoming a trait. When a second modal wants a text field — an environment editor,
+opening a project — that is the moment to lift the shared part out.
+
+Two details in it:
+
+- **One field for both sources.** A URL/file toggle would be a mode to choose before typing, to
+  describe a difference the text already carries: `http` at the front, or not.
+- **A failure reports *in* the dialog and leaves it open**, with what you typed still in it. The
+  fix for a wrong path or a non-spec URL is usually a character or two, and the status bar is
+  cleared by the next thing that touches it.
+- The `enter`/`escape` bindings are scoped to `ImportSource`, the *field's* leaf context — the
+  panel's own `ImportPanel` context never holds focus, because the input does. Registered after
+  their global twins, for the sixth time.
+
+*Deliberately absent:* YAML, which most published specs use — the crate landscape is a graveyard
+(`serde_yaml` is versioned `0.9.34+deprecated`, `serde_yml` is `0.0.13` and self-tagged the same),
+and JSON-only is a real limitation recorded rather than hidden. Also absent: OpenAPI 2.0/Swagger,
+a different document shape rather than an older version of this one, and refused with a message
+that says so.
 
 ---
 
@@ -1913,6 +2079,48 @@ context, so "not inside a modal" cannot be written once — it has to be restate
 context that ever exists, and the failure mode when someone forgets is a dead keymap with nothing on
 screen explaining it. A guard on the handler is one place and cannot be forgotten by a *new* modal,
 only by a new focus-moving action.
+
+**A row's two columns elide in opposite directions.** Imported collections put paths like
+`TheGameYou-Misc-API-Notification-Blob/notification-controller/getPreSignedUrlInternal` beside
+URLs like `http://localhost:8080/api/notification/v1/blob/internal/presigned-url`, and two faults
+surfaced together: neither column set `whitespace_nowrap`, so a long one *wrapped* and the fixed
+`ROW_HEIGHT` sliced the second line; and the label was `flex_none`, so it could not shrink and
+pushed the detail out of the row. Neither shows in a short label, which is every label this
+picker had until the OpenAPI importer.
+
+The direction follows where each string keeps its information. A path's head names the
+collection and its tail is one more request, so the **label keeps its head** (`elide`). A URL's
+head is the `http://host:port` every row repeats and its tail is the endpoint that tells them
+apart, so the **detail keeps its tail** (`elide_front`) — trimmed the other way, every row in a
+collection reads `http://localhost:8080/api/notif…`.
+
+**Neither column reserves half.** They are sized to their content — the default `flex: 0 1 auto`
+with `min_w(0)`, *not* `flex_1`, which is `flex: 1 1 0%` and therefore a fixed half each whatever
+they hold. And `split_budget` hands the spare characters to whichever column wants them: a short
+label takes only what it needs and the URL beside it gets the rest, with half-and-half reserved
+for the case where both want more than half. That rule is a pure function with a unit test, so it
+is checked rather than eyeballed.
+
+> **Two earlier versions, both worth keeping.** *Middle*-elision came first and was the wrong
+> answer to the wrong question — it shortened the label alone, keeping both of *its* ends, which
+> is sensible for one string and not what a two-column row needs. Then the budget was a fixed 62
+> characters while the column was whatever flex left it, so the text was elided **and then
+> clipped**: an ellipsis in the middle and a hard cut at the end of the same string. **A character
+> budget only means something if it matches the width the column actually gets** — which is why
+> `ROW_CHARS` is derived from the modal's real width and then split, rather than picked per
+> column.
+
+**Elided at render, never in `Item::label`.** `refilter` ranks the stored string, so shortening at
+construction would mean typing the part that was dropped stops finding the row — searching against
+an ellipsis. `a_long_label_is_shortened_on_screen_but_still_matches_in_full` types the middle of a
+path, which both elisions remove.
+
+The tooltip carries **both** strings, one per line, and appears when *either* was cut — whichever
+one lost characters, the row as a whole is what you were trying to read. It has **no maximum
+width**: the strings that need a tooltip are the ones too long for their row, and wrapping one
+mid-path is precisely what the tooltip exists to undo. A pathological path makes a very wide
+tooltip, which is the accepted cost. Lines are separate elements rather than one string with
+`\n` in it, because `shape_line` carries a `debug_assert!` against newlines.
 
 Deliberately absent: **no highlighting of matched characters.** It needs match positions threaded
 out of the scorer and styled text runs, and the picker is useful without it.

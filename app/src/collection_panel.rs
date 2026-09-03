@@ -18,12 +18,12 @@
 
 use gpui::{
     Context, Div, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, Styled, Window, div, px,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
     uniform_list,
 };
 use zuno_core::collection::{Node, NodeKind};
 
-use crate::actions::{OpenCollectionMenu, ToggleCollectionPanel};
+use crate::actions::{NewFolder, OpenCollectionMenu, ToggleCollectionPanel};
 use gpui::Action as _;
 use crate::theme::Theme;
 use crate::ui::{Icon, glyph, icon_button};
@@ -62,8 +62,13 @@ pub fn render(
     // Resolved once per frame rather than per row: `rename_input_for` would be a lookup on
     // every one of them to answer "no" for all but a single row.
     let renaming = workspace.renaming_row();
+    // While the new-folder box is open the list is one row longer than `tree_visible`, and every
+    // row at or past the insertion point shifts down by one. Rendering it as a real row rather
+    // than splicing a placeholder into `tree_visible` keeps that index — which the selection, the
+    // fold walk and `scroll_to_item` all address — meaning exactly one thing.
+    let pending = workspace.new_folder_row();
     let row_theme = theme.clone();
-    let count = visible.len();
+    let count = visible.len() + usize::from(pending.is_some());
     // A `uniform_list` render closure is handed a bare `&mut App`, not a `Context<Workspace>`,
     // so `cx.listener` is unavailable inside it and the entity has to be captured instead —
     // the same shape the response body's rows use.
@@ -72,7 +77,18 @@ pub fn render(
     let list = uniform_list("collection-tree", count, move |range, _window, _cx| {
         range
             .map(|visible_ix| {
-                let row_ix = visible[visible_ix];
+                if let Some((insert_at, depth, input)) = &pending {
+                    if visible_ix == *insert_at {
+                        return new_folder_cell(*depth, input.clone(), &row_theme);
+                    }
+                }
+                let shifted = match &pending {
+                    Some((insert_at, _, _)) if visible_ix > *insert_at => visible_ix - 1,
+                    _ => visible_ix,
+                };
+                let Some(&row_ix) = visible.get(shifted) else {
+                    return div().w_full().h(px(ROW_HEIGHT));
+                };
                 let Some(node) = nodes.get(row_ix) else {
                     return div().w_full().h(px(ROW_HEIGHT));
                 };
@@ -145,13 +161,63 @@ fn header(
                 .overflow_hidden()
                 .child(name),
         )
-        .child(icon_button(
-            "collection-hide",
-            Icon::Close,
-            "Hide the collection panel",
-            ToggleCollectionPanel,
-            theme,
-        ))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .child(icon_button(
+                    "collection-new-folder",
+                    Icon::Plus,
+                    "New folder",
+                    NewFolder,
+                    theme,
+                ))
+                .child(icon_button(
+                    "collection-hide",
+                    Icon::Close,
+                    "Hide the collection panel",
+                    ToggleCollectionPanel,
+                    theme,
+                )),
+        )
+}
+
+/// The name box for a folder being created, drawn as a row *in* the tree.
+///
+/// **Not a strip under the header, which is where it started.** A box that says "billing" beside
+/// it describes the destination; a box sitting one indent inside `billing`, as its last child,
+/// *is* the destination — which is what every editor does and what a reader already knows how to
+/// read. It costs an index translation in the list closure and nothing else.
+fn new_folder_cell(
+    depth: u16,
+    input: Entity<crate::input::TextInput>,
+    theme: &Theme,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .pr_2()
+        .pl(px(6. + f32::from(depth) * INDENT))
+        .gap_1()
+        .text_xs()
+        // **Both columns, at their real widths.** The first version put the folder glyph in the
+        // *chevron* column and shrank the second to compensate, which left the input starting
+        // 14px left of where a folder name starts — the box did not line up with the row it was
+        // about to become. The chevron slot is reserved and empty: there is nothing to expand
+        // yet, and drawing a chevron that toggles nothing is a dead control.
+        .child(div().flex_none().w(px(CHEVRON)))
+        .child(div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
+            Icon::Folder,
+            theme.text_faint,
+            theme.text_faint,
+            13.,
+        )))
+        .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(input))
 }
 
 /// Shown instead of an empty list, because a blank panel is indistinguishable from a broken
@@ -177,6 +243,59 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
                 "Reading the collection…"
             }),
     )
+}
+
+/// Roughly how many characters of a name fit at `depth`, in the panel's font at `text_xs`.
+///
+/// Computed rather than measured, the same bet `TAB_LABEL_CHARS` makes: real widths need the
+/// shipping font, which the test platform does not have, and a pure function over a string is
+/// something a unit test can actually check. Only used to decide whether a name needs a tooltip,
+/// so erring low costs a tooltip nobody needed and erring high costs one that was wanted.
+///
+/// `5.95` is `TAB_LABEL_WIDTH / TAB_LABEL_CHARS` — the same measured advance the tab strip is
+/// tuned to, since both draw `text_xs` in the UI font.
+pub(crate) fn name_budget(depth: u16, is_directory: bool) -> usize {
+    // 6 left pad, the chevron column, two 4px gaps, the method-or-folder column, 8 right pad.
+    let chrome = 6. + CHEVRON + 4. + METHOD_WIDTH + 4. + 8. + f32::from(depth) * INDENT;
+    let _ = is_directory; // Both kinds reserve the same columns, which is why names line up.
+    (((WIDTH - chrome) / 5.95).max(0.)) as usize
+}
+
+/// One row's name: a single line, clipped, with the full text on hover when it does not fit.
+///
+/// **`whitespace_nowrap` is the whole fix, and its absence was the bug.** gpui's default is
+/// `WhiteSpace::Normal`, so a long name *wrapped* — and the row is a fixed `ROW_HEIGHT`, as
+/// `uniform_list` requires, so the second line was sliced in half. It read as a rendering fault
+/// rather than as a name too long for the panel, which is why it was misdiagnosed as clipping.
+///
+/// The tooltip is attached only when the name is over budget. One that repeats a name you can
+/// already read in full is noise, and the panel would have one on every row.
+fn name_cell(
+    name: &str,
+    depth: u16,
+    is_directory: bool,
+    color: gpui::Hsla,
+    row_ix: usize,
+) -> gpui::Stateful<Div> {
+    let full = SharedString::from(name.to_string());
+    let overflows = name.chars().count() > name_budget(depth, is_directory);
+
+    let mut cell = div()
+        // `tooltip` lives on `StatefulInteractiveElement`, so the cell needs an id — which is
+        // also why the tooltip is here rather than on the row: a `.id()` there would make it
+        // `Stateful<Div>` and it could no longer share a `Vec` with the list's fallback row.
+        .id(("collection-name", row_ix))
+        .flex_1()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_color(color)
+        .child(full.clone());
+
+    if overflows {
+        cell = cell.tooltip(move |_window, cx| crate::ui::Tooltip::text(full.clone(), cx));
+    }
+    cell
 }
 
 fn row(
@@ -255,14 +374,28 @@ fn row(
                     10.,
                 )),
             )
+            // **The folder icon sits in the method column's slot**, so a folder name and a
+            // request name below it start at the same x. Give it its own narrow column instead
+            // and the two kinds of row indent differently for no reason a reader could name.
             .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .text_color(theme.text)
-                    .child(SharedString::from(node.name.clone())),
-            ),
+                div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
+                    if expanded {
+                        Icon::FolderOpen
+                    } else {
+                        Icon::Folder
+                    },
+                    theme.text_muted,
+                    theme.text,
+                    13.,
+                )),
+            )
+            .child(name_cell(
+                &node.name,
+                node.depth,
+                true,
+                theme.text,
+                row_ix,
+            )),
         NodeKind::Request { method, .. } => row
             // The chevron's column is held open on a request row too, so a request and a
             // sibling directory start their names at the same x.
@@ -282,13 +415,48 @@ fn row(
                     .flex_1()
                     .min_w(px(0.))
                     .overflow_hidden()
-                    .child(input),
-                None => div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(node.name.clone())),
+                    .child(input)
+                    .into_any_element(),
+                None => name_cell(
+                    &node.name,
+                    node.depth,
+                    false,
+                    theme.text_muted,
+                    row_ix,
+                )
+                .into_any_element(),
             }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_name_budget_shrinks_with_depth_and_stays_sane() {
+        // Decides whether a row gets a hover tooltip, so both failure modes are silent: a budget
+        // of zero puts one on every row, and an enormous one puts it on none. A bounded range is
+        // the only assertion that catches either — the same shape as the response viewer's
+        // `the_widest_row_can_actually_be_reached`.
+        let root = name_budget(0, false);
+        assert!(
+            (20..=32).contains(&root),
+            "a root-level name should fit roughly 25 characters, got {root}"
+        );
+
+        // Each level of nesting costs `INDENT`, which is about two characters.
+        for depth in 1..6u16 {
+            let deeper = name_budget(depth, false);
+            assert!(
+                deeper < name_budget(depth - 1, false),
+                "depth {depth} must have less room than depth {}",
+                depth - 1
+            );
+            assert!(deeper > 0, "a name must never be budgeted to nothing");
+        }
+
+        // Directories reserve the same columns, which is what makes the names line up.
+        assert_eq!(name_budget(2, true), name_budget(2, false));
     }
 }

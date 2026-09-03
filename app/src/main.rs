@@ -11,6 +11,7 @@ mod actions;
 mod body_view;
 mod chrome;
 mod collection_panel;
+mod import_panel;
 mod collections;
 mod commands;
 mod context_menu;
@@ -49,7 +50,8 @@ use crate::actions::{
     MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
     ScrollRight, ScrollStart, ToggleFold,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
-    CancelRename, CommitRename, DeleteRequest, RenameRequest, ToggleCollectionPanel,
+    CancelRename, CommitRename, DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
+    NewFolder, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
 use crate::theme::{Appearance, Theme};
@@ -183,6 +185,9 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("delete", DeleteRequest, Some("CollectionPanel")),
         // The desktop convention for rename, in every file manager and in VS Code.
         KeyBinding::new("f2", RenameRequest, Some("CollectionPanel")),
+        // The file-manager convention for a new folder, and free here: `ctrl-shift-n` is
+        // otherwise unused, and `ctrl-n` is not bound at all.
+        KeyBinding::new("ctrl-shift-n", NewFolder, Some("CollectionPanel")),
         // --- Buffers (global) ---
         //
         // `ctrl-tab` is a distinct keystroke from bare `tab` above, so tab-cycling focus
@@ -208,6 +213,7 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("ctrl-shift-m", AddMultipartField, None),
         // Paste-special: import a curl command from the clipboard.
         KeyBinding::new("ctrl-shift-v", ImportCurl, None),
+        KeyBinding::new("ctrl-shift-i", ImportOpenApi, None),
         // Headers ⇄ Params ⇄ Body, cycling forward and back like `ctrl-tab` does for buffers.
         // Not `alt-tab`, which the compositor's window switcher takes before we ever see it;
         // `alt-q` sits beside `alt-r` for the response pane's equivalent.
@@ -320,6 +326,11 @@ fn register_keymap(cx: &mut App) {
         // why `CollectionRename` matches without any nesting.
         KeyBinding::new("enter", CommitRename, Some("CollectionRename")),
         KeyBinding::new("escape", CancelRename, Some("CollectionRename")),
+        // After the global `escape` for the reason above. The input's leaf context is
+        // `"TextInput ImportSource"`, so `ImportSource` is what matches — the panel's own
+        // `"ImportPanel"` context never holds focus, since the field does.
+        KeyBinding::new("enter", ImportConfirm, Some("ImportSource")),
+        KeyBinding::new("escape", ImportDismiss, Some("ImportSource")),
         // --- Text editing, scoped to any focused TextInput ---
         KeyBinding::new("backspace", text_input::Backspace, Some("TextInput")),
         KeyBinding::new("delete", text_input::Delete, Some("TextInput")),

@@ -55,6 +55,8 @@ pub enum Icon {
     ChevronLeft,
     ChevronRight,
     ChevronDown,
+    Folder,
+    FolderOpen,
     Replace,
     ReplaceAll,
     Minimize,
@@ -79,6 +81,8 @@ impl Icon {
             Icon::ChevronLeft => "icons/chevron-left.svg",
             Icon::ChevronRight => "icons/chevron-right.svg",
             Icon::ChevronDown => "icons/chevron-down.svg",
+            Icon::Folder => "icons/folder.svg",
+            Icon::FolderOpen => "icons/folder-open.svg",
             Icon::Replace => "icons/replace.svg",
             Icon::ReplaceAll => "icons/replace-all.svg",
             Icon::Minimize => "icons/minimize.svg",
@@ -103,6 +107,8 @@ impl Icon {
         Icon::ChevronLeft,
         Icon::ChevronRight,
         Icon::ChevronDown,
+        Icon::Folder,
+        Icon::FolderOpen,
         Icon::Replace,
         Icon::ReplaceAll,
         Icon::Minimize,
@@ -128,6 +134,8 @@ impl AssetSource for Assets {
             "icons/chevron-left.svg" => include_bytes!("../assets/icons/chevron-left.svg"),
             "icons/chevron-right.svg" => include_bytes!("../assets/icons/chevron-right.svg"),
             "icons/chevron-down.svg" => include_bytes!("../assets/icons/chevron-down.svg"),
+            "icons/folder.svg" => include_bytes!("../assets/icons/folder.svg"),
+            "icons/folder-open.svg" => include_bytes!("../assets/icons/folder-open.svg"),
             "icons/replace.svg" => include_bytes!("../assets/icons/replace.svg"),
             "icons/replace-all.svg" => include_bytes!("../assets/icons/replace-all.svg"),
             "icons/minimize.svg" => include_bytes!("../assets/icons/minimize.svg"),
@@ -151,7 +159,10 @@ impl AssetSource for Assets {
 /// gpui 0.2.2 ships no tooltip view, only the `tooltip()` hook that wants an `AnyView`, so this is
 /// the smallest thing that satisfies it.
 pub struct Tooltip {
-    label: SharedString,
+    /// One per line. A tooltip is the one surface here that may take more than one, because it
+    /// floats and nothing clips it — so a picker row hands over both of its columns rather than
+    /// whichever one happened to be cut.
+    lines: Vec<SharedString>,
 }
 
 impl Tooltip {
@@ -171,6 +182,22 @@ impl Tooltip {
         }
     }
 
+    /// A tooltip carrying plain text, for a label the layout had to cut short.
+    pub fn text(label: impl Into<SharedString>, cx: &mut App) -> AnyView {
+        Self::lines([label.into()], cx)
+    }
+
+    /// A tooltip of several lines, one per string.
+    ///
+    /// **No maximum width.** The strings that need a tooltip are the ones too long for the row
+    /// they came from, and wrapping one mid-path is the thing the tooltip exists to undo — a
+    /// bound would break the primary line to save space the tooltip does not have to save. A
+    /// pathological path therefore makes a very wide tooltip, which is the accepted cost.
+    pub fn lines(lines: impl IntoIterator<Item = SharedString>, cx: &mut App) -> AnyView {
+        let lines: Vec<SharedString> = lines.into_iter().filter(|line| !line.is_empty()).collect();
+        cx.new(|_| Tooltip { lines }).into()
+    }
+
     pub fn for_action(
         label: &str,
         action: &dyn gpui::Action,
@@ -179,7 +206,7 @@ impl Tooltip {
     ) -> AnyView {
         let label = Self::label_for(label, action, window);
         cx.new(|_| Tooltip {
-            label: SharedString::from(label),
+            lines: vec![SharedString::from(label)],
         })
         .into()
     }
@@ -192,12 +219,21 @@ impl Render for Tooltip {
             .px_2()
             .py_1()
             .rounded_md()
+            .flex()
+            .flex_col()
             .bg(theme.bg_elevated)
             .border_1()
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.text)
-            .child(self.label.clone())
+            // One element per line rather than one string with newlines in it: `shape_line` has
+            // a `debug_assert!` against newlines, so a `\n` here is a panic waiting for a debug
+            // build.
+            .children(
+                self.lines
+                    .iter()
+                    .map(|line| div().whitespace_nowrap().child(line.clone())),
+            )
     }
 }
 
