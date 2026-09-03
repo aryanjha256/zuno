@@ -54,6 +54,8 @@ pub fn palette() -> Vec<Command> {
         // makes a folder at the collection root — so it is a real palette row rather than an
         // exclusion.
         command("New folder in collection", NewFolder),
+        command("Collapse all folders", CollectionCollapseAll),
+        command("Expand all folders", CollectionExpandAll),
         command("Switch environment", SwitchEnvironment),
         command("New tab", NewTab),
         command("Close tab", CloseTab),

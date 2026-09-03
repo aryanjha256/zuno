@@ -1084,6 +1084,24 @@ Decisions worth keeping:
   rides in the session envelope (v4). Spelled out as its own `SessionV3` rather than given a
   serde default, per invariant 8 — a default cannot tell "written by an older Zuno" from
   "written by this one, with the panel hidden", and those two want opposite answers.
+- **Collapse-all is the new fold path `rebuild_tree_visible` warned about.** That comment says
+  the panel needs no selection clamp because every fold path selects the directory before folding
+  it, and that a new one must do the same. This is that new one: it folds the whole tree at once,
+  so a selection on a nested request would be left on a row nothing paints — invisible until the
+  next `down` jumps from wherever the cursor secretly still was. `outermost_ancestor` walks the
+  selection up to its depth-0 row *before* collapsing, while the depths still describe a visible
+  tree. Expand-all needs none of this, and the asymmetry is the point: expanding only ever adds
+  rows, so nothing selected can stop being drawn.
+
+  **Two buttons, not one that toggles.** A single control has to read the tree to decide its
+  meaning, and a half-collapsed tree has no honest answer — you could not expand-all from one
+  without collapsing everything first. The response pane's `fold all` / `expand` pair is the same
+  shape.
+
+  The test asserts the *consequence* rather than the selection alone: after collapsing it presses
+  `down` and requires the next row **on screen**. Left nested, the selection is still a valid
+  index into `tree` and reads back fine — it is only the following keystroke that exposes it.
+
 - **The toggle lives in the titlebar, not in the panel.** It shipped as a `×` in the panel's
   own header, which can only ever perform *half* of a toggle: pressing it took the button away
   along with the panel, and since `panel_visible` gates the whole render there is no rail or stub

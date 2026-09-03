@@ -33,7 +33,8 @@ use crate::actions::{
     ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
-    CancelRename, CommitRename, CopyRequestPath, CopyRequestRelativePath, DuplicateRequest,
+    CancelRename, CollectionCollapseAll, CollectionExpandAll, CommitRename, CopyRequestPath,
+    CopyRequestRelativePath, DuplicateRequest,
     ImportConfirm, ImportDismiss, ImportOpenApi, MoveRequest, NewFolder, OpenRequestExternally,
     RenameRequest, RevealRequest, TrashRequest,
 };
@@ -782,6 +783,77 @@ impl Workspace {
             self.panel_selection = Some(ix + 1);
         }
         cx.notify();
+    }
+
+    /// Collapse every directory in the tree.
+    ///
+    /// **This is the new fold path `rebuild_tree_visible` warns about.** Every other one selects
+    /// the directory before folding it, which is why the panel has no selection clamp; this one
+    /// folds everything at once, so a selection sitting on a nested request would be left on a
+    /// row nothing paints — and the next `down` would jump from wherever it secretly still was.
+    /// The selection therefore walks up to its outermost ancestor, which is the row that remains
+    /// visible and the one that now stands for where you were. Same rule the response viewer
+    /// follows when you fold the container you are standing in.
+    fn collection_collapse_all(
+        &mut self,
+        _: &CollectionCollapseAll,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Walk up *before* collapsing, while the depths still describe a visible tree.
+        if let Some(ix) = self.panel_selection {
+            self.panel_selection = self.outermost_ancestor(ix);
+        }
+
+        for node in &self.tree {
+            if matches!(node.kind, NodeKind::Directory) {
+                self.collapsed.insert(node.path.clone());
+            }
+        }
+
+        self.rebuild_tree_visible();
+        cx.notify();
+    }
+
+    /// Expand every directory in the tree.
+    ///
+    /// No selection work, and the asymmetry is the point: expanding only ever *adds* rows, so
+    /// whatever was selected is still drawn and still at the same index into `tree`.
+    fn collection_expand_all(
+        &mut self,
+        _: &CollectionExpandAll,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.collapsed.is_empty() {
+            return;
+        }
+        self.collapsed.clear();
+        self.rebuild_tree_visible();
+        cx.notify();
+    }
+
+    /// The depth-0 row that `ix` sits under, or `ix` itself when it is already at the root.
+    ///
+    /// A scan backwards rather than a stored parent link, for the reason `ancestors_of` does it
+    /// in the response viewer: `Node` records no parent, and the flat depth-tagged list makes
+    /// the nearest earlier shallower row the answer by construction.
+    fn outermost_ancestor(&self, ix: usize) -> Option<usize> {
+        let mut best = ix;
+        let mut depth = self.tree.get(ix)?.depth;
+
+        for candidate in (0..ix).rev() {
+            if depth == 0 {
+                break;
+            }
+            let node = self.tree.get(candidate)?;
+            if node.depth < depth {
+                depth = node.depth;
+                best = candidate;
+            }
+        }
+
+        Some(best)
     }
 
     /// Select a row and act on it: a directory folds, a request opens.
@@ -3076,6 +3148,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::collection_confirm))
             .on_action(cx.listener(Self::collection_collapse))
             .on_action(cx.listener(Self::collection_expand))
+            .on_action(cx.listener(Self::collection_collapse_all))
+            .on_action(cx.listener(Self::collection_expand_all))
             .on_action(cx.listener(Self::open_collection_menu))
             .on_action(cx.listener(Self::delete_request))
             .on_action(cx.listener(Self::confirm_delete_request))

@@ -38,6 +38,11 @@ actions!(
         CollectionConfirm,
         CollectionCollapse,
         CollectionExpand,
+        // Whole-tree folding. `CollectionCollapse` acts on the selected directory; these act on
+        // everything, which is a *new fold path* — and `rebuild_tree_visible` warns that one has
+        // to move the selection itself, since the panel has no clamp.
+        CollectionCollapseAll,
+        CollectionExpandAll,
         OpenCollectionMenu,
         // Two actions, because deleting a file has no undo: `DeleteRequest` only *asks*, and
         // `ConfirmDeleteRequest` is the one that removes anything. Splitting them is what lets

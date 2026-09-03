@@ -23,7 +23,7 @@ use gpui::{
 };
 use zuno_core::collection::{Node, NodeKind};
 
-use crate::actions::{NewFolder, OpenCollectionMenu};
+use crate::actions::{CollectionCollapseAll, CollectionExpandAll, NewFolder, OpenCollectionMenu};
 use gpui::Action as _;
 use crate::theme::Theme;
 use crate::ui::{Icon, glyph, icon_button};
@@ -175,6 +175,24 @@ fn header(
                     Icon::FolderPlus,
                     "New folder",
                     NewFolder,
+                    theme,
+                ))
+                // Two controls rather than one that toggles, matching the response pane's
+                // `fold all` / `expand` pair. A single button would have to read the tree's
+                // state to decide its meaning, and a half-collapsed tree has no honest answer —
+                // you could not expand-all from it without collapsing everything first.
+                .child(icon_button(
+                    "collection-collapse-all",
+                    Icon::ChevronsDownUp,
+                    "Collapse all folders",
+                    CollectionCollapseAll,
+                    theme,
+                ))
+                .child(icon_button(
+                    "collection-expand-all",
+                    Icon::ChevronsUpDown,
+                    "Expand all folders",
+                    CollectionExpandAll,
                     theme,
                 )),
         )

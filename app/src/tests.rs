@@ -4251,6 +4251,12 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("fold-all", "zuno::FoldAll"),
         ("unfold-all", "zuno::UnfoldAll"),
         ("collection-toggle", "zuno::ToggleCollectionPanel"),
+        // The panel header. `collection-new-folder` predates this list and was never in
+        // it — the table only fails on an entry with no button, so a button with no entry
+        // is silently uncovered, which is how it stayed missing.
+        ("collection-new-folder", "zuno::NewFolder"),
+        ("collection-collapse-all", "zuno::CollectionCollapseAll"),
+        ("collection-expand-all", "zuno::CollectionExpandAll"),
     ]
 }
 
@@ -8178,6 +8184,97 @@ async fn moving_a_request_relocates_its_file_and_the_open_buffer(cx: &mut TestAp
     assert!(
         !root.join("invoices.json").exists(),
         "Ctrl+S recreated the request where it used to live"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn collapse_all_folds_every_folder_and_expand_all_restores_them(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-fold-all");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices/create.json", "https://a.test/invoices");
+    seed_request(&root, "users/list.json", "https://a.test/users");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() > 4).then_some(())
+    });
+
+    // billing / invoices / create / users / list — everything open.
+    let expanded = tree_rows(&window, &mut cx).len();
+
+    let collapse = cx.debug_bounds("collection-collapse-all").expect("collapse button");
+    cx.simulate_click(collapse.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // Only the two root directories survive. Asserting the *names* rather than the count,
+    // because a count alone holds for any two rows.
+    let rows = tree_rows(&window, &mut cx);
+    let names: Vec<&str> = rows.iter().map(|(_, name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["billing", "users"],
+        "collapse all must leave exactly the root folders"
+    );
+
+    let expand = cx.debug_bounds("collection-expand-all").expect("expand button");
+    cx.simulate_click(expand.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        tree_rows(&window, &mut cx).len(),
+        expanded,
+        "expand all must restore every row collapse all hid"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn collapsing_everything_leaves_the_selection_somewhere_you_can_see(cx: &mut TestAppContext) {
+    // **The trap `rebuild_tree_visible` names.** The panel has no selection clamp on purpose,
+    // because every other fold path selects the directory before folding it. Collapse-all does
+    // not, so without moving the selection itself it would leave the cursor on a row nothing
+    // paints — and the failure is invisible until the *next* keystroke jumps from wherever the
+    // selection secretly still was. So this asserts the consequence: press `down` afterwards and
+    // land on the row below the one that is highlighted.
+    let dir = scratch_dir("panel-fold-selection");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices/create.json", "https://a.test/invoices");
+    seed_request(&root, "users/list.json", "https://a.test/users");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() > 4).then_some(())
+    });
+
+    // Walk down to `create`, three levels deep inside `billing/invoices`.
+    cx.simulate_keystrokes("ctrl-shift-e down down down");
+    let selection =
+        |cx: &mut VisualTestContext| window.update(cx, |w, _, _| w.tree_selection()).expect("window");
+    assert_eq!(
+        selection(&mut cx).as_deref(),
+        Some("create"),
+        "precondition: the selection must start on a deeply nested request"
+    );
+
+    let collapse = cx.debug_bounds("collection-collapse-all").expect("collapse button");
+    cx.simulate_click(collapse.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        selection(&mut cx).as_deref(),
+        Some("billing"),
+        "the selection must come up to the outermost folder that is still drawn"
+    );
+
+    // The consequence, and the half a reader would actually notice: `down` steps to the next
+    // *visible* row. Left on the hidden `create`, this lands somewhere else entirely.
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        selection(&mut cx).as_deref(),
+        Some("users"),
+        "after collapsing, `down` must step to the next row on screen"
     );
 
     remove_scratch(&mut cx, &dir.join("session.json"));
