@@ -62,6 +62,8 @@ pub enum Icon {
     Minimize,
     Maximize,
     Restore,
+    Sun,
+    Moon,
 }
 
 impl Icon {
@@ -88,6 +90,8 @@ impl Icon {
             Icon::Minimize => "icons/minimize.svg",
             Icon::Maximize => "icons/maximize.svg",
             Icon::Restore => "icons/restore.svg",
+            Icon::Sun => "icons/sun.svg",
+            Icon::Moon => "icons/moon.svg",
         }
     }
 
@@ -114,6 +118,8 @@ impl Icon {
         Icon::Minimize,
         Icon::Maximize,
         Icon::Restore,
+        Icon::Sun,
+        Icon::Moon,
     ];
 }
 
@@ -141,6 +147,8 @@ impl AssetSource for Assets {
             "icons/minimize.svg" => include_bytes!("../assets/icons/minimize.svg"),
             "icons/maximize.svg" => include_bytes!("../assets/icons/maximize.svg"),
             "icons/restore.svg" => include_bytes!("../assets/icons/restore.svg"),
+            "icons/sun.svg" => include_bytes!("../assets/icons/sun.svg"),
+            "icons/moon.svg" => include_bytes!("../assets/icons/moon.svg"),
             _ => return Ok(None),
         };
         Ok(Some(std::borrow::Cow::Borrowed(bytes)))

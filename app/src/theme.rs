@@ -16,15 +16,6 @@ pub enum Appearance {
     Dark,
 }
 
-impl Appearance {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Appearance::Light => "Light",
-            Appearance::Dark => "Dark",
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub appearance: Appearance,

@@ -16,7 +16,7 @@ use gpui::{
     ParentElement, ResizeEdge, SharedString, Stateful, Styled, Window, div, px,
 };
 
-use crate::theme::Theme;
+use crate::theme::{Appearance, Theme};
 use crate::ui::Icon;
 
 /// Width of the invisible strips along each edge that start a resize.
@@ -140,13 +140,20 @@ pub fn titlebar(title: SharedString, theme: &Theme, window: &Window) -> impl Int
                 .flex_row()
                 .items_center()
                 .flex_none()
-                // Clickable, not just informative. This label named its own shortcut while being
-                // the one thing in the titlebar you couldn't press — which is the discoverability
-                // gap in miniature: the app *told* you the keystroke and still had no button.
+                // An icon, and it names the *destination* rather than the current theme — a sun
+                // while dark means "this makes it light". Same rule as the maximize button three
+                // lines down, which is the argument for it: two buttons in one titlebar reading
+                // opposite conventions is worse than either convention on its own.
+                //
+                // It was the word "Dark"/"Light" until now, which is the one place the titlebar
+                // stated a *state* instead of an action, and the only text button among icons.
                 .child(
-                    div().px_2().child(crate::ui::text_action(
+                    div().px_2().child(crate::ui::icon_button(
                         "theme-toggle",
-                        theme.appearance.label().into(),
+                        match theme.appearance {
+                            Appearance::Dark => Icon::Sun,
+                            Appearance::Light => Icon::Moon,
+                        },
                         "Toggle theme",
                         crate::actions::ToggleTheme,
                         theme,
