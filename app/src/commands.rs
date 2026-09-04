@@ -127,6 +127,12 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::SettingDecrease", "only valid inside the settings panel"),
     ("zuno::SettingConfirm", "only valid inside the settings panel"),
     ("zuno::SettingsDismiss", "only valid inside the settings panel"),
+    // Only valid while the unsaved-changes prompt is open. `CloseTab` is the entry point and it
+    // *is* offered; a row for "discard" would be a destructive command reachable on its own.
+    ("zuno::ConfirmClose", "only valid inside the unsaved-changes prompt"),
+    ("zuno::CancelClose", "only valid inside the unsaved-changes prompt"),
+    ("zuno::CloseChoiceNext", "only valid inside the unsaved-changes prompt"),
+    ("zuno::CloseChoicePrev", "only valid inside the unsaved-changes prompt"),
     // Only valid while the find bar is open, where they're already bound. "Find in response"
     // is the entry point and it *is* offered; a palette row for "next match" would be a
     // command you can only reach by first running another one.

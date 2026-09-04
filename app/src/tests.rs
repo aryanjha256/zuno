@@ -1902,12 +1902,255 @@ async fn ctrl_tab_cycles_buffers_and_wraps(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn a_buffer_is_clean_until_edited_and_clean_again_once_saved(cx: &mut TestAppContext) {
+    let dir = scratch_dir("dirty-round-trip");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _v, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.run_until_parked();
+    let dirty = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |w, _, cx| w.active().is_some_and(|v| v.read(cx).is_dirty(cx)))
+            .expect("window")
+    };
+
+    assert!(!dirty(&mut cx), "a request just opened from its file is clean");
+
+    cx.simulate_keystrokes("ctrl-l end");
+    cx.simulate_input("/edited");
+    cx.run_until_parked();
+    assert!(dirty(&mut cx), "typing into the url must make the buffer dirty");
+
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+    assert!(!dirty(&mut cx), "saving must make it clean again");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_freshly_loaded_request_is_clean_for_every_body_type(cx: &mut TestAppContext) {
+    // `body_matches` mirrors `body()` by hand so `is_dirty` can avoid allocating, and a mirror
+    // drifts. Each variant loaded and immediately compared is what catches that: a wrong arm
+    // reports a request as edited the instant it opens.
+    let (view, mut cx) = open_workspace(cx);
+
+    let bodies = [
+        Body::Empty,
+        Body::Raw { text: "{\"a\":1}".into(), kind: RawKind::Json },
+        Body::Form(vec![zuno_core::FormField { enabled: true, name: "a".into(), value: "1".into() }]),
+        Body::Multipart(vec![
+            zuno_core::MultipartField {
+                enabled: true,
+                name: "text".into(),
+                value: zuno_core::MultipartValue::Text("hi".into()),
+            },
+            zuno_core::MultipartField {
+                enabled: true,
+                name: "file".into(),
+                value: zuno_core::MultipartValue::File("/tmp/x.bin".into()),
+            },
+        ]),
+        Body::Binary("/tmp/x.bin".into()),
+    ];
+
+    for body in bodies {
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.load(RequestSpec { body: body.clone(), ..RequestSpec::sample() }, cx)
+            })
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.update(|_, cx| view.read(cx).is_dirty(cx)),
+            "a request loaded with {body:?} must read clean"
+        );
+    }
+
+    // **A whitespace-only raw body is the one that reads dirty on open, and correctly so.**
+    // `body()` collapses a blank editor to `Empty`, so saving really would rewrite the file —
+    // `is_dirty` is answering "would a save change this?", and the honest answer is yes. Pinned
+    // rather than dropped, because the obvious "fix" is to special-case it in `body_matches`,
+    // which would make the dot lie about a save that does change the file.
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.load(
+                RequestSpec {
+                    body: Body::Raw { text: "   ".into(), kind: RawKind::Json },
+                    ..RequestSpec::sample()
+                },
+                cx,
+            )
+        })
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_dirty(cx)),
+        "a whitespace-only raw body saves as Empty, so it differs from its file the moment it opens"
+    );
+}
+
+#[gpui::test]
+async fn closing_a_dirty_buffer_asks_and_cancelling_keeps_it(cx: &mut TestAppContext) {
+    // The data-loss path this whole slice exists for: quitting preserves every buffer through
+    // the session envelope, and `Ctrl+W` preserved none.
+    let (window, _v, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.simulate_input("https://second.test");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+    assert_eq!(
+        tabs_of(&window, &mut cx).0,
+        2,
+        "ctrl-w on a dirty buffer must ask, not close"
+    );
+    assert!(
+        cx.debug_bounds("close-discard").is_some(),
+        "the prompt must offer a discard"
+    );
+
+    // Escape cancels, and the buffer keeps what was typed.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert_eq!(tabs_of(&window, &mut cx).0, 2, "cancelling must keep the buffer");
+    assert_eq!(
+        tabs_of(&window, &mut cx).1.url,
+        "https://second.test",
+        "cancelling must keep the edits too"
+    );
+
+    // And the keymap is alive again afterwards — the modal moved focus to an element that is
+    // no longer painted, so this is the half that would silently die.
+    cx.simulate_input("/still-typing");
+    assert_eq!(
+        tabs_of(&window, &mut cx).1.url,
+        "https://second.test/still-typing",
+        "typing must land in the buffer once the prompt is gone"
+    );
+}
+
+#[gpui::test]
+async fn an_untouched_new_tab_closes_without_asking(cx: &mut TestAppContext) {
+    // The baseline for a scratch buffer is what it was created with, so a tab you have not
+    // typed into is clean and closes silently. Without that, every `ctrl-t` `ctrl-w` prompts.
+    let (window, _v, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.run_until_parked();
+    assert_eq!(tabs_of(&window, &mut cx).0, 2);
+
+    cx.simulate_keystrokes("ctrl-w");
+    cx.run_until_parked();
+    assert_eq!(
+        tabs_of(&window, &mut cx).0,
+        1,
+        "an untouched new tab must close with no prompt"
+    );
+}
+
+#[gpui::test]
+async fn saving_from_the_prompt_writes_the_file_and_then_closes(cx: &mut TestAppContext) {
+    let dir = scratch_dir("dirty-prompt-save");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _v, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.run_until_parked();
+    let before = tabs_of(&window, &mut cx).0;
+
+    cx.simulate_keystrokes("ctrl-l end");
+    cx.simulate_input("/edited");
+    cx.run_until_parked();
+
+    // Prompt opens on Cancel; two steps left reaches Save.
+    cx.simulate_keystrokes("ctrl-w");
+    cx.simulate_keystrokes("left left enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        tabs_of(&window, &mut cx).0,
+        before - 1,
+        "saving from the prompt must also close the buffer"
+    );
+    assert_eq!(
+        zuno_core::collection::read(&root.join("posts.json")).expect("read").url,
+        "https://a.test/posts/edited",
+        "the edit must have reached the file"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_restored_buffer_reads_its_baseline_back_from_disk(cx: &mut TestAppContext) {
+    // The session stores each buffer's *live* spec and has never stored what the file said, so
+    // without the re-read every restored buffer compares against itself and reads clean — which
+    // is exactly the state the prompt exists to catch.
+    let (session, root) = scratch_collection("dirty-restore");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    {
+        let (window, _v, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+        wait_for(&mut cx, "the collection scan", |cx| {
+            (!tree_rows(&window, cx).is_empty()).then_some(())
+        });
+        cx.simulate_keystrokes("ctrl-shift-e down enter");
+        cx.run_until_parked();
+
+        // A send is the save point that writes the session envelope, so the edit has to be the
+        // URL that gets sent. It differs from what the file holds, which is the whole point:
+        // the session keeps the edit, the file does not.
+        let served = serve_once(OK_JSON);
+        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.simulate_input(&served);
+        cx.simulate_keystrokes("ctrl-enter");
+        cx.run_until_parked();
+    }
+
+    let (window, _v, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    cx.run_until_parked();
+    wait_for(&mut cx, "the baselines to be re-read", |cx| {
+        window
+            .update(cx, |w, _, cx| {
+                w.active().is_some_and(|v| v.read(cx).is_dirty(cx)).then_some(())
+            })
+            .ok()
+            .flatten()
+    });
+
+    remove_scratch(&mut cx, &session);
+}
+
+/// `Ctrl+W` on a buffer with unsaved edits asks first. Discard and close.
+///
+/// The prompt opens on Cancel — the safe default — so `left` steps back to "Don't save".
+fn close_discarding(cx: &mut VisualTestContext) {
+    cx.simulate_keystrokes("ctrl-w");
+    cx.simulate_keystrokes("left enter");
+    cx.run_until_parked();
+}
+
+#[gpui::test]
 async fn ctrl_w_closes_a_buffer_and_leaves_focus_usable(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
     cx.simulate_keystrokes("ctrl-t");
     cx.simulate_input("https://second.test");
-    cx.simulate_keystrokes("ctrl-w");
+    close_discarding(&mut cx);
 
     let (count, active) = tabs_of(&window, &mut cx);
     assert_eq!(count, 1);
@@ -1948,8 +2191,7 @@ async fn closing_a_buffer_cancels_its_in_flight_request(cx: &mut TestAppContext)
         cx.update(|_, cx| doomed.read(cx).is_sending().then_some(()))
     });
 
-    cx.simulate_keystrokes("ctrl-w");
-    cx.run_until_parked();
+    close_discarding(&mut cx);
 
     assert_eq!(tabs_of(&window, &mut cx).0, 1, "the buffer should be gone");
     assert!(
@@ -3443,7 +3685,7 @@ async fn a_long_tab_label_is_ellipsised_before_it_reaches_the_strip(cx: &mut Tes
 
     let labels = window
         .update(&mut cx, |workspace, _, cx| {
-            workspace.tab_labels(cx).into_iter().map(|(_, label, _)| label).collect::<Vec<_>>()
+            workspace.tab_labels(cx).into_iter().map(|(_, label, _, _)| label).collect::<Vec<_>>()
         })
         .expect("window");
 

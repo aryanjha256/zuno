@@ -226,9 +226,31 @@ pub enum RowKind {
 /// meant, large enough that crossing a long token isn't a drum solo.
 const H_SCROLL_STEP: f32 = 70.;
 
+/// Compare a table of live rows against the baseline's, without building either.
+fn rows_match<T>(
+    rows: &[KeyValueRow],
+    base: &[T],
+    field: impl Fn(&T) -> (bool, &str, &str),
+    cx: &App,
+) -> bool {
+    rows.len() == base.len()
+        && rows.iter().zip(base).all(|(row, base)| {
+            let (enabled, name, value) = field(base);
+            row.enabled == enabled
+                && row.name.read(cx).text() == name
+                && row.value.read(cx).text() == value
+        })
+}
+
 pub struct RequestView {
     pub id: RequestId,
     pub name: String,
+    /// The request as its file has it — the other half of `is_dirty`.
+    ///
+    /// Set in `load`, which every path that fills a buffer goes through, and again on save. A
+    /// buffer with no file keeps whatever it was created with, so a fresh tab reads clean while
+    /// one you typed into does not.
+    pub baseline: RequestSpec,
     /// The collection file this buffer is backed by, or `None` for a scratch buffer.
     ///
     /// Set when a buffer is opened from a collection or saved into one. It exists because a
@@ -326,6 +348,7 @@ impl RequestView {
         let mut view = Self {
             id: spec.id,
             name: String::new(),
+            baseline: RequestSpec::default(),
             path: None,
             method: Method::Get,
             url: cx.new(|cx| TextInput::new("", "", "UrlBar", cx)),
@@ -373,6 +396,8 @@ impl RequestView {
     ///
     /// `response_focus` is intentionally not rebuilt, so focus survives the swap.
     pub fn load(&mut self, spec: RequestSpec, cx: &mut Context<Self>) {
+        self.baseline = spec.clone();
+
         let url = cx.new(|cx| {
             TextInput::new(spec.url.clone(), "https://api.example.com/…", "UrlBar", cx)
         });
@@ -593,6 +618,78 @@ impl RequestView {
                 .collect(),
             body: self.body(cx),
             settings: self.settings.clone(),
+        }
+    }
+
+    /// Whether this buffer differs from the file it came from.
+    ///
+    /// Compares against `baseline` field by field rather than building `spec()` and comparing
+    /// that: the tab strip asks every buffer every frame, and `spec()` clones every row and the
+    /// whole body. Ordered cheapest first and short-circuiting, so nothing here allocates.
+    ///
+    /// `id` is excluded. Collection files write 0 and it is reassigned on open (invariant 9), so
+    /// it is never a difference the reader made.
+    pub fn is_dirty(&self, cx: &App) -> bool {
+        let base = &self.baseline;
+
+        self.method != base.method
+            || self.settings != base.settings
+            || self.url.read(cx).text() != base.url
+            || !rows_match(&self.query, &base.query, |p| (p.enabled, &p.name, &p.value), cx)
+            || !rows_match(&self.headers, &base.headers, |h| (h.enabled, &h.name, &h.value), cx)
+            || !self.body_matches(&base.body, cx)
+    }
+
+    /// `body()`'s mapping asked as a question instead of built as a value.
+    ///
+    /// **Must stay in step with `body()` directly below**, including its two collapses to
+    /// `Empty` — a blank editor and a binary body with no file chosen. Mirroring by hand is what
+    /// keeps `is_dirty` allocation-free; `a_freshly_loaded_request_is_clean` covers every variant
+    /// so the mirror cannot drift silently.
+    fn body_matches(&self, base: &Body, cx: &App) -> bool {
+        match self.body_type {
+            BodyType::Empty => matches!(base, Body::Empty),
+            BodyType::Raw => {
+                let text = self.body_editor.read(cx).text();
+                match base {
+                    Body::Empty => text.trim().is_empty(),
+                    Body::Raw { text: base, kind } => {
+                        !text.trim().is_empty() && base == text && *kind == self.body_kind
+                    }
+                    _ => false,
+                }
+            }
+            BodyType::Binary => match (&self.binary_path, base) {
+                (Some(path), Body::Binary(base)) => path == base,
+                (None, Body::Empty) => true,
+                _ => false,
+            },
+            BodyType::Form => match base {
+                Body::Form(base) => {
+                    rows_match(&self.form, base, |f| (f.enabled, &f.name, &f.value), cx)
+                }
+                _ => false,
+            },
+            BodyType::Multipart => match base {
+                Body::Multipart(base) => {
+                    self.multipart.len() == base.len()
+                        && self.multipart.iter().zip(base).all(|(row, part)| {
+                            let text = row.row.value.read(cx).text();
+                            row.row.enabled == part.enabled
+                                && row.row.name.read(cx).text() == part.name
+                                && match (&part.value, row.is_file) {
+                                    // `body()` builds this with `PathBuf::from(text)`, so the
+                                    // round trip back to a string is the comparison.
+                                    (MultipartValue::File(path), true) => {
+                                        path.display().to_string() == text
+                                    }
+                                    (MultipartValue::Text(base), false) => base == text,
+                                    _ => false,
+                                }
+                        })
+                }
+                _ => false,
+            },
         }
     }
 

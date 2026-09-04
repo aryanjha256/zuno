@@ -33,7 +33,8 @@ use crate::actions::{
     ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
-    CancelRename, CollectionCollapseAll, CollectionExpandAll, CommitRename, CopyRequestPath,
+    CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
+    CollectionExpandAll, CommitRename, ConfirmClose, CopyRequestPath,
     CopyRequestRelativePath, DuplicateRequest,
     ImportConfirm, ImportDismiss, ImportOpenApi, MoveRequest, NewFolder, OpenRequestExternally,
     RenameRequest, RevealRequest, TrashRequest,
@@ -124,6 +125,8 @@ pub struct Workspace {
     /// menu that has to appear in the same place — a "delete this?" that jumps across the
     /// window reads as a different question about something else.
     collection_menu_at: Option<gpui::Point<gpui::Pixels>>,
+    /// The unsaved-changes prompt, when one is open.
+    close_confirm: Option<crate::close_panel::CloseConfirm>,
 }
 
 /// An in-progress inline rename.
@@ -256,12 +259,73 @@ impl Workspace {
             import: None,
             import_task: None,
             collection_menu_at: None,
+            close_confirm: None,
         };
 
         // Off-thread and non-blocking, so a large collection cannot delay the first frame —
         // the panel opens empty and fills in, the same bargain the picker's scan makes.
         workspace.refresh_tree(cx);
+        workspace.reread_baselines(cx);
         workspace
+    }
+
+    /// Re-read each restored buffer's file, so `is_dirty` has a real baseline again.
+    ///
+    /// The session envelope stores each buffer's *live* spec, edits included, and has never
+    /// stored what the file said. So a restored buffer starts with baseline == live and reads
+    /// clean; this corrects it from disk a moment later. Clean-until-corrected is the right way
+    /// round — the alternative marks every tab dirty on launch until the reads land.
+    ///
+    /// Read rather than persisted, and that is the point rather than a saving: a stored baseline
+    /// records what the file said when you *quit*, so a `git pull` while Zuno was closed would
+    /// leave a buffer reading clean against a file it no longer matches. The disk is the truth.
+    ///
+    /// Off the UI thread per invariant 3, even though the files are small and few.
+    fn reread_baselines(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<_> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, view)| view.read(cx).path.clone().map(|path| (ix, path)))
+            .collect();
+
+        if paths.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |workspace, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .filter_map(|(ix, path)| {
+                            // A file deleted or made unreadable while Zuno was closed leaves the
+                            // buffer with its session baseline. It reads clean, which matches how
+                            // a buffer with no file at all behaves.
+                            collection::read(&path).ok().map(|spec| (ix, spec))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+
+            workspace
+                .update(cx, |workspace, cx| {
+                    for (ix, spec) in read {
+                        let Some(view) = workspace.views.get(ix) else {
+                            continue;
+                        };
+                        view.update(cx, |view, cx| {
+                            // The file's id is 0 (invariant 9) and `is_dirty` ignores it, so it
+                            // is stored as read rather than patched.
+                            view.baseline = spec;
+                            cx.notify();
+                        });
+                    }
+                })
+                .ok();
+        })
+        .detach();
     }
 
     pub fn active(&self) -> Option<Entity<RequestView>> {
@@ -278,7 +342,11 @@ impl Workspace {
     ///
     /// Everything that opens a modal, and everything that moves focus, has to consult this.
     fn modal_open(&self) -> bool {
-        self.picker.is_some() || self.settings.is_some() || self.menu.is_some() || self.import.is_some()
+        self.picker.is_some()
+            || self.settings.is_some()
+            || self.menu.is_some()
+            || self.import.is_some()
+            || self.close_confirm.is_some()
     }
 
     #[cfg(test)]
@@ -389,7 +457,7 @@ impl Workspace {
 
     /// One `(index, label, is_active)` per open buffer. A method, not a closure in `render`, so
     /// a test can read the elided label — shaped text is not measurable headlessly.
-    pub(crate) fn tab_labels(&self, cx: &App) -> Vec<(usize, SharedString, bool)> {
+    pub(crate) fn tab_labels(&self, cx: &App) -> Vec<(usize, SharedString, bool, bool)> {
         self.views
             .iter()
             .enumerate()
@@ -399,7 +467,7 @@ impl Workspace {
                     std::borrow::Cow::Borrowed(_) => label,
                     std::borrow::Cow::Owned(short) => SharedString::from(short),
                 };
-                (ix, label, ix == self.active_ix)
+                (ix, label, ix == self.active_ix, view.read(cx).is_dirty(cx))
             })
             .collect()
     }
@@ -437,7 +505,111 @@ impl Workspace {
     /// An empty `views` would make `active()` return `None`, which every action handler
     /// treats as "do nothing" — the window would still be there, silently inert. Ctrl+W
     /// also shouldn't quit the app; that's Ctrl+Q's job.
+    /// Set by a click, which both chooses and confirms; the selection exists for the keyboard.
+    pub(crate) fn set_close_choice(&mut self, choice: crate::close_panel::Choice) {
+        if let Some(state) = self.close_confirm.as_mut() {
+            state.choice = choice;
+        }
+    }
+
+    fn close_choice_next(&mut self, _: &CloseChoiceNext, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.close_confirm.as_mut() {
+            state.step(1);
+            cx.notify();
+        }
+    }
+
+    fn close_choice_prev(&mut self, _: &CloseChoicePrev, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.close_confirm.as_mut() {
+            state.step(-1);
+            cx.notify();
+        }
+    }
+
+    fn cancel_close(&mut self, _: &CancelClose, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.close_confirm.take() else {
+            return;
+        };
+        if let Some(focus) = state.restore_focus {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    fn confirm_close(&mut self, _: &ConfirmClose, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::close_panel::Choice;
+        let Some(state) = self.close_confirm.take() else {
+            return;
+        };
+
+        // `force_close_tab` and `save_request` both act on the *active* buffer, and the prompt
+        // records the one it was opened for. A modal owns the keyboard, so the two cannot
+        // diverge — this refuses rather than trusting that, since acting on the wrong buffer
+        // here would discard a request nobody was asked about.
+        if self.active_ix != state.ix {
+            cx.notify();
+            return;
+        }
+
+        match state.choice {
+            Choice::Cancel => {
+                if let Some(focus) = state.restore_focus {
+                    window.focus(&focus);
+                }
+                cx.notify();
+            }
+            Choice::Save => {
+                // Taken *before* saving: `save_request` acts on the active buffer, and the
+                // prompt is modal, so that is still the one being closed.
+                self.save_request(&SaveRequest, window, cx);
+                // Saving can fail — no collection directory, an unwritable file — and it says
+                // so in the status bar. Closing anyway would discard the work the person just
+                // asked to keep, so the buffer stays and the message stands.
+                let saved = self
+                    .active()
+                    .is_some_and(|view| !view.read(cx).is_dirty(cx));
+                if saved {
+                    self.force_close_tab(window, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            Choice::Discard => self.force_close_tab(window, cx),
+        }
+    }
+
+    /// Ask before discarding. **This closes nothing** — `force_close_tab` is the only thing
+    /// that does, the same split `DeleteRequest`/`ConfirmDeleteRequest` uses and for the same
+    /// reason: closing a tab is irreversible, and quitting is not, because the session envelope
+    /// keeps every open buffer while `Ctrl+W` kept none.
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.views.is_empty() || self.modal_open() {
+            return;
+        }
+
+        let dirty = self
+            .active()
+            .is_some_and(|view| view.read(cx).is_dirty(cx));
+
+        if dirty {
+            let label = self
+                .active()
+                .map(|view| view.read(cx).label(cx))
+                .unwrap_or_else(|| SharedString::from("This request"));
+            let restore = Some(window.focused(cx).unwrap_or_else(|| self.focus_handle.clone()));
+            let state =
+                crate::close_panel::CloseConfirm::new(self.active_ix, label, restore, cx);
+            let focus = state.focus_handle.clone();
+            self.close_confirm = Some(state);
+            window.focus(&focus);
+            cx.notify();
+            return;
+        }
+
+        self.force_close_tab(window, cx);
+    }
+
+    fn force_close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.views.is_empty() {
             return;
         }
@@ -3032,6 +3204,8 @@ impl Workspace {
         let shown = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
         view.update(cx, |view, cx| {
             view.path = Some(path);
+            // The file now says what the buffer says, so this is the new clean state.
+            view.baseline = spec;
             cx.notify();
         });
         // A request you just saved and cannot find in the tree reads as a save that failed.
@@ -3148,6 +3322,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::collection_confirm))
             .on_action(cx.listener(Self::collection_collapse))
             .on_action(cx.listener(Self::collection_expand))
+            .on_action(cx.listener(Self::confirm_close))
+            .on_action(cx.listener(Self::cancel_close))
+            .on_action(cx.listener(Self::close_choice_next))
+            .on_action(cx.listener(Self::close_choice_prev))
             .on_action(cx.listener(Self::collection_collapse_all))
             .on_action(cx.listener(Self::collection_expand_all))
             .on_action(cx.listener(Self::open_collection_menu))
@@ -3297,6 +3475,13 @@ impl Render for Workspace {
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
             .children(self.import.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
+            // Built here rather than held as an `Entity`: it owns no input and no state beyond
+            // which button is selected, so it is plain workspace state like `RenameState`.
+            .children(
+                self.close_confirm
+                    .as_ref()
+                    .map(|state| crate::close_panel::render(state, &theme, cx)),
+            )
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
     }
@@ -3326,7 +3511,7 @@ const TAB_WIDTH: f32 = TAB_LABEL_WIDTH + TAB_CLOSE_WIDTH + TAB_CHROME_WIDTH;
 /// the window title already names the request. It appears the moment there's a choice to
 /// make, which is also the moment it starts carrying information.
 fn tab_strip(
-    tabs: Vec<(usize, SharedString, bool)>,
+    tabs: Vec<(usize, SharedString, bool, bool)>,
     theme: &Theme,
     cx: &mut Context<Workspace>,
 ) -> Option<impl IntoElement> {
@@ -3348,7 +3533,7 @@ fn tab_strip(
             .bg(theme.bg_panel)
             .border_b_1()
             .border_color(theme.border)
-            .children(tabs.into_iter().map(|(ix, label, active)| {
+            .children(tabs.into_iter().map(|(ix, label, active, dirty)| {
                 div()
                     .id(("tab", ix))
                     // So a test can click a real tab. The click handler sits out here while the
@@ -3406,6 +3591,11 @@ fn tab_strip(
                             .text_xs()
                             .text_color(if active { theme.text } else { theme.text_muted })
                             .hover(|style| style.bg(theme.bg_hover))
+                            // Drives the dot/× swap below. `GroupBounds::get` takes the
+                            // innermost open group of that name and sibling tabs push and pop
+                            // separately, so one shared constant still resolves per tab —
+                            // hovering one does not light up the rest.
+                            .group(crate::ui::ICON_GROUP)
                             .child(
                                 div()
                                     .w(px(TAB_LABEL_WIDTH))
@@ -3426,6 +3616,7 @@ fn tab_strip(
                                     .justify_center()
                                     .size(px(TAB_CLOSE_WIDTH))
                                     .rounded_md()
+                                    .relative()
                                     .hover(|style| style.bg(theme.bg_hover))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -3440,10 +3631,42 @@ fn tab_strip(
                                             },
                                         ),
                                     )
+                                    // The dirty dot sits *in* the close slot and hovering the
+                                    // tab trades it for the ×, which is what every editor does.
+                                    // Stacked rather than swapped in Rust: hover is a paint-time
+                                    // style, so both are always painted and only the colours
+                                    // move — which is also what keeps the label from shifting.
+                                    .child(
+                                        div()
+                                            .debug_selector(move || format!("tab-dirty-{ix}"))
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .size(px(8.))
+                                                    .rounded_full()
+                                                    .bg(if dirty {
+                                                        theme.text_muted
+                                                    } else {
+                                                        gpui::transparent_black()
+                                                    })
+                                                    .group_hover(
+                                                        crate::ui::ICON_GROUP,
+                                                        |style| {
+                                                            style.bg(gpui::transparent_black())
+                                                        },
+                                                    ),
+                                            ),
+                                    )
                                     .child(crate::ui::glyph(
                                         crate::ui::Icon::Close,
                                         // Transparent, not absent — the slot must keep its size.
-                                        if active {
+                                        // A dirty tab hides it so the dot shows through; a clean
+                                        // inactive one hides it until the tab is hovered.
+                                        if active && !dirty {
                                             theme.text_muted
                                         } else {
                                             gpui::transparent_black()

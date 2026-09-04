@@ -72,6 +72,12 @@ actions!(
         // Buffers
         NewTab,
         CloseTab,
+        // Closing a tab is the one path that can destroy work: quitting preserves every buffer
+        // through the session envelope, `Ctrl+W` did not. These drive the prompt that asks.
+        ConfirmClose,
+        CancelClose,
+        CloseChoiceNext,
+        CloseChoicePrev,
         NextTab,
         PrevTab,
         // Request editing

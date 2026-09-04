@@ -2067,9 +2067,37 @@ Curl import now opens a **new** buffer. Replacing was only defensible while ther
 to put the result; an import over unsaved work destroyed it with no undo. `RequestView::load`
 remains for genuine in-place replacement.
 
-Still deliberately **unanswered: what a *dirty* buffer means.** With no collections there is no
-saved baseline to be dirty against, so any meaning invented now would be rewritten when the
-collection format lands. Also absent by choice: tab reordering and renaming.
+**Dirty buffers — answered.** `RequestView::baseline` holds the request as its *file* has it,
+set in `load` (the one funnel every buffer fill goes through) and again on save; `is_dirty`
+compares against it. Three decisions:
+
+- **The baseline is not an `Option`.** A buffer with no file keeps what it was created with, so a
+  fresh tab is clean and one you typed into is not — no second "untitled" case to special-case.
+- **Restored buffers re-read their file rather than persisting the baseline.** The session stores
+  each buffer's *live* spec and never what the file said. A stored baseline would record what the
+  file held when you quit, so a `git pull` while Zuno was closed would leave a buffer reading
+  clean against a file it no longer matches. Reading is also clean-until-corrected, which is the
+  right way round — the alternative marks every tab dirty on launch until the reads land.
+- **`is_dirty` compares field by field instead of building `spec()`.** The strip asks every buffer
+  every frame and `spec()` clones every row and the whole body. The cost is `body_matches`
+  mirroring `body()` by hand, including its two collapses to `Empty`;
+  `a_freshly_loaded_request_is_clean_for_every_body_type` is what stops that drifting.
+
+What this bought is not the dot. **`Ctrl+W` was the one path in Zuno that could destroy work** —
+quitting preserves every buffer through the session envelope, and closing a tab preserved none,
+with no prompt and no undo. `close_tab` now only asks; `force_close_tab` is the only thing that
+closes, the same split `DeleteRequest`/`ConfirmDeleteRequest` uses. Saving from the prompt closes
+only if the save actually succeeded, since a failed write plus a close discards the work the
+person just asked to keep.
+
+The dot shares the close button's slot and the tab's hover trades one for the other, the editor
+convention. Stacked rather than chosen in Rust, since hover is a paint-time style: both are always
+painted and only their colours move, which is also what keeps the label from shifting. It reuses
+`ICON_GROUP` — `GroupBounds::get` takes the innermost open group of a name and sibling tabs push
+and pop separately, so one constant is still per-tab and hovering one does not light up the rest.
+
+*Still absent:* tab reordering and renaming. And the strip hides itself at one buffer, so a lone
+dirty buffer shows no dot — the prompt is what covers that case.
 
 **Reaching a saved request — answered.** `Ctrl+P` opens the picker over open buffers *and*
 `collection::scan`, and choosing a file opens it as a buffer with its `path` set, so the next

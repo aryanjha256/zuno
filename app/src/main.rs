@@ -10,6 +10,7 @@ mod timing;
 mod actions;
 mod body_view;
 mod chrome;
+mod close_panel;
 mod collection_panel;
 mod import_panel;
 mod collections;
@@ -50,7 +51,8 @@ use crate::actions::{
     MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
     ScrollRight, ScrollStart, ToggleFold,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
-    CancelRename, CommitRename, DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
+    CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CommitRename, ConfirmClose,
+    DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
@@ -331,6 +333,17 @@ fn register_keymap(cx: &mut App) {
         // `"ImportPanel"` context never holds focus, since the field does.
         KeyBinding::new("enter", ImportConfirm, Some("ImportSource")),
         KeyBinding::new("escape", ImportDismiss, Some("ImportSource")),
+        // The unsaved-changes prompt. After the global `escape` and `enter` for the reason
+        // above — a leaf-matching predicate only *ties* with a context-less one, and the tie
+        // goes to whichever was registered later. `left`/`right` move between the buttons and
+        // `tab` does too, the dialog convention; `FocusNext` already refuses while a modal is
+        // open, so `tab` would otherwise be dead here rather than merely unbound.
+        KeyBinding::new("enter", ConfirmClose, Some("CloseConfirm")),
+        KeyBinding::new("escape", CancelClose, Some("CloseConfirm")),
+        KeyBinding::new("right", CloseChoiceNext, Some("CloseConfirm")),
+        KeyBinding::new("left", CloseChoicePrev, Some("CloseConfirm")),
+        KeyBinding::new("tab", CloseChoiceNext, Some("CloseConfirm")),
+        KeyBinding::new("shift-tab", CloseChoicePrev, Some("CloseConfirm")),
         // --- Text editing, scoped to any focused TextInput ---
         KeyBinding::new("backspace", text_input::Backspace, Some("TextInput")),
         KeyBinding::new("delete", text_input::Delete, Some("TextInput")),
