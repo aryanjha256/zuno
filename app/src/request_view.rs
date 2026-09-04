@@ -246,7 +246,7 @@ pub struct RequestView {
     ///
     /// Stored rather than inferred: a `Form` body with no fields yet and an `Empty` body are
     /// different intentions that look identical in the data, so nothing else records the
-    /// choice. Ignored while `preserved_body` is set — see there.
+    /// choice.
     pub body_type: BodyType,
     /// Private, and set only through `set_body_kind`. The editor's colouring is derived from it,
     /// and a public field is how those two drift: assigning it directly compiles and silently
