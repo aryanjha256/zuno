@@ -419,6 +419,81 @@ pub fn rename(path: &Path, label: &str) -> Result<PathBuf, CollectionError> {
     Ok(target)
 }
 
+/// Rename a folder in place, returning its new path.
+///
+/// Separate from `rename` rather than a branch inside it, because that one appends `EXTENSION`
+/// unconditionally — passed a directory it would turn `billing` into `billing.json`. The rules
+/// are otherwise identical: the label goes through `slug` so a typed `../../evil` cannot walk
+/// out, and a name already taken is refused rather than merging two folders silently.
+pub fn rename_folder(path: &Path, label: &str) -> Result<PathBuf, CollectionError> {
+    if !path.is_dir() {
+        return Err(CollectionError::NotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    let name = slug(label);
+    if name.is_empty() {
+        return Err(CollectionError::NameTaken(name));
+    }
+    let target = path.parent().unwrap_or(Path::new(".")).join(&name);
+
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(CollectionError::NameTaken(name));
+    }
+
+    std::fs::rename(path, &target).map_err(|source| CollectionError::Write {
+        path: target.clone(),
+        source,
+    })?;
+    Ok(target)
+}
+
+/// Delete a folder and everything in it.
+///
+/// **The one call in this module with no undo and no bound**, which is why `remove` refuses a
+/// directory and this exists separately: `remove_dir_all` on a path from a UI selection is a
+/// mistake that cannot be walked back, and a collection folder can hold work the panel never
+/// showed — an unreadable request is skipped by `scan`, so it has no row and would go anyway.
+/// The caller is expected to have asked first, and to name the count from `request_count`.
+pub fn remove_folder(path: &Path) -> Result<(), CollectionError> {
+    if !path.is_dir() {
+        return Err(CollectionError::NotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    std::fs::remove_dir_all(path).map_err(|source| CollectionError::Delete {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Move a folder to the desktop trash — the recoverable sibling of `remove_folder`.
+pub fn trash_folder(path: &Path) -> Result<(), CollectionError> {
+    if !path.is_dir() {
+        return Err(CollectionError::NotAFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    trash::delete(path).map_err(|source| CollectionError::Trash {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// How many requests a folder holds, at any depth.
+///
+/// For the delete confirmation: "delete billing?" with no number is how a folder of forty
+/// requests goes missing. Counts what `scan` would list, so it is the number the panel showed.
+pub fn request_count(path: &Path) -> usize {
+    scan(path).len()
+}
+
 /// Create a folder inside `parent`, returning its path.
 ///
 /// `label` is typed by a person, so it goes through `slug` for the reason `rename` does — the

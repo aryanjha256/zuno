@@ -53,10 +53,9 @@ it, and **both were invisible to the audit because it only ever looked inward**:
    existing / Switch / Forget. The git argument this whole format is built on — commit your
    requests, review them in a pull request — is reachable now, because a workspace can live
    inside the repo it describes rather than only in `~/.local/share`. See architecture.md §12.
-2. **Folders are still read-mostly** — and this entry said *requests* were, for two slices after
-   they stopped being. A request can be created, renamed, duplicated, moved, trashed and deleted;
-   a *folder* can be made but not renamed or deleted, and `Ctrl+S` cannot target one. `mv` and
-   `rmdir` still work.
+2. **Folder verbs — done.** A folder can be made, renamed, trashed and deleted, and its
+   right-click menu offers everything that works on a directory. Still absent: duplicating or
+   moving a *folder*, and `Ctrl+S` cannot target one. See architecture.md §6a.
 
 Then the two named-not-planned items (scripting, request chaining) that would decide the ceiling,
 and the three capabilities item 4 now names that these documents had never mentioned at all —

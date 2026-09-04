@@ -7982,10 +7982,98 @@ async fn deleting_a_request_that_is_open_stops_ctrl_s_from_recreating_it(
 }
 
 #[gpui::test]
-async fn a_directory_offers_no_delete(cx: &mut TestAppContext) {
-    // `collection::remove` refuses a directory by design, so offering the verb there would be a
-    // control that always fails — the dead-control shape this codebase keeps finding. Asserted
-    // at the consequence: pressing the key must leave the tree exactly as it was.
+async fn renaming_a_folder_moves_the_buffers_inside_it(cx: &mut TestAppContext) {
+    // The rule requests already follow, applied to a *prefix*. `save_request` writes to a
+    // remembered path with no existence check, so a buffer still holding `billing/x.json` after
+    // `billing` became `finance` would recreate the old folder on the next Ctrl+S — leaving the
+    // request in two places and the tree showing a folder you had just renamed away.
+    let dir = scratch_dir("folder-rename");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    // Open the request so a buffer points inside the folder, then select the folder.
+    cx.simulate_keystrokes("ctrl-shift-e down down enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("up");
+    assert_eq!(
+        window.update(&mut cx, |w, _, _| w.tree_selection()).expect("window"),
+        Some("billing".to_string()),
+        "the folder must be selected for this to test anything"
+    );
+
+    cx.simulate_keystrokes("f2");
+    cx.simulate_input("finance");
+    cx.simulate_keystrokes("enter");
+    wait_for(&mut cx, "the rescan", |cx| {
+        tree_rows(&window, cx)
+            .iter()
+            .any(|(_, name, _)| name == "finance")
+            .then_some(())
+    });
+
+    // `rename` would have made this `billing.json` — a folder needs its own verb.
+    assert!(root.join("finance").is_dir(), "the folder must be renamed, not given an extension");
+    assert!(root.join("finance").join("invoices.json").is_file());
+    assert!(!root.join("billing").exists());
+
+    let path = window
+        .update(&mut cx, |w, _, cx| w.active().and_then(|v| v.read(cx).path.clone()))
+        .expect("window");
+    assert_eq!(
+        path,
+        Some(root.join("finance").join("invoices.json")),
+        "the open buffer must follow the folder, or Ctrl+S recreates the old one"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn deleting_a_folder_removes_it_and_the_buffers_forget(cx: &mut TestAppContext) {
+    let dir = scratch_dir("folder-delete");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() == 2).then_some(())
+    });
+
+    cx.simulate_keystrokes("ctrl-shift-e down down enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("up delete");
+    cx.run_until_parked();
+    // The confirmation's destructive row is first; `enter` takes it.
+    cx.simulate_keystrokes("enter");
+    wait_for(&mut cx, "the rescan", |cx| {
+        tree_rows(&window, cx).is_empty().then_some(())
+    });
+
+    assert!(!root.join("billing").exists(), "the folder and its requests must be gone");
+
+    let path = window
+        .update(&mut cx, |w, _, cx| w.active().and_then(|v| v.read(cx).path.clone()))
+        .expect("window");
+    assert_eq!(
+        path, None,
+        "a buffer inside a deleted folder must forget its path, or Ctrl+S recreates the folder"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn a_directory_offers_delete_but_not_the_file_only_verbs(cx: &mut TestAppContext) {
+    // **This test used to assert the opposite**, and correctly: `collection::remove` refuses a
+    // directory, so offering delete there was a control that could only fail. `remove_folder`
+    // is what changed that. The rule it was protecting has not changed at all — a menu must not
+    // offer a verb that cannot work — so it now guards the two that still cannot: Duplicate and
+    // Move to… both take a file, and their recursive versions are their own decision.
     let dir = scratch_dir("panel-delete-dir");
     let root = dir.join("collections");
     seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
@@ -8007,25 +8095,43 @@ async fn a_directory_offers_no_delete(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("delete");
     cx.run_until_parked();
 
-    // **Asserted on the menu, not on the outcome.** `collection::remove` refuses a directory
-    // anyway, so "the directory survived" is true whether or not the verb was offered — that
-    // version of this test passed against a `selected_request` that returned directories too.
-    // What is actually wrong there is offering a control that can only ever fail. Read from
-    // real state rather than `debug_bounds`, whose `is_none` reports the last painted frame.
+    // `delete` asks first, so a menu is exactly what should be open.
     assert!(
-        !window
+        window
             .update(&mut cx, |workspace, _, _| workspace.menu_open())
             .expect("window"),
-        "a directory must not offer a delete that can only fail"
+        "delete on a folder must ask rather than doing nothing"
     );
-
-    // And the safety property itself, which core holds independently.
-    cx.simulate_keystrokes("enter");
-    cx.run_until_parked();
-    assert!(root.join("billing").is_dir(), "the directory must survive");
+    // And the prompt names the count — "Delete billing?" with no number is how a folder of
+    // forty requests goes missing.
+    let labels = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_labels(cx))
+        .expect("window");
     assert!(
-        root.join("billing").join("invoices.json").is_file(),
-        "and so must the request inside it"
+        labels.iter().any(|row| row == "Delete billing and 1 request"),
+        "the confirmation must say how much goes with it, got {labels:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // The right-click menu offers what works and leaves out what cannot.
+    cx.update(|window, cx| {
+        window.dispatch_action(
+            gpui::Action::boxed_clone(&crate::actions::OpenCollectionMenu),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+    let rows = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_labels(cx))
+        .expect("window");
+    assert!(
+        rows.iter().any(|row| row == "Rename") && rows.iter().any(|row| row == "Delete…"),
+        "a folder must offer rename and delete, got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row == "Duplicate") && !rows.iter().any(|row| row == "Move to…"),
+        "both take a file, so offering them on a folder is a control that can only fail: {rows:?}"
     );
 
     remove_scratch(&mut cx, &dir.join("session.json"));

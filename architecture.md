@@ -1352,8 +1352,34 @@ neither can be seen. The panel header carries them now, as `ui::menu_button`: a 
 trailing chevron, the mirror of `icon_text_action` whose glyph leads. Without the chevron the
 header was muted text that happened to be clickable.
 
-*Still absent:* renaming or deleting a *folder*, and nesting a new folder deeper than the
-selection allows. `mv` and `rmdir` still work.
+### Folder verbs — and the guard that had to be inverted
+
+Right-clicking a folder opened nothing, because `open_collection_menu` guarded on
+`selected_request`. Rename, trash and delete now act on whatever is selected — one `Rename` that
+renames what you point at is what `f2` means in a tree, so they branch rather than gaining a
+parallel `…Folder` action each. Four things it needed:
+
+- **Separate core verbs, not a flag.** `rename` appends `EXTENSION` unconditionally, so on a
+  directory it would produce `billing.json`; `remove` uses `remove_file` and `trash` refuses a
+  non-file. `rename_folder`, `remove_folder` and `trash_folder` sit beside them.
+- **The confirmation names the count.** A folder can hold work the panel never showed — an
+  unreadable request is skipped by `scan` and has no row — so `request_count` answers "and how
+  many requests" before anything is destroyed.
+- **Buffers are retargeted by *prefix*.** `save_request` writes to a remembered path with no
+  existence check, so a buffer holding `billing/x.json` after `billing` became `finance` would
+  recreate the old folder on the next `Ctrl+S`. `retarget_prefix` rewrites the ones underneath a
+  rename and clears them on a delete — the request rules, one level up.
+- **Duplicate and Move to… are left out**, since both take a file. That is the rule the old
+  guard was enforcing from the other side, kept rather than dropped.
+
+> **The rename box was drawn only in the request arm**, so renaming a folder focused a handle
+> whose element was never painted: the box appeared not to open, typing vanished, and `Enter`
+> fell through to the panel's own binding. Invisible from state — `renaming_row()` reported it
+> open — and found only because the test asserted the *typed text* rather than that a rename had
+> started.
+
+*Still absent:* duplicating or moving a folder, and nesting a new folder deeper than the
+selection allows. `mv` still works.
 
 ---
 

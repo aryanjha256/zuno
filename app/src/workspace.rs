@@ -1187,15 +1187,55 @@ impl Workspace {
         matches!(node.kind, NodeKind::Request { .. }).then_some(node)
     }
 
+    /// The selected row, whichever kind it is.
+    ///
+    /// The verbs that act on both — rename, trash, delete, and the paths — read this and branch,
+    /// rather than gaining a parallel `…Folder` action each. One `Rename` that renames what is
+    /// selected is what `f2` means in a tree, and a second action would be two ways to say it.
+    fn selected_node(&self) -> Option<&Node> {
+        self.tree.get(self.panel_selection?)
+    }
+
+    fn selection_is_directory(&self) -> bool {
+        self.selected_node()
+            .is_some_and(|node| matches!(node.kind, NodeKind::Directory))
+    }
+
+    /// Rewrite or clear `path` on every buffer inside `prefix`.
+    ///
+    /// The prefix form of `forget_path`, and the reason folder verbs are not just the request
+    /// ones pointed at a directory: renaming `billing/` moves every request under it, so a
+    /// buffer holding `billing/invoices.json` has to become `finance/invoices.json` or the next
+    /// Ctrl+S recreates the folder that was just renamed away.
+    fn retarget_prefix(&mut self, prefix: &Path, moved_to: Option<&Path>, cx: &mut Context<Self>) {
+        for view in &self.views {
+            let Some(path) = view.read(cx).path.clone() else {
+                continue;
+            };
+            let Ok(rest) = path.strip_prefix(prefix) else {
+                continue;
+            };
+            let next = moved_to.map(|root| root.join(rest));
+            view.update(cx, |view, cx| {
+                view.path = next;
+                cx.notify();
+            });
+        }
+    }
+
     fn open_collection_menu(
         &mut self,
         _: &OpenCollectionMenu,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.modal_open() || self.selected_request().is_none() {
+        if self.modal_open() || self.selected_node().is_none() {
             return;
         }
+        // Right-clicking a *folder* opened nothing for several slices: this guard read
+        // `selected_request`, so the gesture a tree most invites was inert — and "New folder"
+        // sat in a menu you could not reach with a folder selected.
+        let directory = self.selection_is_directory();
         let at = self.collection_menu_anchor();
         let focus = self.panel_focus.clone();
         let restore = Some(focus.clone());
@@ -1205,6 +1245,29 @@ impl Workspace {
         // destructive rows sit last and together, so the pointer never passes over them on the
         // way to something harmless.
         use context_menu::{MenuItem, MenuRow};
+
+        // Duplicate and Move to… both take a *file*; the recursive versions are their own
+        // decision, so a folder's menu leaves them out rather than offering a control that can
+        // only fail — the rule the request guard already followed from the other side.
+        if directory {
+            let rows = vec![
+                MenuItem::new("Reveal in file manager", RevealRequest, &focus, window).into(),
+                MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
+                MenuRow::Separator,
+                MenuItem::new("New folder", NewFolder, &focus, window).into(),
+                MenuRow::Separator,
+                MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
+                MenuItem::new("Copy relative path", CopyRequestRelativePath, &focus, window)
+                    .into(),
+                MenuRow::Separator,
+                MenuItem::new("Rename", RenameRequest, &focus, window).into(),
+                MenuItem::new("Move to trash", TrashRequest, &focus, window).into(),
+                MenuItem::new("Delete…", DeleteRequest, &focus, window).into(),
+            ];
+            self.show_menu(rows, at, restore, window, cx);
+            return;
+        }
+
         let rows = vec![
             MenuItem::new("Reveal in file manager", RevealRequest, &focus, window).into(),
             MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
@@ -1239,15 +1302,30 @@ impl Workspace {
         // opened one — where `show_menu` would otherwise refuse as a stacked modal.
         self.close_row_menu(window, cx);
 
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let name = node.name.clone();
+        let directory = matches!(node.kind, NodeKind::Directory);
+        let path = node.path.clone();
         let at = self.collection_menu_anchor();
         let restore = Some(self.panel_focus.clone());
+
+        // **A folder's prompt names the count.** "Delete billing?" with no number is how a
+        // folder of forty requests goes missing — and a folder can hold work the panel never
+        // showed, since an unreadable request is skipped by `scan` and has no row.
+        let label = if directory {
+            match collection::request_count(&path) {
+                0 => format!("Delete {name} and everything in it"),
+                1 => format!("Delete {name} and 1 request"),
+                n => format!("Delete {name} and {n} requests"),
+            }
+        } else {
+            format!("Delete {name}")
+        };
 
         let rows = vec![
             // Not `MenuItem::new`: this row is reached by choosing the one above it, never by a
             // keystroke, so a keymap lookup would draw an empty column implying one exists.
-            context_menu::MenuItem::plain(format!("Delete {name}"), ConfirmDeleteRequest).into(),
+            context_menu::MenuItem::plain(label, ConfirmDeleteRequest).into(),
             context_menu::MenuItem::dismiss("Keep it").into(),
         ];
         self.show_menu(rows, at, restore, window, cx);
@@ -1261,25 +1339,29 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.collection_menu_at = None;
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let (path, name) = (node.path.clone(), node.name.clone());
+        let directory = matches!(node.kind, NodeKind::Directory);
 
-        if let Err(error) = collection::remove(&path) {
+        let removed = if directory {
+            collection::remove_folder(&path)
+        } else {
+            collection::remove(&path)
+        };
+        if let Err(error) = removed {
             self.set_status(&format!("Could not delete: {error}"), cx);
             return;
         }
 
-        // **Any buffer open on that file forgets it.** `save_request` writes to a remembered
+        // **Any buffer open on it forgets its path.** `save_request` writes to a remembered
         // `path` with no existence check, so leaving it set means the next Ctrl+S silently
-        // recreates the file you just deleted — and the buffer stays open, which is right: the
-        // request is still in front of you, it simply has no file any more.
-        for view in &self.views {
-            if view.read(cx).path.as_deref() == Some(path.as_path()) {
-                view.update(cx, |view, cx| {
-                    view.path = None;
-                    cx.notify();
-                });
-            }
+        // recreates what was just deleted — and for a folder that means recreating the folder
+        // too. The buffers stay open, which is right: the requests are still in front of you,
+        // they simply have no file any more.
+        if directory {
+            self.retarget_prefix(&path, None, cx);
+        } else {
+            self.forget_path(&path, cx);
         }
 
         self.refresh_tree(cx);
@@ -1294,7 +1376,7 @@ impl Workspace {
     /// Derived rather than stored on `Node`: it is wanted by exactly one verb, and a second
     /// copy of the string on every row of a large collection is memory spent on a menu item.
     fn selected_relative(&self, cx: &App) -> Option<String> {
-        let path = self.selected_request()?.path.clone();
+        let path = self.selected_node()?.path.clone();
         let root = crate::collections::root(cx)?;
         Some(
             path.strip_prefix(root)
@@ -1312,7 +1394,7 @@ impl Workspace {
     /// nothing here can be driven headlessly. What *is* testable is that the menu offers the
     /// row against the right selection, which is where the mistake would be.
     fn reveal_request(&mut self, _: &RevealRequest, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let path = node.path.clone();
         cx.reveal_path(&path);
     }
@@ -1325,13 +1407,13 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let path = node.path.clone();
         cx.open_with_system(&path);
     }
 
     fn copy_request_path(&mut self, _: &CopyRequestPath, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let path = node.path.display().to_string();
         cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
         self.set_status(&format!("Copied {path}"), cx);
@@ -1376,15 +1458,25 @@ impl Workspace {
     /// delete exists because it cannot be undone, and trashing can. A dialog in front of a
     /// recoverable action trains people to dismiss dialogs.
     fn trash_request(&mut self, _: &TrashRequest, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let (path, name) = (node.path.clone(), node.name.clone());
+        let directory = matches!(node.kind, NodeKind::Directory);
 
-        if let Err(error) = collection::trash(&path) {
+        let trashed = if directory {
+            collection::trash_folder(&path)
+        } else {
+            collection::trash(&path)
+        };
+        if let Err(error) = trashed {
             self.set_status(&format!("Could not trash: {error}"), cx);
             return;
         }
 
-        self.forget_path(&path, cx);
+        if directory {
+            self.retarget_prefix(&path, None, cx);
+        } else {
+            self.forget_path(&path, cx);
+        }
         self.refresh_tree(cx);
         window.focus(&self.panel_focus);
         self.set_status(&format!("Moved {name} to the trash"), cx);
@@ -1920,7 +2012,7 @@ impl Workspace {
         // A menu row dispatched this, and it is still open until closed.
         self.close_row_menu(window, cx);
 
-        let Some(node) = self.selected_request() else { return };
+        let Some(node) = self.selected_node() else { return };
         let row_ix = self.panel_selection.unwrap_or_default();
         let (path, name) = (node.path.clone(), node.name.clone());
 
@@ -1999,17 +2091,31 @@ impl Workspace {
             return;
         }
 
-        match collection::rename(&state.path, &typed) {
+        // `rename` appends the `.json` extension unconditionally, which on a directory would
+        // produce `billing.json` — hence the separate folder verb rather than a flag.
+        let directory = state.path.is_dir();
+        let renamed = if directory {
+            collection::rename_folder(&state.path, &typed)
+        } else {
+            collection::rename(&state.path, &typed)
+        };
+
+        match renamed {
             Ok(renamed) => {
-                // The buffer follows the file rather than forgetting it: unlike a delete, the
-                // request still exists and Ctrl+S should still overwrite *it*.
-                for view in &self.views {
-                    if view.read(cx).path.as_deref() == Some(state.path.as_path()) {
-                        let renamed = renamed.clone();
-                        view.update(cx, |view, cx| {
-                            view.path = Some(renamed);
-                            cx.notify();
-                        });
+                // The buffers follow rather than forgetting: unlike a delete, the requests still
+                // exist and Ctrl+S should still overwrite *them*. For a folder that is every
+                // buffer underneath it, which is what `retarget_prefix` is for.
+                if directory {
+                    self.retarget_prefix(&state.path.clone(), Some(&renamed), cx);
+                } else {
+                    for view in &self.views {
+                        if view.read(cx).path.as_deref() == Some(state.path.as_path()) {
+                            let renamed = renamed.clone();
+                            view.update(cx, |view, cx| {
+                                view.path = Some(renamed);
+                                cx.notify();
+                            });
+                        }
                     }
                 }
                 self.refresh_tree(cx);

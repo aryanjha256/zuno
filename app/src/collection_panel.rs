@@ -437,13 +437,20 @@ fn row(
                     13.,
                 )),
             )
-            .child(name_cell(
-                &node.name,
-                node.depth,
-                true,
-                theme.text,
-                row_ix,
-            )),
+            // **The rename box has to be drawn here too.** It was only in the request arm, so
+            // renaming a folder focused a handle whose element was never painted — the box
+            // appeared not to open, typing went nowhere, and `Enter` fell through to the panel's
+            // own binding. The failure is invisible: `renaming_row()` reported it open.
+            .child(match renaming {
+                Some(input) => div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .child(input)
+                    .into_any_element(),
+                None => name_cell(&node.name, node.depth, true, theme.text, row_ix)
+                    .into_any_element(),
+            }),
         NodeKind::Request { method, .. } => row
             // The chevron's column is held open on a request row too, so a request and a
             // sibling directory start their names at the same x.
