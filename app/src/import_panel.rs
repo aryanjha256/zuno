@@ -159,21 +159,7 @@ impl Render for ImportPanel {
                             .text_color(theme.text)
                             .child("Import from OpenAPI"),
                     )
-                    .child(
-                        div()
-                            .w_full()
-                            // `TextInput` paints a custom shaped line and relies on its parent
-                            // for the clip — see the same comment on `url_bar`. Without this the
-                            // typed URL paints straight out of the field and across the dialog.
-                            .overflow_hidden()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(theme.bg)
-                            .border_1()
-                            .border_color(theme.border_focused)
-                            .child(self.source.clone()),
-                    )
+                    .child(crate::ui::field_box(self.source.clone(), &theme))
                     .child(
                         div()
                             .text_xs()

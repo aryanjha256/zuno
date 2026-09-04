@@ -135,7 +135,7 @@ impl Render for WorkspacePanel {
                             .text_color(theme.text)
                             .child("New workspace"),
                     )
-                    .child(labelled("Name", &theme, input_box(self.name.clone(), &theme)))
+                    .child(labelled("Name", &theme, crate::ui::field_box(self.name.clone(), &theme)))
                     // The browse button pairs with the *box*, not with the field: a row of
                     // [label-over-box, button] centres the button against both lines together,
                     // which lands it up at the label rather than on the input.
@@ -151,7 +151,7 @@ impl Render for WorkspacePanel {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .child(input_box(self.location.clone(), &theme)),
+                                    .child(crate::ui::field_box(self.location.clone(), &theme)),
                             )
                             .child(crate::ui::icon_button(
                                 "workspace-browse",
@@ -197,16 +197,4 @@ fn labelled<C: IntoElement>(
         .gap_1()
         .child(div().text_xs().text_color(theme.text_faint).child(label))
         .child(content)
-}
-
-fn input_box(input: Entity<TextInput>, theme: &crate::theme::Theme) -> impl IntoElement + use<> {
-    div()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.bg)
-        .text_xs()
-        .child(input)
 }

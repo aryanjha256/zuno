@@ -10,7 +10,7 @@
 //! rather than replacing it. That is also why a rebinding can never leave a tooltip lying.
 
 use gpui::{
-    AnyView, App, AppContext, AssetSource, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyView, App, AppContext, AssetSource, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, Result, SharedString, StatefulInteractiveElement, Styled,
     Svg, Window, div, px, svg,
 };
@@ -551,6 +551,27 @@ pub fn syntax_colour(kind: zuno_core::TokenKind, syntax: &crate::theme::SyntaxTh
 /// `theme::tests::border_is_too_dim_to_read_as_text` names this function as that exception.
 pub fn separator(theme: &Theme) -> impl IntoElement + use<> {
     div().flex_none().text_xs().text_color(theme.border).child("│")
+}
+
+/// A dialog's bordered text field.
+///
+/// **The `overflow_hidden` is the whole point.** `TextInput` paints a custom shaped line, which
+/// `truncate()` does not clip — only a real clip on the parent does, and without one the text
+/// paints straight out of the box and across the dialog. `url_bar` and `import_panel` each
+/// carried that as a comment and a fourth field was still written without it, so it is a
+/// primitive now rather than a rule to remember.
+pub fn field_box(input: Entity<crate::input::TextInput>, theme: &Theme) -> impl IntoElement + use<> {
+    div()
+        .w_full()
+        .overflow_hidden()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(theme.bg)
+        .border_1()
+        .border_color(theme.border_focused)
+        .text_xs()
+        .child(input)
 }
 
 /// A word with a trailing chevron: a control that opens a menu.
