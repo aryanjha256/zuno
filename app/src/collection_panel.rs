@@ -21,6 +21,7 @@ use gpui::{
     ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
     uniform_list,
 };
+use zuno_core::Method;
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{CollectionCollapseAll, CollectionExpandAll, NewFolder, OpenCollectionMenu};
@@ -37,9 +38,8 @@ const INDENT: f32 = 12.0;
 /// The chevron's column, reserved on *every* row including requests, so names at one depth
 /// line up whether or not their neighbour is a directory.
 const CHEVRON: f32 = 14.0;
-/// Wide enough for `DELETE` at `text_xs`, so the name column starts at the same x on every
-/// row rather than jittering with the verb.
-const METHOD_WIDTH: f32 = 46.0;
+/// The kind column — a folder glyph, or a method-tinted one. Fixed so names line up across rows.
+const METHOD_WIDTH: f32 = 16.0;
 
 /// The panel's width.
 ///
@@ -275,6 +275,23 @@ pub(crate) fn name_budget(depth: u16, is_directory: bool) -> usize {
     (((WIDTH - chrome) / 5.95).max(0.)) as usize
 }
 
+/// The glyph for a method. Exhaustive with no catch-all, so a new `Method` is a compile error.
+///
+/// Shape carries the verb and colour carries it again, which is what lets HEAD and OPTIONS stay
+/// apart despite sharing `method_other`.
+fn method_icon(method: &Method) -> Icon {
+    match method {
+        Method::Get => Icon::Eye,
+        Method::Post => Icon::PlusCircle,
+        Method::Put => Icon::RotateCw,
+        Method::Patch => Icon::Pencil,
+        Method::Delete => Icon::Trash,
+        Method::Head => Icon::Info,
+        Method::Options => Icon::CircleEllipsis,
+        Method::Other(_) => Icon::Asterisk,
+    }
+}
+
 /// One row's name: a single line, clipped, with the full text on hover when it does not fit.
 ///
 /// **`whitespace_nowrap` is the whole fix, and its absence was the bug.** gpui's default is
@@ -415,11 +432,12 @@ fn row(
             // sibling directory start their names at the same x.
             .child(div().flex_none().w(px(CHEVRON)))
             .child(
-                div()
-                    .flex_none()
-                    .w(px(METHOD_WIDTH))
-                    .text_color(theme.method_color(method))
-                    .child(SharedString::from(method.as_str().to_string())),
+                div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
+                    method_icon(method),
+                    theme.method_color(method),
+                    theme.method_color(method),
+                    13.,
+                )),
             )
             .child(match renaming {
                 // The rename box takes the name's place rather than overlaying the row, so the
@@ -456,7 +474,7 @@ mod tests {
         let root = name_budget(0, false);
         assert!(
             (20..=32).contains(&root),
-            "a root-level name should fit roughly 25 characters, got {root}"
+            "a root-level name should fit roughly 30 characters, got {root}"
         );
 
         // Each level of nesting costs `INDENT`, which is about two characters.
@@ -472,5 +490,32 @@ mod tests {
 
         // Directories reserve the same columns, which is what makes the names line up.
         assert_eq!(name_budget(2, true), name_budget(2, false));
+    }
+
+    #[test]
+    fn every_method_gets_its_own_glyph() {
+        // A duplicated arm is a copy-paste away and shows on screen only if a reader happens to
+        // have both verbs in the tree. HEAD and OPTIONS are the pair that matters: they share
+        // `method_other`, so the shape is the only thing telling them apart.
+        let methods = [
+            Method::Get,
+            Method::Post,
+            Method::Put,
+            Method::Patch,
+            Method::Delete,
+            Method::Head,
+            Method::Options,
+            Method::Other("REPORT".into()),
+        ];
+
+        let mut seen = Vec::new();
+        for method in &methods {
+            let icon = method_icon(method);
+            assert!(
+                !seen.contains(&icon),
+                "{method:?} reuses the glyph of an earlier method"
+            );
+            seen.push(icon);
+        }
     }
 }

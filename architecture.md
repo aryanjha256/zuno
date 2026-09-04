@@ -1336,8 +1336,10 @@ bounded range rather than a value.
 **Directories carry a folder icon, in the method column's slot.** Not a column of its own: give
 it one and a folder name and the request name below it indent differently for no reason a reader
 could name. It opens with the row — redundant against the chevron, and conventional enough that
-the redundancy reads as polish rather than noise. Requests have no icon, because the method is
-more informative than a document glyph and 232px does not have room for both.
+the redundancy reads as polish rather than noise. Requests carry a per-method glyph in the same
+slot, tinted by `method_color`. One glyph for all of them was tried first and read as noise
+repeated down the tree; per method also keeps HEAD and OPTIONS apart, which colour alone cannot
+since both resolve to `method_other`.
 
 *Still absent:* renaming or deleting a *folder*, and nesting a new folder deeper than the
 selection allows. `mv` and `rmdir` still work.
