@@ -64,6 +64,16 @@ actions!(
         // at the collection root and nothing could put a request anywhere else.
         NewFolder,
         MoveRequest,
+        // Workspaces. A workspace is a collection directory; the registry in `app.json` is
+        // Zuno's own bookkeeping about which ones exist, and never lives inside one.
+        NewWorkspace,
+        OpenWorkspace,
+        SwitchWorkspace,
+        ForgetWorkspace,
+        OpenWorkspaceMenu,
+        WorkspaceConfirm,
+        WorkspaceDismiss,
+        WorkspaceBrowse,
         // Import a whole API at once. `ImportCurl` is one request per paste; this is the way a
         // collection gets filled from what a team already has.
         ImportOpenApi,

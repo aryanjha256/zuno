@@ -53,6 +53,10 @@ pub fn palette() -> Vec<Command> {
         // Unlike the panel's other verbs this one needs no selection — with nothing selected it
         // makes a folder at the collection root — so it is a real palette row rather than an
         // exclusion.
+        command("New workspace", NewWorkspace),
+        command("Open workspace…", OpenWorkspace),
+        command("Switch workspace", SwitchWorkspace),
+        command("Forget workspace", ForgetWorkspace),
         command("New folder in collection", NewFolder),
         command("Collapse all folders", CollectionCollapseAll),
         command("Expand all folders", CollectionExpandAll),
@@ -129,6 +133,13 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::SettingsDismiss", "only valid inside the settings panel"),
     // Only valid while the unsaved-changes prompt is open. `CloseTab` is the entry point and it
     // *is* offered; a row for "discard" would be a destructive command reachable on its own.
+    // Only valid while the new-workspace dialog is open, where they are already bound.
+    // Same reasoning as `OpenAppMenu`: this menu exists so someone who does not know the
+    // palette can find the workspace verbs, and all four are offered here already.
+    ("zuno::OpenWorkspaceMenu", "a menu reached from the palette is backwards"),
+    ("zuno::WorkspaceConfirm", "only valid inside the new-workspace dialog"),
+    ("zuno::WorkspaceDismiss", "only valid inside the new-workspace dialog"),
+    ("zuno::WorkspaceBrowse", "only valid inside the new-workspace dialog"),
     ("zuno::ConfirmClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CancelClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CloseChoiceNext", "only valid inside the unsaved-changes prompt"),

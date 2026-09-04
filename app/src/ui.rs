@@ -553,6 +553,53 @@ pub fn separator(theme: &Theme) -> impl IntoElement + use<> {
     div().flex_none().text_xs().text_color(theme.border).child("│")
 }
 
+/// A word with a trailing chevron: a control that opens a menu.
+///
+/// The mirror of `icon_text_action`, whose glyph *leads* because there the icon carries the verb
+/// and the word says which table it acts on. Here the word is the subject and the chevron is the
+/// only thing saying it opens something — which is exactly why the panel header needed one, since
+/// as plain muted text it looked like a label.
+///
+/// `chrome.rs`'s app-name button is the same shape hand-rolled, and stays that way: it paints
+/// accent and semibold because it is the application's identity, not a muted control.
+pub fn menu_button<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    text: SharedString,
+    label: &'static str,
+    action: A,
+    tint: Hsla,
+    theme: &Theme,
+) -> impl IntoElement + use<A> {
+    let tooltip_action = action.clone();
+
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .group(ICON_GROUP)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .min_w(px(0.))
+        .px_1()
+        .rounded_sm()
+        .overflow_hidden()
+        .text_color(tint)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.bg_hover))
+        .tooltip(move |window, cx| Tooltip::for_action(label, &tooltip_action, window, cx))
+        .on_mouse_down(
+            MouseButton::Left,
+            move |_: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(action.boxed_clone(), cx);
+            },
+        )
+        .child(div().whitespace_nowrap().overflow_hidden().child(text))
+        .child(glyph(Icon::ChevronDown, tint, tint, GLYPH_INLINE))
+}
+
 /// An icon *and* a word, dispatching one action.
 ///
 /// For a control where the icon carries the verb but the word says which table it acts on — a

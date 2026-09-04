@@ -34,6 +34,9 @@ use crate::actions::{
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
+    ForgetWorkspace, NewWorkspace, OpenWorkspace, OpenWorkspaceMenu, SwitchWorkspace,
+    WorkspaceBrowse,
+    WorkspaceConfirm, WorkspaceDismiss,
     CollectionExpandAll, CommitRename, ConfirmClose, CopyRequestPath,
     CopyRequestRelativePath, DuplicateRequest,
     ImportConfirm, ImportDismiss, ImportOpenApi, MoveRequest, NewFolder, OpenRequestExternally,
@@ -92,6 +95,10 @@ pub struct Workspace {
     /// Whether a scan has completed. Distinguishes "nothing saved" from "still reading",
     /// which are the same empty list and want different words on screen.
     pub(crate) tree_scanned: bool,
+    /// Ordinary files the last scan passed over, so the empty state can tell "this directory
+    /// holds other things" from "you have not saved anything yet". Open a folder of images and
+    /// the old message claimed the second while the truth was the first.
+    pub(crate) tree_skipped: usize,
     pub(crate) panel_visible: bool,
     /// **An index into `tree`, not into `tree_visible`.** Folding rewrites `tree_visible`
     /// underneath the selection, so a visible index would silently retarget it at whatever
@@ -127,6 +134,9 @@ pub struct Workspace {
     collection_menu_at: Option<gpui::Point<gpui::Pixels>>,
     /// The unsaved-changes prompt, when one is open.
     close_confirm: Option<crate::close_panel::CloseConfirm>,
+    new_workspace_panel: Option<WorkspacePanelState>,
+    /// The folder dialog behind New and Open. Held because dropping the task cancels it.
+    workspace_prompt: Option<Task<()>>,
 }
 
 /// An in-progress inline rename.
@@ -147,6 +157,12 @@ struct RenameState {
 /// `PickerState` pairs them: either alone leaves a modal nothing can dismiss.
 struct ImportState {
     panel: Entity<crate::import_panel::ImportPanel>,
+    _subscription: Subscription,
+}
+
+/// Same pairing again: the panel and the subscription that lets it be closed.
+struct WorkspacePanelState {
+    panel: Entity<crate::workspace_panel::WorkspacePanel>,
     _subscription: Subscription,
 }
 
@@ -185,6 +201,19 @@ struct MenuState {
 struct PickerState {
     picker: Entity<picker::Picker>,
     _subscription: Subscription,
+}
+
+/// Expand a leading `~`, since the location field is typed by hand and a bare `~/code` would
+/// otherwise become a directory literally named `~`.
+fn shellexpand_home(input: &str) -> String {
+    let trimmed = input.trim();
+    let Some(rest) = trimmed.strip_prefix('~') else {
+        return trimmed.to_string();
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return trimmed.to_string();
+    };
+    format!("{}{rest}", home.to_string_lossy())
 }
 
 impl Workspace {
@@ -249,6 +278,7 @@ impl Workspace {
             tree_visible: Vec::new(),
             collapsed: HashSet::new(),
             tree_scanned: false,
+            tree_skipped: 0,
             panel_visible: session_panel,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
@@ -260,6 +290,8 @@ impl Workspace {
             import_task: None,
             collection_menu_at: None,
             close_confirm: None,
+            new_workspace_panel: None,
+            workspace_prompt: None,
         };
 
         // Off-thread and non-blocking, so a large collection cannot delay the first frame —
@@ -328,6 +360,63 @@ impl Workspace {
         .detach();
     }
 
+    /// Point the window at a different workspace.
+    ///
+    /// **The current session is written first, synchronously.** It has to land before the
+    /// globals move — `session::save` writes to whatever `SessionFile` currently holds, so
+    /// re-resolving first would file this workspace's buffers under the next one's id. That is
+    /// also why switching needs no unsaved-changes prompt: every open buffer's live spec goes
+    /// into the session, edits included, and comes back when you switch back.
+    pub fn switch_workspace(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::app_state::active_id(cx).as_deref() == Some(id) {
+            return;
+        }
+
+        self.session_save = None;
+        crate::session::save(&self.session(cx), cx);
+
+        if !crate::app_state::set_active(cx, id) {
+            return;
+        }
+
+        self.reload_active_workspace(window, cx);
+    }
+
+    /// Rebuild the window from whatever workspace is now active.
+    ///
+    /// Split from `switch_workspace` because forgetting the active workspace re-resolves the
+    /// globals without going through `set_active`, and the window still has to follow.
+    fn reload_active_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let session = crate::session::load(cx)
+            .unwrap_or_else(|| crate::session::Session::single(RequestSpec::default()));
+
+        self.views = session
+            .tabs
+            .into_iter()
+            .map(|tab| {
+                cx.new(|cx| {
+                    let mut view = RequestView::new(tab.spec, cx);
+                    view.path = tab.path;
+                    view
+                })
+            })
+            .collect();
+        self.environment = session.environment;
+        self.panel_visible = session.collection_panel;
+
+        // Every handle into the old buffers is dead, so focus has to move or the keymap goes
+        // with them. `activate` is the one funnel that does both.
+        self.active_ix = session.active.min(self.views.len().saturating_sub(1));
+        self.activate(self.active_ix, window, cx);
+
+        self.collapsed.clear();
+        self.panel_selection = None;
+        self.tree_scanned = false;
+        self.refresh_tree(cx);
+        self.reread_baselines(cx);
+        cx.notify();
+    }
+
     pub fn active(&self) -> Option<Entity<RequestView>> {
         self.views.get(self.active_ix).cloned()
     }
@@ -347,6 +436,7 @@ impl Workspace {
             || self.menu.is_some()
             || self.import.is_some()
             || self.close_confirm.is_some()
+            || self.new_workspace_panel.is_some()
     }
 
     #[cfg(test)]
@@ -750,18 +840,19 @@ impl Workspace {
     pub(crate) fn refresh_tree(&mut self, cx: &mut Context<Self>) {
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
             self.tree.clear();
+            self.tree_skipped = 0;
             self.tree_scanned = true;
             self.rebuild_tree_visible();
             return;
         };
 
         let scan = cx.background_executor().spawn(async move {
-            let entries = collection::scan(&root);
+            let (entries, skipped) = collection::scan_counted(&root);
             // Two walks rather than one, and worth the second: a directory earns a row by
             // existing, so an empty folder has to come from the filesystem rather than be
             // inferred from the requests inside it.
             let folders = collection::folders(&root);
-            collection::tree(&root, &entries, &folders)
+            (collection::tree(&root, &entries, &folders), skipped)
         });
 
         // **The selection is restored by path, not by index**, and that distinction is the
@@ -775,9 +866,10 @@ impl Workspace {
             .map(|node| node.path.clone());
 
         self.tree_scan = Some(cx.spawn(async move |this, cx| {
-            let nodes = scan.await;
+            let (nodes, skipped) = scan.await;
             this.update(cx, |this, cx| {
                 this.tree = nodes;
+                this.tree_skipped = skipped;
                 this.tree_scanned = true;
                 // Gone from disk since the last scan means gone from the panel: no selection
                 // rather than a neighbouring row nobody asked for.
@@ -1483,6 +1575,165 @@ impl Workspace {
     }
 
     /// Open the OpenAPI import modal.
+    fn new_workspace(&mut self, _: &NewWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let location = crate::app_state::default_new_location()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let panel = cx.new(|cx| {
+            crate::workspace_panel::WorkspacePanel::new(location, restore, window, cx)
+        });
+
+        let subscription =
+            cx.subscribe_in(&panel, window, |workspace, panel, event, window, cx| {
+                let crate::workspace_panel::WorkspaceEvent::Confirmed { name, location } = event;
+                workspace.create_workspace(
+                    panel.clone(),
+                    name.clone(),
+                    location.clone(),
+                    window,
+                    cx,
+                );
+            });
+
+        self.new_workspace_panel = Some(WorkspacePanelState {
+            panel,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    /// Create the directory, register it, and switch to it.
+    ///
+    /// The name goes through `slug` for the reason every other typed name does: it becomes a
+    /// path segment, so `../../evil` must not walk out of the location.
+    fn create_workspace(
+        &mut self,
+        panel: Entity<crate::workspace_panel::WorkspacePanel>,
+        name: String,
+        location: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let stem = collection::slug(&name);
+        if stem.is_empty() {
+            panel.update(cx, |panel, cx| panel.report("That name has no usable characters", cx));
+            return;
+        }
+        if location.trim().is_empty() {
+            panel.update(cx, |panel, cx| panel.report("Choose where the folder goes", cx));
+            return;
+        }
+
+        let path = PathBuf::from(shellexpand_home(&location)).join(&stem);
+        if path.exists() {
+            panel.update(cx, |panel, cx| {
+                panel.report(format!("{} already exists", path.display()), cx)
+            });
+            return;
+        }
+        if let Err(error) = std::fs::create_dir_all(&path) {
+            panel.update(cx, |panel, cx| {
+                panel.report(format!("Could not create it: {error}"), cx)
+            });
+            return;
+        }
+
+        let Some(id) = crate::app_state::add_workspace(cx, path.clone()) else {
+            panel.update(cx, |panel, cx| panel.report("Workspaces are not being saved", cx));
+            return;
+        };
+
+        self.close_workspace_panel(window, cx);
+        self.switch_workspace(&id, window, cx);
+        self.set_status(&format!("Created {}", path.display()), cx);
+    }
+
+    /// Register a directory that already exists — a collection someone cloned, or one built by
+    /// hand. The other half of `NewWorkspace`, and the reason the location field is not the only
+    /// way to put a workspace somewhere unusual.
+    fn open_workspace(&mut self, _: &OpenWorkspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open workspace".into()),
+        });
+
+        self.workspace_prompt = Some(cx.spawn_in(window, async move |workspace, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let Some(id) = crate::app_state::add_workspace(cx, path.clone()) else {
+                        workspace.set_status("Workspaces are not being saved", cx);
+                        return;
+                    };
+                    workspace.switch_workspace(&id, window, cx);
+                    workspace.set_status(&format!("Opened {}", path.display()), cx);
+                })
+                .ok();
+        }));
+    }
+
+    fn workspace_confirm(&mut self, _: &WorkspaceConfirm, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.new_workspace_panel.as_ref() else { return };
+        state.panel.clone().update(cx, |panel, cx| panel.confirm(cx));
+    }
+
+    fn workspace_dismiss(&mut self, _: &WorkspaceDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_workspace_panel(window, cx);
+    }
+
+    fn close_workspace_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.new_workspace_panel.take() else { return };
+        if let Some(focus) = state.panel.read(cx).restore_focus() {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    /// The folder dialog behind the location field.
+    ///
+    /// One call, like `RevealRequest` and `ChooseBodyFile`: `prompt_for_paths` is
+    /// `unimplemented!()` in the test platform, so the handler is kept as small as the untestable
+    /// part has to be.
+    fn workspace_browse(&mut self, _: &WorkspaceBrowse, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.new_workspace_panel.as_ref() else { return };
+        let panel = state.panel.clone();
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a folder".into()),
+        });
+
+        self.workspace_prompt = Some(cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            panel
+                .update_in(cx, |panel, window, cx| {
+                    panel.set_location(path.display().to_string(), window, cx)
+                })
+                .ok();
+        }));
+    }
+
     fn import_openapi(&mut self, _: &ImportOpenApi, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
@@ -2059,6 +2310,70 @@ impl Workspace {
         );
     }
 
+    /// The workspace switcher, and the same list again for forgetting.
+    ///
+    /// One builder rather than two: the rows are identical and only the target differs, so a
+    /// second copy would be the place the two drift.
+    fn workspace_items(&self, forget: bool, cx: &App) -> Vec<picker::Item> {
+        let active = crate::app_state::active_id(cx);
+        crate::app_state::workspaces(cx)
+            .into_iter()
+            .filter(|entry| !forget || Some(&entry.id) != active.as_ref())
+            .map(|entry| {
+                let is_active = Some(&entry.id) == active.as_ref();
+                // A directory that has gone — deleted, unmounted, a different machine — is
+                // *marked*, not dropped. The fix is usually to reconnect it, not to start over.
+                let detail = match (is_active, entry.path.is_dir()) {
+                    (_, false) => format!("missing — {}", entry.path.display()),
+                    (true, _) => format!("current — {}", entry.path.display()),
+                    (false, _) => entry.path.display().to_string(),
+                };
+                picker::Item {
+                    label: SharedString::from(crate::app_state::label(&entry.path)),
+                    detail: SharedString::from(detail),
+                    target: if forget {
+                        picker::Target::ForgetWorkspace(entry.id)
+                    } else {
+                        picker::Target::Workspace(entry.id)
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn switch_workspace_action(
+        &mut self,
+        _: &SwitchWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let items = self.workspace_items(false, cx);
+        self.show_picker(items, "No workspaces", window, cx);
+    }
+
+    fn forget_workspace_action(
+        &mut self,
+        _: &ForgetWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        // The active one is filtered out: forgetting what you are looking at would have to
+        // switch you somewhere else as a side effect of a verb that does not say so.
+        let items = self.workspace_items(true, cx);
+        self.show_picker(
+            items,
+            "No other workspaces — the one you are in cannot be forgotten",
+            window,
+            cx,
+        );
+    }
+
     fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.picker.take() else { return };
         self.picker_scan = None;
@@ -2124,6 +2439,26 @@ impl Workspace {
             }
             picker::Target::Folder(directory) => {
                 self.move_selected_into(directory, window, cx);
+            }
+            picker::Target::Workspace(id) => self.switch_workspace(&id, window, cx),
+            picker::Target::ForgetWorkspace(id) => {
+                let name = crate::app_state::workspaces(cx)
+                    .into_iter()
+                    .find(|entry| entry.id == id)
+                    .map(|entry| crate::app_state::label(&entry.path))
+                    .unwrap_or_else(|| id.clone());
+
+                if crate::app_state::forget_workspace(cx, &id) {
+                    // Forgetting the active one re-resolves onto another, so the window has to
+                    // follow — otherwise the buffers on screen belong to a workspace that is no
+                    // longer registered.
+                    if crate::app_state::active_id(cx).is_some() {
+                        self.reload_active_workspace(window, cx);
+                    }
+                    self.set_status(&format!("Forgot {name} — its files were left alone"), cx);
+                } else {
+                    self.set_status("The last workspace cannot be forgotten", cx);
+                }
             }
             picker::Target::File(path) => {
                 // Focus is left where `activate` put it — inside the new buffer. The panel
@@ -2882,6 +3217,41 @@ impl Workspace {
         ]
     }
 
+    /// The workspace menu, hung off the panel header.
+    ///
+    /// Four verbs that had a palette row each and, between them, one mouse path — which is §2's
+    /// discoverability failure recurring exactly as it describes it: a binding and a palette row
+    /// both satisfy the convention checklist and neither can be seen.
+    fn open_workspace_menu(
+        &mut self,
+        _: &OpenWorkspaceMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        use context_menu::{MenuItem, MenuRow};
+        let focus = self.panel_focus.clone();
+        // Under the header it belongs to, not at the cursor — the same rule the app menu
+        // follows, and for the same reason: this menu belongs to a button.
+        let at = gpui::point(
+            gpui::px(8.),
+            gpui::px(crate::chrome::TITLEBAR_HEIGHT + crate::collection_panel::HEADER_HEIGHT),
+        );
+        let rows = vec![
+            MenuItem::new("Switch workspace", SwitchWorkspace, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("New workspace", NewWorkspace, &focus, window).into(),
+            MenuItem::new("Open workspace…", OpenWorkspace, &focus, window).into(),
+            MenuRow::Separator,
+            // Last and behind a rule, like Quit in the app menu: it is the only row here that
+            // takes something away.
+            MenuItem::new("Forget workspace", ForgetWorkspace, &focus, window).into(),
+        ];
+        self.show_menu(rows, at, Some(focus), window, cx);
+    }
+
     fn open_app_menu(&mut self, _: &OpenAppMenu, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
@@ -3131,6 +3501,10 @@ impl Workspace {
 
     fn toggle_theme(&mut self, _: &ToggleTheme, _: &mut Window, cx: &mut Context<Self>) {
         cx.global_mut::<Theme>().toggle();
+        // Persisted, or the choice lasts until the next launch and no further — `main` used to
+        // hardcode `Appearance::Dark` on every boot.
+        let appearance = cx.global::<Theme>().appearance;
+        crate::app_state::set_theme(cx, appearance);
         // A theme change repaints every window, not just this view.
         cx.refresh_windows();
     }
@@ -3322,6 +3696,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::collection_confirm))
             .on_action(cx.listener(Self::collection_collapse))
             .on_action(cx.listener(Self::collection_expand))
+            .on_action(cx.listener(Self::open_workspace_menu))
+            .on_action(cx.listener(Self::new_workspace))
+            .on_action(cx.listener(Self::open_workspace))
+            .on_action(cx.listener(Self::workspace_confirm))
+            .on_action(cx.listener(Self::workspace_dismiss))
+            .on_action(cx.listener(Self::workspace_browse))
+            .on_action(cx.listener(Self::switch_workspace_action))
+            .on_action(cx.listener(Self::forget_workspace_action))
             .on_action(cx.listener(Self::confirm_close))
             .on_action(cx.listener(Self::cancel_close))
             .on_action(cx.listener(Self::close_choice_next))
@@ -3474,6 +3856,7 @@ impl Render for Workspace {
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
             .children(self.import.as_ref().map(|state| state.panel.clone()))
+            .children(self.new_workspace_panel.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
             // Built here rather than held as an `Entity`: it owns no input and no state beyond
             // which button is selected, so it is plain workspace state like `RenameState`.

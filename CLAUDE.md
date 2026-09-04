@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 633 tests, ~20s
+cargo test --workspace                   # 645 tests, ~20s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -70,7 +70,8 @@ Breaking any of these is a bug, not a tradeoff.
 5. **Check the registry before writing a version string.** `cargo info <crate>`. Never write one
    from memory — see "Lessons" below.
 6. **Tests must never write to the developer's own files.** `session::install_at(cx, None)` and
-   `collections::install_at(cx, None)` in the test harness — the suite drives `SendRequest` and
+   `collections::install_at(cx, None)` in the test harness — plus `app_state::install_at`, which
+   sets both from a registry entry the way boot does — the suite drives `SendRequest` and
    `SaveRequest`, and both are save points. `~/.config/zuno` holds the session,
    `~/.local/share/zuno/collections` the requests.
 7. **New `RequestSettings` fields need serde defaults.** The container carries

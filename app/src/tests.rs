@@ -64,6 +64,200 @@ fn boot(
     (window, view, vcx)
 }
 
+#[gpui::test]
+async fn the_registry_resolves_the_active_workspace_into_root_and_session(cx: &mut TestAppContext) {
+    // The whole point of `app_state`: the registry is the source of truth and the collection
+    // root and session file are the *resolved answer*. `boot` sets those two globals directly,
+    // so nothing else in the suite covers the resolution itself.
+    let config = scratch_dir("registry-resolve");
+    let one = config.join("workspace-one");
+    let two = config.join("workspace-two");
+    std::fs::create_dir_all(&one).expect("mkdir");
+    std::fs::create_dir_all(&two).expect("mkdir");
+
+    cx.update(|cx| {
+        crate::app_state::install_at(
+            cx,
+            Some(config.clone()),
+            vec![
+                crate::app_state::WorkspaceEntry { id: "one".into(), path: one.clone() },
+                crate::app_state::WorkspaceEntry { id: "two".into(), path: two.clone() },
+            ],
+        );
+    });
+
+    cx.update(|cx| {
+        assert_eq!(
+            crate::collections::root(cx).map(|p| p.to_path_buf()),
+            Some(one.clone()),
+            "the first entry is active, so its directory is the collection root"
+        );
+        assert_eq!(
+            crate::session::path(cx).map(|p| p.to_path_buf()),
+            Some(config.join("sessions").join("one.json")),
+            "the session file is derived from the active workspace's id, not shared"
+        );
+    });
+
+    let _ = std::fs::remove_dir_all(&config);
+}
+
+#[gpui::test]
+async fn clicking_the_workspace_header_offers_all_four_verbs(cx: &mut TestAppContext) {
+    // The four workspace verbs shipped with a palette row each and *one* mouse path between
+    // them, which is §2's discoverability failure recurring: a binding and a palette row both
+    // satisfy the convention checklist, and neither can be seen.
+    let (session, root) = scratch_collection("workspace-menu");
+    let (window, _v, mut cx) = boot(cx, Some(session.clone()), Some(root));
+
+    let header = cx
+        .debug_bounds("workspace-name")
+        .expect("the panel header names the workspace");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let labels = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_labels(cx))
+        .expect("window");
+    assert_eq!(
+        labels,
+        vec![
+            "Switch workspace",
+            "---",
+            "New workspace",
+            "Open workspace…",
+            "---",
+            // Last and behind a rule, like Quit in the app menu: the one row here that takes
+            // something away should not sit where the pointer passes on its way elsewhere.
+            "Forget workspace",
+        ],
+        "clicking the header must offer every workspace verb, not just switching"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+/// Two registered workspaces, each with one request, and the app state pointed at them.
+fn two_workspaces(cx: &mut TestAppContext, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let config = scratch_dir(name);
+    let one = config.join("one");
+    let two = config.join("two");
+    seed_request(&one, "alpha.json", "https://one.test/alpha");
+    seed_request(&two, "beta.json", "https://two.test/beta");
+
+    cx.update(|cx| {
+        crate::app_state::install_at(
+            cx,
+            Some(config.clone()),
+            vec![
+                crate::app_state::WorkspaceEntry { id: "one".into(), path: one.clone() },
+                crate::app_state::WorkspaceEntry { id: "two".into(), path: two.clone() },
+            ],
+        );
+    });
+
+    (config, one, two)
+}
+
+#[gpui::test]
+async fn switching_workspace_swaps_the_collection_and_the_buffers(cx: &mut TestAppContext) {
+    let (config, one, two) = two_workspaces(cx, "switch-workspace");
+
+    cx.update(|cx| {
+        crate::register_keymap(cx);
+        crate::engine::install(cx).expect("engine");
+        cx.set_global(Theme::new(Appearance::Dark, "monospace".into()));
+    });
+    let window = cx.add_window(|window, cx| Workspace::new(window, cx));
+    let mut cx = VisualTestContext::from_window(window.into(), cx);
+    wait_for(&mut cx, "the first collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    assert_eq!(
+        tree_rows(&window, &mut cx).iter().map(|(_, n, _)| n.clone()).collect::<Vec<_>>(),
+        vec!["alpha"],
+        "the tree must show the active workspace's requests"
+    );
+
+    // Open the request, so the buffer belongs to workspace one and must not survive the switch.
+    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.run_until_parked();
+    let before = tabs_of(&window, &mut cx).1.url;
+    assert_eq!(before, "https://one.test/alpha");
+
+    window
+        .update(&mut cx, |workspace, window, cx| {
+            workspace.switch_workspace("two", window, cx)
+        })
+        .expect("window");
+    wait_for(&mut cx, "the second collection scan", |cx| {
+        tree_rows(&window, cx)
+            .iter()
+            .any(|(_, name, _)| name == "beta")
+            .then_some(())
+    });
+
+    assert_eq!(
+        cx.update(|_, cx| crate::collections::root(cx).map(|p| p.to_path_buf())),
+        Some(two.clone()),
+        "the collection root must follow the switch"
+    );
+    assert_ne!(
+        tabs_of(&window, &mut cx).1.url,
+        "https://one.test/alpha",
+        "a buffer from the previous workspace must not survive into the next one"
+    );
+
+    // And back: workspace one's session was written before the globals moved, so its buffer
+    // comes back rather than being replaced by a fresh scratch request.
+    window
+        .update(&mut cx, |workspace, window, cx| {
+            workspace.switch_workspace("one", window, cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    assert_eq!(
+        tabs_of(&window, &mut cx).1.url,
+        "https://one.test/alpha",
+        "switching back must restore that workspace's own buffers"
+    );
+
+    let _ = std::fs::remove_dir_all(&config);
+    let _ = &one;
+}
+
+#[gpui::test]
+async fn forgetting_a_workspace_leaves_its_files_alone(cx: &mut TestAppContext) {
+    // The registry is Zuno's bookkeeping and the folder is your work — the same line
+    // `collection::remove` draws by refusing a directory outright.
+    let (config, one, two) = two_workspaces(cx, "forget-workspace");
+
+    let forgotten = cx.update(|cx| {
+        let ok = crate::app_state::forget_workspace(cx, "two");
+        (ok, crate::app_state::workspaces(cx))
+    });
+
+    assert!(forgotten.0, "a non-active workspace can be forgotten");
+    assert_eq!(forgotten.1.len(), 1);
+    assert!(
+        two.join("beta.json").exists(),
+        "forgetting must not delete the workspace's requests"
+    );
+    assert!(
+        !config.join("sessions").join("two.json").exists(),
+        "its session goes with it — re-adding is a fresh start, so nothing would read it again"
+    );
+
+    // The last one cannot go: a registry with nothing in it leaves the window with no
+    // collection at all.
+    let last = cx.update(|cx| crate::app_state::forget_workspace(cx, "one"));
+    assert!(!last, "the last workspace must be refused");
+    assert!(one.join("alpha.json").exists());
+
+    let _ = std::fs::remove_dir_all(&config);
+}
+
 /// A scratch directory that is never `~/.config/zuno` (CLAUDE.md invariant 6). Named per
 /// test and per process so a parallel run can't collide.
 fn scratch_dir(name: &str) -> PathBuf {
@@ -4496,6 +4690,7 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         // The panel header. `collection-new-folder` predates this list and was never in
         // it — the table only fails on an entry with no button, so a button with no entry
         // is silently uncovered, which is how it stayed missing.
+        ("workspace-name", "zuno::OpenWorkspaceMenu"),
         ("collection-new-folder", "zuno::NewFolder"),
         ("collection-collapse-all", "zuno::CollectionCollapseAll"),
         ("collection-expand-all", "zuno::CollectionExpandAll"),

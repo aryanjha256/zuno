@@ -192,15 +192,31 @@ const MAX_DEPTH: usize = 8;
 /// Does file IO and JSON parsing, so callers on the UI thread must push this to a
 /// background executor (CLAUDE.md invariant 3).
 pub fn scan(root: &Path) -> Vec<Entry> {
+    scan_counted(root).0
+}
+
+/// `scan`, plus how many ordinary files it passed over.
+///
+/// The count exists because the panel's empty state was a lie in one case: open a directory that
+/// is full of something else and it said "Nothing saved yet", which is the message for a
+/// genuinely empty collection. The number is what distinguishes the two, and it is the same
+/// courtesy `Import::skipped` already extends — an operation that silently drops ninety files
+/// should say so.
+///
+/// **Dotfiles are not counted.** They are skipped everywhere else in Zuno without comment, and
+/// including `.gitignore` and friends would inflate a number whose whole job is to say "this
+/// folder holds other things".
+pub fn scan_counted(root: &Path) -> (Vec<Entry>, usize) {
     let mut entries = Vec::new();
-    walk(root, root, 0, &mut entries);
+    let mut skipped = 0;
+    walk(root, root, 0, &mut entries, &mut skipped);
     // Sorted by the displayed string rather than by `path`, so the picker's order matches
     // what a person reads.
     entries.sort_by(|a, b| a.relative.cmp(&b.relative));
-    entries
+    (entries, skipped)
 }
 
-fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
+fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, skipped: &mut usize) {
     if depth > MAX_DEPTH {
         eprintln!("[zuno] skipping {}: nested deeper than {MAX_DEPTH}", dir.display());
         return;
@@ -246,13 +262,14 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
             if name == crate::environment::DIRECTORY {
                 continue;
             }
-            walk(root, &path, depth + 1, out);
+            walk(root, &path, depth + 1, out, skipped);
             continue;
         }
 
         // `write` leaves a `.json.tmp` only if it dies between write and rename; ignore
         // any that exist rather than reporting a parse failure for a half-written file.
         if !name.ends_with(&format!(".{EXTENSION}")) {
+            *skipped += 1;
             continue;
         }
 
@@ -262,7 +279,10 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
                 path,
                 spec,
             }),
-            Err(error) => eprintln!("[zuno] skipping {}: {error}", path.display()),
+            Err(error) => {
+                *skipped += 1;
+                eprintln!("[zuno] skipping {}: {error}", path.display());
+            }
         }
     }
 }
@@ -829,6 +849,27 @@ mod scan_tests {
         )
         .expect("write");
         path
+    }
+
+    #[test]
+    fn scanning_counts_the_files_it_passed_over() {
+        // Open a directory full of something else and the panel used to say "Nothing saved yet",
+        // which is the message for an empty collection rather than for a folder of other things.
+        let root = scratch("skipped").join("mixed");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        save(&root, "real", "https://a.test/real");
+        std::fs::write(root.join("logo.png"), b"not json").expect("write");
+        std::fs::write(root.join("notes.txt"), b"hello").expect("write");
+        // A `.json` that is not a request counts too — `RequestSpec` is strict (invariant 7),
+        // so this is the `package.json` case.
+        std::fs::write(root.join("package.json"), br#"{"name":"x"}"#).expect("write");
+        // Dotfiles do not: they are skipped everywhere else without comment, and counting them
+        // would inflate a number whose whole job is to say "this folder holds other things".
+        std::fs::write(root.join(".gitignore"), b"*.local.json").expect("write");
+
+        let (entries, skipped) = scan_counted(&root);
+        assert_eq!(entries.len(), 1, "only the real request earns a row");
+        assert_eq!(skipped, 3, "two wrong extensions and one unparseable json");
     }
 
     #[test]

@@ -99,6 +99,12 @@ pub enum Target {
     /// The eighth consumer, and still no `PickerDelegate` trait: it draws as label plus dimmed
     /// detail like the other seven, which is the bar §12 sets for reconsidering.
     Folder(PathBuf),
+    /// Switch to a registered workspace, by id. The ninth consumer, and still label plus dimmed
+    /// detail — the path — so §12's bar for a `PickerDelegate` trait is still not met.
+    Workspace(String),
+    /// Drop a workspace from the registry. A separate variant rather than a flag on the one
+    /// above, because one picker row must mean exactly one thing.
+    ForgetWorkspace(String),
 }
 
 // Hand-written because `Box<dyn Action>` isn't `Clone`; `boxed_clone` is the trait's own
@@ -114,6 +120,8 @@ impl Clone for Target {
             Self::Run(offset) => Self::Run(*offset),
             Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),
             Self::Folder(path) => Self::Folder(path.clone()),
+            Self::Workspace(id) => Self::Workspace(id.clone()),
+            Self::ForgetWorkspace(id) => Self::ForgetWorkspace(id.clone()),
         }
     }
 }

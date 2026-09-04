@@ -19,7 +19,7 @@ pub struct CollectionRoot(Option<PathBuf>);
 
 impl Global for CollectionRoot {}
 
-fn default_path() -> Option<PathBuf> {
+pub(crate) fn default_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -31,12 +31,10 @@ fn default_path() -> Option<PathBuf> {
     Some(base.join("zuno").join("collections"))
 }
 
-pub fn install(cx: &mut App) {
-    cx.set_global(CollectionRoot(default_path()));
-}
-
 /// Point collections at a specific directory, or disable saving with `None`.
-#[cfg(test)]
+///
+/// Two callers, and they are the same idea from opposite ends: `app_state::resolve` sets this
+/// from the active workspace, and the test harness sets it to a scratch directory (invariant 6).
 pub fn install_at(cx: &mut App, path: Option<PathBuf>) {
     cx.set_global(CollectionRoot(path));
 }

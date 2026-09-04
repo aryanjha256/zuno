@@ -1341,6 +1341,17 @@ slot, tinted by `method_color`. One glyph for all of them was tried first and re
 repeated down the tree; per method also keeps HEAD and OPTIONS apart, which colour alone cannot
 since both resolve to `method_other`.
 
+**The header is a menu button, and the empty state has three cases.** Opening a directory that
+holds other things showed "Nothing saved yet", which is the message for an *empty collection* —
+so `scan_counted` returns how many ordinary files it passed over and the notice says which
+problem you have. Dotfiles are not counted: they are skipped everywhere else without comment.
+
+The four workspace verbs shipped with a palette row each and one mouse path between them — §2's
+failure recurring, since a binding and a palette row both satisfy the convention checklist and
+neither can be seen. The panel header carries them now, as `ui::menu_button`: a word with a
+trailing chevron, the mirror of `icon_text_action` whose glyph leads. Without the chevron the
+header was muted text that happened to be clickable.
+
 *Still absent:* renaming or deleting a *folder*, and nesting a new folder deeper than the
 selection allows. `mv` and `rmdir` still work.
 
@@ -1972,6 +1983,24 @@ purpose:
   pretty-printed, newline-terminated, and byte-identical when nothing changed, so an unrelated save
   doesn't dirty the working tree. A single-file bundle or a SQLite database each turn "added a
   header" into an unreadable diff. Rejected for that reason, not for weight.
+- **Workspaces: a registry in `app/src/app_state.rs`.** `app.json` under `XDG_CONFIG_HOME` holds
+  `{id, path}` per workspace, the last one opened, and the theme. The collection root and the
+  session file are the *resolved answer* rather than sources of truth — `resolve` installs both
+  from the active entry, which is what let the test harness's `install_at` seams stay exactly as
+  they were. Three decisions: an entry has **no name** (it is the directory's, so a `mv` cannot
+  leave one lying — the `label_for` argument); the session path is **derived** from the id rather
+  than stored, so an entry cannot point at another workspace's session; and the pre-registry
+  `session.json` is **copied** into `sessions/default.json` once, never moved, so a downgrade
+  still finds its session.
+
+  Four rules the verbs follow. **Switching writes the current session before the globals move** —
+  `session::save` writes to whatever `SessionFile` holds, so re-resolving first files this
+  workspace's buffers under the next one's id. It also means switching needs no unsaved-changes
+  prompt: every buffer's live spec goes into the session and comes back. **Forget never touches
+  the directory**, only the entry and `sessions/<id>.json`, and **refuses the last entry**, since
+  an empty registry leaves the window with no collection at all. And an **id is a filename**, so
+  it is `slug`ged *and lowercased* — `Payments-API` and `payments-api` would otherwise be two
+  entries fighting over one session file on a case-insensitive filesystem.
 - **Window session: a versioned JSON envelope** in `app/src/session.rs` — which buffers are open,
   which was in front, and which file each came from. Deliberately in `app/`, not `core/`: that is
   window state, not part of the request model a future CLI shares. JSON rather than SQLite because

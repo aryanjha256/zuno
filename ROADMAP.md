@@ -49,12 +49,14 @@ that framing survived two slices past being true. The loop is excellent and the 
 is built, but the audit's own item 4 now names two structural gaps that outrank everything else on
 it, and **both were invisible to the audit because it only ever looked inward**:
 
-1. **The collection root cannot be changed.** One XDG path, no runtime setter. The git argument
-   this whole format is built on — commit your requests, review them in a pull request — is
-   unreachable from inside the app, because the collection lives in `~/.local/share` rather than
-   in your repo. Nothing is *blocked* by this, and it is still the largest thing missing.
-2. **The collection is read-mostly from Zuno's side.** You can now see it (the panel) and open
-   from it, but not delete, rename, or make a folder.
+1. **Workspaces — done.** A registry in `app.json`, one session per workspace, and New / Open
+   existing / Switch / Forget. The git argument this whole format is built on — commit your
+   requests, review them in a pull request — is reachable now, because a workspace can live
+   inside the repo it describes rather than only in `~/.local/share`. See architecture.md §12.
+2. **Folders are still read-mostly** — and this entry said *requests* were, for two slices after
+   they stopped being. A request can be created, renamed, duplicated, moved, trashed and deleted;
+   a *folder* can be made but not renamed or deleted, and `Ctrl+S` cannot target one. `mv` and
+   `rmdir` still work.
 
 Then the two named-not-planned items (scripting, request chaining) that would decide the ceiling,
 and the three capabilities item 4 now names that these documents had never mentioned at all —

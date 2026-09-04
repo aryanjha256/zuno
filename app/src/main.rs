@@ -10,6 +10,7 @@ mod timing;
 mod actions;
 mod body_view;
 mod chrome;
+mod app_state;
 mod close_panel;
 mod collection_panel;
 mod import_panel;
@@ -29,6 +30,7 @@ mod tests;
 mod theme;
 mod ui;
 mod workspace;
+mod workspace_panel;
 
 use std::time::Instant;
 
@@ -52,11 +54,12 @@ use crate::actions::{
     ScrollRight, ScrollStart, ToggleFold,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CommitRename, ConfirmClose,
+    WorkspaceConfirm, WorkspaceDismiss,
     DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
-use crate::theme::{Appearance, Theme};
+use crate::theme::Theme;
 use crate::workspace::Workspace;
 
 /// Startup stage timings, printed when `ZUNO_TIMING=1`.
@@ -87,8 +90,13 @@ fn main() {
     Application::new().with_assets(ui::Assets).run(move |cx: &mut App| {
         boot.mark("runtime ready");
 
+        // Before the theme: `app.json` is where the chosen appearance lives, and it also
+        // resolves the active workspace into the collection-root and session-file globals that
+        // everything downstream reads.
+        app_state::install(cx);
+
         let mono = theme::pick_mono_font(cx);
-        cx.set_global(Theme::new(Appearance::Dark, mono));
+        cx.set_global(Theme::new(app_state::theme(cx), mono));
         register_keymap(cx);
         boot.mark("theme + keymap");
 
@@ -98,9 +106,6 @@ fn main() {
         if let Err(error) = engine::install(cx) {
             eprintln!("[zuno] could not start the HTTP engine: {error}");
         }
-        session::install(cx);
-        collections::install(cx);
-
         // Without this, closing the last window leaves the process running with nothing
         // on screen — GPUI does not quit on last-window-close by default. Quitting here
         // is also what makes `Workspace`'s `on_app_quit` save hook fire on that path.
@@ -338,6 +343,13 @@ fn register_keymap(cx: &mut App) {
         // goes to whichever was registered later. `left`/`right` move between the buttons and
         // `tab` does too, the dialog convention; `FocusNext` already refuses while a modal is
         // open, so `tab` would otherwise be dead here rather than merely unbound.
+        // The new-workspace dialog. Its two fields carry leaf contexts `WorkspaceName` and
+        // `WorkspaceLocation`, so both are bound — the panel's own `WorkspacePanel` context never
+        // holds focus, since an input always does. After the global twins, for the usual reason.
+        KeyBinding::new("enter", WorkspaceConfirm, Some("WorkspaceName")),
+        KeyBinding::new("enter", WorkspaceConfirm, Some("WorkspaceLocation")),
+        KeyBinding::new("escape", WorkspaceDismiss, Some("WorkspaceName")),
+        KeyBinding::new("escape", WorkspaceDismiss, Some("WorkspaceLocation")),
         KeyBinding::new("enter", ConfirmClose, Some("CloseConfirm")),
         KeyBinding::new("escape", CancelClose, Some("CloseConfirm")),
         KeyBinding::new("right", CloseChoiceNext, Some("CloseConfirm")),

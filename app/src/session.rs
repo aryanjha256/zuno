@@ -152,32 +152,16 @@ pub struct SessionFile(Option<PathBuf>);
 
 impl Global for SessionFile {}
 
-/// Follows the XDG basedir spec directly rather than taking a `dirs`-style dependency —
-/// it's a few lines, and Zuno is Linux-first for now. A macOS or Windows build will want
-/// the platform-conventional location instead.
-fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-
-    Some(base.join("zuno").join("session.json"))
-}
-
-pub fn install(cx: &mut App) {
-    cx.set_global(SessionFile(default_path()));
-}
-
 /// Point persistence at a specific file, or disable it with `None`.
 ///
-/// Test-only for now. It exists because the suite drives `SendRequest`, a send is a save
-/// point, and without an override the tests would overwrite the developer's own session.
-#[cfg(test)]
+/// Two callers: `app_state::resolve` sets it from the active workspace's id, and the test
+/// harness sets it to a scratch file — the suite drives `SendRequest`, a send is a save point,
+/// and without the override it would overwrite the developer's own session (invariant 6).
 pub fn install_at(cx: &mut App, path: Option<PathBuf>) {
     cx.set_global(SessionFile(path));
 }
 
-fn path(cx: &App) -> Option<PathBuf> {
+pub(crate) fn path(cx: &App) -> Option<PathBuf> {
     cx.try_global::<SessionFile>()?.0.clone()
 }
 
@@ -319,15 +303,6 @@ fn write_to(path: &std::path::Path, session: &Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_default_path_sits_under_the_xdg_config_dir() {
-        // Reads the real environment, so assert on shape rather than an exact value.
-        if let Some(path) = default_path() {
-            assert!(path.ends_with("zuno/session.json"), "{path:?}");
-            assert!(path.is_absolute(), "{path:?}");
-        }
-    }
 
     #[test]
     fn a_spec_survives_a_round_trip_through_json() {

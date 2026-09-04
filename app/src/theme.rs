@@ -10,7 +10,8 @@
 use gpui::{App, Global, Hsla, SharedString, hsla, rgb};
 use zuno_core::{Method, StatusClass};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Appearance {
     Light,
     Dark,

@@ -24,7 +24,9 @@ use gpui::{
 use zuno_core::Method;
 use zuno_core::collection::{Node, NodeKind};
 
-use crate::actions::{CollectionCollapseAll, CollectionExpandAll, NewFolder, OpenCollectionMenu};
+use crate::actions::{
+    CollectionCollapseAll, CollectionExpandAll, NewFolder, OpenCollectionMenu, OpenWorkspaceMenu,
+};
 use gpui::Action as _;
 use crate::theme::Theme;
 use crate::ui::{Icon, glyph, icon_button};
@@ -40,6 +42,9 @@ const INDENT: f32 = 12.0;
 const CHEVRON: f32 = 14.0;
 /// The kind column — a folder glyph, or a method-tinted one. Fixed so names line up across rows.
 const METHOD_WIDTH: f32 = 16.0;
+
+/// The title strip's height. Named because the workspace menu anchors just below it.
+pub const HEADER_HEIGHT: f32 = 28.0;
 
 /// The panel's width.
 ///
@@ -150,17 +155,20 @@ fn header(
         .items_center()
         .justify_between()
         .flex_none()
-        .h(px(28.))
+        .h(px(HEADER_HEIGHT))
         .px_2()
         .border_b_1()
         .border_color(theme.border)
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.text_muted)
-                .overflow_hidden()
-                .child(name),
-        )
+        // The line that says *which* workspace you are in, so it is also the way to change it —
+        // this header's own comment predicted that before switching existed.
+        .child(crate::ui::menu_button(
+            "workspace-name",
+            name,
+            "Workspace",
+            OpenWorkspaceMenu,
+            theme.text_muted,
+            theme,
+        ))
         .child(
             div()
                 .flex()
@@ -251,10 +259,19 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
             .px_3()
             .text_xs()
             .text_color(theme.text_faint)
-            .child(if workspace.tree_scanned {
-                "Nothing saved yet. Ctrl+S writes the request you're editing into the collection."
-            } else {
-                "Reading the collection…"
+            // Three states, not two. A folder that holds *other* things is not an empty
+            // collection, and saying "Nothing saved yet" there described the wrong problem —
+            // the same courtesy `Import::skipped` already extends.
+            .child(match (workspace.tree_scanned, workspace.tree_skipped) {
+                (false, _) => SharedString::from("Reading the collection…"),
+                (true, 0) => SharedString::from(
+                    "Nothing saved yet. Ctrl+S writes the request you're editing into the \
+                     collection.",
+                ),
+                (true, 1) => SharedString::from("No requests here — 1 other file was skipped."),
+                (true, n) => {
+                    SharedString::from(format!("No requests here — {n} other files were skipped."))
+                }
             }),
     )
 }
