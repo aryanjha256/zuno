@@ -205,8 +205,18 @@ Four decisions worth keeping:
 - **Values are re-read per send, not cached at switch**, so editing `dev.json` in an editor takes
   effect on the next request. The files are the interface, so they stay authoritative.
 
-*Deliberately absent:* no in-app environment editor. Environments are JSON files in your
-collection — the same bet the collection format makes; an editing UI is its own slice.
+**The editor — done**, and it closes the last place that bet was still being paid. `Ctrl+Alt+E`,
+or "Edit environments…" at the foot of the switcher, opens a modal listing the set with each one's
+variables; `globals` is in the list, pinned and unrenameable, because it could not be edited from
+anywhere either. A per-row lock toggle decides which of the two files a value is written to, which
+is the only honest surface for a marking that *is* a file split. Trash rather than delete, for a
+sharper reason than the collection panel has: the `.local` half is gitignored, so it is the only
+copy of every secret in it anywhere.
+
+The bet it retires was recorded here as *"no in-app environment editor — environments are JSON
+files in your collection, the same bet the collection format makes"*. That bet was taken back for
+collections when the panel grew folders, rename, delete and import, which left environments as the
+last surface where "the files are the interface" still meant leaving Zuno for a text editor.
 
 A gap turned up on the way: `build.rs` validated the URL and headers but **not query rows**, so an
 unsubstituted `{{var}}` in a query parameter reached the wire literally. Fixed, with a test.

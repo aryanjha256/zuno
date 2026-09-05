@@ -74,6 +74,20 @@ actions!(
         WorkspaceConfirm,
         WorkspaceDismiss,
         WorkspaceBrowse,
+        // Editing environments. Selecting one has existed since M3; until these, *authoring*
+        // one meant leaving Zuno for a text editor — the last place where "the files are the
+        // interface" still meant that.
+        EditEnvironments,
+        EnvNext,
+        EnvPrev,
+        EnvNewVariable,
+        EnvRemoveVariable,
+        EnvToggleSecret,
+        EnvNewEnvironment,
+        EnvRenameEnvironment,
+        EnvTrashEnvironment,
+        EnvConfirm,
+        EnvDismiss,
         // Import a whole API at once. `ImportCurl` is one request per paste; this is the way a
         // collection gets filled from what a team already has.
         ImportOpenApi,

@@ -22,6 +22,8 @@ use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
+    EditEnvironments, EnvConfirm, EnvDismiss, EnvNewEnvironment, EnvNewVariable, EnvNext,
+    EnvPrev, EnvRemoveVariable, EnvRenameEnvironment, EnvToggleSecret, EnvTrashEnvironment,
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
     MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ScrollLeft, ScrollRight,
     ScrollStart, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
@@ -76,6 +78,15 @@ pub struct Workspace {
     session_save: Option<Task<()>>,
     /// Same, for the choose-a-body-file dialog.
     body_file_prompt: Option<Task<()>>,
+    /// Whether `globals.json` has anything in it.
+    ///
+    /// Cached rather than read in `render`: the badge has to say whether *anything* is
+    /// substituting, and answering that means opening and parsing a file — invariant 3. Refreshed
+    /// wherever it can change, which since the editor exists is three places: boot, a workspace
+    /// swap, and the editor closing. An external edit while Zuno is open leaves it stale, the
+    /// same way every other read-at-switch does.
+    globals_active: bool,
+
     /// The selected environment's name, restored from the session.
     ///
     /// Only the *name* is held. The values are re-read from disk on every send, so editing
@@ -135,6 +146,7 @@ pub struct Workspace {
     /// The unsaved-changes prompt, when one is open.
     close_confirm: Option<crate::close_panel::CloseConfirm>,
     new_workspace_panel: Option<WorkspacePanelState>,
+    environment_panel: Option<EnvPanelState>,
     /// The folder dialog behind New and Open. Held because dropping the task cancels it.
     workspace_prompt: Option<Task<()>>,
 }
@@ -163,6 +175,12 @@ struct ImportState {
 /// Same pairing again: the panel and the subscription that lets it be closed.
 struct WorkspacePanelState {
     panel: Entity<crate::workspace_panel::WorkspacePanel>,
+    _subscription: Subscription,
+}
+
+/// Same pairing again, for the environment editor.
+struct EnvPanelState {
+    panel: Entity<crate::environment_panel::EnvironmentPanel>,
     _subscription: Subscription,
 }
 
@@ -273,6 +291,7 @@ impl Workspace {
             response_save: None,
             session_save: None,
             body_file_prompt: None,
+            globals_active: globals_has_values(cx),
             environment,
             tree: Vec::new(),
             tree_visible: Vec::new(),
@@ -291,6 +310,7 @@ impl Workspace {
             collection_menu_at: None,
             close_confirm: None,
             new_workspace_panel: None,
+            environment_panel: None,
             workspace_prompt: None,
         };
 
@@ -402,6 +422,7 @@ impl Workspace {
             })
             .collect();
         self.environment = session.environment;
+        self.globals_active = globals_has_values(cx);
         self.panel_visible = session.collection_panel;
 
         // Every handle into the old buffers is dead, so focus has to move or the keymap goes
@@ -437,6 +458,19 @@ impl Workspace {
             || self.import.is_some()
             || self.close_confirm.is_some()
             || self.new_workspace_panel.is_some()
+            || self.environment_panel.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn env_panel_for_test(
+        &self,
+    ) -> Option<Entity<crate::environment_panel::EnvironmentPanel>> {
+        self.env_panel()
+    }
+
+    #[cfg(test)]
+    pub fn badge_for_test(&self) -> SharedString {
+        environment_badge(self.environment.as_deref(), self.globals_active).0
     }
 
     #[cfg(test)]
@@ -1779,6 +1813,164 @@ impl Workspace {
         }));
     }
 
+    /// Open the environment editor.
+    fn edit_environments(
+        &mut self,
+        _: &EditEnvironments,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.set_status("No collection directory to hold environments", cx);
+            return;
+        };
+
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let active = self.environment.clone();
+        let panel = cx.new(|cx| {
+            crate::environment_panel::EnvironmentPanel::new(root, active, restore, window, cx)
+        });
+
+        let subscription = cx.subscribe_in(&panel, window, |workspace, _, event, _, cx| {
+            use crate::environment_panel::EnvEvent;
+            match event {
+                // The selected environment is stored by name, in the session, so a rename or a
+                // removal that isn't followed here leaves the app pointed at a file that no
+                // longer exists — and `load` answers that with an empty map rather than an
+                // error, so every `{{var}}` would quietly stop resolving.
+                EnvEvent::Renamed { from, to } => {
+                    if workspace.environment.as_deref() == Some(from.as_str()) {
+                        workspace.environment = Some(to.clone());
+                        crate::session::save(&workspace.session(cx), cx);
+                    }
+                }
+                EnvEvent::Removed(name) => {
+                    if workspace.environment.as_deref() == Some(name.as_str()) {
+                        workspace.environment = None;
+                        crate::session::save(&workspace.session(cx), cx);
+                    }
+                }
+                // The editor has *just* written one, so the "is there anything to protect"
+                // half of `protect_secrets` is already answered.
+                EnvEvent::SecretWritten => workspace.ensure_gitignored(cx),
+            }
+        });
+
+        self.environment_panel = Some(EnvPanelState {
+            panel,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn env_panel(&self) -> Option<Entity<crate::environment_panel::EnvironmentPanel>> {
+        self.environment_panel.as_ref().map(|state| state.panel.clone())
+    }
+
+    fn env_next(&mut self, _: &EnvNext, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.select(1, cx));
+    }
+
+    fn env_prev(&mut self, _: &EnvPrev, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.select(-1, cx));
+    }
+
+    fn env_new_variable(
+        &mut self,
+        _: &EnvNewVariable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.add_variable(window, cx));
+    }
+
+    /// Both row verbs act on the *focused* row, the way `RemoveRow` does in the request pane —
+    /// gpui 0.2.2 has no parameterised actions, and the per-row buttons call the same panel
+    /// methods directly with their own index.
+    fn env_remove_variable(
+        &mut self,
+        _: &EnvRemoveVariable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.env_panel() else { return };
+        let Some(ix) = panel.read(cx).focused_row(window, cx) else { return };
+        panel.update(cx, |panel, cx| panel.remove_variable(ix, cx));
+    }
+
+    fn env_toggle_secret(
+        &mut self,
+        _: &EnvToggleSecret,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.env_panel() else { return };
+        let Some(ix) = panel.read(cx).focused_row(window, cx) else { return };
+        panel.update(cx, |panel, cx| panel.toggle_secret(ix, cx));
+    }
+
+    fn env_new_environment(
+        &mut self,
+        _: &EnvNewEnvironment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.start_new(window, cx));
+    }
+
+    fn env_rename_environment(
+        &mut self,
+        _: &EnvRenameEnvironment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.start_rename(window, cx));
+    }
+
+    fn env_trash_environment(
+        &mut self,
+        _: &EnvTrashEnvironment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.trash_selected(window, cx));
+    }
+
+    fn env_confirm(&mut self, _: &EnvConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.env_panel() else { return };
+        panel.update(cx, |panel, cx| panel.confirm(window, cx));
+    }
+
+    /// `escape` backs out of the innermost thing: a name box if one is open, otherwise the
+    /// panel. One action rather than two, because "cancel the rename" and "close the editor"
+    /// are the same gesture at different depths and a second binding would have to guess.
+    fn env_dismiss(&mut self, _: &EnvDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.env_panel() else { return };
+        if panel.update(cx, |panel, cx| panel.cancel(window, cx)) {
+            return;
+        }
+        self.close_environment_panel(window, cx);
+    }
+
+    fn close_environment_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.environment_panel.take() else { return };
+        state.panel.update(cx, |panel, cx| panel.commit(cx));
+        self.globals_active = globals_has_values(cx);
+        if let Some(focus) = state.panel.read(cx).restore_focus() {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
     fn workspace_confirm(&mut self, _: &WorkspaceConfirm, _: &mut Window, cx: &mut Context<Self>) {
         let Some(state) = self.new_workspace_panel.as_ref() else { return };
         state.panel.clone().update(cx, |panel, cx| panel.confirm(cx));
@@ -2308,6 +2500,14 @@ impl Workspace {
             return;
         }
 
+        self.ensure_gitignored(cx);
+    }
+
+    fn ensure_gitignored(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+
         match environment::ensure_gitignored(&root) {
             Ok(true) => self.set_status("Added *.local.json to the collection's .gitignore", cx),
             Ok(false) => {}
@@ -2378,13 +2578,16 @@ impl Workspace {
             .unwrap_or_default();
 
         let current = self.environment.clone();
+        // "None" means no *selected* environment, never "no substitution": globals is the bottom
+        // layer either way. Both of the strings this row used to carry said otherwise.
         let mut items = vec![picker::Item {
             label: SharedString::from("None"),
-            detail: if current.is_none() {
-                SharedString::from("current — variables are left unresolved")
-            } else {
-                SharedString::from("send requests without substitution")
-            },
+            detail: SharedString::from(match (current.is_none(), self.globals_active) {
+                (true, true) => "current — globals still substitutes",
+                (true, false) => "current — variables are left unresolved",
+                (false, true) => "fall back to globals alone",
+                (false, false) => "send requests without substitution",
+            }),
             target: picker::Target::Environment(None),
         }];
 
@@ -2408,9 +2611,18 @@ impl Workspace {
             }
         }));
 
+        // Last, under the environments themselves: the switcher is the surface you are already
+        // on when you want to change one, so it is where the editor is discoverable — the badge
+        // stays a one-click switch rather than becoming a menu.
+        items.push(picker::Item {
+            label: SharedString::from("Edit environments…"),
+            detail: SharedString::from("add, rename or remove variables"),
+            target: picker::Target::Action(Box::new(EditEnvironments)),
+        });
+
         self.show_picker(
             items,
-            "No environments — add one to environments/ in your collection",
+            "No environments yet — choose \"Edit environments\" to make one",
             window,
             cx,
         );
@@ -3767,6 +3979,8 @@ impl Render for Workspace {
         let focused_region = self.focused_region(window, cx);
         let status_message = self.status_message(cx);
         let cookies = self.cookies_enabled(cx);
+        let (badge, resolving) =
+            environment_badge(self.environment.as_deref(), self.globals_active);
         let title = self
             .views
             .get(self.active_ix)
@@ -3808,6 +4022,17 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::workspace_confirm))
             .on_action(cx.listener(Self::workspace_dismiss))
             .on_action(cx.listener(Self::workspace_browse))
+            .on_action(cx.listener(Self::edit_environments))
+            .on_action(cx.listener(Self::env_next))
+            .on_action(cx.listener(Self::env_prev))
+            .on_action(cx.listener(Self::env_new_variable))
+            .on_action(cx.listener(Self::env_remove_variable))
+            .on_action(cx.listener(Self::env_toggle_secret))
+            .on_action(cx.listener(Self::env_new_environment))
+            .on_action(cx.listener(Self::env_rename_environment))
+            .on_action(cx.listener(Self::env_trash_environment))
+            .on_action(cx.listener(Self::env_confirm))
+            .on_action(cx.listener(Self::env_dismiss))
             .on_action(cx.listener(Self::switch_workspace_action))
             .on_action(cx.listener(Self::forget_workspace_action))
             .on_action(cx.listener(Self::confirm_close))
@@ -3954,7 +4179,8 @@ impl Render for Workspace {
                 focused_region,
                 status_message,
                 cookies,
-                self.environment.clone().map(SharedString::from),
+                badge,
+                resolving,
                 &theme,
                 window,
             ))
@@ -3963,6 +4189,7 @@ impl Render for Workspace {
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
             .children(self.import.as_ref().map(|state| state.panel.clone()))
             .children(self.new_workspace_panel.as_ref().map(|state| state.panel.clone()))
+            .children(self.environment_panel.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
             // Built here rather than held as an `Entity`: it owns no input and no state beyond
             // which button is selected, so it is plain workspace state like `RenameState`.
@@ -4382,6 +4609,33 @@ fn spell(binding: &gpui::KeyBinding) -> String {
 /// `modal_open` checks drifted: repeated logic diverges, and one forgotten copy is the bug.
 ///
 /// A clause whose action is unbound is dropped; if none survive, so is the dash.
+/// What the environment badge says, and whether anything is actually substituting.
+///
+/// **Three states, because "nothing selected" and "nothing substituting" are different things.**
+/// `globals.json` is the bottom layer whether or not an environment is chosen, so with none
+/// chosen a `{{var}}` may still resolve. The badge showed a bare globe for both cases and the
+/// switcher's "None" row *said* variables were left unresolved — false whenever globals had
+/// values, and a confident string in the UI is read by more people than a stale comment is.
+///
+/// A pure function so the rule is testable: nothing headless can read a rendered badge.
+pub fn environment_badge(environment: Option<&str>, globals_active: bool) -> (SharedString, bool) {
+    match (environment, globals_active) {
+        (Some(name), _) => (SharedString::from(name.to_string()), true),
+        (None, true) => (SharedString::from(environment::GLOBALS), true),
+        (None, false) => (SharedString::from("none"), false),
+    }
+}
+
+/// Whether the always-active layer has anything to substitute.
+///
+/// A file read, so every caller is a state change rather than a frame — see `globals_active`.
+fn globals_has_values(cx: &App) -> bool {
+    crate::collections::root(cx)
+        .map(Path::to_path_buf)
+        .and_then(|root| environment::load(&root, environment::GLOBALS).ok())
+        .is_some_and(|env| !env.values.is_empty())
+}
+
 pub fn hint_sentence(lead: &str, clauses: &[(&dyn gpui::Action, &str)], window: &Window) -> String {
     let rendered: Vec<String> = clauses
         .iter()
@@ -4414,7 +4668,8 @@ fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     cookies: bool,
-    environment: Option<SharedString>,
+    environment: SharedString,
+    resolving: bool,
     theme: &Theme,
     window: &Window,
 ) -> impl IntoElement {
@@ -4493,32 +4748,22 @@ fn status_bar(
                 // consecutive requests silently non-independent — the exact thing that
                 // costs an hour of debugging a phantom auth bug. Shown only when it's on:
                 // a badge that's always there stops being read.
-                // Which environment a request will be sent against changes where it
-                // goes and what credentials it carries, so it belongs on screen rather than
-                // two keystrokes away. No badge at all means no substitution — a quieter
-                // way of saying it than a badge reading "None".
-                // Clickable in both states, which is the point: the badge was information only,
-                // so with no environment selected there was nothing on screen leading to the
-                // switcher at all. Named `environment-badge` either way so a test doesn't have to
-                // know which branch it's in.
-                .child(match environment {
-                    Some(name) => crate::ui::text_action(
-                        "environment-badge",
-                        name,
-                        "Switch environment",
-                        SwitchEnvironment,
-                        theme,
-                    )
-                    .into_any_element(),
-                    None => crate::ui::icon_button(
-                        "environment-badge",
-                        crate::ui::Icon::Globe,
-                        "Switch environment",
-                        SwitchEnvironment,
-                        theme,
-                    )
-                    .into_any_element(),
-                })
+                // Which environment a request will be sent against changes where it goes and
+                // what credentials it carries, so it belongs on screen rather than two keystrokes
+                // away. **One shape in every state**, globe plus word: it used to be a bare globe
+                // with nothing selected and a bare word otherwise, so the control moved and
+                // changed size depending on what it was reporting. The globe is now a fixed
+                // anchor and the word carries the state — see `environment_badge` for why there
+                // are three of those rather than two.
+                .child(crate::ui::icon_text_action(
+                    "environment-badge",
+                    crate::ui::Icon::Globe,
+                    environment,
+                    "Switch environment",
+                    SwitchEnvironment,
+                    if resolving { theme.text_muted } else { theme.text_faint },
+                    theme,
+                ))
                 .children(cookies.then(|| {
                     div()
                         .flex_none()

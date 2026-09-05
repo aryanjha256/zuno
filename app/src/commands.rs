@@ -61,6 +61,7 @@ pub fn palette() -> Vec<Command> {
         command("Collapse all folders", CollectionCollapseAll),
         command("Expand all folders", CollectionExpandAll),
         command("Switch environment", SwitchEnvironment),
+        command("Edit environments", EditEnvironments),
         command("New tab", NewTab),
         command("Close tab", CloseTab),
         command("Next tab", NextTab),
@@ -137,6 +138,18 @@ const EXCLUDED: &[(&str, &str)] = &[
     // Same reasoning as `OpenAppMenu`: this menu exists so someone who does not know the
     // palette can find the workspace verbs, and all four are offered here already.
     ("zuno::OpenWorkspaceMenu", "a menu reached from the palette is backwards"),
+    // Only valid inside the environment editor, where they are already reachable — each has a
+    // button, which is the mouse path the keyboard-only ones would otherwise lack.
+    ("zuno::EnvNext", "only valid inside the environment editor"),
+    ("zuno::EnvPrev", "only valid inside the environment editor"),
+    ("zuno::EnvNewVariable", "only valid inside the environment editor"),
+    ("zuno::EnvRemoveVariable", "only valid inside the environment editor"),
+    ("zuno::EnvToggleSecret", "only valid inside the environment editor"),
+    ("zuno::EnvNewEnvironment", "only valid inside the environment editor"),
+    ("zuno::EnvRenameEnvironment", "only valid inside the environment editor"),
+    ("zuno::EnvTrashEnvironment", "only valid inside the environment editor"),
+    ("zuno::EnvConfirm", "only valid inside the environment editor"),
+    ("zuno::EnvDismiss", "only valid inside the environment editor"),
     ("zuno::WorkspaceConfirm", "only valid inside the new-workspace dialog"),
     ("zuno::WorkspaceDismiss", "only valid inside the new-workspace dialog"),
     ("zuno::WorkspaceBrowse", "only valid inside the new-workspace dialog"),

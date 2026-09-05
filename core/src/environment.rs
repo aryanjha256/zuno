@@ -66,6 +66,24 @@ pub enum EnvironmentError {
         #[source]
         source: io::Error,
     },
+    #[error("could not delete {}: {source}", path.display())]
+    Delete {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("could not move {} to the trash: {source}", path.display())]
+    Trash {
+        path: PathBuf,
+        #[source]
+        source: trash::Error,
+    },
+    #[error("could not serialize the environment: {0}")]
+    Serialize(#[source] serde_json::Error),
+    #[error("{0:?} already exists")]
+    NameTaken(String),
+    #[error("{0:?} is not a usable environment name")]
+    InvalidName(String),
 }
 
 /// One environment's values, plus which of them came from the gitignored sidecar.
@@ -83,6 +101,36 @@ impl Environment {
     /// Whether a value should be hidden on screen.
     pub fn is_secret(&self, name: &str) -> bool {
         self.secret.contains(name)
+    }
+}
+
+/// One environment's two files, held apart.
+///
+/// `Environment` is the *merged* view, which is what resolution wants and what editing cannot
+/// use: a name may sit in both files — a placeholder committed, the real value local — and the
+/// merged map has nowhere to keep the pair. Writing that back would drop the placeholder, or
+/// put the secret in the committed file. So the editor reads this and `Environment` derives
+/// from it, which also leaves exactly one merge rule.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EnvironmentFile {
+    /// Filename stem: `dev`.
+    pub name: String,
+    /// `dev.json`.
+    pub committed: BTreeMap<String, String>,
+    /// `dev.local.json` — gitignored, and overrides.
+    pub local: BTreeMap<String, String>,
+}
+
+impl EnvironmentFile {
+    pub fn resolved(&self) -> Environment {
+        let mut values = self.committed.clone();
+        values.extend(self.local.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+        Environment {
+            name: self.name.clone(),
+            secret: self.local.keys().cloned().collect(),
+            values,
+        }
     }
 }
 
@@ -392,20 +440,175 @@ pub fn scan(collection_root: &Path) -> Vec<Environment> {
 
 /// Read one environment, merging its `.local` sidecar over the committed file.
 pub fn load(collection_root: &Path, name: &str) -> Result<Environment, EnvironmentError> {
+    read(collection_root, name).map(|file| file.resolved())
+}
+
+/// Read both halves without merging them.
+pub fn read(collection_root: &Path, name: &str) -> Result<EnvironmentFile, EnvironmentError> {
     let dir = directory(collection_root);
-    let mut values = read_map(&dir.join(format!("{name}.json")))?;
 
-    let local = read_map(&dir.join(format!("{name}{LOCAL_SUFFIX}.json")))?;
-    let secret = local.keys().cloned().collect();
-    // The sidecar overrides, so a placeholder can sit in the committed file and the real
-    // value can live only locally.
-    values.extend(local);
-
-    Ok(Environment {
+    Ok(EnvironmentFile {
         name: name.to_string(),
-        values,
-        secret,
+        committed: read_map(&dir.join(format!("{name}.json")))?,
+        local: read_map(&dir.join(format!("{name}{LOCAL_SUFFIX}.json")))?,
     })
+}
+
+/// Write both halves, each value back into the file it belongs in.
+///
+/// The committed file is written even when empty, because `scan` lists an environment by its
+/// `<name>.json` and one holding only secrets would otherwise vanish. The sidecar is the
+/// opposite: removed when it holds nothing, so an empty `{}` never implies there are secrets.
+pub fn save(collection_root: &Path, file: &EnvironmentFile) -> Result<(), EnvironmentError> {
+    let dir = directory(collection_root);
+    std::fs::create_dir_all(&dir).map_err(|source| EnvironmentError::Write {
+        path: dir.clone(),
+        source,
+    })?;
+
+    write_map(&dir.join(format!("{}.json", file.name)), &file.committed)?;
+
+    let local = dir.join(format!("{}{LOCAL_SUFFIX}.json", file.name));
+    if file.local.is_empty() {
+        remove_if_present(&local)
+    } else {
+        write_map(&local, &file.local)
+    }
+}
+
+/// Create an empty environment, returning the name it was actually given.
+pub fn create(collection_root: &Path, label: &str) -> Result<String, EnvironmentError> {
+    let name = valid_name(label)?;
+    if directory(collection_root).join(format!("{name}.json")).exists() {
+        return Err(EnvironmentError::NameTaken(name));
+    }
+
+    save(
+        collection_root,
+        &EnvironmentFile {
+            name: name.clone(),
+            ..Default::default()
+        },
+    )?;
+    Ok(name)
+}
+
+/// Rename both halves, returning the new name.
+pub fn rename(
+    collection_root: &Path,
+    from: &str,
+    label: &str,
+) -> Result<String, EnvironmentError> {
+    let name = valid_name(label)?;
+    if name == from {
+        return Ok(name);
+    }
+
+    let dir = directory(collection_root);
+    if dir.join(format!("{name}.json")).exists() {
+        return Err(EnvironmentError::NameTaken(name));
+    }
+
+    for (old, new) in [
+        (format!("{from}.json"), format!("{name}.json")),
+        (
+            format!("{from}{LOCAL_SUFFIX}.json"),
+            format!("{name}{LOCAL_SUFFIX}.json"),
+        ),
+    ] {
+        let old = dir.join(old);
+        // The sidecar is optional — an environment with no secrets has only one file.
+        if !old.exists() {
+            continue;
+        }
+        std::fs::rename(&old, dir.join(new)).map_err(|source| EnvironmentError::Write {
+            path: old,
+            source,
+        })?;
+    }
+
+    Ok(name)
+}
+
+/// Move both halves to the desktop trash.
+///
+/// Trash rather than delete, for a sharper reason than the collection panel has: the `.local`
+/// half is gitignored, so it is the only copy of every secret in it anywhere.
+pub fn trash(collection_root: &Path, name: &str) -> Result<(), EnvironmentError> {
+    let paths = halves(collection_root, name);
+    let Some(first) = paths.first().cloned() else {
+        return Ok(());
+    };
+
+    trash::delete_all(&paths).map_err(|source| EnvironmentError::Trash {
+        path: first,
+        source,
+    })
+}
+
+/// The files an environment actually has on disk, committed half first.
+///
+/// Split out of `trash` because it is the half a test can reach: trashing needs a real desktop
+/// trash on the same filesystem, which a scratch directory under `/tmp` is not, so the suite
+/// covers which paths get collected and leaves the vendor call alone.
+fn halves(collection_root: &Path, name: &str) -> Vec<PathBuf> {
+    let dir = directory(collection_root);
+    [
+        format!("{name}.json"),
+        format!("{name}{LOCAL_SUFFIX}.json"),
+    ]
+    .into_iter()
+    .map(|file| dir.join(file))
+    .filter(|path| path.exists())
+    .collect()
+}
+
+/// Slug a typed label into a filename stem, refusing the three that misbehave.
+///
+/// `globals` is the always-active layer rather than a peer. The `.local` suffix is the trap:
+/// `dev.local.json` is already `dev`'s sidecar, so an environment named `dev.local` would be
+/// created, filtered out by `scan`, and appear never to have existed.
+fn valid_name(label: &str) -> Result<String, EnvironmentError> {
+    // Checked on the label, not the slug: `slug` answers an unusable name with `"request"`,
+    // which is the right fallback for a derived filename and the wrong one here — an
+    // environment silently called `request` is worse than a refusal.
+    if !label.chars().any(char::is_alphanumeric) {
+        return Err(EnvironmentError::InvalidName(label.to_string()));
+    }
+
+    let name = crate::collection::slug(label);
+    if name == GLOBALS || name.ends_with(LOCAL_SUFFIX) {
+        return Err(EnvironmentError::InvalidName(label.to_string()));
+    }
+    Ok(name)
+}
+
+fn write_map(path: &Path, values: &BTreeMap<String, String>) -> Result<(), EnvironmentError> {
+    let mut bytes = serde_json::to_vec_pretty(values).map_err(EnvironmentError::Serialize)?;
+    bytes.push(b'\n');
+
+    // Written through a temp file for the reason `collection::write` is: a half-written
+    // environment is one `scan` skips, and the switcher would silently lose it.
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, &bytes).map_err(|source| EnvironmentError::Write {
+        path: temp.clone(),
+        source,
+    })?;
+    std::fs::rename(&temp, path).map_err(|source| EnvironmentError::Write {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn remove_if_present(path: &Path) -> Result<(), EnvironmentError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(EnvironmentError::Delete {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// A missing file is an empty map, not an error: an environment may have only a committed
@@ -754,6 +957,113 @@ mod tests {
         assert_eq!(names, ["good"]);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn saving_puts_each_value_back_in_the_file_it_came_from() {
+        // The one that matters. `dev.json` holds a placeholder and `dev.local.json` the real
+        // token, which `load` merges away — so a save built from the merged view would either
+        // drop the placeholder or commit the secret.
+        let root = scratch("round-trip");
+        write_env(&root, "dev.json", r#"{"host":"dev.test","token":"set-me"}"#);
+        write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+
+        let mut file = read(&root, "dev").expect("read");
+        file.committed.insert("host".into(), "staging.test".into());
+        save(&root, &file).expect("save");
+
+        let committed = std::fs::read_to_string(directory(&root).join("dev.json")).expect("read");
+        assert!(committed.contains("staging.test"), "the edit landed: {committed}");
+        assert!(committed.contains("set-me"), "the placeholder survived: {committed}");
+        assert!(!committed.contains("s3cret"), "the secret stayed out: {committed}");
+
+        let back = load(&root, "dev").expect("load");
+        assert_eq!(back.values.get("token").map(String::as_str), Some("s3cret"));
+        assert!(back.is_secret("token"));
+    }
+
+    #[test]
+    fn an_environment_holding_only_secrets_is_still_listed() {
+        // `scan` finds an environment by its committed file, so that file is written even
+        // when there is nothing in it to commit.
+        let root = scratch("secrets-only");
+        let file = EnvironmentFile {
+            name: "dev".into(),
+            local: [("token".to_string(), "s3cret".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        save(&root, &file).expect("save");
+
+        let names: Vec<String> = scan(&root).into_iter().map(|env| env.name).collect();
+        assert_eq!(names, vec!["dev".to_string()]);
+    }
+
+    #[test]
+    fn clearing_the_last_secret_removes_the_sidecar() {
+        let root = scratch("empty-sidecar");
+        write_env(&root, "dev.json", r#"{"host":"dev.test"}"#);
+        write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+
+        let mut file = read(&root, "dev").expect("read");
+        file.local.clear();
+        save(&root, &file).expect("save");
+
+        // An empty `{}` left behind reads as "there are secrets here" to anyone browsing.
+        assert!(!directory(&root).join("dev.local.json").exists());
+    }
+
+    #[test]
+    fn an_environment_cannot_be_named_after_a_sidecar() {
+        let root = scratch("sidecar-name");
+        // `dev.local.json` is `dev`'s secret half, so this one would be created and then
+        // filtered straight back out by `scan`.
+        assert!(create(&root, "dev.local").is_err());
+        assert!(create(&root, GLOBALS).is_err());
+        assert!(create(&root, "///").is_err());
+    }
+
+    #[test]
+    fn creating_refuses_a_name_already_in_use() {
+        let root = scratch("name-taken");
+        assert_eq!(create(&root, "Dev EU").expect("create"), "Dev-EU");
+        assert!(create(&root, "Dev EU").is_err());
+    }
+
+    #[test]
+    fn renaming_carries_the_secret_half_across() {
+        let root = scratch("rename");
+        write_env(&root, "dev.json", r#"{"host":"dev.test"}"#);
+        write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+
+        assert_eq!(rename(&root, "dev", "staging").expect("rename"), "staging");
+
+        let moved = load(&root, "staging").expect("load");
+        assert_eq!(moved.values.get("token").map(String::as_str), Some("s3cret"));
+        assert!(moved.is_secret("token"), "still marked secret after the move");
+        assert!(!directory(&root).join("dev.json").exists());
+        assert!(!directory(&root).join("dev.local.json").exists());
+    }
+
+    #[test]
+    fn renaming_refuses_to_overwrite_another_environment() {
+        let root = scratch("rename-clash");
+        write_env(&root, "dev.json", r#"{"a":"1"}"#);
+        write_env(&root, "staging.json", r#"{"b":"2"}"#);
+
+        assert!(rename(&root, "dev", "staging").is_err());
+        assert_eq!(load(&root, "staging").expect("load").values.len(), 1);
+    }
+
+    #[test]
+    fn trashing_collects_both_halves_but_only_the_ones_that_exist() {
+        let root = scratch("halves");
+        write_env(&root, "dev.json", r#"{"host":"dev.test"}"#);
+        assert_eq!(halves(&root, "dev").len(), 1);
+
+        write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
+        assert_eq!(halves(&root, "dev").len(), 2, "the sidecar must go too");
+
+        assert!(halves(&root, "nope").is_empty());
     }
 
     #[test]

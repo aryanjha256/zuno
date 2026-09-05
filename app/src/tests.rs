@@ -3431,7 +3431,13 @@ async fn ctrl_e_lists_environments_with_none_always_offered(cx: &mut TestAppCont
         .iter()
         .map(|row| row.split(" — ").next().unwrap_or(""))
         .collect();
-    assert_eq!(labels, ["None", "dev", "prod"], "{rows:?}");
+    // "Edit environments…" is last on purpose: the switcher is where authoring is discoverable,
+    // and putting it under the environments keeps switching the one-keystroke default.
+    assert_eq!(
+        labels,
+        ["None", "dev", "prod", "Edit environments…"],
+        "{rows:?}"
+    );
 
     // The secret's *value* must never be on screen; a count is what tells you it loaded.
     let dev = rows.iter().find(|row| row.starts_with("dev")).expect("dev row");
@@ -9142,4 +9148,309 @@ async fn a_long_label_is_shortened_on_screen_but_still_matches_in_full(cx: &mut 
     );
 
     remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+// --- The environment editor ------------------------------------------------------------
+//
+// Until these, selecting an environment was reachable and *authoring* one was not: the empty
+// state told you to go make a JSON file by hand.
+
+fn env_panel(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> gpui::Entity<crate::environment_panel::EnvironmentPanel> {
+    window
+        .update(cx, |workspace, _, _| workspace.env_panel_for_test())
+        .expect("window")
+        .expect("the environment editor should be open")
+}
+
+fn env_file(root: &PathBuf, name: &str) -> String {
+    std::fs::read_to_string(root.join("environments").join(name)).unwrap_or_default()
+}
+
+#[gpui::test]
+async fn the_editor_lists_globals_first_then_every_environment(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-list");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), r#"{"host":"dev.test"}"#).expect("write");
+    std::fs::write(root.join("environments/prod.json"), r#"{"host":"prod.test"}"#).expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-e");
+
+    let panel = env_panel(&window, &mut cx);
+    // `scan` deliberately hides globals, because it cannot be *selected*. It can be edited,
+    // and leaving it out of the editor would just move the text-editor problem.
+    assert_eq!(
+        panel.read_with(&mut cx, |panel, _| panel.listed().to_vec()),
+        vec!["globals".to_string(), "dev".to_string(), "prod".to_string()],
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn adding_a_variable_writes_it_to_the_committed_file(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-add");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-e alt-down");
+
+    let panel = env_panel(&window, &mut cx);
+    assert_eq!(
+        panel.read_with(&mut cx, |panel, _| panel.selected_name().cloned()),
+        Some("dev".to_string()),
+    );
+
+    cx.dispatch_action(crate::actions::EnvNewVariable);
+    cx.simulate_input("baseUrl");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("https://dev.test");
+    // Closing is what persists — there is no discard, the way the settings panel has none.
+    cx.simulate_keystrokes("escape");
+
+    let written = env_file(&root, "dev.json");
+    assert!(written.contains("baseUrl"), "{written}");
+    assert!(written.contains("https://dev.test"), "{written}");
+    assert!(
+        !root.join("environments/dev.local.json").exists(),
+        "nothing was marked secret, so there is no sidecar to write",
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn marking_a_variable_secret_moves_it_to_the_gitignored_file(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-secret");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), r#"{"token":"live-key"}"#).expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-e alt-down");
+
+    let panel = env_panel(&window, &mut cx);
+    panel.update(&mut cx, |panel, cx| panel.toggle_secret(0, cx));
+    cx.simulate_keystrokes("escape");
+
+    // Invariant 10: the committed file is the one that gets reviewed, and a token in it is a
+    // token leaked by design.
+    let committed = env_file(&root, "dev.json");
+    assert!(!committed.contains("live-key"), "{committed}");
+    let local = env_file(&root, "dev.local.json");
+    assert!(local.contains("live-key"), "{local}");
+
+    // And the rule that arms it: a secret exists now, so the collection must ignore the sidecar.
+    let ignored = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
+    assert!(ignored.contains("*.local.json"), "{ignored:?}");
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn editing_a_secret_leaves_the_committed_placeholder_alone(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-placeholder");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    // The pattern `environment::load`'s own doc names: a placeholder committed for whoever
+    // clones the repo, the real value only in the gitignored half.
+    std::fs::write(root.join("environments/dev.json"), r#"{"token":"ask-alice"}"#).expect("write");
+    std::fs::write(root.join("environments/dev.local.json"), r#"{"token":"s3cret"}"#)
+        .expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-e alt-down");
+
+    let panel = env_panel(&window, &mut cx);
+    assert_eq!(
+        panel.read_with(&mut cx, |panel, cx| panel.variables(cx)),
+        vec![("token".to_string(), "s3cret".to_string(), true)],
+        "the row shows the value that wins, marked secret",
+    );
+
+    // Change the secret and save. The placeholder is not on screen anywhere, so a save built
+    // from the rows alone has nothing to put back — which is the bug this asserts against.
+    panel.update(&mut cx, |panel, cx| {
+        panel.set_value_for_test(0, "rotated", cx);
+    });
+    cx.simulate_keystrokes("escape");
+
+    let committed = env_file(&root, "dev.json");
+    assert!(committed.contains("ask-alice"), "the placeholder survived: {committed}");
+    assert!(!committed.contains("rotated"), "the secret stayed out: {committed}");
+    assert!(env_file(&root, "dev.local.json").contains("rotated"));
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn creating_an_environment_from_the_editor_makes_it_selectable(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-create");
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.dispatch_action(crate::actions::EnvNewEnvironment);
+    cx.simulate_input("Staging EU");
+    cx.simulate_keystrokes("enter");
+
+    let panel = env_panel(&window, &mut cx);
+    assert_eq!(
+        panel.read_with(&mut cx, |panel, _| panel.selected_name().cloned()),
+        Some("Staging-EU".to_string()),
+        "the typed label goes through `slug`, because it becomes a filename",
+    );
+    cx.simulate_keystrokes("escape");
+
+    // The switcher reads the directory, so the round trip is what proves it is usable.
+    assert!(root.join("environments/Staging-EU.json").exists());
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn renaming_the_selected_environment_keeps_it_selected(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-rename-active");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), r#"{"host":"dev.test"}"#).expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    // Select it for real, so the session is pointing at the name that is about to move.
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    // No `alt-down`: the editor opens *on* the selected environment, which is the one being
+    // renamed here.
+    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.dispatch_action(crate::actions::EnvRenameEnvironment);
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input("local");
+    cx.simulate_keystrokes("enter escape");
+
+    assert!(root.join("environments/local.json").exists(), "both halves moved");
+
+    // The session stores the environment by *name*, and `load` answers a missing file with an
+    // empty map rather than an error — so an unfollowed rename would silently stop every
+    // `{{var}}` resolving, with nothing on screen to say why.
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.active_environment())
+            .expect("window"),
+        Some("local".to_string()),
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn globals_cannot_be_renamed_or_removed(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-globals");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/globals.json"), r#"{"v":"v1"}"#).expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-e");
+
+    let panel = env_panel(&window, &mut cx);
+    assert_eq!(
+        panel.read_with(&mut cx, |panel, _| panel.selected_name().cloned()),
+        Some("globals".to_string()),
+    );
+
+    cx.dispatch_action(crate::actions::EnvTrashEnvironment);
+    cx.simulate_keystrokes("escape");
+
+    // It is the always-active layer, not a peer: removing it is not a thing to confirm, it is
+    // a thing that has no meaning.
+    assert!(root.join("environments/globals.json").exists());
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn closing_the_editor_leaves_typing_somewhere_to_land(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.simulate_keystrokes("escape");
+
+    // The panel's inputs are gone, so focus must have been handed back to something painted —
+    // otherwise no `TextInput` holds it, no `key_context` node exists, and typing vanishes with
+    // nothing on screen explaining why. Asserted through the typing, never through which handle
+    // reports focus: the bug leaves focus exactly where the code intended to put it.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/after");
+    let url = cx.update(|_, cx| view.read(cx).url.read(cx).text().to_string());
+    assert_eq!(url, "https://api.test/after");
+}
+
+#[test]
+fn the_badge_separates_nothing_selected_from_nothing_substituting() {
+    use crate::workspace::environment_badge;
+
+    assert_eq!(environment_badge(Some("dev"), true).0.as_ref(), "dev");
+    assert_eq!(environment_badge(Some("dev"), false).0.as_ref(), "dev");
+
+    // The two that used to look identical — a bare globe, either way. Globals is the bottom
+    // layer whether or not an environment is chosen, so with values in it a `{{var}}` still
+    // resolves and the badge has to say so.
+    assert_eq!(environment_badge(None, true).0.as_ref(), "globals");
+    assert_eq!(environment_badge(None, false).0.as_ref(), "none");
+
+    // The tint follows the same distinction, so the two read differently at a glance and not
+    // only on a careful read of the word.
+    assert!(environment_badge(None, true).1, "globals is substituting");
+    assert!(!environment_badge(None, false).1, "nothing is");
+}
+
+#[gpui::test]
+async fn the_switcher_does_not_claim_none_means_no_substitution(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-none-row");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/globals.json"), r#"{"v":"v1"}"#).expect("write");
+    std::fs::write(root.join("environments/dev.json"), r#"{"host":"dev.test"}"#).expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e");
+
+    // Nothing is selected, so this row is current — and it used to read "variables are left
+    // unresolved", which is false with anything in `globals.json`. A confident string in the UI
+    // is read by more people than a stale comment is.
+    let rows = picker_rows(&window, &mut cx);
+    let none = rows.iter().find(|row| row.starts_with("None")).expect("None row");
+    assert!(
+        none.contains("globals"),
+        "the None row must say globals is still substituting: {none:?}"
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn writing_a_global_from_the_editor_updates_the_badge(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("env-badge-refresh");
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+
+    let badge = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, _| workspace.badge_for_test())
+            .expect("window")
+    };
+    assert_eq!(badge(&mut cx).as_ref(), "none", "nothing to substitute yet");
+
+    // `globals` is what the editor opens on when no environment is selected.
+    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.dispatch_action(crate::actions::EnvNewVariable);
+    cx.simulate_input("v");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("v1");
+    cx.simulate_keystrokes("escape");
+
+    // The flag behind the badge is a *cache* — reading `globals.json` every frame would be a
+    // file read on the UI thread. So the refresh points are the thing under test, not the read:
+    // a cache nobody refreshes reports the old answer forever, and looks exactly like a badge
+    // that simply doesn't work.
+    assert_eq!(badge(&mut cx).as_ref(), "globals");
+
+    remove_scratch(&mut cx, &root);
 }

@@ -1451,6 +1451,58 @@ that says so.
 
 ---
 
+## 6c. The environment editor — and the merge that could not be saved
+
+Resolution has existed since M3; authoring has not. `Ctrl+Alt+E` opens a modal listing every
+environment beside the variables of the selected one.
+
+**`Environment` is a merged view, and merged views cannot be written back.** `load` overlays the
+`.local` sidecar onto the committed file and returns one map, which is exactly what `Resolver`
+wants. It is also lossy in the one way that matters: a name may sit in *both* files — a placeholder
+committed for whoever clones the repo, the real token only in the gitignored half — and the merged
+map has nowhere to keep the pair. A save rebuilt from it would either drop the placeholder or push
+the token into the committed file. `EnvironmentFile` holds the two halves and `Environment` is now
+derived from it, so there is one merge rule rather than two that can disagree. Same shape as the
+`preserved_body` lesson in §2: what the view cannot represent, the derivation destroys.
+
+The rule has a second half that only a test found. Preserving a committed entry under a secret name
+is right when the name was *already* secret, and wrong when it is being marked secret now — there
+the committed value **is** the thing being hidden, and carrying it across copies the token into the
+sidecar while leaving the original in the file that gets pushed. Invariant 10 broken by the fix for
+invariant 10.
+
+Decisions worth keeping:
+
+- **`globals` is in the list**, pinned, unrenameable, undeletable. `scan` hides it because it
+  cannot be *selected*; it can be edited, and leaving it out would move the text-editor problem
+  rather than solve it. Its two verbs are absent rather than disabled — a control you cannot use
+  teaches nothing.
+- **Commit on the way out, with no discard**, the way the settings panel commits per row. An editor
+  over files that can silently throw an edit away is a worse story than one that always lands, and
+  a discard would import the dirty-buffer problem into a modal.
+- **A save that changes nothing writes nothing.** Moving through the list saves on the way out of
+  each entry, so an unconditional write created `globals.json` for anyone who merely opened the
+  editor and pressed a key.
+- **Reached from the switcher, not from a menu on the badge.** The badge stays a one-click switch;
+  "Edit environments…" sits last in the picker, which is the surface you are already on when you
+  want to change one. Cheaper than the workspace header's chevron menu and better placed.
+- **Trash, not delete.** Sharper than the collection panel's reason: the `.local` half is
+  gitignored, so it holds the only copy of every secret in it anywhere.
+- **The badge has three states, not two.** It showed a bare globe with nothing selected and a
+  bare word otherwise — two shapes for one control — and the switcher's "None" row said variables
+  were left unresolved. That was simply false: `resolver` loads `globals.json` unconditionally, so
+  the bottom layer applies whether or not an environment is chosen. It is one shape now, globe
+  plus word, reading the environment's name, `globals`, or `none`. The flag behind the third state
+  is **cached** rather than read in `render` — answering "is anything substituting" means opening
+  and parsing a file, which invariant 3 forbids on the UI thread — and refreshed at the three
+  points it can change: boot, a workspace swap, and the editor closing.
+- **Values are shown, not masked.** `Environment::is_secret` says "masked on screen", and this is
+  the one screen you opened deliberately to read them. Masking here would need a per-row reveal and
+  a non-editable variant of `TextInput`; the switcher, which is the surface someone else might see
+  over your shoulder, still shows counts and never values.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains

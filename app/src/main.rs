@@ -13,6 +13,7 @@ mod chrome;
 mod app_state;
 mod close_panel;
 mod collection_panel;
+mod environment_panel;
 mod import_panel;
 mod collections;
 mod commands;
@@ -55,6 +56,7 @@ use crate::actions::{
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CommitRename, ConfirmClose,
     WorkspaceConfirm, WorkspaceDismiss,
+    EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev,
     DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
@@ -279,6 +281,9 @@ fn register_keymap(cx: &mut App) {
         // keystroke to advertise rather than being mouse-only.
         KeyBinding::new("f10", OpenAppMenu, None),
         KeyBinding::new("ctrl-e", SwitchEnvironment, None),
+        // `ctrl-e` selects an environment, `ctrl-shift-e` is the collection panel, so the
+        // editor takes the next free chord in the same family.
+        KeyBinding::new("ctrl-alt-e", EditEnvironments, None),
         KeyBinding::new("ctrl-h", ShowHistory, None),
         KeyBinding::new("down", PickerNext, Some("Picker")),
         KeyBinding::new("up", PickerPrev, Some("Picker")),
@@ -350,6 +355,21 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("enter", WorkspaceConfirm, Some("WorkspaceLocation")),
         KeyBinding::new("escape", WorkspaceDismiss, Some("WorkspaceName")),
         KeyBinding::new("escape", WorkspaceDismiss, Some("WorkspaceLocation")),
+        // The environment editor. Three leaf contexts hold focus inside it — the panel's own
+        // handle when nothing is being typed, `EnvField` for a variable's two boxes, and
+        // `EnvRename` for the name box — and a leaf predicate matches only the last context, so
+        // each one is bound separately. All after the global `escape`, for the usual reason: a
+        // leaf match merely *ties* with a context-less binding and the later registration wins.
+        KeyBinding::new("escape", EnvDismiss, Some("EnvPanel")),
+        KeyBinding::new("escape", EnvDismiss, Some("EnvField")),
+        KeyBinding::new("escape", EnvDismiss, Some("EnvRename")),
+        KeyBinding::new("enter", EnvConfirm, Some("EnvPanel")),
+        KeyBinding::new("enter", EnvConfirm, Some("EnvField")),
+        KeyBinding::new("enter", EnvConfirm, Some("EnvRename")),
+        KeyBinding::new("alt-down", EnvNext, Some("EnvPanel")),
+        KeyBinding::new("alt-up", EnvPrev, Some("EnvPanel")),
+        KeyBinding::new("alt-down", EnvNext, Some("EnvField")),
+        KeyBinding::new("alt-up", EnvPrev, Some("EnvField")),
         KeyBinding::new("enter", ConfirmClose, Some("CloseConfirm")),
         KeyBinding::new("escape", CancelClose, Some("CloseConfirm")),
         KeyBinding::new("right", CloseChoiceNext, Some("CloseConfirm")),
