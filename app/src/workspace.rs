@@ -22,7 +22,8 @@ use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    EditEnvironments, EnvConfirm, EnvDismiss, EnvNewEnvironment, EnvNewVariable, EnvNext,
+    AddCapture, CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNewEnvironment,
+    EnvNewVariable, EnvNext, ShowCaptureTab, ToggleCaptureSecret,
     EnvPrev, EnvRemoveVariable, EnvRenameEnvironment, EnvToggleSecret, EnvTrashEnvironment,
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
     MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ScrollLeft, ScrollRight,
@@ -3121,6 +3122,64 @@ impl Workspace {
         self.show_request_tab(RequestTab::Body, cx);
     }
 
+    fn show_capture_tab(&mut self, _: &ShowCaptureTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_request_tab(RequestTab::Capture, cx);
+    }
+
+    fn add_capture(&mut self, _: &AddCapture, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| {
+                view.add_row(RowKind::Capture, window, cx);
+            });
+        }
+    }
+
+    fn toggle_capture_secret(
+        &mut self,
+        _: &ToggleCaptureSecret,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        let focused = view.read(cx).focused_row(window, cx);
+        match focused {
+            Some((RowKind::Capture, ix)) => {
+                view.update(cx, |view, cx| view.toggle_capture_secret(ix, cx))
+            }
+            _ => self.set_status("Focus a capture row first", cx),
+        }
+    }
+
+    /// Turn the selected response row into a capture rule.
+    ///
+    /// The authoring path that matters: the path comes from `path_to`, the same function behind
+    /// `Alt+C`, so it is right by construction rather than typed. A name typed by hand against a
+    /// path typed by hand is two chances to be wrong about a chain that then fails silently one
+    /// request later.
+    fn capture_value(&mut self, _: &CaptureValue, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        if view.read(cx).selected_body_row().is_none() {
+            self.set_status(&self.select_a_row_hint(window), cx);
+            return;
+        }
+        let Some(path) = view.read(cx).selected_body_path() else {
+            self.set_status("That row has no path to capture", cx);
+            return;
+        };
+
+        let name = capture_name(&path);
+        // Publishes immediately, against the response on screen. Deferring to the next send is
+        // what shipped first, and it made the one path whose whole argument is "author it where
+        // the data is" the one path that looks at the data and declines to read it — silently,
+        // under a menu row that says "Capture as variable" rather than "capture on next send".
+        let environment = self.environment.clone();
+        view.update(cx, |view, cx| {
+            view.push_capture(path, name, window, cx);
+            view.publish_captures(environment, cx);
+        });
+    }
+
     fn show_request_tab(&mut self, tab: RequestTab, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.show_request_tab(tab, cx));
@@ -3487,6 +3546,14 @@ impl Workspace {
         )];
         if view.read(cx).selected_body_path().is_some() {
             items.push(context_menu::MenuItem::new("Copy path", CopyRowPath, &focus, window));
+            // Offered beside "Copy path" because it *is* that path, put somewhere useful instead
+            // of on the clipboard. Absent for a raw body, where there is no path to capture.
+            items.push(context_menu::MenuItem::new(
+                "Capture as variable",
+                CaptureValue,
+                &focus,
+                window,
+            ));
         }
         if view.read(cx).selected_is_container() {
             let label = if view.read(cx).selected_is_folded() {
@@ -3848,7 +3915,8 @@ impl Workspace {
         // environment file takes effect on the next request. It's a couple of small files;
         // if it ever shows up in a profile, cache it and invalidate on a file watch.
         let resolver = self.resolver(cx);
-        view.update(cx, |view, cx| view.send(&engine, &resolver, cx));
+        let environment = self.environment.clone();
+        view.update(cx, |view, cx| view.send(&engine, &resolver, environment, cx));
     }
 
     /// Write the active buffer into the collection as a file of its own.
@@ -3956,6 +4024,7 @@ impl Workspace {
                 RowKind::Query => "query",
                 RowKind::Form => "form field",
                 RowKind::Multipart => "part",
+                RowKind::Capture => "capture",
             };
             return SharedString::from(format!("{label} row {}", ix + 1));
         }
@@ -4022,6 +4091,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::workspace_confirm))
             .on_action(cx.listener(Self::workspace_dismiss))
             .on_action(cx.listener(Self::workspace_browse))
+            .on_action(cx.listener(Self::show_capture_tab))
+            .on_action(cx.listener(Self::add_capture))
+            .on_action(cx.listener(Self::toggle_capture_secret))
+            .on_action(cx.listener(Self::capture_value))
             .on_action(cx.listener(Self::edit_environments))
             .on_action(cx.listener(Self::env_next))
             .on_action(cx.listener(Self::env_prev))
@@ -4609,6 +4682,19 @@ fn spell(binding: &gpui::KeyBinding) -> String {
 /// `modal_open` checks drifted: repeated logic diverges, and one forgotten copy is the bug.
 ///
 /// A clause whose action is unbound is dropped; if none survive, so is the dash.
+/// A variable name suggested from a JSONPath: the last segment, or empty when there isn't one.
+///
+/// A suggestion, not a rule — the name box is focused when a capture is authored this way, so
+/// the first thing you can do is disagree with it.
+fn capture_name(path: &str) -> String {
+    path.rsplit(['.', '['])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(']')
+        .trim_matches('"')
+        .to_string()
+}
+
 /// What the environment badge says, and whether anything is actually substituting.
 ///
 /// **Three states, because "nothing selected" and "nothing substituting" are different things.**

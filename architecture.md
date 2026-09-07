@@ -1503,6 +1503,68 @@ Decisions worth keeping:
 
 ---
 
+## 6d. Request chaining — the rule lives on the producer
+
+`$.access_token → token`, recorded on the request that returns it and published into the selected
+environment after a successful send. Consumers need nothing: `{{token}}` is an ordinary variable.
+
+**The fork, and why this side of it.** The alternative is "run X before me" — a rule on the
+*consumer*. Rejected on four counts, of which the first is principle 3: producer-side rides
+entirely on machinery that exists (`Resolver` substitutes, `environment::save` writes, the
+committed/gitignored split decides the file), while consumer-side needs a runner with ordering,
+a dependency graph and a story for a failed prerequisite — none of which is chaining. It also
+authors where the data is, since the path comes from the outline you are looking at; keeps the
+token in a file you can read rather than in invisible state; and composes with no graph, because
+two producers writing one variable is a last-write-wins you can see on disk. The cost is real and
+accepted: an expired token means re-sending the producer by hand.
+
+**Three refusals, each of which would otherwise be a silent wrong answer:**
+
+- **Only on a 2xx.** An error body has fields too, and publishing one into `{{token}}` produces a
+  chain that fails on the *next* request — the hardest kind to read back to its cause.
+- **Only on the live run.** `index_body` also runs when you browse the history, so without the
+  guard, *looking at* a response from three sends ago rewrites the environment with its expired
+  token.
+- **Only into a selected environment, never globals.** A captured token is environment-specific by
+  nature — dev's and prod's are different values — so putting one in the always-active layer means
+  switching environment does not switch the token. This also keeps §6c's `globals_active` cache
+  honest, since nothing but the editor can write globals.
+
+Decisions worth keeping:
+
+- **`captures` is a `RequestSpec` field with a per-field `#[serde(default)]`.** Not a violation of
+  the rule above `RequestSettings`: what `RequestSpec` refuses is the *container* default, so a
+  corrupt file is still rejected rather than becoming an empty request. No session bump either —
+  invariant 8 governs `Session`'s own fields.
+- **`extract` descends, it does not scan.** The obvious build asks `path_to` of every row until one
+  matches, which is O(n²) because `path_to` itself walks back to the document start for ancestors.
+  Fine on a token response, unusable on a 50MB one — and the difference only appears on the bodies
+  nobody tests with.
+- **Segment matching is gated on the container's kind.** Without it `$.data[0]` resolves against an
+  *object* by matching its first key, so a path with the wrong bracket captures a real value
+  instead of reporting a miss.
+- **`every_path_the_ui_can_copy_is_a_path_extract_can_follow`** pins `path_to` to `extract`. The
+  writer is what `Alt+C` copies and what the capture editor is filled from, so a path the writer
+  emits and the reader cannot follow is a chain that silently captures nothing.
+- **Capturing a row publishes immediately**, against the response already on screen. It shipped
+  deferring to the next send, which made the one path whose whole argument is "author it where the
+  data is" the one path that looked at the data and declined to read it — and did so *silently*,
+  under a menu row reading "Capture as variable" rather than "capture on next send". The test that
+  covered it asserted the rule, the suggested name, the secret flag and the revealed tab, and
+  never the file, so it passed against the gap for a slice. `CaptureTrigger` is what the fix
+  turns on: after a send a refusal is not worth saying, and when someone asked for one every
+  refusal has to name itself. The environment is passed in rather than reused from
+  `capture_target`, or sending, switching, then capturing a row would publish into the environment
+  you had just left.
+
+  One cost, accepted: renaming a capture after it has published leaves the value behind under the
+  old name. Visible in the editor, and the same shape as renaming any variable.
+- **A fourth request-pane tab**, not a strip that appears only when a request has captures. A rule
+  you cannot see is what the consumer-side design was rejected for; hiding this one until it exists
+  would reintroduce the same complaint one level down.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains

@@ -88,6 +88,12 @@ actions!(
         EnvTrashEnvironment,
         EnvConfirm,
         EnvDismiss,
+        // Chaining. The rule lives on the request that *produces* the value, so the consumer
+        // side needs nothing: `{{token}}` is an ordinary variable the existing resolver handles.
+        ShowCaptureTab,
+        AddCapture,
+        ToggleCaptureSecret,
+        CaptureValue,
         // Import a whole API at once. `ImportCurl` is one request per paste; this is the way a
         // collection gets filled from what a team already has.
         ImportOpenApi,

@@ -21,6 +21,7 @@ use gpui::{
 };
 use zuno_core::{
     Body, Engine, EngineError, Event, FormField, Header, Hits, JobId, Method, MultipartField,
+    capture::Capture,
     MultipartValue, QueryParam, RawKind, RequestId, RequestSettings, RequestSpec, Resolver,
     ResponseData, ResponseDiff,
 };
@@ -125,6 +126,45 @@ impl KeyValueRow {
     }
 }
 
+/// Why captures are running.
+///
+/// The only thing it decides is whether a refusal is reported. After a send, silence is right —
+/// a request with no rules has nothing to say, and a failed one already shows its status. When
+/// someone chose "Capture as variable", every refusal has to be named: they just asked for a
+/// thing, and this path shipped doing nothing at all without a word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTrigger {
+    Send,
+    Requested,
+}
+
+/// One editable capture rule. `enabled` and `secret` live here rather than in the inputs for
+/// the reason `KeyValueRow::enabled` does: toggling either must not disturb what you typed.
+pub struct CaptureRow {
+    pub enabled: bool,
+    pub path: Entity<TextInput>,
+    pub name: Entity<TextInput>,
+    pub secret: bool,
+}
+
+impl CaptureRow {
+    fn new(capture: &Capture, cx: &mut Context<RequestView>) -> Self {
+        Self {
+            enabled: capture.enabled,
+            path: cx.new(|cx| {
+                TextInput::new(capture.path.clone(), "$.access_token", "CaptureCell", cx)
+            }),
+            name: cx.new(|cx| TextInput::new(capture.name.clone(), "token", "CaptureCell", cx)),
+            secret: capture.secret,
+        }
+    }
+
+    fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path.read(cx).focus_handle(cx).is_focused(window)
+            || self.name.read(cx).focus_handle(cx).is_focused(window)
+    }
+}
+
 /// Which section of the request the pane shows.
 ///
 /// Headers, query and body used to stack, so the two you weren't editing still cost a header
@@ -140,13 +180,20 @@ pub enum RequestTab {
     /// Default: authoring a body is where the time goes.
     #[default]
     Body,
+    /// What this request publishes into the environment after a successful send.
+    Capture,
 }
 
 impl RequestTab {
     /// Visual order, which is also cycle order — deliberately not most-recently-used. With
     /// three tabs in a fixed strip, MRU sends the same keystroke somewhere different each time
     /// and throws away the muscle memory the strip gives for free.
-    pub const ALL: [RequestTab; 3] = [RequestTab::Headers, RequestTab::Query, RequestTab::Body];
+    pub const ALL: [RequestTab; 4] = [
+        RequestTab::Headers,
+        RequestTab::Query,
+        RequestTab::Body,
+        RequestTab::Capture,
+    ];
 
     fn step(self, delta: isize) -> Self {
         let at = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
@@ -218,6 +265,9 @@ pub enum RowKind {
     Form,
     /// A part of a `multipart/form-data` body.
     Multipart,
+    /// A capture rule. Shares the enum so `ToggleRow` and `RemoveRow` reach it without a second
+    /// pair of actions, and so the compiler names every site that has to decide about it.
+    Capture,
 }
 
 /// How far one `left`/`right` press moves the response body.
@@ -279,6 +329,9 @@ pub struct RequestView {
     pub form: Vec<KeyValueRow>,
     /// Parts of a multipart body.
     pub multipart: Vec<MultipartRow>,
+    /// What this request publishes. Held as rows for the same reason every other table is:
+    /// `spec` derives from the inputs, so anything not represented here is destroyed on save.
+    pub captures: Vec<CaptureRow>,
     /// The file a binary body sends.
     ///
     /// Only the path is held — the bytes are read at the send boundary by `build.rs`, so a
@@ -310,6 +363,13 @@ pub struct RequestView {
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
+    /// Which environment a capture writes into, taken at send time.
+    ///
+    /// Passed in rather than read here because only `Workspace` knows what is selected. `None`
+    /// means nothing was selected, which captures refuse rather than falling back to globals —
+    /// see `run_captures`.
+    capture_target: Option<String>,
+    capture_task: Option<Task<()>>,
     /// The find bar, when open.
     pub search: Option<TextSearch>,
     /// The request body's own find bar. Separate from `search` because both can be open at
@@ -359,6 +419,9 @@ impl RequestView {
             body_kind: RawKind::Json,
             form: Vec::new(),
             multipart: Vec::new(),
+            captures: Vec::new(),
+            capture_target: None,
+            capture_task: None,
             binary_path: None,
             settings: RequestSettings::default(),
             response: None,
@@ -482,6 +545,11 @@ impl RequestView {
         self.form = form;
         self.binary_path = binary_path;
         self.multipart = multipart;
+        self.captures = spec
+            .captures
+            .iter()
+            .map(|capture| CaptureRow::new(capture, cx))
+            .collect();
         self.settings = spec.settings;
 
         // A different request has no relationship to the last one's response.
@@ -594,6 +662,16 @@ impl RequestView {
     /// same guarantee: no staleness, because nothing is cached.
     pub fn spec(&self, cx: &App) -> RequestSpec {
         RequestSpec {
+            captures: self
+                .captures
+                .iter()
+                .map(|row| Capture {
+                    enabled: row.enabled,
+                    path: row.path.read(cx).text().to_string(),
+                    name: row.name.read(cx).text().to_string(),
+                    secret: row.secret,
+                })
+                .collect(),
             id: self.id,
             name: self.name.clone(),
             method: self.method.clone(),
@@ -855,7 +933,15 @@ impl RequestView {
     /// The resolver is applied to a *copy*: the buffer keeps its `{{placeholders}}`, which
     /// is the entire point of having them. Anything the resolver doesn't know is left
     /// verbatim, so `build.rs`'s existing check is what reports it — by name, before DNS.
-    pub fn send(&mut self, engine: &Arc<Engine>, resolver: &Resolver, cx: &mut Context<Self>) {
+    pub fn send(
+        &mut self,
+        engine: &Arc<Engine>,
+        resolver: &Resolver,
+        environment: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture_target = environment;
+
         // Hitting Send again must abandon the previous attempt immediately. Without
         // this, a rapid resend leaves the old socket draining and the new response can
         // land behind a stale one.
@@ -1070,6 +1156,7 @@ impl RequestView {
                     view.row_count()
                 );
                 this.body_view = Some(view);
+                this.run_captures(CaptureTrigger::Send, cx);
                 // Matches belong to the bytes they were found in. A resend, or picking a run
                 // out of the history browser, replaces those bytes — so offsets from the old
                 // body would point into the new one at random, and the count would describe a
@@ -1078,6 +1165,126 @@ impl RequestView {
                 if this.is_searching() {
                     this.run_search(cx);
                 }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Publish this request's captures into the selected environment.
+    ///
+    /// Three refusals, each of which would otherwise be a silent wrong answer:
+    ///
+    /// - **Only on a success.** A 401 body has fields too, and pulling one into `{{token}}`
+    ///   produces a chain that fails on the *next* request — the hardest kind to read back.
+    /// - **Only on the live run.** `index_body` also runs when you browse the history, and
+    ///   re-publishing a token from three sends ago because you looked at it is not a thing
+    ///   anyone asked for.
+    /// - **Only into a selected environment**, never globals. A captured token is
+    ///   environment-specific by nature — dev's and prod's are different values — so putting one
+    ///   in the always-active layer means switching environment does not switch the token.
+    fn run_captures(&mut self, trigger: CaptureTrigger, cx: &mut Context<Self>) {
+        let requested = trigger == CaptureTrigger::Requested;
+
+        if self.captures.is_empty() {
+            return;
+        }
+        if self.viewing != 0 {
+            self.refuse(requested, "Captures publish from the live response, not a retained run", cx);
+            return;
+        }
+        let Some(response) = self.response.as_ref() else {
+            self.refuse(requested, "Send the request first", cx);
+            return;
+        };
+        if !(200..300).contains(&response.status) {
+            self.refuse(requested, "Captures only publish from a successful response", cx);
+            return;
+        }
+
+        let rules: Vec<(String, String, bool)> = self
+            .captures
+            .iter()
+            .filter(|row| row.enabled)
+            .map(|row| {
+                (
+                    row.path.read(cx).text().to_string(),
+                    row.name.read(cx).text().trim().to_string(),
+                    row.secret,
+                )
+            })
+            .filter(|(path, name, _)| !path.is_empty() && !name.is_empty())
+            .collect();
+        if rules.is_empty() {
+            self.refuse(requested, "Give the capture a path and a variable name", cx);
+            return;
+        }
+
+        let Some(target) = self.capture_target.clone() else {
+            self.status = Some("Select an environment to capture into".into());
+            return;
+        };
+        let Some(root) = crate::collections::root(cx).map(std::path::Path::to_path_buf) else {
+            self.refuse(requested, "No collection directory to hold environments", cx);
+            return;
+        };
+        let Some(outline) = self
+            .body_view
+            .as_ref()
+            .and_then(|body| body.outline())
+            .cloned()
+        else {
+            self.status = Some("Captures need a JSON response".into());
+            return;
+        };
+
+        // Extraction is a descent rather than a scan, so it is cheap even on a large body — but
+        // reading and writing the environment is file IO, and invariant 3 keeps that off this
+        // thread whatever its size.
+        let work = cx.background_executor().spawn(async move {
+            let mut file = match zuno_core::environment::read(&root, &target) {
+                Ok(file) => file,
+                Err(error) => return Err(format!("{error}")),
+            };
+
+            let mut written = Vec::new();
+            let mut missed = Vec::new();
+            for (path, name, secret) in rules {
+                match zuno_core::capture::extract(&outline, &path) {
+                    Some(value) => {
+                        // Marking secret moves it between the two halves, so the other one has
+                        // to let go — otherwise a value that used to be committed stays there.
+                        if secret {
+                            file.committed.remove(&name);
+                            file.local.insert(name.clone(), value);
+                        } else {
+                            file.local.remove(&name);
+                            file.committed.insert(name.clone(), value);
+                        }
+                        written.push(name);
+                    }
+                    None => missed.push(path),
+                }
+            }
+
+            match zuno_core::environment::save(&root, &file) {
+                Ok(()) => Ok((target, written, missed)),
+                Err(error) => Err(format!("{error}")),
+            }
+        });
+
+        self.capture_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.status = Some(SharedString::from(match outcome {
+                    Err(error) => error,
+                    Ok((target, written, missed)) if missed.is_empty() => {
+                        format!("Captured {} into {target}", written.join(", "))
+                    }
+                    // Named, not counted: "1 path did not match" makes you go and find which.
+                    Ok((_, _, missed)) => {
+                        format!("No match for {}", missed.join(", "))
+                    }
+                }));
                 cx.notify();
             });
         }));
@@ -1598,6 +1805,12 @@ impl RequestView {
                 });
                 self.multipart.last().map(|part| &part.row)
             }
+            // A different row type, so it cannot ride the shared `Option<&KeyValueRow>` return.
+            // It moves focus itself, into the path cell rather than a name cell.
+            RowKind::Capture => {
+                self.push_capture(String::new(), String::new(), window, cx);
+                None
+            }
         };
 
         if let Some(row) = row {
@@ -1623,10 +1836,17 @@ impl RequestView {
         if let Some(ix) = self.form.iter().position(|row| row.is_focused(window, cx)) {
             return Some((RowKind::Form, ix));
         }
-        self.multipart
+        if let Some(ix) = self
+            .multipart
             .iter()
             .position(|part| part.row.is_focused(window, cx))
-            .map(|ix| (RowKind::Multipart, ix))
+        {
+            return Some((RowKind::Multipart, ix));
+        }
+        self.captures
+            .iter()
+            .position(|row| row.is_focused(window, cx))
+            .map(|ix| (RowKind::Capture, ix))
     }
 
     /// Flip a row's `enabled` flag. Multipart parts wrap their row, so this can't hand back
@@ -1643,6 +1863,13 @@ impl RequestView {
                 }
                 None => false,
             },
+            RowKind::Capture => match self.captures.get_mut(ix) {
+                Some(row) => {
+                    row.enabled = !row.enabled;
+                    true
+                }
+                None => false,
+            },
         }
     }
 
@@ -1652,6 +1879,7 @@ impl RequestView {
             RowKind::Query => self.query.len(),
             RowKind::Form => self.form.len(),
             RowKind::Multipart => self.multipart.len(),
+            RowKind::Capture => self.captures.len(),
         };
         if ix >= len {
             return false;
@@ -1661,6 +1889,7 @@ impl RequestView {
             RowKind::Query => drop(self.query.remove(ix)),
             RowKind::Form => drop(self.form.remove(ix)),
             RowKind::Multipart => drop(self.multipart.remove(ix)),
+            RowKind::Capture => drop(self.captures.remove(ix)),
         }
         true
     }
@@ -1689,6 +1918,60 @@ impl RequestView {
         if self.toggle(kind, ix) {
             cx.notify();
         }
+    }
+
+    /// Add a capture, focused on whichever cell still needs typing.
+    ///
+    /// Authoring from a response row fills both, so focus goes to the *name* — the path came
+    /// from `path_to` and is right by construction, and the variable is the decision left.
+    pub fn push_capture(
+        &mut self,
+        path: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prefilled = !path.is_empty();
+        self.captures.push(CaptureRow::new(
+            &Capture {
+                path,
+                name,
+                ..Default::default()
+            },
+            cx,
+        ));
+
+        if let Some(row) = self.captures.last() {
+            let cell = if prefilled { &row.name } else { &row.path };
+            let handle = cell.read(cx).focus_handle(cx);
+            window.focus(&handle);
+        }
+        self.request_tab = RequestTab::Capture;
+        cx.notify();
+    }
+
+    /// Say why captures did nothing, but only when someone asked for them.
+    fn refuse(&mut self, requested: bool, why: &'static str, cx: &mut Context<Self>) {
+        if requested {
+            self.status = Some(SharedString::from(why));
+            cx.notify();
+        }
+    }
+
+    /// Publish now, against the response already on screen.
+    ///
+    /// **`environment` is passed rather than reused from the last send.** `capture_target` is set
+    /// when a request goes out, so sending, switching environment, and *then* capturing a row
+    /// would publish into the environment you had just left.
+    pub fn publish_captures(&mut self, environment: Option<String>, cx: &mut Context<Self>) {
+        self.capture_target = environment;
+        self.run_captures(CaptureTrigger::Requested, cx);
+    }
+
+    pub fn toggle_capture_secret(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.captures.get_mut(ix) else { return };
+        row.secret = !row.secret;
+        cx.notify();
     }
 
     pub fn remove_row_at(&mut self, kind: RowKind, ix: usize, cx: &mut Context<Self>) {

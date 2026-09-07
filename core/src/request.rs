@@ -238,6 +238,14 @@ pub struct RequestSpec {
     pub headers: Vec<Header>,
     pub body: Body,
     pub settings: RequestSettings,
+    /// What this request publishes into the environment after a successful send.
+    ///
+    /// `#[serde(default)]` per *field*, which is the pattern the note above `RequestSettings`
+    /// prescribes: the container-level default is what `RequestSpec` refuses, so a corrupt file
+    /// is still rejected rather than becoming an empty request, while a collection written by an
+    /// older build still parses.
+    #[serde(default)]
+    pub captures: Vec<crate::capture::Capture>,
 }
 
 impl Default for RequestSpec {
@@ -251,6 +259,7 @@ impl Default for RequestSpec {
             headers: Vec::new(),
             body: Body::Empty,
             settings: RequestSettings::default(),
+            captures: Vec::new(),
         }
     }
 }
@@ -285,6 +294,7 @@ impl RequestSpec {
                 kind: RawKind::Json,
             },
             settings: RequestSettings::default(),
+            captures: Vec::new(),
         }
     }
 }

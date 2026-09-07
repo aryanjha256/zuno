@@ -230,6 +230,21 @@ request, the motivating case for request chaining, is a *form* body, so it sent 
 `RequestView::load` already uses: a new `Body` variant fails the build until someone decides whether
 a variable belongs in it.
 
+**Request chaining — done**, and it is where OAuth ended up living. A capture rule sits on the
+request that *produces* a value: `$.access_token → token`, published into the selected environment
+after a successful send, secret by default. Every consumer then needs nothing at all — `{{token}}`
+is an ordinary variable the resolver already handled. A client-credentials flow is two requests and
+one rule.
+
+Authored from the response itself: select the row, `Alt+Shift+C` or "Capture as variable" in its
+menu, and the path comes from `path_to` — the same function behind `Alt+C`, so it is right by
+construction rather than typed twice. That path publishes straight away rather than waiting for
+another send, since the value is in the outline you just clicked. Listed on a fourth request-pane
+tab, because a rule you cannot see is the thing the consumer-side design was rejected for.
+
+The cost, stated plainly: an expired token means re-sending the producer yourself. Re-running it
+automatically is a later slice, and one that now has somewhere to live.
+
 **Auth helpers — dropped, not deferred.** Recorded so nobody rebuilds it because the roadmap once
 said to. Environments made it redundant, and a dedicated auth tab would now be actively *worse*:
 
@@ -676,10 +691,6 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
-- **Request chaining** — extract a value from one response, feed it to the next. Arguably more
-  valuable than general scripting and far smaller. **This is where OAuth lives**: a
-  client-credentials flow is exactly "POST for a token, then use it", and building it here rather
-  than as an auth feature means every other token-then-call API gets it too.
 - **Client certificates.** `RequestSettings` has room; reqwest supports it.
 - **Inline body diff.** The summary diff answers "did my change do anything?". A structural diff
   over `Row` spans is probably better than a text diff, now that the JSON outline exists.

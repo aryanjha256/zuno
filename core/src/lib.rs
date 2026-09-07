@@ -9,6 +9,7 @@
 //! the picker, and body search. Listed by *what* rather than by milestone — the milestone tags
 //! this line used to carry stopped meaning anything once modules kept arriving after M1.
 
+pub mod capture;
 pub mod collection;
 pub mod curl;
 pub mod diff;

@@ -56,7 +56,7 @@ use crate::actions::{
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CommitRename, ConfirmClose,
     WorkspaceConfirm, WorkspaceDismiss,
-    EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev,
+    CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev,
     DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
@@ -244,6 +244,9 @@ fn register_keymap(cx: &mut App) {
         // the obvious key while `CancelRequest` had to settle for `escape`.
         KeyBinding::new("ctrl-c", CopyRowValue, Some("ResponsePane")),
         KeyBinding::new("alt-c", CopyRowPath, Some("ResponsePane")),
+        // Beside `alt-c`, because capturing *is* copying the path — into a rule rather than
+        // onto the clipboard. Scoped to the pane the row lives in, like both of its neighbours.
+        KeyBinding::new("alt-shift-c", CaptureValue, Some("ResponsePane")),
         KeyBinding::new("space", ToggleFold, Some("ResponsePane")),
         // Horizontal scrolling. `up`/`down` already move the row selection in this context, so
         // `left`/`right` moving the view across is the completion of that idiom rather than a

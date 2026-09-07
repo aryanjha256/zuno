@@ -77,6 +77,8 @@ pub fn palette() -> Vec<Command> {
         command("Show request headers", ShowHeadersTab),
         command("Show request params", ShowParamsTab),
         command("Show request body", ShowBodyTab),
+        command("Show request captures", ShowCaptureTab),
+        command("Capture a value from the response", AddCapture),
         command("Next request tab", NextRequestTab),
         command("Previous request tab", PrevRequestTab),
         command("Add multipart part", AddMultipartField),
@@ -138,6 +140,13 @@ const EXCLUDED: &[(&str, &str)] = &[
     // Same reasoning as `OpenAppMenu`: this menu exists so someone who does not know the
     // palette can find the workspace verbs, and all four are offered here already.
     ("zuno::OpenWorkspaceMenu", "a menu reached from the palette is backwards"),
+    // Acts on whichever response row is selected, which the palette cannot show you — the same
+    // reasoning as the collection panel's row verbs. `Capture a value from the response` is the
+    // entry point that *is* offered, and it adds an empty rule you fill in.
+    ("zuno::CaptureValue", "acts on the selected response row"),
+    // Acts on the focused capture row, and a palette row aimed at a target you cannot see is
+    // worse than no row. The lock in the table is the mouse path, and it teaches the keystroke.
+    ("zuno::ToggleCaptureSecret", "acts on the focused capture row"),
     // Only valid inside the environment editor, where they are already reachable — each has a
     // button, which is the mouse path the keyboard-only ones would otherwise lack.
     ("zuno::EnvNext", "only valid inside the environment editor"),

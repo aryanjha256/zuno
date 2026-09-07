@@ -16,8 +16,8 @@ use gpui::{
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext, BodyFindPrev,
     CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl, OpenBodyType,
-    OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest, ShowBodyTab, ShowHeadersTab,
-    ShowParamsTab,
+    AddCapture, OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest, ShowBodyTab,
+    ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
 };
 use crate::ui::{Icon, icon_button};
 use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind};
@@ -71,6 +71,17 @@ pub fn render(
                     .map(|search| body_find_bar(search, theme, cx)),
             )
             .child(body_region(view, theme, body_focused, window, cx)),
+        RequestTab::Capture => pane
+            .child(section_header(
+                "Capture",
+                count_label(
+                    view.captures.iter().filter(|row| row.enabled).count(),
+                    view.captures.len(),
+                ),
+                RowKind::Capture,
+                theme,
+            ))
+            .child(capture_table(view, theme, window, cx)),
     }
 }
 
@@ -121,6 +132,14 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
             body_label,
             active == RequestTab::Body,
             ShowBodyTab,
+            theme,
+            cx,
+        ))
+        .child(section_tab(
+            "request-tab-capture",
+            count_suffix("Capture", view.captures.len()),
+            active == RequestTab::Capture,
+            ShowCaptureTab,
             theme,
             cx,
         ))
@@ -441,6 +460,16 @@ fn add_control(kind: RowKind, theme: &Theme) -> gpui::AnyElement {
             theme,
         )
         .into_any_element(),
+        RowKind::Capture => crate::ui::icon_text_action(
+            "add-capture",
+            Icon::Plus,
+            "Add".into(),
+            "Capture a value from the response",
+            AddCapture,
+            theme.accent,
+            theme,
+        )
+        .into_any_element(),
         RowKind::Form => crate::ui::icon_text_action(
             "add-form-field",
             Icon::Plus,
@@ -508,9 +537,10 @@ fn rows_table(
         RowKind::Header => "hdr",
         RowKind::Query => "qry",
         RowKind::Form => "fld",
-        // Never reached: multipart goes through `multipart_table`, which labels each row by
-        // whether it is a file.
+        // Never reached: multipart goes through `multipart_table` and captures through
+        // `capture_table`, each of which labels its own rows.
         RowKind::Multipart => "prt",
+        RowKind::Capture => "cap",
     };
 
     div().flex().flex_col().children(
@@ -555,6 +585,12 @@ fn empty_table(kind: RowKind, theme: &Theme, window: &Window) -> Div {
         RowKind::Header => hint_row("headers", &[(&AddHeader, "to add")], theme, window),
         RowKind::Query => hint_row("query parameters", &[(&AddQuery, "to add")], theme, window),
         RowKind::Form => hint_row("fields", &[(&AddFormField, "to add")], theme, window),
+        RowKind::Capture => hint_row(
+            "captures",
+            &[(&AddCapture, "to add one")],
+            theme,
+            window,
+        ),
         RowKind::Multipart => hint_row(
             "parts",
             &[
@@ -565,6 +601,152 @@ fn empty_table(kind: RowKind, theme: &Theme, window: &Window) -> Div {
             window,
         ),
     }
+}
+
+/// The capture table. Separate from `rows_table` for a stronger reason than multipart's: the
+/// third column is a *lock*, not a value, and the two text columns mean path-then-name rather
+/// than the name-then-value every other table has.
+fn capture_table(
+    view: &RequestView,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    if view.captures.is_empty() {
+        return empty_table(RowKind::Capture, theme, window);
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .children(
+            view.captures
+                .iter()
+                .enumerate()
+                .map(|(ix, row)| capture_row(row, ix, theme, cx)),
+        )
+}
+
+fn capture_row(
+    row: &crate::request_view::CaptureRow,
+    ix: usize,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    let marker_color = if row.enabled {
+        theme.accent
+    } else {
+        theme.border
+    };
+    let text_color = if row.enabled {
+        theme.text
+    } else {
+        theme.text_muted
+    };
+    let (icon, hint) = if row.secret {
+        (Icon::Lock, "Secret — written to the gitignored file")
+    } else {
+        (Icon::LockOpen, "Written to the committed file")
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .hover(|style| style.bg(theme.bg_hover))
+        .font_family(theme.mono.clone())
+        .text_xs()
+        .text_color(text_color)
+        .child(
+            div()
+                .id(SharedString::from(format!("cap-toggle-{ix}")))
+                .flex_none()
+                .w(px(10.))
+                .h(px(10.))
+                .rounded_full()
+                .bg(marker_color)
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        view.toggle_row_at(RowKind::Capture, ix, cx)
+                    }),
+                ),
+        )
+        // Path first, because that is the half you copy out of the response and the half that
+        // can be wrong. The variable name is short and usually follows from it.
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(row.path.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(24.))
+                .text_color(theme.text_faint)
+                .child("→"),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(140.))
+                .overflow_hidden()
+                .text_color(theme.text_muted)
+                .child(row.name.clone()),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("cap-secret-{ix}")))
+                .debug_selector(move || format!("cap-secret-{ix}"))
+                .group(crate::ui::ICON_GROUP)
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover))
+                .tooltip({
+                    let hint = hint.to_string();
+                    move |_, cx| crate::ui::Tooltip::text(hint.clone(), cx)
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        view.toggle_capture_secret(ix, cx)
+                    }),
+                )
+                .child(crate::ui::glyph(
+                    icon,
+                    if row.secret { theme.accent } else { theme.text_muted },
+                    theme.text,
+                    12.,
+                )),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("cap-remove-{ix}")))
+                .debug_selector(move || format!("cap-remove-{ix}"))
+                .group(crate::ui::ICON_GROUP)
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        view.remove_row_at(RowKind::Capture, ix, cx)
+                    }),
+                )
+                .child(crate::ui::glyph(Icon::Close, theme.text_muted, theme.text, 12.)),
+        )
 }
 
 /// The multipart table. Separate from `rows_table` because the prefix is per *row* — a part

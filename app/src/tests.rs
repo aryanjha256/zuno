@@ -935,7 +935,8 @@ async fn clicking_add_in_a_section_header_adds_a_row_to_that_section(cx: &mut Te
     // sections differ only in which action they name — so asserting the *other* table stayed put
     // is what catches a wrong one being wired in.
     let (view, mut cx) = open_workspace(cx);
-    cx.simulate_keystrokes("alt-q");
+    // By name rather than by counting `alt-q` presses, which a new tab silently re-aims.
+    cx.dispatch_action(crate::actions::ShowHeadersTab);
     cx.run_until_parked();
 
     let headers_before = spec_of(&view, &mut cx).headers.len();
@@ -3998,12 +3999,14 @@ fn request_tab(
 
 #[gpui::test]
 async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
-    // Three tabs, so this cannot reuse the response pane's single toggling action. Cycle order
-    // is the visual order, deliberately not most-recently-used: with a fixed three-item strip,
-    // MRU means the same keystroke lands somewhere different each time.
+    // Four tabs, so this cannot reuse the response pane's single toggling action. Cycle order
+    // is the visual order, deliberately not most-recently-used: with a fixed strip, MRU means
+    // the same keystroke lands somewhere different each time.
     let (_, view, mut cx) = boot(cx, None, None);
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Body, "authoring is the default");
 
+    cx.simulate_keystrokes("alt-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Capture);
     cx.simulate_keystrokes("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers, "forward wraps past the end");
     cx.simulate_keystrokes("alt-q");
@@ -4049,7 +4052,7 @@ async fn the_request_tab_is_sticky_per_buffer(cx: &mut TestAppContext) {
     let (window, first, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
-    cx.simulate_keystrokes("alt-q");
+    cx.dispatch_action(crate::actions::ShowHeadersTab);
     assert_eq!(request_tab(&first, &mut cx), RequestTab::Headers);
 
     cx.simulate_keystrokes("ctrl-l ctrl-a");
@@ -5532,15 +5535,15 @@ async fn the_menu_offers_fold_only_on_a_container(cx: &mut TestAppContext) {
     // A scalar: two items, no fold.
     let scalar = cx.debug_bounds("response-row-2").expect("the inner row");
     right_click(&mut cx, scalar.center());
-    assert_eq!(menu_row_count(&mut cx), 2, "value and path, no fold on a scalar");
+    assert_eq!(menu_row_count(&mut cx), 3, "value, path and capture — no fold on a scalar");
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
 
-    // A container: three.
+    // A container: one more.
     let container = cx.debug_bounds("response-row-1").expect("the outer object's row");
     right_click(&mut cx, container.center());
     assert!(view.read_with(&cx, |view, _| view.selected_is_container()));
-    assert_eq!(menu_row_count(&mut cx), 3, "value, path, and fold on a container");
+    assert_eq!(menu_row_count(&mut cx), 4, "value, path, capture and fold on a container");
 }
 
 #[gpui::test]
@@ -5601,10 +5604,11 @@ async fn the_menu_is_keyboard_navigable_and_escape_does_not_cancel_the_request(
 
     let row = cx.debug_bounds("response-row-1").expect("the outer object's row");
     right_click(&mut cx, row.center());
-    assert_eq!(menu_row_count(&mut cx), 3);
+    // Copy value, Copy path, Capture as variable, Fold.
+    assert_eq!(menu_row_count(&mut cx), 4);
 
-    // Third row is Fold. Arrow down twice and confirm.
-    cx.simulate_keystrokes("down down enter");
+    // Last row is Fold. Arrow down to it and confirm.
+    cx.simulate_keystrokes("down down down enter");
     cx.run_until_parked();
 
     assert!(!menu_is_open(&window, &mut cx), "confirming closes the menu");
@@ -8475,12 +8479,16 @@ async fn the_response_row_menu_names_its_keystrokes_too(cx: &mut TestAppContext)
     let details = window
         .update(&mut cx, |workspace, _, cx| workspace.menu_details(cx))
         .expect("window");
-    // Row 1 is the `outer` container, so Fold applies and is offered — all three scoped.
+    // Row 1 is the `outer` container, so Fold applies and is offered — all four scoped, and
+    // every one of them names a key. A blank column here is the failure this test exists for:
+    // `bindings_for_action` finds only *globally* bound actions, so a scoped verb reads as
+    // unbound unless the lookup goes through the focus handle.
     assert_eq!(
         details,
         [
             ("Copy value".to_string(), "Ctrl+C".to_string()),
             ("Copy path".to_string(), "Alt+C".to_string()),
+            ("Capture as variable".to_string(), "Alt+Shift+C".to_string()),
             ("Fold".to_string(), "Space".to_string()),
         ]
     );
@@ -9451,6 +9459,340 @@ async fn writing_a_global_from_the_editor_updates_the_badge(cx: &mut TestAppCont
     // a cache nobody refreshes reports the old answer forever, and looks exactly like a badge
     // that simply doesn't work.
     assert_eq!(badge(&mut cx).as_ref(), "globals");
+
+    remove_scratch(&mut cx, &root);
+}
+
+// --- Request chaining -------------------------------------------------------------------
+//
+// The rule lives on the request that *produces* the value, so the consumer side needs nothing:
+// `{{token}}` is an ordinary variable the resolver already handles.
+
+/// Add a capture to the active buffer and send, waiting for the write to land.
+fn capture_and_send(
+    cx: &mut VisualTestContext,
+    view: &gpui::Entity<RequestView>,
+    url: &str,
+    path: &str,
+    name: &str,
+) {
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(url);
+
+    cx.dispatch_action(crate::actions::AddCapture);
+    cx.simulate_input(path);
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input(name);
+
+    send_and_wait(cx, view, 200);
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+async fn a_capture_publishes_into_the_selected_environment(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("capture-writes");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    let url = serve_sequence(&[(200, r#"{"access_token":"abc123","expires_in":3600}"#)]);
+    capture_and_send(&mut cx, &view, &url, "$.access_token", "token");
+
+    wait_for(&mut cx, "the capture to land", |_| {
+        let local = std::fs::read_to_string(root.join("environments/dev.local.json")).ok()?;
+        local.contains("abc123").then_some(local)
+    });
+
+    // Secret by default, so the token lands in the gitignored half without anyone remembering
+    // to say so. The failure directions are not symmetric.
+    let committed = std::fs::read_to_string(root.join("environments/dev.json")).expect("read");
+    assert!(!committed.contains("abc123"), "the token stayed out of git: {committed}");
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn a_captured_value_resolves_in_the_next_request(cx: &mut TestAppContext) {
+    // The whole point, asserted at the wire: this is a client-credentials flow in miniature.
+    let (session, root) = scratch_collection("capture-chain");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (window, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    let auth = serve_sequence(&[(200, r#"{"access_token":"abc123"}"#)]);
+    capture_and_send(&mut cx, &view, &auth, "$.access_token", "token");
+    wait_for(&mut cx, "the capture to land", |_| {
+        let local = std::fs::read_to_string(root.join("environments/dev.local.json")).ok()?;
+        local.contains("abc123").then_some(local)
+    });
+
+    // Second request, in a second buffer, carrying the header that uses it.
+    let (echo, received) = serve_capturing(
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+    );
+    cx.simulate_keystrokes("ctrl-t");
+    let next = active_view(&window, &mut cx);
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&echo);
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.simulate_input("Authorization");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("Bearer {{token}}");
+    send_and_wait(&mut cx, &next, 200);
+
+    let text = received.join().expect("server thread");
+    assert!(
+        text.contains("authorization: Bearer abc123"),
+        "the captured token has to reach the wire: {text}"
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn a_capture_does_not_run_on_a_failed_response(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("capture-failure");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    // An error body has fields too. Publishing one into `{{token}}` produces a chain that fails
+    // on the *next* request, which is the hardest kind to read back to its cause.
+    let url = serve_sequence(&[(401, r#"{"access_token":"nope"}"#)]);
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    cx.dispatch_action(crate::actions::AddCapture);
+    cx.simulate_input("$.access_token");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("token");
+    send_and_wait(&mut cx, &view, 401);
+    cx.run_until_parked();
+
+    assert!(!root.join("environments/dev.local.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join("environments/dev.json")).expect("read"),
+        "{}",
+        "nothing was written at all"
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn a_capture_that_matches_nothing_says_so_rather_than_writing_empty(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("capture-miss");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    let url = serve_sequence(&[(200, r#"{"something_else":1}"#)]);
+    capture_and_send(&mut cx, &view, &url, "$.access_token", "token");
+
+    // An empty `{{token}}` would send `Bearer ` and fail one request later with a 401 that
+    // points at the wrong thing entirely.
+    let status = wait_for(&mut cx, "the miss to be reported", |cx| {
+        cx.update(|_, cx| view.read(cx).status.clone())
+    });
+    assert!(status.contains("$.access_token"), "names the path that missed: {status}");
+    assert!(!root.join("environments/dev.local.json").exists());
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn capturing_from_a_response_row_publishes_it_immediately(cx: &mut TestAppContext) {
+    // **This test used to assert only the rule**, which is true whether or not the value is ever
+    // published — and it passed for a slice against a path that authored the rule and then did
+    // nothing, silently, until the next send. The file is the assertion that separates the two.
+    let (session, root) = scratch_collection("capture-row-publish");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    let url = serve_sequence(&[(200, r#"{"data":{"access_token":"abc"}}"#)]);
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    cx.run_until_parked();
+
+    // Select the token row and capture it. The path comes from `path_to` — the same function
+    // behind `Alt+C` — so it is right by construction rather than typed twice.
+    let row = cx.debug_bounds("response-row-2").expect("the token row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.simulate_keystrokes("alt-shift-c");
+    cx.run_until_parked();
+
+    let spec = spec_of(&view, &mut cx);
+    assert_eq!(spec.captures.len(), 1);
+    assert_eq!(spec.captures[0].path, "$.data.access_token");
+    assert_eq!(spec.captures[0].name, "access_token", "suggested from the last segment");
+    assert!(spec.captures[0].secret);
+    assert_eq!(
+        request_tab(&view, &mut cx),
+        crate::request_view::RequestTab::Capture,
+        "and it reveals the tab, or the rule is authored somewhere you cannot see",
+    );
+
+    // The half that was missing: the value is in the outline you just clicked, so no second
+    // send should be needed to get it out.
+    let local = wait_for(&mut cx, "the value to be published", |_| {
+        let text = std::fs::read_to_string(root.join("environments/dev.local.json")).ok()?;
+        text.contains("abc").then_some(text)
+    });
+    assert!(local.contains("access_token"), "{local}");
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn capturing_a_row_publishes_into_the_environment_selected_now(cx: &mut TestAppContext) {
+    // `capture_target` is set when a request goes *out*, so reusing it here would publish into
+    // whichever environment was live at send time — not the one you have since switched to.
+    let (session, root) = scratch_collection("capture-row-switch");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+    std::fs::write(root.join("environments/prod.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter"); // dev
+
+    let url = serve_sequence(&[(200, r#"{"access_token":"abc"}"#)]);
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    cx.run_until_parked();
+
+    // Switch after sending, then capture.
+    cx.simulate_keystrokes("ctrl-e down down enter"); // prod
+    let row = cx.debug_bounds("response-row-1").expect("the token row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.simulate_keystrokes("alt-shift-c");
+
+    wait_for(&mut cx, "prod to receive it", |_| {
+        let text = std::fs::read_to_string(root.join("environments/prod.local.json")).ok()?;
+        text.contains("abc").then_some(text)
+    });
+    assert!(
+        !root.join("environments/dev.local.json").exists(),
+        "the environment left behind must not receive it",
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn capturing_from_a_retained_run_says_why_it_will_not(cx: &mut TestAppContext) {
+    // Publishing from history is refused for the same reason a send from history is — the token
+    // on screen is expired. What was wrong before was doing it *silently*: every other refusal
+    // in `run_captures` names itself, and this was the one path that said nothing at all.
+    let (session, root) = scratch_collection("capture-row-history");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    let url = serve_sequence(&[
+        (200, r#"{"access_token":"first"}"#),
+        (200, r#"{"access_token":"second"}"#),
+    ]);
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    cx.run_until_parked();
+    send_and_wait(&mut cx, &view, 200);
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-h down enter");
+    cx.run_until_parked();
+    assert_eq!(viewing(&view, &mut cx), 1, "the older run is on screen");
+
+    let row = cx.debug_bounds("response-row-1").expect("the token row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.simulate_keystrokes("alt-shift-c");
+    cx.run_until_parked();
+
+    let status = wait_for(&mut cx, "the refusal", |cx| {
+        cx.update(|_, cx| view.read(cx).status.clone())
+    });
+    assert!(status.contains("retained run"), "must say why: {status}");
+    assert!(!root.join("environments/dev.local.json").exists());
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn captures_survive_a_save_and_reopen(cx: &mut TestAppContext) {
+    // `spec` derives from the inputs, so anything the rows cannot represent is destroyed on
+    // save — the trap `preserved_body` was removed to make impossible. A capture is the newest
+    // thing that could fall into it.
+    let (session, root) = scratch_collection("capture-round-trip");
+    let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/token");
+    cx.dispatch_action(crate::actions::AddCapture);
+    cx.simulate_input("$.access_token");
+    cx.simulate_keystrokes("tab");
+    cx.simulate_input("token");
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+
+    let saved = collection_files(&root);
+    let file = saved.first().expect("a saved request");
+    let text = std::fs::read_to_string(root.join(file)).expect("read");
+    assert!(text.contains("$.access_token"), "the rule reached the file: {text}");
+
+    let _ = view;
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn browsing_the_history_does_not_republish_an_old_capture(cx: &mut TestAppContext) {
+    // `index_body` runs again when you pick a retained run, and captures hang off it. Without a
+    // guard, *looking at* a response from three sends ago quietly rewrites the environment with
+    // its expired token — and the next request then fails for a reason nothing on screen names.
+    let (session, root) = scratch_collection("capture-history");
+    std::fs::create_dir_all(root.join("environments")).expect("scratch");
+    std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
+
+    let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-e down enter");
+
+    let url = serve_sequence(&[
+        (200, r#"{"access_token":"first"}"#),
+        (200, r#"{"access_token":"second"}"#),
+    ]);
+    capture_and_send(&mut cx, &view, &url, "$.access_token", "token");
+    wait_for(&mut cx, "the first capture", |_| {
+        let local = std::fs::read_to_string(root.join("environments/dev.local.json")).ok()?;
+        local.contains("first").then_some(local)
+    });
+
+    send_and_wait(&mut cx, &view, 200);
+    wait_for(&mut cx, "the second capture", |_| {
+        let local = std::fs::read_to_string(root.join("environments/dev.local.json")).ok()?;
+        local.contains("second").then_some(local)
+    });
+
+    // Now look at the older run.
+    cx.simulate_keystrokes("ctrl-h down enter");
+    cx.run_until_parked();
+    assert_eq!(viewing(&view, &mut cx), 1, "the older run is on screen");
+
+    let local = std::fs::read_to_string(root.join("environments/dev.local.json")).expect("read");
+    assert!(local.contains("second"), "the live token is untouched: {local}");
+    assert!(!local.contains("first"), "and the expired one was not put back: {local}");
 
     remove_scratch(&mut cx, &root);
 }
