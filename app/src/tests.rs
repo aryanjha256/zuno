@@ -3178,6 +3178,31 @@ fn settings_open(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestCont
         .expect("window")
 }
 
+/// Move the settings panel's selection onto a named row.
+///
+/// **By name, not by counting `down` presses from the top** — which is how these tests were
+/// written, and a new row at index 0 silently re-aimed every one of them at its neighbour. The
+/// scope row is that new row; the next one will be too.
+fn select_setting(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+    label: &str,
+) {
+    let rows = settings_rows(window, cx);
+    let target = rows
+        .iter()
+        .position(|row| row.starts_with(label))
+        .unwrap_or_else(|| panic!("no settings row starting with {label:?}"));
+    let current = window
+        .update(cx, |workspace, _, cx| workspace.setting_selection(cx))
+        .expect("window");
+
+    let key = if target > current { "down" } else { "up" };
+    for _ in 0..target.abs_diff(current) {
+        cx.simulate_keystrokes(key);
+    }
+}
+
 /// The value shown for a settings row, by label prefix.
 fn setting_value(
     window: &gpui::WindowHandle<Workspace>,
@@ -3222,7 +3247,7 @@ async fn toggling_a_setting_reaches_the_spec_that_gets_sent(cx: &mut TestAppCont
     assert!(spec_of(&view, &mut cx).settings.cookie_store);
 
     cx.simulate_keystrokes("ctrl-,");
-    // Cookies is the first row, so Enter toggles it without moving.
+    select_setting(&window, &mut cx, "Store and replay cookies");
     cx.simulate_keystrokes("enter");
 
     assert!(
@@ -3262,7 +3287,9 @@ async fn an_edit_survives_dismissing_the_panel(cx: &mut TestAppContext) {
     // There is no OK/Cancel here, so Esc must not silently discard what you changed.
     let (window, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-, enter escape");
+    cx.simulate_keystrokes("ctrl-,");
+    select_setting(&window, &mut cx, "Store and replay cookies");
+    cx.simulate_keystrokes("enter escape");
     assert!(!settings_open(&window, &mut cx));
     assert!(!spec_of(&view, &mut cx).settings.cookie_store);
 
@@ -3277,16 +3304,15 @@ async fn arrows_step_the_numeric_settings_within_bounds(cx: &mut TestAppContext)
     let (window, view, mut cx) = boot(cx, None, None);
     cx.simulate_keystrokes("ctrl-,");
 
-    // Down three times: cookies -> tls -> redirects -> max hops.
-    cx.simulate_keystrokes("down down down");
+    select_setting(&window, &mut cx, "Maximum redirect hops");
     cx.simulate_keystrokes("right");
     assert_eq!(setting_value(&window, &mut cx, "Maximum redirect hops"), "11");
     cx.simulate_keystrokes("left left");
     assert_eq!(setting_value(&window, &mut cx, "Maximum redirect hops"), "9");
     assert_eq!(spec_of(&view, &mut cx).settings.max_redirects, 9);
 
-    // Timeout is two rows further down, and steps in 5s.
-    cx.simulate_keystrokes("down down");
+    // Steps in 5s.
+    select_setting(&window, &mut cx, "Timeout");
     cx.simulate_keystrokes("right");
     assert_eq!(setting_value(&window, &mut cx, "Timeout"), "35s");
 
@@ -3312,10 +3338,12 @@ async fn the_selection_wraps_in_both_directions(cx: &mut TestAppContext) {
             .expect("window")
     };
 
+    let last = settings_rows(&window, &mut cx).len() - 1;
     assert_eq!(selection(&mut cx), 0);
-    // Up from the first row must wrap rather than underflow a usize.
+    // Up from the first row must wrap rather than underflow a usize. Derived from the row count
+    // rather than written as a literal, which a new row silently invalidates.
     cx.simulate_keystrokes("up");
-    assert_eq!(selection(&mut cx), 6);
+    assert_eq!(selection(&mut cx), last);
     cx.simulate_keystrokes("down");
     assert_eq!(selection(&mut cx), 0);
 }
@@ -3333,7 +3361,9 @@ async fn the_status_bar_says_when_cookies_are_on(cx: &mut TestAppContext) {
 
     assert!(cookies_on(&mut cx), "on by default, matching the engine");
 
-    cx.simulate_keystrokes("ctrl-, enter escape");
+    cx.simulate_keystrokes("ctrl-,");
+    select_setting(&window, &mut cx, "Store and replay cookies");
+    cx.simulate_keystrokes("enter escape");
     assert!(!cookies_on(&mut cx), "the indicator must follow the setting");
 }
 
@@ -3365,7 +3395,9 @@ async fn settings_are_per_request_not_global(cx: &mut TestAppContext) {
     // environments has to solve, so this deliberately edits one buffer only.
     let (window, first, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-, enter escape");
+    cx.simulate_keystrokes("ctrl-,");
+    select_setting(&window, &mut cx, "Store and replay cookies");
+    cx.simulate_keystrokes("enter escape");
     assert!(!spec_of(&first, &mut cx).settings.cookie_store);
 
     cx.simulate_keystrokes("ctrl-t");
@@ -3385,8 +3417,9 @@ async fn settings_survive_a_save_and_reopen(cx: &mut TestAppContext) {
 
     cx.simulate_keystrokes("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/insecure");
-    // Row 1 is Verify TLS.
-    cx.simulate_keystrokes("ctrl-, down enter escape");
+    cx.simulate_keystrokes("ctrl-,");
+    select_setting(&window, &mut cx, "Verify TLS certificates");
+    cx.simulate_keystrokes("enter escape");
     cx.simulate_keystrokes("ctrl-s");
 
     let bytes = std::fs::read(root.join("insecure.json")).expect("read");
@@ -4692,6 +4725,9 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("hint-commands", "zuno::OpenPalette"),
         ("hint-env", "zuno::SwitchEnvironment"),
         ("hint-send", "zuno::SendRequest"),
+        // App-level, so it lives in the titlebar rather than in the request pane, whose own gear
+        // is `action-settings` above and edits the request in front of you.
+        ("defaults-settings", "zuno::OpenDefaults"),
         ("theme-toggle", "zuno::ToggleTheme"),
         ("fold-all", "zuno::FoldAll"),
         ("unfold-all", "zuno::UnfoldAll"),
@@ -9795,4 +9831,120 @@ async fn browsing_the_history_does_not_republish_an_old_capture(cx: &mut TestApp
     assert!(!local.contains("first"), "and the expired one was not put back: {local}");
 
     remove_scratch(&mut cx, &root);
+}
+
+// --- Global settings defaults -----------------------------------------------------------
+//
+// The panel edits two scopes now: the buffer's own settings, and what a new request starts
+// from. `app.json` holds the second.
+
+#[gpui::test]
+async fn the_defaults_panel_does_not_touch_this_request(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    assert!(spec_of(&view, &mut cx).settings.verify_tls, "on by default");
+
+    // A different trigger, not a scope row: the titlebar's gear is app-level furniture, so
+    // where it lives is what says what it changes.
+    cx.simulate_keystrokes("ctrl-shift-,");
+    select_setting(&window, &mut cx, "Verify TLS certificates");
+    cx.simulate_keystrokes("enter");
+
+    // The open buffer must not move. Its settings live in its own collection file, and shifting
+    // them under it would change what a saved request means.
+    assert!(
+        spec_of(&view, &mut cx).settings.verify_tls,
+        "editing the defaults must leave this request alone"
+    );
+    assert_eq!(setting_value(&window, &mut cx, "Verify TLS certificates"), "off");
+}
+
+#[gpui::test]
+async fn a_new_tab_starts_from_the_defaults(cx: &mut TestAppContext) {
+    // The point of the whole layer: work against a self-signed dev box and you turn TLS
+    // verification off once, not on every request you open for the rest of the week.
+    let (window, first, mut cx) = boot(cx, None, None);
+    // `boot` installs no registry, and the defaults live in it — so without this `set_defaults`
+    // returns early and the test would pass or fail on whatever is in the developer's own
+    // `app.json`. `None` for the directory keeps the write in memory (invariant 6).
+    cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
+
+    cx.simulate_keystrokes("ctrl-shift-,");
+    select_setting(&window, &mut cx, "Verify TLS certificates");
+    cx.simulate_keystrokes("enter escape");
+
+    assert!(spec_of(&first, &mut cx).settings.verify_tls, "the existing buffer is untouched");
+
+    cx.simulate_keystrokes("ctrl-t");
+    let fresh = active_view(&window, &mut cx);
+    assert!(
+        !spec_of(&fresh, &mut cx).settings.verify_tls,
+        "a new tab has to start from the defaults, or the layer does nothing"
+    );
+}
+
+#[gpui::test]
+async fn defaults_survive_a_restart(cx: &mut TestAppContext) {
+    // They live in `app.json` beside the workspace registry, so this is also a check that the
+    // field did not have to bump the format: a *required* field there would make `read` discard
+    // an existing file whole, taking every registered workspace with it.
+    let config = scratch_dir("defaults-restart");
+    let root = config.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    cx.update(|cx| {
+        crate::app_state::install_at(
+            cx,
+            Some(config.clone()),
+            vec![crate::app_state::WorkspaceEntry {
+                id: "default".into(),
+                path: root.clone(),
+            }],
+        );
+    });
+
+    let settings = zuno_core::RequestSettings {
+        verify_tls: false,
+        ..Default::default()
+    };
+    cx.update(|cx| crate::app_state::set_defaults(cx, settings));
+
+    // Reading the same directory back from disk is what a restart is.
+    cx.update(|cx| crate::app_state::install_from_disk_for_test(cx, config.clone()));
+
+    let back = cx.update(|cx| crate::app_state::defaults(cx));
+    assert!(!back.verify_tls, "the defaults have to come back from disk");
+
+    std::fs::remove_dir_all(&config).ok();
+}
+
+#[gpui::test]
+async fn an_app_file_from_before_defaults_still_loads_its_workspaces(cx: &mut TestAppContext) {
+    // The failure this guards is silent and total: `read` discards an `app.json` it cannot
+    // deserialize, so a required `defaults` would have thrown away every registered workspace
+    // of every existing install and looked like a first run.
+    let config = scratch_dir("defaults-legacy");
+    std::fs::create_dir_all(&config).expect("mkdir");
+    let root = config.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    std::fs::write(
+        config.join("app.json"),
+        format!(
+            r#"{{"version":1,"theme":"dark","last":"default","workspaces":[{{"id":"default","path":{}}}]}}"#,
+            serde_json::to_string(&root).expect("path")
+        ),
+    )
+    .expect("write");
+
+    cx.update(|cx| crate::app_state::install_from_disk_for_test(cx, config.clone()));
+
+    let registered = cx.update(|cx| crate::app_state::workspaces(cx));
+    assert_eq!(registered.len(), 1, "the registry must survive the new field");
+    assert_eq!(registered[0].id, "default");
+    assert!(
+        cx.update(|cx| crate::app_state::defaults(cx)).verify_tls,
+        "and a file with no defaults reads Zuno's own",
+    );
+
+    std::fs::remove_dir_all(&config).ok();
 }

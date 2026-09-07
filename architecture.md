@@ -2101,10 +2101,26 @@ Two things the settings panel turned up that are worth knowing before touching e
   `spec(cx)` precisely because "a panel that edits a copy nothing reads would look identical on
   screen", and then no equivalent test was written for the click. That asymmetry is the lesson:
   **a convention checked only on the path that already worked proves nothing about the other one.**
-- **Settings are per-request, and stay that way for now.** `RequestSettings` lives on `RequestSpec`,
-  so it already persists per collection file. A global-defaults layer needs a scope model
-  (global → environment → request) — the same one environments has to build in M3 — and doing it
-  twice would mean throwing one away.
+- ~~**Settings are per-request, and stay that way for now.**~~ **Two scopes now.** The claim
+  above was that a defaults layer needed a global → environment → request scope model, "the same
+  one environments has to build". It needed **two of those three**: `app.json` holds one
+  `RequestSettings` that a new request starts from, and the request holds its own. There is no
+  middle layer, because nothing anyone has asked for varies a timeout *by environment* while
+  varying it by request — environments carry values, not policy. Dropping the layer that was
+  never wanted is what turned this from a blocked design into one panel row.
+
+  **Two triggers, not a scope row.** `Ctrl+,` and the request pane's gear edit the buffer in
+  front of you; `Ctrl+Shift+,` and a gear in the titlebar edit the defaults. The first build put
+  a scope row inside one panel, and it needed the header *and* that row to both spell out which
+  set was live — a design arguing with itself. Where a gear lives says what it changes, so the
+  titlebar's sits in the app's own furniture and the pane's stays with the request. The panel is
+  one entity either way; it holds one `RequestSettings` and a `Scope` saying where to write it.
+
+  Applied wherever the app makes a request rather than loading one: a new tab, the buffer that
+  replaces the last closed one, the OpenAPI spec **fetch** — which is the case that earns it most,
+  since a spec served from the same self-signed box as the API cannot be downloaded without it —
+  and the requests an import writes, because fixing TLS on forty files one at a time is the same
+  papercut multiplied. Never applied to a request read from a file: its settings are in it.
 
 ---
 

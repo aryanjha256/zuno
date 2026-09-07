@@ -23,6 +23,7 @@ use zuno_core::collection::{Node, NodeKind};
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
     AddCapture, CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNewEnvironment,
+    OpenDefaults,
     EnvNewVariable, EnvNext, ShowCaptureTab, ToggleCaptureSecret,
     EnvPrev, EnvRemoveVariable, EnvRenameEnvironment, EnvToggleSecret, EnvTrashEnvironment,
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
@@ -48,7 +49,7 @@ use crate::actions::{
 use crate::engine::ActiveEngine;
 use crate::context_menu;
 use crate::picker;
-use crate::settings_panel::{SettingsEvent, SettingsPanel};
+use crate::settings_panel::{Scope, SettingsEvent, SettingsPanel};
 use crate::request_view::{BodyType, RequestTab, RequestView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
@@ -613,6 +614,7 @@ impl Workspace {
     fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         let spec = RequestSpec {
             id: self.next_id(cx),
+            settings: crate::app_state::defaults(cx),
             ..RequestSpec::default()
         };
         self.open(spec, window, cx);
@@ -752,7 +754,10 @@ impl Workspace {
         self.views.remove(self.active_ix);
 
         if self.views.is_empty() {
-            let spec = RequestSpec::default();
+            let spec = RequestSpec {
+                settings: crate::app_state::defaults(cx),
+                ..RequestSpec::default()
+            };
             self.open(spec, window, cx);
             return;
         }
@@ -2100,10 +2105,13 @@ impl Workspace {
             return;
         };
 
+        // A spec served from the same self-signed box as the API cannot be fetched without the
+        // same TLS setting, which is arguably where this layer earns most.
         let spec = RequestSpec {
             id: RequestId(0),
             url: source.clone(),
             method: zuno_core::Method::Get,
+            settings: crate::app_state::defaults(cx),
             ..RequestSpec::default()
         };
         let (_job, events) = engine.send(spec);
@@ -2161,6 +2169,9 @@ impl Workspace {
         // Everything lands under one folder named for the spec, so an import is a thing you can
         // find and a thing you can delete. Without it a hundred requests scatter through a
         // collection someone had already organised.
+        // Stamped into the written files: fixing TLS on forty imported requests one at a time
+        // is the papercut this layer exists to remove.
+        let defaults = crate::app_state::defaults(cx);
         let title = import.title.clone().unwrap_or_else(|| "imported".to_string());
         let base = root.join(collection::slug(&title));
 
@@ -2175,8 +2186,12 @@ impl Workspace {
             };
             // `allocate` creates the directory and picks a free name, so re-importing the same
             // spec adds `-2` files rather than overwriting a request someone has since edited.
-            match collection::allocate(&directory, &request.spec.name)
-                .and_then(|path| collection::write(&path, &request.spec).map(|()| path))
+            let spec = RequestSpec {
+                settings: defaults.clone(),
+                ..request.spec.clone()
+            };
+            match collection::allocate(&directory, &spec.name)
+                .and_then(|path| collection::write(&path, &spec).map(|()| path))
             {
                 Ok(_) => written += 1,
                 Err(_) => failures += 1,
@@ -2827,7 +2842,32 @@ impl Workspace {
 
         let settings = view.read(cx).settings.clone();
         let restore = Some(view.read(cx).url_focus(cx));
-        let panel = cx.new(|cx| SettingsPanel::new(settings, restore, cx));
+        self.show_settings(Scope::Request, settings, restore, window, cx);
+    }
+
+    /// The titlebar's gear: what a *new* request starts from.
+    ///
+    /// A separate trigger rather than a scope row inside `Ctrl+,`, because where a gear lives is
+    /// what says what it changes — one in the request pane that could also rewrite app state
+    /// needed both the header and a row to say so, which is a design arguing with itself.
+    fn open_defaults(&mut self, _: &OpenDefaults, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let settings = crate::app_state::defaults(cx);
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        self.show_settings(Scope::Defaults, settings, restore, window, cx);
+    }
+
+    fn show_settings(
+        &mut self,
+        scope: Scope,
+        settings: zuno_core::RequestSettings,
+        restore: Option<gpui::FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = cx.new(|cx| SettingsPanel::new(scope, settings, restore, cx));
 
         let subscription =
             cx.subscribe_in(&panel, window, |workspace, _, event, window, cx| match event {
@@ -2861,14 +2901,26 @@ impl Workspace {
     /// Written back on every change rather than on close, so dismissing with Esc keeps what
     /// you changed — there is no OK/Cancel here, and a modal that silently discards edits on
     /// Esc is worse than one that has no Esc.
+    /// Write back whichever scope was edited.
+    ///
+    /// Dispatched rather than writing both, because the defaults live in `app.json` and every
+    /// left/right press comes through here — committing both would put a file write behind each
+    /// keystroke to change a per-request timeout.
     fn commit_settings(&mut self, cx: &mut Context<Self>) {
         let Some(state) = &self.settings else { return };
-        let Some(view) = self.active() else { return };
-        let settings = state.panel.read(cx).settings().clone();
-        view.update(cx, |view, cx| {
-            view.settings = settings;
-            cx.notify();
-        });
+        let panel = state.panel.clone();
+
+        let settings = panel.read(cx).settings().clone();
+        match panel.read(cx).scope() {
+            Scope::Request => {
+                let Some(view) = self.active() else { return };
+                view.update(cx, |view, cx| {
+                    view.settings = settings;
+                    cx.notify();
+                });
+            }
+            Scope::Defaults => crate::app_state::set_defaults(cx, settings),
+        }
     }
 
     fn setting_next(&mut self, _: &SettingNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -2937,6 +2989,14 @@ impl Workspace {
     #[cfg(test)]
     pub fn settings_is_open(&self) -> bool {
         self.settings.is_some()
+    }
+
+    #[cfg(test)]
+    pub fn setting_selection(&self, cx: &App) -> usize {
+        self.settings
+            .as_ref()
+            .map(|state| state.panel.read(cx).selection())
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -4135,6 +4195,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::open_defaults))
             .on_action(cx.listener(Self::setting_next))
             .on_action(cx.listener(Self::setting_prev))
             .on_action(cx.listener(Self::setting_increase))

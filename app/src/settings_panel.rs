@@ -6,11 +6,11 @@
 //! content encodings — which makes it the best capability-per-line work left (ROADMAP
 //! principle 3). ROADMAP claims six; counting them, it's five.
 //!
-//! **Per-request, deliberately.** `RequestSettings` lives on `RequestSpec`, so it's already
-//! per-request and already persisted per collection file. A global-defaults layer would need
-//! a scope model (global → environment → request), which is the *same* problem environments
-//! has to solve in M3 — building a second one here would mean throwing one away. So: this
-//! edits the active buffer only, and the panel says so.
+//! **Two scopes, chosen by the trigger, not by a row.** The request pane's gear (`Ctrl+,`) edits
+//! the active buffer's settings; the titlebar's edits the set in `app.json` a *new* request starts
+//! from. Where a gear lives is what says what it changes — a scope row inside one panel needed
+//! the header *and* the row to both spell it out, which is a design arguing with itself. Why
+//! there is no per-environment layer between the two is in architecture.md §11.
 //!
 //! **Cookies are the reason this can't be pure UI.** `cookie_store` is part of the engine's
 //! `ClientKey`, so toggling it off routes through a different cached client rather than
@@ -36,6 +36,31 @@ const TIMEOUT_MIN_SECS: u64 = 1;
 const TIMEOUT_MAX_SECS: u64 = 600;
 /// Redirect hops. reqwest takes a `u8`, and beyond this a loop is the likelier explanation.
 const MAX_REDIRECTS_CEILING: u8 = 50;
+
+/// Which set of settings the panel is editing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The active buffer's own, stored in its collection file.
+    Request,
+    /// What a new request starts from, stored in `app.json`.
+    Defaults,
+}
+
+impl Scope {
+    fn title(self) -> &'static str {
+        match self {
+            Scope::Request => "Request settings",
+            Scope::Defaults => "Default request settings",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Scope::Request => "Applies to this request only",
+            Scope::Defaults => "Applies to new requests, not to existing ones",
+        }
+    }
+}
 
 /// Which row the keyboard is on.
 ///
@@ -110,6 +135,7 @@ impl gpui::EventEmitter<SettingsEvent> for SettingsPanel {}
 
 pub struct SettingsPanel {
     focus_handle: FocusHandle,
+    scope: Scope,
     settings: RequestSettings,
     selected: usize,
     /// Where focus was when the panel opened, so dismissing puts it back. Same failure as
@@ -123,6 +149,7 @@ pub struct SettingsPanel {
 
 impl SettingsPanel {
     pub fn new(
+        scope: Scope,
         settings: RequestSettings,
         restore_focus: Option<FocusHandle>,
         cx: &mut Context<Self>,
@@ -134,6 +161,7 @@ impl SettingsPanel {
             // `tab_stop(false)` call that was never here. The default is *why* Tab used to escape
             // the panel entirely; `Workspace::modal_open` is what stops it now.)
             focus_handle: cx.focus_handle(),
+            scope,
             settings,
             selected: 0,
             restore_focus,
@@ -149,9 +177,17 @@ impl SettingsPanel {
         self.restore_focus.clone()
     }
 
-    /// The edited settings, for the workspace to write back onto the buffer.
+    pub fn scope(&self) -> Scope {
+        self.scope
+    }
+
+    /// The edited settings, for the workspace to write back to whichever place `scope` names.
     pub fn settings(&self) -> &RequestSettings {
         &self.settings
+    }
+
+    fn settings_mut(&mut self) -> &mut RequestSettings {
+        &mut self.settings
     }
 
     fn row(&self) -> Row {
@@ -172,25 +208,25 @@ impl SettingsPanel {
         let changed = match self.row() {
             // A toggle ignores direction: left and right both flip it, which is what every
             // keyboard-driven settings list does.
-            Row::CookieStore => flip(&mut self.settings.cookie_store),
-            Row::VerifyTls => flip(&mut self.settings.verify_tls),
-            Row::FollowRedirects => flip(&mut self.settings.follow_redirects),
-            Row::AcceptEncodings => flip(&mut self.settings.accept_encodings),
+            Row::CookieStore => flip(&mut self.settings_mut().cookie_store),
+            Row::VerifyTls => flip(&mut self.settings_mut().verify_tls),
+            Row::FollowRedirects => flip(&mut self.settings_mut().follow_redirects),
+            Row::AcceptEncodings => flip(&mut self.settings_mut().accept_encodings),
             Row::MaxRedirects => {
-                let next = (self.settings.max_redirects as i64 + delta)
+                let next = (self.settings().max_redirects as i64 + delta)
                     .clamp(0, MAX_REDIRECTS_CEILING as i64) as u8;
-                std::mem::replace(&mut self.settings.max_redirects, next) != next
+                std::mem::replace(&mut self.settings_mut().max_redirects, next) != next
             }
             Row::Timeout => {
                 let current = self
-                    .settings
+                    .settings()
                     .timeout
                     .map(|timeout| timeout.as_secs())
                     .unwrap_or(0);
                 let next = (current as i64 + delta * TIMEOUT_STEP_SECS as i64)
                     .clamp(TIMEOUT_MIN_SECS as i64, TIMEOUT_MAX_SECS as i64) as u64;
                 let next = Some(Duration::from_secs(next));
-                std::mem::replace(&mut self.settings.timeout, next) != next
+                std::mem::replace(&mut self.settings_mut().timeout, next) != next
             }
             // Not a value; Enter is its verb.
             Row::ClearCookies => false,
@@ -217,12 +253,12 @@ impl SettingsPanel {
     fn value(&self, row: Row) -> SharedString {
         let on_off = |on: bool| if on { "on" } else { "off" };
         match row {
-            Row::CookieStore => on_off(self.settings.cookie_store).into(),
-            Row::VerifyTls => on_off(self.settings.verify_tls).into(),
-            Row::FollowRedirects => on_off(self.settings.follow_redirects).into(),
-            Row::AcceptEncodings => on_off(self.settings.accept_encodings).into(),
-            Row::MaxRedirects => SharedString::from(self.settings.max_redirects.to_string()),
-            Row::Timeout => match self.settings.timeout {
+            Row::CookieStore => on_off(self.settings().cookie_store).into(),
+            Row::VerifyTls => on_off(self.settings().verify_tls).into(),
+            Row::FollowRedirects => on_off(self.settings().follow_redirects).into(),
+            Row::AcceptEncodings => on_off(self.settings().accept_encodings).into(),
+            Row::MaxRedirects => SharedString::from(self.settings().max_redirects.to_string()),
+            Row::Timeout => match self.settings().timeout {
                 Some(timeout) => SharedString::from(format!("{}s", timeout.as_secs())),
                 // Not currently reachable — `adjust` clamps above zero — but the model
                 // allows it and rendering "0s" would be a lie.
@@ -303,14 +339,14 @@ impl Render for SettingsPanel {
                     .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                     })
-                    .child(header(&theme))
+                    .child(header(self.scope, &theme))
                     .children(rows)
                     .child(footer(&theme)),
             )
     }
 }
 
-fn header(theme: &Theme) -> impl IntoElement {
+fn header(scope: Scope, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -319,19 +355,15 @@ fn header(theme: &Theme) -> impl IntoElement {
         .py_2()
         .border_b_1()
         .border_color(theme.border)
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.text)
-                .child("Request settings"),
-        )
-        // Says out loud that this is per-request. Without it, someone reasonably assumes
-        // they've just changed a global default — and only finds out otherwise later.
+        .child(div().text_xs().text_color(theme.text).child(scope.title()))
+        // Stated twice, here and in the first row: this panel can write to a collection file or
+        // to `app.json`, and mistaking one for the other is silent either way — you change a
+        // default and wonder why this request did not move, or the reverse.
         .child(
             div()
                 .text_xs()
                 .text_color(theme.text_muted)
-                .child("Applies to this request only"),
+                .child(scope.subtitle()),
         )
 }
 

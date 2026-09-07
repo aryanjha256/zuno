@@ -177,6 +177,19 @@ pub fn titlebar(
                 //
                 // It was the word "Dark"/"Light" until now, which is the one place the titlebar
                 // stated a *state* instead of an action, and the only text button among icons.
+                // App-level, so it sits in the app's own furniture rather than in the request
+                // pane — that pane's gear edits the request in front of you, and a second gear
+                // there that rewrote app state was the version of this that needed a header and
+                // a row to explain itself.
+                .child(
+                    div().px_2().child(crate::ui::icon_button(
+                        "defaults-settings",
+                        Icon::Settings,
+                        "Default request settings",
+                        crate::actions::OpenDefaults,
+                        theme,
+                    )),
+                )
                 .child(
                     div().px_2().child(crate::ui::icon_button(
                         "theme-toggle",

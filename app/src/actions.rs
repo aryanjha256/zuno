@@ -90,6 +90,11 @@ actions!(
         EnvDismiss,
         // Chaining. The rule lives on the request that *produces* the value, so the consumer
         // side needs nothing: `{{token}}` is an ordinary variable the existing resolver handles.
+        // App-level defaults, deliberately a *different* trigger from `OpenSettings` rather
+        // than a scope row inside it: where a gear lives is what says what it changes, and one
+        // in the request pane that could rewrite app state needed the header and a row to both
+        // say so — a design arguing with itself.
+        OpenDefaults,
         ShowCaptureTab,
         AddCapture,
         ToggleCaptureSecret,

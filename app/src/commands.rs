@@ -78,6 +78,7 @@ pub fn palette() -> Vec<Command> {
         command("Show request params", ShowParamsTab),
         command("Show request body", ShowBodyTab),
         command("Show request captures", ShowCaptureTab),
+        command("Default settings for new requests", OpenDefaults),
         command("Capture a value from the response", AddCapture),
         command("Next request tab", NextRequestTab),
         command("Previous request tab", PrevRequestTab),

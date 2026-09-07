@@ -56,7 +56,7 @@ use crate::actions::{
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CommitRename, ConfirmClose,
     WorkspaceConfirm, WorkspaceDismiss,
-    CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev,
+    CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev, OpenDefaults,
     DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
@@ -327,6 +327,7 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("enter", MenuConfirm, Some("ContextMenu")),
         KeyBinding::new("escape", MenuDismiss, Some("ContextMenu")),
         KeyBinding::new("ctrl-,", OpenSettings, None),
+        KeyBinding::new("ctrl-shift-,", OpenDefaults, None),
         KeyBinding::new("down", SettingNext, Some("SettingsPanel")),
         KeyBinding::new("up", SettingPrev, Some("SettingsPanel")),
         KeyBinding::new("right", SettingIncrease, Some("SettingsPanel")),

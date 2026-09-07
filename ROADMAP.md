@@ -272,10 +272,13 @@ Two things it turned out not to be:
   cookies off routes through a different cached client rather than emptying a jar — and toggling
   back restores it. A toggle alone would have shipped the confusion it was meant to remove, so
   `Engine::clear_cookies` landed with it.
-- **Not a global settings screen.** These are per-request, because `RequestSettings` already lives
-  on `RequestSpec` and persists per collection file. Global defaults need the same
-  global → environment → request scope model that environments has to build below; building a
-  second one here would mean discarding one.
+- ~~**Not a global settings screen.**~~ **It is one now**, and the reasoning above was wrong in a
+  useful way. It said global defaults needed the same global → environment → request scope model
+  environments has to build. Two of those three were enough: `app.json` holds the set a *new*
+  request starts from, the request holds its own, and there is no per-environment layer because
+  nothing varies a timeout by environment. Reached by its own trigger — `Ctrl+Shift+,`, or a gear
+  in the titlebar beside the theme toggle — rather than a scope row inside `Ctrl+,`: where a gear
+  lives is what says what it changes, and mistaking one scope for the other is silent either way.
 
 The status bar now carries a `cookies on` badge. That's the half that actually saves the hour: the
 toggle says what will happen, the badge says what *is* happening.

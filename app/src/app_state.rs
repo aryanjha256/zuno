@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
+use zuno_core::RequestSettings;
+
 use crate::theme::Appearance;
 
 /// The id of the workspace that has always existed: the XDG collections directory.
@@ -47,6 +49,12 @@ struct AppFile {
     /// first entry — a registry that names a workspace it does not hold must still start.
     last: Option<String>,
     workspaces: Vec<WorkspaceEntry>,
+    /// What a *new* request starts with. Existing ones carry their own, in their own file.
+    ///
+    /// Defaulted per field rather than bumped: `read` discards an `app.json` it cannot
+    /// deserialize, so a required field here would throw away every existing install's registry.
+    #[serde(default)]
+    defaults: RequestSettings,
 }
 
 pub struct AppState {
@@ -61,6 +69,7 @@ impl AppState {
     fn fresh(default_workspace: Option<PathBuf>) -> AppFile {
         AppFile {
             version: CURRENT_VERSION,
+            defaults: RequestSettings::default(),
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.to_string()),
             workspaces: default_workspace
@@ -315,11 +324,27 @@ pub fn install(cx: &mut App) {
 pub fn install_at(cx: &mut App, dir: Option<PathBuf>, workspaces: Vec<WorkspaceEntry>) {
     let file = AppFile {
         version: CURRENT_VERSION,
+        defaults: RequestSettings::default(),
         theme: Appearance::Dark,
         last: workspaces.first().map(|entry| entry.id.clone()),
         workspaces,
     };
     cx.set_global(AppState { dir, file });
+    resolve(cx);
+}
+
+/// `install`, but reading a directory the caller names instead of `config_dir()`.
+///
+/// Invariant 6 in both directions: the suite must never read the developer's real `app.json`
+/// either, or a test asserting "no defaults are stored" passes or fails by whatever happens to
+/// be in `~/.config/zuno`.
+#[cfg(test)]
+pub fn install_from_disk_for_test(cx: &mut App, dir: PathBuf) {
+    let file = read(&dir).unwrap_or_else(|| AppState::fresh(None));
+    cx.set_global(AppState {
+        dir: Some(dir),
+        file,
+    });
     resolve(cx);
 }
 
@@ -345,6 +370,30 @@ pub fn theme(cx: &App) -> Appearance {
     cx.try_global::<AppState>()
         .map(|state| state.file.theme)
         .unwrap_or(Appearance::Dark)
+}
+
+/// What a new request starts with.
+///
+/// Zuno's own defaults when nothing is stored, so this is safe to call before boot has installed
+/// the registry — the test harness runs that way.
+pub fn defaults(cx: &App) -> RequestSettings {
+    cx.try_global::<AppState>()
+        .map(|state| state.file.defaults.clone())
+        .unwrap_or_default()
+}
+
+/// Change what new requests start with. Existing buffers keep theirs — the alternative would
+/// silently rewrite what a collection file means.
+pub fn set_defaults(cx: &mut App, settings: RequestSettings) {
+    if cx.try_global::<AppState>().is_none() {
+        return;
+    }
+    let state = cx.global_mut::<AppState>();
+    if state.file.defaults == settings {
+        return;
+    }
+    state.file.defaults = settings;
+    save(cx);
 }
 
 /// Remember the theme across restarts. It was hardcoded to `Dark` at every startup, so
@@ -427,6 +476,7 @@ mod tests {
             dir: None,
             file: AppFile {
                 version: CURRENT_VERSION,
+                defaults: RequestSettings::default(),
                 theme: Appearance::Dark,
                 last: Some("gone".into()),
                 workspaces: vec![WorkspaceEntry {
@@ -444,6 +494,7 @@ mod tests {
             dir: None,
             file: AppFile {
                 version: CURRENT_VERSION,
+                defaults: RequestSettings::default(),
                 theme: Appearance::Dark,
                 last: None,
                 workspaces: Vec::new(),
@@ -458,6 +509,7 @@ mod tests {
         // reset of someone's registry.
         let file = AppFile {
             version: CURRENT_VERSION,
+            defaults: RequestSettings::default(),
             theme: Appearance::Light,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![WorkspaceEntry {
@@ -496,6 +548,7 @@ mod tests {
 
         let file = AppFile {
             version: CURRENT_VERSION,
+            defaults: RequestSettings::default(),
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![
