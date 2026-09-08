@@ -10538,6 +10538,139 @@ async fn a_postman_export_imports_as_a_tree_with_its_environment_selected(cx: &m
     remove_scratch(&mut cx, &session);
 }
 
+
+#[gpui::test]
+async fn a_postman_environment_export_lands_split_and_gitignored(cx: &mut TestAppContext) {
+    // Invariant 10 through the real modal: Postman marks its own secrets, and the marking has to
+    // survive into the gitignored half rather than being guessed from the name. Only reachable
+    // here — the parser knows which variables are secret and nothing else decides where they go.
+    let dir = scratch_dir("postman-env-import");
+    let root = dir.join("collections");
+    let session = dir.join("config").join("session.json");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::create_dir_all(session.parent().unwrap()).expect("mkdir");
+
+    let export = dir.join("staging.postman_environment.json");
+    std::fs::write(
+        &export,
+        r#"{
+          "id": "b2a1",
+          "name": "Staging",
+          "values": [
+            { "key": "baseUrl", "value": "https://staging.test", "enabled": true },
+            { "key": "token", "value": "sk-stg-1", "enabled": true, "type": "secret" }
+          ],
+          "_postman_variable_scope": "environment"
+        }"#,
+    )
+    .expect("write export");
+
+    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.simulate_input(export.to_str().expect("path"));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let environments = root.join("environments");
+    let committed =
+        std::fs::read_to_string(environments.join("Staging.json")).expect("committed half");
+    let local =
+        std::fs::read_to_string(environments.join("Staging.local.json")).expect("local half");
+
+    assert!(committed.contains("baseUrl"));
+    assert!(
+        !committed.contains("sk-stg-1"),
+        "a secret must never reach the committed file: {committed}"
+    );
+    assert!(local.contains("sk-stg-1"), "and must be in the sidecar: {local}");
+
+    // Writing a secret is pointless if the sidecar is still committable, and a globals import
+    // selects nothing — so this cannot be left to `protect_secrets`, which reads the selection.
+    assert!(
+        std::fs::read_to_string(root.join(".gitignore"))
+            .expect(".gitignore")
+            .contains("*.local.json")
+    );
+
+    // An imported environment is selected, and says so.
+    let active = window
+        .update(&mut cx, |workspace, _, _| workspace.active_environment())
+        .expect("window");
+    assert_eq!(active.as_deref(), Some("Staging"));
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    assert!(
+        status.contains("2 variables") && status.contains("now selected"),
+        "the report must name both halves: {status:?}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
+#[gpui::test]
+async fn a_postman_globals_export_lands_on_the_base_layer_and_selects_nothing(
+    cx: &mut TestAppContext,
+) {
+    // Postman globals are the layer every environment resolves over, which is exactly what
+    // Zuno's are — so this imports onto `globals` rather than into an environment named for the
+    // workspace. Selecting it would be wrong *and* impossible: globals are always in effect.
+    let dir = scratch_dir("postman-globals-import");
+    let root = dir.join("collections");
+    let session = dir.join("config").join("session.json");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::create_dir_all(session.parent().unwrap()).expect("mkdir");
+
+    let export = dir.join("globals.json");
+    std::fs::write(
+        &export,
+        r#"{
+          "name": "My Workspace Globals",
+          "values": [{ "key": "apiVersion", "value": "v2", "enabled": true }],
+          "_postman_variable_scope": "globals"
+        }"#,
+    )
+    .expect("write export");
+
+    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.simulate_input(export.to_str().expect("path"));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        std::fs::read_to_string(root.join("environments").join("globals.json"))
+            .expect("globals on disk")
+            .contains("apiVersion"),
+        "a globals export must land on the base layer, not under its own name"
+    );
+    assert!(
+        !root.join("environments").join("My-Workspace-Globals.json").exists(),
+        "the export's name is a workspace label, not somewhere to write"
+    );
+
+    let active = window
+        .update(&mut cx, |workspace, _, _| workspace.active_environment())
+        .expect("window");
+    assert_eq!(active, None, "globals are not a selection");
+
+    // The badge reads a cached `globals_active`, so an import that fills globals has to refresh
+    // it — otherwise the status bar keeps saying nothing is set until something else happens.
+    let badge = window
+        .update(&mut cx, |workspace, _, _| workspace.badge_for_test())
+        .expect("window");
+    assert_eq!(badge, zuno_core::environment::GLOBALS);
+
+    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    assert!(
+        status.contains("globals are always active"),
+        "nobody should go looking for it in the switcher: {status:?}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
 #[gpui::test]
 async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext) {
     // **The class of bug nothing else here can see.** Two context-less bindings on one keystroke

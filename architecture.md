@@ -1735,8 +1735,8 @@ creates directories, allocates free filenames, writes an environment and reports
 is written once in `Workspace::finish_import`. A third format is a parser plus one sniff arm.
 
 **The format is sniffed, never chosen.** `import::parse` reads the document and decides:
-`openapi` present → OpenAPI, `item` present → Postman, and then arms for every shape we can
-*recognise but not read*. A second `Import from Postman` verb would make someone classify their
+`openapi` present → OpenAPI, `item` present → Postman collection, `values` plus a Postman marker
+→ Postman environment, and then arms for every shape we can *recognise but not read*. A second `Import from Postman` verb would make someone classify their
 own export before they could use it — friction of exactly the shape this feature removes. The
 cost is paid in refusals instead, and that is the better trade: "this is a Postman v1 collection —
 re-export it as v2.1" is a next step, and "unrecognised document" is a dead end. Swagger 2.0, v1
@@ -1813,6 +1813,37 @@ And the environment is **selected**, overriding whatever was active. An export w
 begins `{{baseUrl}}` otherwise imports as a folder of requests that cannot be sent, and asking
 someone to find the switcher first is the friction this feature exists to remove. The status line
 names the switch, because a *silent* switch is the failure mode rather than the switch itself.
+
+### Environment exports — and the one exact mapping in the feature
+
+A Postman *environment* export is a different document and a different **outcome**, so
+`import::parse` answers with a `Parsed` enum rather than an `Import` carrying no requests. The
+enum is not ceremony: without it, a caller reports "no requests to import" about a perfectly good
+export, which is the shape of half the bugs in this file.
+
+- **`type: "secret"` goes to the gitignored half.** Postman marks its own secrets, so invariant
+  10's file split survives the crossing instead of being guessed from a name — `token` and
+  `apiKey` are heuristics, and the export is a fact.
+- **A globals export lands on `environment::GLOBALS`.** Postman globals are the layer every
+  environment resolves over, which is exactly what Zuno's are: the one place in this whole feature
+  where the two models agree completely rather than approximately. Its own `name` is a workspace
+  label and is dropped, because that layer is not a name anyone picks — `valid_name` refuses it on
+  purpose, so `Target::Globals` is the deliberate way in.
+- **"Switched off" is spelled oppositely by the two formats.** A collection variable carries
+  `disabled: true`; an environment value carries `enabled: false`. Which one a given Postman
+  version writes is not worth betting on, so either counts. Getting the polarity wrong is silent
+  and exactly backwards — every dormant variable arrives live and every live one dormant — so both
+  spellings are pinned by a test, in both directions.
+- **The `.gitignore` rule is written from what was imported**, not through `protect_secrets`.
+  That reads the *selected* environment, and nothing is selected yet at that point — a globals
+  import never selects anything at all. Taking the convenient route leaves a `.local.json` full of
+  tokens sitting there committable, which is invariant 10 defeated by a call order. Break-tested.
+- **A named export is selected and a globals one says it needn't be.** "Globals are always active"
+  in the status line, so nobody goes hunting the switcher for an environment that isn't there.
+  The badge reads a cached `globals_active`, so an import that fills globals refreshes it.
+
+An export with nothing live in it is refused rather than creating an empty environment and
+reporting success.
 
 ### Scripts are named, not dropped
 

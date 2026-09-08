@@ -2195,7 +2195,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let import = match zuno_core::import::parse(bytes) {
-            Ok(import) => import,
+            Ok(zuno_core::import::Parsed::Collection(import)) => import,
+            Ok(zuno_core::import::Parsed::Environment(import)) => {
+                self.finish_environment_import(panel, root, import, cx);
+                return;
+            }
             Err(error) => {
                 panel.update(cx, |panel, cx| panel.report(error.to_string(), cx));
                 return;
@@ -2283,7 +2287,11 @@ impl Workspace {
             return None;
         }
 
-        let merged = match environment::merge_imported(root, title, &import.variables) {
+        let merged = match environment::merge_imported(
+            root,
+            environment::Target::Named(title),
+            &import.variables,
+        ) {
             Ok(merged) => merged,
             // The requests are already on disk, so this is a note on a successful import rather
             // than a failure of one.
@@ -2306,6 +2314,65 @@ impl Workspace {
             note.push_str(&format!(" ({} already set were left alone)", merged.kept));
         }
         Some(note)
+    }
+
+    /// Write a Postman environment export into `environments/`.
+    ///
+    /// The other half of `finish_import`, and a genuinely different outcome rather than a
+    /// collection with no requests: nothing is written into the tree, so there is no folder to
+    /// name and nothing to refresh there.
+    fn finish_environment_import(
+        &mut self,
+        panel: &Entity<crate::import_panel::ImportPanel>,
+        root: &Path,
+        import: zuno_core::import::EnvironmentImport,
+        cx: &mut Context<Self>,
+    ) {
+        // `None` is a globals export. Postman's globals are the layer every environment resolves
+        // over, which is exactly what Zuno's are, so the mapping is the whole feature here.
+        let target = match import.name.as_deref() {
+            Some(name) => environment::Target::Named(name),
+            None => environment::Target::Globals,
+        };
+
+        let merged = match environment::merge_imported(root, target, &import.variables) {
+            Ok(merged) => merged,
+            Err(error) => {
+                panel.update(cx, |panel, cx| panel.report(error.to_string(), cx));
+                return;
+            }
+        };
+
+        // Checked from what was imported rather than through `protect_secrets`, which reads the
+        // environment *currently selected* — nothing is selected yet here, and a globals import
+        // never selects anything at all, so that route writes no rule and leaves a
+        // `.local.json` full of tokens sitting there committable. Break-tested.
+        if import.variables.iter().any(|variable| variable.secret) {
+            self.ensure_gitignored(cx);
+        }
+
+        let mut message = format!("Imported {} variables into {}", merged.added, merged.name);
+        if merged.kept > 0 {
+            message.push_str(&format!(" ({} already set were left alone)", merged.kept));
+        }
+
+        if import.name.is_some() {
+            // Selected for the collection import's reason: someone who imported `staging` meant
+            // to use it, and the switch is named because a silent one is the failure mode.
+            self.environment = Some(merged.name.clone());
+            crate::session::save(&self.session(cx), cx);
+            message.push_str(" — now selected");
+        } else {
+            // Globals need no selecting; they are always in effect, which is worth saying so
+            // nobody goes looking for the new environment in the switcher.
+            message.push_str(" — globals are always active");
+        }
+
+        // A file read, so it belongs at a state change: an import is one.
+        self.globals_active = globals_has_values(cx);
+        self.import = None;
+        self.set_status(&message, cx);
+        cx.notify();
     }
 
     /// Open the rename box on the selected request.

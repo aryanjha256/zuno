@@ -503,6 +503,18 @@ pub struct Merged {
     pub kept: usize,
 }
 
+/// Which environment an import's variables land in.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Target<'a> {
+    /// A label to be slugged and validated — a collection's name, or an environment export's.
+    Named(&'a str),
+    /// The always-on base layer. Its own arm because `valid_name` **refuses** the name on
+    /// purpose: an environment accidentally called `globals` would silently change every other
+    /// environment in the workspace, so reaching it has to be deliberate. Postman's globals
+    /// export is the one thing that legitimately means it.
+    Globals,
+}
+
 /// Write an import's variables into an environment, creating it if it isn't there.
 ///
 /// **Only names the environment does not already have are written.** Re-importing a collection
@@ -516,10 +528,13 @@ pub struct Merged {
 /// survives the crossing rather than being guessed from the name.
 pub fn merge_imported(
     collection_root: &Path,
-    label: &str,
+    target: Target<'_>,
     variables: &[crate::import::Variable],
 ) -> Result<Merged, EnvironmentError> {
-    let name = valid_name(label)?;
+    let name = match target {
+        Target::Named(label) => valid_name(label)?,
+        Target::Globals => GLOBALS.to_string(),
+    };
     let mut file = read(collection_root, &name)?;
 
     let mut merged = Merged {
@@ -1173,7 +1188,7 @@ mod tests {
             },
         ];
 
-        let merged = merge_imported(&root, "Billing", &variables).expect("merge");
+        let merged = merge_imported(&root, Target::Named("Billing"), &variables).expect("merge");
         // `slug` does not lower-case, so the environment and the folder the import
         // writes into carry the same name.
         assert_eq!(merged.name, "Billing");
@@ -1202,8 +1217,16 @@ mod tests {
             secret: false,
         }];
         assert!(matches!(
-            merge_imported(&root, "globals", &variables),
+            merge_imported(&root, Target::Named("globals"), &variables),
             Err(EnvironmentError::InvalidName(_))
         ));
+
+        // `Target::Globals` is the deliberate way in, and it writes the same base layer.
+        let merged = merge_imported(&root, Target::Globals, &variables).expect("globals");
+        assert_eq!(merged.name, GLOBALS);
+        assert_eq!(
+            read(&root, GLOBALS).expect("read").committed.get("a").map(String::as_str),
+            Some("1")
+        );
     }
 }

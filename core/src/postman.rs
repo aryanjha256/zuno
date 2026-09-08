@@ -22,7 +22,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::import::{Import, Imported, Variable};
+use crate::import::{EnvironmentImport, Import, Imported, Variable};
 use crate::{
     Body, FormField, Header, Method, MultipartField, MultipartValue, QueryParam, RawKind,
     RequestId, RequestSpec,
@@ -44,6 +44,8 @@ pub enum PostmanError {
     UnsupportedSchema(String),
     #[error("the collection has no requests in it")]
     NoItems,
+    #[error("the environment export has no variables in it")]
+    NoVariables,
 }
 
 /// Read a collection.
@@ -87,21 +89,10 @@ pub fn parse(root: &Value) -> Result<Import, PostmanError> {
         return Err(PostmanError::NoItems);
     }
 
-    for row in array(root.get("variable")) {
-        let Some(name) = row.get("key").and_then(Value::as_str) else {
-            continue;
-        };
-        // A disabled variable is not in effect in Postman, and an environment has no row to be
-        // switched off, so importing it would turn something dormant back on.
-        if name.is_empty() || flag(row, "disabled") {
-            continue;
-        }
-        import.variables.push(Variable {
-            name: name.to_string(),
-            value: row.get("value").map(scalar).unwrap_or_default(),
-            secret: row.get("type").and_then(Value::as_str) == Some("secret"),
-        });
-    }
+    import.variables = array(root.get("variable"))
+        .iter()
+        .filter_map(variable_from)
+        .collect();
 
     if descriptions > 0 {
         import.skipped.push(format!(
@@ -110,6 +101,69 @@ pub fn parse(root: &Value) -> Result<Import, PostmanError> {
     }
 
     Ok(import)
+}
+
+/// Read a Postman environment or globals export.
+///
+/// The same file shape covers both, told apart by `_postman_variable_scope` — and the globals
+/// case is a genuinely exact mapping rather than an approximation: Postman globals are the layer
+/// every environment resolves over, which is precisely what `environment::GLOBALS` is here.
+pub fn parse_environment(root: &Value) -> Result<EnvironmentImport, PostmanError> {
+    let scope = root
+        .get("_postman_variable_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("environment");
+
+    let rows = array(root.get("values"));
+    let variables: Vec<Variable> = rows.iter().filter_map(variable_from).collect();
+    if variables.is_empty() {
+        return Err(PostmanError::NoVariables);
+    }
+
+    let mut skipped = Vec::new();
+    let switched_off = rows.iter().filter(|row| switched_off(row)).count();
+    if switched_off > 0 {
+        skipped.push(format!("{switched_off} switched-off variables"));
+    }
+
+    Ok(EnvironmentImport {
+        // A globals export carries a name too — usually the workspace's — but it is not a name
+        // anything can be written under, so the scope decides and the name is dropped.
+        name: (scope != "globals")
+            .then(|| root.get("name").and_then(Value::as_str).map(str::to_string))
+            .flatten(),
+        variables,
+        skipped,
+    })
+}
+
+/// One variable row, from either format.
+///
+/// A collection's `variable[]` and an environment's `values[]` are the same shape under two
+/// names, so they share this.
+fn variable_from(row: &Value) -> Option<Variable> {
+    let name = row.get("key").and_then(Value::as_str)?;
+    if name.is_empty() || switched_off(row) {
+        return None;
+    }
+    Some(Variable {
+        name: name.to_string(),
+        value: row.get("value").map(scalar).unwrap_or_default(),
+        secret: row.get("type").and_then(Value::as_str) == Some("secret"),
+    })
+}
+
+/// Is this row switched off?
+///
+/// **The two formats spell it oppositely** — a collection variable carries `disabled: true`, an
+/// environment value carries `enabled: false` — and which one a given Postman version writes is
+/// not worth betting on, so either counts. Getting the polarity wrong here is silent and
+/// exactly backwards: every dormant variable would arrive live and every live one dormant.
+///
+/// It has to be honoured at all because an environment has no row to switch off, so importing a
+/// dormant variable turns it back on.
+fn switched_off(row: &Value) -> bool {
+    flag(row, "disabled") || row.get("enabled").and_then(Value::as_bool) == Some(false)
 }
 
 /// Walk the item tree, carrying the folders above and the auth in force.
@@ -1051,4 +1105,106 @@ mod tests {
         ));
     }
 
+
+    /// A real export's shape, including the two spellings of "switched off".
+    const ENVIRONMENT: &str = r##"{
+      "id": "b2a1",
+      "name": "Staging",
+      "values": [
+        { "key": "baseUrl", "value": "https://staging.test", "enabled": true, "type": "default" },
+        { "key": "token", "value": "sk-stg-1", "enabled": true, "type": "secret" },
+        { "key": "retired", "value": "x", "enabled": false, "type": "default" },
+        { "key": "alsoRetired", "value": "y", "disabled": true },
+        { "key": "", "value": "nameless" },
+        { "key": "port", "value": 8443 }
+      ],
+      "_postman_variable_scope": "environment",
+      "_postman_exported_at": "2026-06-29T09:05:52.000Z",
+      "_postman_exported_using": "Postman/11.0.0"
+    }"##;
+
+    fn read_environment(document: &str) -> Result<EnvironmentImport, PostmanError> {
+        parse_environment(&serde_json::from_str(document).expect("test document is valid JSON"))
+    }
+
+    #[test]
+    fn an_environment_export_carries_its_secret_marking_across() {
+        let import = read_environment(ENVIRONMENT).expect("parse");
+        assert_eq!(import.name.as_deref(), Some("Staging"));
+
+        let names: Vec<&str> = import
+            .variables
+            .iter()
+            .map(|variable| variable.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["baseUrl", "token", "port"]);
+
+        // Postman's own marking, which lands on invariant 10's file split.
+        assert!(!import.variables[0].secret);
+        assert!(import.variables[1].secret);
+        // A value written as a number is still a value; `as_str` alone reads it as absent.
+        assert_eq!(import.variables[2].value, "8443");
+    }
+
+    #[test]
+    fn a_switched_off_variable_is_honoured_whichever_way_the_format_spells_it() {
+        // The two formats are *opposite*: a collection variable carries `disabled: true`, an
+        // environment value `enabled: false`. Getting the polarity wrong is silent and exactly
+        // backwards — every dormant variable arrives live and every live one dormant — so both
+        // spellings are honoured and both are pinned here.
+        let import = read_environment(ENVIRONMENT).expect("parse");
+        assert!(
+            !import
+                .variables
+                .iter()
+                .any(|variable| variable.name.starts_with("retired")
+                    || variable.name == "alsoRetired"),
+            "a switched-off variable must not import: {:?}",
+            import.variables
+        );
+        // And it is reported, because an environment has no row to switch off — the fact that
+        // they existed is otherwise lost.
+        assert!(
+            import.skipped.iter().any(|note| note.contains("2 switched-off")),
+            "{:?}",
+            import.skipped
+        );
+
+        // The live ones must actually be live, which is the half a flipped polarity would break
+        // without failing anything above.
+        assert!(
+            read_environment(r#"{"name":"E","values":[{"key":"a","value":"1","enabled":true}]}"#)
+                .expect("parse")
+                .variables
+                .len()
+                == 1
+        );
+    }
+
+    #[test]
+    fn a_globals_export_lands_on_the_base_layer_rather_than_a_name() {
+        // Postman globals are the layer every environment resolves over, which is exactly what
+        // `environment::GLOBALS` is — so this is an exact mapping, not an approximation. The
+        // export's own name is a workspace label and is not somewhere anything can be written.
+        let import = read_environment(
+            r#"{"name":"My Workspace Globals","_postman_variable_scope":"globals",
+                "values":[{"key":"v","value":"1","enabled":true}]}"#,
+        )
+        .expect("parse");
+        assert_eq!(import.name, None);
+        assert_eq!(import.variables.len(), 1);
+    }
+
+    #[test]
+    fn an_environment_export_with_nothing_live_in_it_is_refused() {
+        // Creating an empty environment file and reporting success is worse than saying so.
+        assert!(matches!(
+            read_environment(r#"{"name":"E","values":[]}"#),
+            Err(PostmanError::NoVariables)
+        ));
+        assert!(matches!(
+            read_environment(r#"{"name":"E","values":[{"key":"a","value":"1","enabled":false}]}"#),
+            Err(PostmanError::NoVariables)
+        ));
+    }
 }

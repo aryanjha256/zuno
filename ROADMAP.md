@@ -559,6 +559,11 @@ cursors stayed separate, because a match and where you are standing are differen
   It was also cheap for its size: the modal, the fetch-or-read, folder allocation and the
   skipped-notes channel all existed from OpenAPI import, so the slice was one parser and a sniff.
 
+  **Environment and globals exports import too.** A `type: "secret"` value goes to the gitignored
+  half — Postman marks its own, so invariant 10's split survives rather than being guessed from a
+  name — and a *globals* export lands on Zuno's globals, which is the one place the two models
+  agree exactly rather than approximately.
+
   Postman's `{{var}}` syntax is already Zuno's, which is luck. What does *not* come across is
   `event` scripts — JavaScript, named in the report rather than dropped silently. Recovering the
   three common shapes (`pm.environment.set` → a capture, a status check → `expect_status`,

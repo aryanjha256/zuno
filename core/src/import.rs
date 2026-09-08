@@ -27,10 +27,31 @@ pub enum ImportError {
     Swagger,
     #[error("this is a Postman v1 collection — re-export it from Postman as v2.1")]
     PostmanV1,
-    #[error("this is a Postman environment export, not a collection")]
-    PostmanEnvironment,
     #[error("not a document Zuno can read — expected an OpenAPI 3.x spec or a Postman collection")]
     Unrecognised,
+}
+
+/// What a document turned out to be.
+///
+/// Two variants rather than one `Import` with an empty `requests`, because they are different
+/// *outcomes* and not a difference of degree: a collection is written into the tree, an
+/// environment into `environments/`, and a caller that forgot the distinction would report "no
+/// requests to import" about a perfectly good environment export.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Parsed {
+    Collection(Import),
+    Environment(EnvironmentImport),
+}
+
+/// A Postman environment or globals export: variables and nothing else.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EnvironmentImport {
+    /// The label to write it under. **`None` for a globals export**, which has no name of its
+    /// own — it is Postman's always-on base layer and maps exactly onto Zuno's, which is not a
+    /// name anyone picks.
+    pub name: Option<String>,
+    pub variables: Vec<Variable>,
+    pub skipped: Vec<String>,
 }
 
 /// One request an import yielded, and where it belongs.
@@ -76,7 +97,7 @@ pub struct Import {
 /// The JSON is parsed **once** and the `Value` handed to whichever parser claims it, rather than
 /// sniffing on bytes and letting the parser start over. A Postman export of a real workspace
 /// runs to megabytes, and this runs on the UI thread's caller.
-pub fn parse(bytes: &[u8]) -> Result<Import, ImportError> {
+pub fn parse(bytes: &[u8]) -> Result<Parsed, ImportError> {
     let root: Value = serde_json::from_slice(bytes)?;
 
     // **The Postman API wraps what the Postman app exports.** A share link
@@ -93,19 +114,22 @@ pub fn parse(bytes: &[u8]) -> Result<Import, ImportError> {
     // Ordered most specific first. Every arm below `openapi` is a shape we can name but not
     // read, and naming it is the whole point — see the module note.
     if root.get("openapi").is_some() {
-        return Ok(crate::openapi::parse(root)?);
+        return Ok(Parsed::Collection(crate::openapi::parse(root)?));
     }
     if root.get("swagger").is_some() {
         return Err(ImportError::Swagger);
     }
     if root.get("item").is_some() {
-        return Ok(crate::postman::parse(root)?);
+        return Ok(Parsed::Collection(crate::postman::parse(root)?));
     }
-    // A Postman environment export is `{ "name", "values": [...] }`. Checked before v1 because
-    // v1 collections have neither key and this one is what someone is most likely to reach for
-    // next after importing a collection.
-    if root.get("values").and_then(Value::as_array).is_some() {
-        return Err(ImportError::PostmanEnvironment);
+    // A Postman environment export is `{ "name", "values": [...] }`. The second key is not
+    // distinctive enough on its own — plenty of JSON has a top-level `values` — so this also
+    // wants one of the two things every real export carries.
+    if root.get("values").and_then(Value::as_array).is_some()
+        && (root.get("_postman_variable_scope").is_some()
+            || root.get("name").and_then(Value::as_str).is_some())
+    {
+        return Ok(Parsed::Environment(crate::postman::parse_environment(root)?));
     }
     // v1 is a different document rather than an older version of v2: a top-level `requests`
     // array with no `item` anywhere.
@@ -128,7 +152,6 @@ mod tests {
         let cases = [
             (r#"{"swagger":"2.0","paths":{}}"#, "Swagger 2.0"),
             (r#"{"id":"x","name":"Old","requests":[]}"#, "Postman v1"),
-            (r#"{"name":"dev","values":[{"key":"a","value":"b"}]}"#, "environment export"),
             (r#"{"totally":"unrelated"}"#, "not a document Zuno can read"),
         ];
         for (document, expected) in cases {
@@ -142,19 +165,45 @@ mod tests {
         assert!(matches!(parse(b"not json"), Err(ImportError::Json(_))));
     }
 
+    fn collection(document: &[u8]) -> Import {
+        match parse(document).expect("parse") {
+            Parsed::Collection(import) => import,
+            other => panic!("wanted a collection, got {other:?}"),
+        }
+    }
+
+    fn environment(document: &[u8]) -> EnvironmentImport {
+        match parse(document).expect("parse") {
+            Parsed::Environment(import) => import,
+            other => panic!("wanted an environment, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_document_is_routed_to_the_parser_that_claims_it() {
-        let openapi = parse(
-            br#"{"openapi":"3.0.0","info":{"title":"A"},"paths":{"/p":{"get":{}}}}"#,
-        )
-        .expect("openapi");
+        let openapi =
+            collection(br#"{"openapi":"3.0.0","info":{"title":"A"},"paths":{"/p":{"get":{}}}}"#);
         assert_eq!(openapi.title.as_deref(), Some("A"));
 
-        let postman = parse(
+        let postman = collection(
             br#"{"info":{"name":"B"},"item":[{"name":"r","request":{"method":"GET","url":"https://a.test"}}]}"#,
-        )
-        .expect("postman");
+        );
         assert_eq!(postman.title.as_deref(), Some("B"));
+
+        // An environment export is a different *outcome*, not a collection with no requests.
+        let staging = environment(
+            br#"{"name":"Staging","_postman_variable_scope":"environment",
+                 "values":[{"key":"baseUrl","value":"https://s.test","enabled":true}]}"#,
+        );
+        assert_eq!(staging.name.as_deref(), Some("Staging"));
+        assert_eq!(staging.variables.len(), 1);
+
+        // And a globals export drops its name, because the layer it maps to is not one you pick.
+        let globals = environment(
+            br#"{"name":"My Workspace Globals","_postman_variable_scope":"globals",
+                 "values":[{"key":"v","value":"1","enabled":true}]}"#,
+        );
+        assert_eq!(globals.name, None);
     }
 
     #[test]
@@ -163,11 +212,10 @@ mod tests {
         // reading only the export, so pasting a share link — the path that needs no export step
         // at all, and so the one someone reaches for first — said "not a document Zuno can
         // read" about a perfectly good collection.
-        let wrapped = parse(
+        let wrapped = collection(
             br#"{"collection":{"info":{"name":"C"},"item":[
                  {"name":"r","request":{"method":"GET","url":"https://a.test"}}]}}"#,
-        )
-        .expect("a wrapped collection must import");
+        );
         assert_eq!(wrapped.title.as_deref(), Some("C"));
         assert_eq!(wrapped.requests.len(), 1);
 
