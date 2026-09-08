@@ -16,8 +16,8 @@ use gpui::{
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext, BodyFindPrev,
     CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl, OpenBodyType,
-    AddCapture, OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest, ShowBodyTab,
-    ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
+    AddAssertion, AddCapture, OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest,
+    ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
 };
 use crate::ui::{Icon, icon_button};
 use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind};
@@ -82,6 +82,9 @@ pub fn render(
                 theme,
             ))
             .child(capture_table(view, theme, window, cx)),
+        RequestTab::Assert => pane
+            .child(assert_header(view, theme))
+            .child(assert_table(view, theme, window, cx)),
     }
 }
 
@@ -140,6 +143,14 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
             count_suffix("Capture", view.captures.len()),
             active == RequestTab::Capture,
             ShowCaptureTab,
+            theme,
+            cx,
+        ))
+        .child(section_tab(
+            "request-tab-assert",
+            count_suffix("Assert", view.assertions.len()),
+            active == RequestTab::Assert,
+            ShowAssertTab,
             theme,
             cx,
         ))
@@ -460,6 +471,16 @@ fn add_control(kind: RowKind, theme: &Theme) -> gpui::AnyElement {
             theme,
         )
         .into_any_element(),
+        RowKind::Assert => crate::ui::icon_text_action(
+            "add-assertion",
+            Icon::Plus,
+            "Add".into(),
+            "Add an assertion",
+            AddAssertion,
+            theme.accent,
+            theme,
+        )
+        .into_any_element(),
         RowKind::Capture => crate::ui::icon_text_action(
             "add-capture",
             Icon::Plus,
@@ -541,6 +562,7 @@ fn rows_table(
         // `capture_table`, each of which labels its own rows.
         RowKind::Multipart => "prt",
         RowKind::Capture => "cap",
+        RowKind::Assert => "asr",
     };
 
     div().flex().flex_col().children(
@@ -585,6 +607,12 @@ fn empty_table(kind: RowKind, theme: &Theme, window: &Window) -> Div {
         RowKind::Header => hint_row("headers", &[(&AddHeader, "to add")], theme, window),
         RowKind::Query => hint_row("query parameters", &[(&AddQuery, "to add")], theme, window),
         RowKind::Form => hint_row("fields", &[(&AddFormField, "to add")], theme, window),
+        RowKind::Assert => hint_row(
+            "assertions",
+            &[(&AddAssertion, "to add one")],
+            theme,
+            window,
+        ),
         RowKind::Capture => hint_row(
             "captures",
             &[(&AddCapture, "to add one")],
@@ -601,6 +629,164 @@ fn empty_table(kind: RowKind, theme: &Theme, window: &Window) -> Div {
             window,
         ),
     }
+}
+
+/// The Assert tab's header: the expected status, then the usual add control.
+///
+/// **The status sits here rather than in the table**, because it is the one check every request
+/// wants and a row for it would be on every request in the collection saying the obvious. It is
+/// a text box rather than a stepper for the same reason the URL is: you type `404` in three
+/// keystrokes, and a box that rejects `4` on the way to `404` is a box nobody can type in.
+fn assert_header(view: &RequestView, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child("Expect status")
+                .child(
+                    div()
+                        .w(px(64.))
+                        .overflow_hidden()
+                        .px_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme.border)
+                        .font_family(theme.mono.clone())
+                        .text_color(theme.text)
+                        .child(view.expect_status.clone()),
+                ),
+        )
+        .child(add_control(RowKind::Assert, theme))
+}
+
+fn assert_table(
+    view: &RequestView,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    if view.assertions.is_empty() {
+        return empty_table(RowKind::Assert, theme, window);
+    }
+
+    div().flex().flex_col().children(
+        view.assertions
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| assert_row(row, ix, theme, cx)),
+    )
+}
+
+fn assert_row(
+    row: &crate::request_view::AssertionRow,
+    ix: usize,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    let marker_color = if row.enabled { theme.accent } else { theme.border };
+    let text_color = if row.enabled { theme.text } else { theme.text_muted };
+    // `exists` takes no value, so showing an empty box beside it invites typing into something
+    // that is ignored.
+    let takes_value = row.op != zuno_core::assertion::Op::Exists;
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .hover(|style| style.bg(theme.bg_hover))
+        .font_family(theme.mono.clone())
+        .text_xs()
+        .text_color(text_color)
+        .child(
+            div()
+                .id(SharedString::from(format!("asr-toggle-{ix}")))
+                .flex_none()
+                .w(px(10.))
+                .h(px(10.))
+                .rounded_full()
+                .bg(marker_color)
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        view.toggle_row_at(RowKind::Assert, ix, cx)
+                    }),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(row.path.clone()),
+        )
+        // Three operators, so a click cycles rather than opening a picker for a choice of three.
+        .child(
+            div()
+                .id(SharedString::from(format!("asr-op-{ix}")))
+                .debug_selector(move || format!("asr-op-{ix}"))
+                .flex_none()
+                .w(px(64.))
+                .px_1()
+                .rounded_sm()
+                .bg(theme.bg_panel)
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover).text_color(theme.text))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        view.cycle_assert_op(ix, cx)
+                    }),
+                )
+                .child(row.op.label()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_color(theme.text_muted)
+                .children(takes_value.then(|| row.value.clone())),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("asr-remove-{ix}")))
+                .debug_selector(move || format!("asr-remove-{ix}"))
+                .group(crate::ui::ICON_GROUP)
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        view.remove_row_at(RowKind::Assert, ix, cx)
+                    }),
+                )
+                .child(crate::ui::glyph(Icon::Close, theme.text_muted, theme.text, 12.)),
+        )
 }
 
 /// The capture table. Separate from `rows_table` for a stronger reason than multipart's: the

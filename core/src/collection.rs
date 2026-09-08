@@ -259,7 +259,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, skipped: &m
             // listing happens to come out the same, because an environment doesn't
             // deserialize as a `RequestSpec` — but a file in there that did would be offered
             // as a request, and the log would be noise either way.
-            if name == crate::environment::DIRECTORY {
+            if name == crate::environment::DIRECTORY || name == crate::flow::DIRECTORY {
                 continue;
             }
             walk(root, &path, depth + 1, out, skipped);
@@ -580,7 +580,10 @@ fn collect_folders(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>)
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if name.starts_with('.') || name == crate::environment::DIRECTORY {
+        if name.starts_with('.')
+            || name == crate::environment::DIRECTORY
+            || name == crate::flow::DIRECTORY
+        {
             continue;
         }
         // `file_type` does not follow symlinks, so a symlinked directory reports as a symlink

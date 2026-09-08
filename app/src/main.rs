@@ -14,6 +14,7 @@ mod app_state;
 mod close_panel;
 mod collection_panel;
 mod environment_panel;
+mod flow_panel;
 mod import_panel;
 mod collections;
 mod commands;
@@ -21,6 +22,7 @@ mod context_menu;
 mod engine;
 mod input;
 mod picker;
+mod run_panel;
 mod request_pane;
 mod request_view;
 mod response_pane;
@@ -56,7 +58,10 @@ use crate::actions::{
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CommitRename, ConfirmClose,
     WorkspaceConfirm, WorkspaceDismiss,
-    CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev, OpenDefaults,
+    AssertValue, CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNext, EnvPrev,
+    FlowConfirm, FlowDismiss, FlowNext, FlowPrev, FlowStepDown, FlowStepNext, FlowStepPrev,
+    FlowStepRemove, FlowStepUp, OpenDefaults,
+    RunDismiss, RunFlow, RunFolder,
     DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
@@ -164,7 +169,17 @@ fn main() {
 /// input — ships `cmd-` bindings that never fire on Linux, so every one of them is
 /// translated to `ctrl-` below.
 fn register_keymap(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(bindings());
+}
+
+/// Every binding, as a list rather than passed straight to `bind_keys`.
+///
+/// **So a test can read it.** A context-less binding registered twice for one keystroke does not
+/// fail to compile and does not fail loudly: `binding_enabled` scores both at maximum depth, the
+/// tiebreak is registration order, and the later one silently wins. `ctrl-shift-r` was taken from
+/// `FocusResponse` that way, and what noticed was two unrelated response tests going red.
+fn bindings() -> Vec<KeyBinding> {
+    vec![
         // --- Focus movement (global) ---
         KeyBinding::new("ctrl-l", FocusUrl, None),
         KeyBinding::new("ctrl-b", FocusBody, None),
@@ -247,6 +262,9 @@ fn register_keymap(cx: &mut App) {
         // Beside `alt-c`, because capturing *is* copying the path — into a rule rather than
         // onto the clipboard. Scoped to the pane the row lives in, like both of its neighbours.
         KeyBinding::new("alt-shift-c", CaptureValue, Some("ResponsePane")),
+        // Beside its capture twin. Same gesture, same source of the path — one puts the value
+        // somewhere, the other checks it.
+        KeyBinding::new("alt-shift-a", AssertValue, Some("ResponsePane")),
         KeyBinding::new("space", ToggleFold, Some("ResponsePane")),
         // Horizontal scrolling. `up`/`down` already move the row selection in this context, so
         // `left`/`right` moving the view across is the completion of that idiom rather than a
@@ -287,6 +305,14 @@ fn register_keymap(cx: &mut App) {
         // `ctrl-e` selects an environment, `ctrl-shift-e` is the collection panel, so the
         // editor takes the next free chord in the same family.
         KeyBinding::new("ctrl-alt-e", EditEnvironments, None),
+        KeyBinding::new("ctrl-r", RunFolder, None),
+        // `ctrl-r` is the folder in front of you; `ctrl-alt-r` is a flow you authored.
+        //
+        // **Not `ctrl-shift-r`**, which `FocusResponse` has held since M1 — and taking it did
+        // not fail to compile or even fail loudly. A context-less binding registered later
+        // simply wins the tie, so focusing the response pane silently started running a flow,
+        // and two unrelated response tests were what noticed.
+        KeyBinding::new("ctrl-alt-r", RunFlow, None),
         KeyBinding::new("ctrl-h", ShowHistory, None),
         KeyBinding::new("down", PickerNext, Some("Picker")),
         KeyBinding::new("up", PickerPrev, Some("Picker")),
@@ -374,6 +400,23 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("alt-up", EnvPrev, Some("EnvPanel")),
         KeyBinding::new("alt-down", EnvNext, Some("EnvField")),
         KeyBinding::new("alt-up", EnvPrev, Some("EnvField")),
+        // After the global `escape`, for the reason every other modal's is.
+        KeyBinding::new("escape", RunDismiss, Some("RunPanel")),
+        // The flow editor. Three leaf contexts hold focus in it — the panel, and the two name
+        // boxes — and all after the global twins, for the reason every other modal's are.
+        KeyBinding::new("escape", FlowDismiss, Some("FlowPanel")),
+        KeyBinding::new("escape", FlowDismiss, Some("FlowName")),
+        KeyBinding::new("enter", FlowConfirm, Some("FlowPanel")),
+        KeyBinding::new("enter", FlowConfirm, Some("FlowName")),
+        // `up`/`down` move the cursor; `alt-` moves the step it is on. Two verbs, one axis,
+        // and the modifier is what separates "which step" from "where it goes".
+        KeyBinding::new("down", FlowStepNext, Some("FlowPanel")),
+        KeyBinding::new("up", FlowStepPrev, Some("FlowPanel")),
+        KeyBinding::new("ctrl-down", FlowNext, Some("FlowPanel")),
+        KeyBinding::new("ctrl-up", FlowPrev, Some("FlowPanel")),
+        KeyBinding::new("alt-up", FlowStepUp, Some("FlowPanel")),
+        KeyBinding::new("alt-down", FlowStepDown, Some("FlowPanel")),
+        KeyBinding::new("delete", FlowStepRemove, Some("FlowPanel")),
         KeyBinding::new("enter", ConfirmClose, Some("CloseConfirm")),
         KeyBinding::new("escape", CancelClose, Some("CloseConfirm")),
         KeyBinding::new("right", CloseChoiceNext, Some("CloseConfirm")),
@@ -427,5 +470,5 @@ fn register_keymap(cx: &mut App) {
         KeyBinding::new("shift-up", editor::SelectUp, Some("BodyEditor")),
         KeyBinding::new("shift-down", editor::SelectDown, Some("BodyEditor")),
         KeyBinding::new("enter", editor::Newline, Some("BodyEditor")),
-    ]);
+    ]
 }

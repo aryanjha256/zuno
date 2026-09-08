@@ -18,6 +18,10 @@ bytes.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# Carrying each run outcome from the background executor back to the report as it lands.
+# Already resolved for `zuno-core`, which uses it for the engine's event stream.
+async-channel.workspace = true
+
 unicode-segmentation.workspace = true
 # Percent-encoding for the "report an issue" link. Already resolved for `zuno-core`, so this
 # adds a name in scope rather than a dependency.

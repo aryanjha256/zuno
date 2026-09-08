@@ -78,6 +78,12 @@ pub fn palette() -> Vec<Command> {
         command("Show request params", ShowParamsTab),
         command("Show request body", ShowBodyTab),
         command("Show request captures", ShowCaptureTab),
+        command("Show request assertions", ShowAssertTab),
+        command("Run the selected folder", RunFolder),
+        command("Run a flow", RunFlow),
+        command("Edit flows", EditFlows),
+        command("Add the selected request to a flow", AddToFlow),
+        command("Add an assertion", AddAssertion),
         command("Default settings for new requests", OpenDefaults),
         command("Capture a value from the response", AddCapture),
         command("Next request tab", NextRequestTab),
@@ -145,6 +151,24 @@ const EXCLUDED: &[(&str, &str)] = &[
     // reasoning as the collection panel's row verbs. `Capture a value from the response` is the
     // entry point that *is* offered, and it adds an empty rule you fill in.
     ("zuno::CaptureValue", "acts on the selected response row"),
+    ("zuno::AssertValue", "acts on the selected response row"),
+    ("zuno::RunDismiss", "only valid while a run report is open"),
+    // Only valid inside the flow editor, where each has a button.
+    ("zuno::FlowNew", "only valid inside the flow editor"),
+    ("zuno::FlowRename", "only valid inside the flow editor"),
+    ("zuno::FlowTrash", "only valid inside the flow editor"),
+    ("zuno::FlowNext", "only valid inside the flow editor"),
+    ("zuno::FlowPrev", "only valid inside the flow editor"),
+    ("zuno::FlowStepNext", "only valid inside the flow editor"),
+    ("zuno::FlowStepPrev", "only valid inside the flow editor"),
+    ("zuno::FlowStepUp", "only valid inside the flow editor"),
+    ("zuno::FlowStepDown", "only valid inside the flow editor"),
+    ("zuno::FlowStepRemove", "only valid inside the flow editor"),
+    ("zuno::FlowConfirm", "only valid inside the flow editor"),
+    ("zuno::FlowDismiss", "only valid inside the flow editor"),
+    // Acts on the focused assertion row. The operator in the table is the mouse path, and it
+    // teaches nothing a palette row could.
+    ("zuno::CycleAssertOp", "acts on the focused assertion row"),
     // Acts on the focused capture row, and a palette row aimed at a target you cannot see is
     // worse than no row. The lock in the table is the mouse path, and it teaches the keystroke.
     ("zuno::ToggleCaptureSecret", "acts on the focused capture row"),

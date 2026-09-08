@@ -4041,6 +4041,8 @@ async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Capture);
     cx.simulate_keystrokes("alt-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Assert);
+    cx.simulate_keystrokes("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers, "forward wraps past the end");
     cx.simulate_keystrokes("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Query);
@@ -5571,15 +5573,19 @@ async fn the_menu_offers_fold_only_on_a_container(cx: &mut TestAppContext) {
     // A scalar: two items, no fold.
     let scalar = cx.debug_bounds("response-row-2").expect("the inner row");
     right_click(&mut cx, scalar.center());
-    assert_eq!(menu_row_count(&mut cx), 3, "value, path and capture — no fold on a scalar");
+    assert_eq!(
+        menu_row_count(&mut cx),
+        4,
+        "value, path, capture and assert — no fold on a scalar"
+    );
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
 
-    // A container: one more.
+    // A container: one more again.
     let container = cx.debug_bounds("response-row-1").expect("the outer object's row");
     right_click(&mut cx, container.center());
     assert!(view.read_with(&cx, |view, _| view.selected_is_container()));
-    assert_eq!(menu_row_count(&mut cx), 4, "value, path, capture and fold on a container");
+    assert_eq!(menu_row_count(&mut cx), 5, "and fold on a container");
 }
 
 #[gpui::test]
@@ -5640,11 +5646,11 @@ async fn the_menu_is_keyboard_navigable_and_escape_does_not_cancel_the_request(
 
     let row = cx.debug_bounds("response-row-1").expect("the outer object's row");
     right_click(&mut cx, row.center());
-    // Copy value, Copy path, Capture as variable, Fold.
-    assert_eq!(menu_row_count(&mut cx), 4);
+    // Copy value, Copy path, Capture as variable, Assert on this, Fold.
+    assert_eq!(menu_row_count(&mut cx), 5);
 
     // Last row is Fold. Arrow down to it and confirm.
-    cx.simulate_keystrokes("down down down enter");
+    cx.simulate_keystrokes("down down down down enter");
     cx.run_until_parked();
 
     assert!(!menu_is_open(&window, &mut cx), "confirming closes the menu");
@@ -8179,6 +8185,15 @@ async fn a_directory_offers_delete_but_not_the_file_only_verbs(cx: &mut TestAppC
         !rows.iter().any(|row| row == "Duplicate") && !rows.iter().any(|row| row == "Move to…"),
         "both take a file, so offering them on a folder is a control that can only fail: {rows:?}"
     );
+    // **First row, and it names the count.** `Ctrl+R` was the only way to run a folder for a
+    // slice — a verb wired up and never offered, which is the §11 shape one level down. The
+    // number is the delete prompt's argument applied to the other direction: "Run billing" with
+    // no count is how forty requests reach production.
+    assert_eq!(
+        rows.first().map(String::as_str),
+        Some("Run 1 request"),
+        "a folder's menu leads with running it: {rows:?}"
+    );
 
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
@@ -8515,7 +8530,7 @@ async fn the_response_row_menu_names_its_keystrokes_too(cx: &mut TestAppContext)
     let details = window
         .update(&mut cx, |workspace, _, cx| workspace.menu_details(cx))
         .expect("window");
-    // Row 1 is the `outer` container, so Fold applies and is offered — all four scoped, and
+    // Row 1 is the `outer` container, so Fold applies and is offered — all five scoped, and
     // every one of them names a key. A blank column here is the failure this test exists for:
     // `bindings_for_action` finds only *globally* bound actions, so a scoped verb reads as
     // unbound unless the lookup goes through the focus handle.
@@ -8525,6 +8540,7 @@ async fn the_response_row_menu_names_its_keystrokes_too(cx: &mut TestAppContext)
             ("Copy value".to_string(), "Ctrl+C".to_string()),
             ("Copy path".to_string(), "Alt+C".to_string()),
             ("Capture as variable".to_string(), "Alt+Shift+C".to_string()),
+            ("Assert on this".to_string(), "Alt+Shift+A".to_string()),
             ("Fold".to_string(), "Space".to_string()),
         ]
     );
@@ -9546,6 +9562,12 @@ async fn a_capture_publishes_into_the_selected_environment(cx: &mut TestAppConte
     let committed = std::fs::read_to_string(root.join("environments/dev.json")).expect("read");
     assert!(!committed.contains("abc123"), "the token stayed out of git: {committed}");
 
+    // And the rule that makes "gitignored half" true. `protect_secrets` only fires on an
+    // environment *switch*, so without this a token captured into a freshly-made environment
+    // sits in a file git is still watching until you happen to switch away and back.
+    let ignored = std::fs::read_to_string(root.join(".gitignore")).unwrap_or_default();
+    assert!(ignored.contains("*.local.json"), "{ignored:?}");
+
     remove_scratch(&mut cx, &root);
 }
 
@@ -9947,4 +9969,510 @@ async fn an_app_file_from_before_defaults_still_loads_its_workspaces(cx: &mut Te
     );
 
     std::fs::remove_dir_all(&config).ok();
+}
+
+#[gpui::test]
+async fn assertions_survive_a_load_and_save_before_any_ui_can_edit_them(cx: &mut TestAppContext) {
+    // `spec` derives from the inputs, so a field the view does not hold is *destroyed* on save —
+    // the trap `preserved_body` was removed to make impossible, and the one a new `RequestSpec`
+    // field walks straight into. Written directly to a file because the Assert tab does not
+    // exist yet: the round trip has to be right before anything can author one, or the first
+    // person to hand-write a rule loses it by opening the request.
+    let (session, root) = scratch_collection("assertions-roundtrip");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    let authored = RequestSpec {
+        url: "https://api.test/health".into(),
+        expect_status: Some(200),
+        assertions: vec![zuno_core::assertion::Assertion {
+            enabled: true,
+            path: "$.status".into(),
+            op: zuno_core::assertion::Op::Equals,
+            value: "ok".into(),
+        }],
+        ..RequestSpec::default()
+    };
+    std::fs::write(
+        root.join("health.json"),
+        serde_json::to_vec_pretty(&authored).expect("serialize"),
+    )
+    .expect("write");
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-p");
+    // The scan is off-thread, so the row arrives after the picker opens.
+    cx.run_until_parked();
+    cx.simulate_input("health");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let opened = active_view(&window, &mut cx);
+    assert_eq!(spec_of(&opened, &mut cx).url, "https://api.test/health", "the file opened");
+
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+
+    let bytes = std::fs::read(root.join("health.json")).expect("read");
+    let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
+    assert_eq!(saved.expect_status, Some(200), "the expected status survived");
+    assert_eq!(saved.assertions, authored.assertions, "and the rules survived");
+
+    remove_scratch(&mut cx, &root);
+}
+
+// --- Authoring assertions ---------------------------------------------------------------
+
+#[gpui::test]
+async fn asserting_on_a_response_row_fills_the_path_from_the_outline(cx: &mut TestAppContext) {
+    // Same gesture as `Alt+Shift+C`, same source of the path: `path_to`, so a rule cannot
+    // quietly check a path that never matches because it was typed twice.
+    let (view, mut cx) = respond_with_json(cx, r#"{"data":{"status":"ok"}}"#);
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("response-row-2").expect("the status row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.simulate_keystrokes("alt-shift-a");
+    cx.run_until_parked();
+
+    let spec = spec_of(&view, &mut cx);
+    assert_eq!(spec.assertions.len(), 1);
+    assert_eq!(spec.assertions[0].path, "$.data.status");
+    assert_eq!(spec.assertions[0].op, zuno_core::assertion::Op::Exists, "the safe default");
+    assert_eq!(
+        request_tab(&view, &mut cx),
+        crate::request_view::RequestTab::Assert,
+        "and it reveals the tab, or the rule is authored somewhere you cannot see",
+    );
+}
+
+#[gpui::test]
+async fn the_expected_status_is_parsed_from_what_is_typed(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    assert_eq!(spec_of(&view, &mut cx).expect_status, None, "no expectation by default");
+
+    cx.dispatch_action(crate::actions::ShowAssertTab);
+    cx.run_until_parked();
+    let field = cx.debug_bounds("request-tab-assert").expect("the tab");
+    cx.simulate_click(field.center(), gpui::Modifiers::default());
+
+    view.update(&mut cx, |view, cx| {
+        view.expect_status.update(cx, |input, cx| {
+            *input = crate::input::TextInput::new("201", "200", "ExpectStatus", cx);
+        });
+    });
+    assert_eq!(spec_of(&view, &mut cx).expect_status, Some(201));
+
+    // Nonsense reads as "no expectation" rather than as an error, for the reason the URL stays
+    // a raw string: you type through invalid states on the way to a valid one.
+    view.update(&mut cx, |view, cx| {
+        view.expect_status.update(cx, |input, cx| {
+            *input = crate::input::TextInput::new("2", "200", "ExpectStatus", cx);
+        });
+    });
+    assert_eq!(spec_of(&view, &mut cx).expect_status, Some(2), "still a number");
+
+    view.update(&mut cx, |view, cx| {
+        view.expect_status.update(cx, |input, cx| {
+            *input = crate::input::TextInput::new("nope", "200", "ExpectStatus", cx);
+        });
+    });
+    assert_eq!(spec_of(&view, &mut cx).expect_status, None);
+    let _ = window;
+}
+
+#[gpui::test]
+async fn cycling_an_operator_walks_all_three_and_returns(cx: &mut TestAppContext) {
+    use zuno_core::assertion::Op;
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.dispatch_action(crate::actions::AddAssertion);
+    cx.simulate_input("$.status");
+    cx.run_until_parked();
+
+    let op = |cx: &mut VisualTestContext| spec_of(&view, cx).assertions[0].op;
+    assert_eq!(op(&mut cx), Op::Exists);
+    for expected in [Op::Equals, Op::Contains, Op::Exists] {
+        cx.dispatch_action(crate::actions::CycleAssertOp);
+        cx.run_until_parked();
+        assert_eq!(op(&mut cx), expected);
+    }
+}
+
+#[gpui::test]
+async fn editing_a_capture_or_an_assertion_makes_the_buffer_dirty(cx: &mut TestAppContext) {
+    // **`is_dirty` is a hand-written mirror of `spec`, and `captures` was simply forgotten in
+    // it.** Editing one left the tab clean, so `Ctrl+W` closed without asking and the rule went
+    // with it. The fix is structural — `is_dirty` destructures `RequestSpec` with no `..`, so a
+    // new field fails to compile until someone decides — and this is the behaviour that proves
+    // the two fields it caught are actually wired.
+    let (session, root) = scratch_collection("dirty-rules");
+    let (window, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/thing");
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).is_dirty(cx)), "clean straight after a save");
+
+    cx.dispatch_action(crate::actions::AddCapture);
+    cx.simulate_input("$.token");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_dirty(cx)),
+        "a capture edit has to mark the buffer"
+    );
+
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).is_dirty(cx)));
+
+    cx.dispatch_action(crate::actions::AddAssertion);
+    cx.simulate_input("$.status");
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).is_dirty(cx)),
+        "and so does an assertion"
+    );
+
+    let _ = window;
+    remove_scratch(&mut cx, &root);
+}
+
+// --- Running a folder -------------------------------------------------------------------
+
+fn run_panel(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> gpui::Entity<crate::run_panel::RunPanel> {
+    window
+        .update(cx, |workspace, _, _| workspace.run_panel_for_test())
+        .expect("window")
+        .expect("the run report should be open")
+}
+
+/// Write a request into the collection, with an expected status.
+fn seed_runnable(root: &PathBuf, path: &str, url: &str, expect: Option<u16>) {
+    let file = root.join(path);
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).expect("mkdir");
+    }
+    let spec = RequestSpec {
+        url: url.to_string(),
+        expect_status: expect,
+        ..RequestSpec::default()
+    };
+    std::fs::write(&file, serde_json::to_vec_pretty(&spec).expect("json")).expect("write");
+}
+
+#[gpui::test]
+async fn running_a_folder_reports_every_request_in_it(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("run-folder");
+    let url = serve_sequence(&[(200, "{}"), (500, "{}")]);
+    seed_runnable(&root, "users/01-create.json", &url, Some(200));
+    seed_runnable(&root, "users/02-get.json", &url, Some(200));
+    // Outside the folder, so it must not run — "run the thing next to what I am looking at" is
+    // the gesture, and a run that quietly widens is one you cannot trust the result of.
+    seed_runnable(&root, "other.json", &url, Some(200));
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-shift-e");
+    // The scan is off-thread, so the rows arrive after the panel opens — selecting before this
+    // moves through an empty tree.
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-r");
+    let panel = run_panel(&window, &mut cx);
+    let rows = wait_for(&mut cx, "the run to finish", |cx| {
+        let done = panel.read_with(cx, |panel, _| !panel.running());
+        done.then(|| panel.read_with(cx, |panel, _| panel.rows_for_test()))
+    });
+
+    assert_eq!(rows.len(), 2, "only the folder's requests: {rows:?}");
+    assert!(rows[0].starts_with("pass"), "{rows:?}");
+    assert!(rows[1].starts_with("fail"), "{rows:?}");
+    // Named, not counted: a row saying "failed" without saying what is a run you repeat by hand.
+    assert!(rows[1].contains("expected status 200, got 500"), "{rows:?}");
+
+    let summary = panel.read_with(&mut cx, |panel, _| panel.summary_for_test());
+    assert_eq!(summary, "1 passed, 1 failed");
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn a_cancelled_run_says_it_stopped_early(cx: &mut TestAppContext) {
+    // The counts alone read as a complete result. Acting on "0 failed" when half the steps never
+    // ran is the worst thing this report could cause, so the wording is the thing under test.
+    //
+    // **Driven through the panel rather than by racing a real run.** Cancelling mid-flight needs
+    // the run still going when `escape` lands, and against a localhost server that finishes in
+    // microseconds there is no such moment to aim at — a test that tried would pass or fail on
+    // scheduling. `runner::a_run_stops_when_it_is_cancelled` covers the loop honestly, over
+    // sockets; this covers what the report then says.
+    let (session, root) = scratch_collection("run-cancel");
+    let url = serve_sequence(&[(200, "{}")]);
+    seed_runnable(&root, "a.json", &url, Some(200));
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-r");
+    let panel = run_panel(&window, &mut cx);
+    wait_for(&mut cx, "the run to finish", |cx| {
+        panel.read_with(cx, |panel, _| (!panel.running()).then_some(()))
+    });
+    assert_eq!(panel.read_with(&mut cx, |p, _| p.summary_for_test()), "1 passed, 0 failed");
+
+    panel.update(&mut cx, |panel, cx| panel.finish(true, cx));
+    let summary = panel.read_with(&mut cx, |panel, _| panel.summary_for_test());
+    assert!(summary.contains("stopped early"), "{summary}");
+    assert!(
+        window.update(&mut cx, |w, _, _| w.run_panel_for_test().is_some()).expect("window"),
+        "and the report stays up, or there is nothing to read"
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn closing_the_report_leaves_typing_somewhere_to_land(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("run-focus");
+    let url = serve_sequence(&[(200, "{}")]);
+    seed_runnable(&root, "a.json", &url, Some(200));
+
+    let (window, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-r");
+    let panel = run_panel(&window, &mut cx);
+    wait_for(&mut cx, "the run to finish", |cx| {
+        panel.read_with(cx, |panel, _| (!panel.running()).then_some(()))
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Asserted through the typing, never through which handle reports focus: the bug leaves
+    // focus exactly where the code intended to put it.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://api.test/after-run");
+    let url = cx.update(|_, cx| view.read(cx).url.read(cx).text().to_string());
+    assert_eq!(url, "https://api.test/after-run");
+
+    remove_scratch(&mut cx, &root);
+}
+
+// --- Flows ------------------------------------------------------------------------------
+
+fn flow_panel(
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> gpui::Entity<crate::flow_panel::FlowPanel> {
+    window
+        .update(cx, |workspace, _, _| workspace.flow_panel_for_test())
+        .expect("window")
+        .expect("the flow editor should be open")
+}
+
+fn write_flow(root: &PathBuf, name: &str, steps: &[&str]) {
+    let dir = root.join("flows");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let flow = zuno_core::flow::Flow {
+        name: name.to_string(),
+        steps: steps.iter().map(|step| step.to_string()).collect(),
+    };
+    std::fs::write(
+        dir.join(format!("{name}.json")),
+        serde_json::to_vec_pretty(&flow).expect("json"),
+    )
+    .expect("write");
+}
+
+#[gpui::test]
+async fn a_flow_runs_across_folders_in_the_order_it_names(cx: &mut TestAppContext) {
+    // **The case folder order cannot express.** A collection is organised by resource and a
+    // workflow runs across that — log in, create, delete — so the run order here is deliberately
+    // the reverse of what sorting these paths would give.
+    let (session, root) = scratch_collection("flow-order");
+    let url = serve_sequence(&[(200, "{}"), (200, "{}"), (200, "{}")]);
+    seed_runnable(&root, "users/delete.json", &url, Some(200));
+    seed_runnable(&root, "users/create.json", &url, Some(200));
+    seed_runnable(&root, "auth/login.json", &url, Some(200));
+    write_flow(
+        &root,
+        "lifecycle",
+        &["auth/login.json", "users/create.json", "users/delete.json"],
+    );
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-r");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+
+    let panel = run_panel(&window, &mut cx);
+    let rows = wait_for(&mut cx, "the flow to finish", |cx| {
+        let done = panel.read_with(cx, |panel, _| !panel.running());
+        done.then(|| panel.read_with(cx, |panel, _| panel.rows_for_test()))
+    });
+
+    let labels: Vec<&str> = rows
+        .iter()
+        .map(|row| row.trim_start_matches("pass ").trim_start_matches("fail "))
+        .collect();
+    assert_eq!(
+        labels,
+        ["auth/login.json", "users/create.json", "users/delete.json"],
+        "the flow's order, not the filenames': {rows:?}"
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn a_flow_step_whose_file_is_gone_fails_rather_than_vanishing(cx: &mut TestAppContext) {
+    // A step quietly dropping out is how a flow reports "1 passed, 0 failed" while checking one
+    // thing instead of two — the most dangerous shape a green run can have.
+    let (session, root) = scratch_collection("flow-missing");
+    let url = serve_sequence(&[(200, "{}")]);
+    seed_runnable(&root, "a.json", &url, Some(200));
+    write_flow(&root, "stale", &["a.json", "deleted.json"]);
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-alt-r");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+
+    let panel = run_panel(&window, &mut cx);
+    let rows = wait_for(&mut cx, "the flow to finish", |cx| {
+        let done = panel.read_with(cx, |panel, _| !panel.running());
+        done.then(|| panel.read_with(cx, |panel, _| panel.rows_for_test()))
+    });
+
+    assert_eq!(rows.len(), 2, "both steps are reported: {rows:?}");
+    assert!(rows[1].starts_with("fail"), "{rows:?}");
+    assert!(rows[1].contains("no longer in the collection"), "{rows:?}");
+    assert_eq!(
+        panel.read_with(&mut cx, |panel, _| panel.summary_for_test()),
+        "1 passed, 1 failed"
+    );
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn reordering_a_step_writes_the_new_order_and_follows_the_selection(
+    cx: &mut TestAppContext,
+) {
+    let (session, root) = scratch_collection("flow-reorder");
+    write_flow(&root, "lifecycle", &["one.json", "two.json", "three.json"]);
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.dispatch_action(crate::actions::EditFlows);
+    let panel = flow_panel(&window, &mut cx);
+    assert_eq!(panel.read_with(&mut cx, |p, _| p.listed()), vec!["lifecycle".to_string()]);
+
+    // Third step to the top, one press at a time. **The selection follows the step**, so three
+    // presses of the same key move the same one — otherwise each press moves a different step.
+    cx.simulate_keystrokes("down down");
+    cx.simulate_keystrokes("alt-up alt-up");
+    cx.run_until_parked();
+
+    assert_eq!(
+        panel.read_with(&mut cx, |p, _| p.steps()),
+        vec!["three.json".to_string(), "one.json".to_string(), "two.json".to_string()],
+    );
+
+    // Written on every edit, not on close: a modal that can lose an edit is what the environment
+    // editor also refuses.
+    let saved = zuno_core::flow::read(&root, "lifecycle").expect("read");
+    assert_eq!(saved.steps[0], "three.json");
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn adding_the_selected_request_appends_it_to_a_flow(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("flow-add");
+    seed_request(&root, "alpha.json", "https://one.test/alpha");
+    write_flow(&root, "smoke", &["existing.json"]);
+
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+
+    cx.dispatch_action(crate::actions::AddToFlow);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // Appended, never inserted: where a step goes is the editor's job, and a picker that also
+    // asked "at which position" would be two questions in one gesture.
+    let saved = zuno_core::flow::read(&root, "smoke").expect("read");
+    assert_eq!(saved.steps, vec!["existing.json".to_string(), "alpha.json".to_string()]);
+
+    let _ = window;
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn creating_a_flow_from_the_editor_makes_it_runnable(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("flow-create");
+    let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
+
+    cx.dispatch_action(crate::actions::EditFlows);
+    cx.dispatch_action(crate::actions::FlowNew);
+    cx.simulate_input("User lifecycle");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let panel = flow_panel(&window, &mut cx);
+    assert_eq!(
+        panel.read_with(&mut cx, |p, _| p.selected_name()),
+        Some("User-lifecycle".to_string()),
+        "the typed label goes through `slug`, because it becomes a filename",
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    assert!(root.join("flows/User-lifecycle.json").exists());
+
+    remove_scratch(&mut cx, &root);
+}
+
+#[gpui::test]
+async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext) {
+    // **The class of bug nothing else here can see.** Two context-less bindings on one keystroke
+    // do not fail to compile and do not fail loudly: `binding_enabled` scores both at maximum
+    // depth, the tiebreak is `ix_b.cmp(ix_a)`, and the later registration silently wins. Taking
+    // `ctrl-shift-r` from `FocusResponse` this way was noticed only because two unrelated
+    // response tests went red — which is luck, not coverage.
+    //
+    // Scoped bindings are deliberately *not* checked: sharing a keystroke across contexts is the
+    // whole point of contexts, and `ctrl-f` meaning the body in the editor and the response
+    // elsewhere is a documented design decision.
+    let _ = cx;
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+
+    for binding in crate::bindings() {
+        if binding.predicate().is_some() {
+            continue;
+        }
+        let keystroke = binding
+            .keystrokes()
+            .iter()
+            .map(|key| key.inner().unparse())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let action = binding.action().name().to_string();
+
+        if let Some(previous) = seen.insert(keystroke.clone(), action.clone()) {
+            panic!(
+                "{keystroke:?} is bound globally twice — to {previous} and then {action}, and \
+                 the later one silently wins"
+            );
+        }
+    }
+
+    assert!(seen.len() > 30, "the list should be substantial: {}", seen.len());
 }

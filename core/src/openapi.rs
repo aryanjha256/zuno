@@ -237,6 +237,8 @@ fn operation_to_request(
             body,
             settings: Default::default(),
             captures: Vec::new(),
+            expect_status: None,
+            assertions: Vec::new(),
         },
     }
 }

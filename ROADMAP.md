@@ -694,6 +694,20 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
+**The collection runner — done**, and it is the third of the three capabilities the audit found
+missing from these documents entirely. Assertions live on the request beside its captures —
+`expect_status` plus a table of `path · operator · value`, authored from a response row with
+`Alt+Shift+A` so the path comes from `path_to` rather than being typed twice.
+
+Two producers feed one loop. `Ctrl+R` runs the folder your panel selection sits in, in filename
+order, which is the smoke test over a feature. `Ctrl+Alt+R` runs a **flow**: a named, ordered list
+of requests in a reserved `flows/` directory, which is the case folder order cannot express —
+a collection is organised by resource and a workflow runs across it. The report fills in as the
+run goes, names what each failure was, and clicking a row opens that request.
+
+The run loop is entirely in `zuno-core` with no GPUI and no async runtime, which is what the crate
+split was for: it is what `zuno run ./collection` would call.
+
 - **Client certificates.** `RequestSettings` has room; reqwest supports it.
 - **Inline body diff.** The summary diff answers "did my change do anything?". A structural diff
   over `Row` spans is probably better than a text diff, now that the JSON outline exists.

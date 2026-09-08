@@ -246,6 +246,15 @@ pub struct RequestSpec {
     /// older build still parses.
     #[serde(default)]
     pub captures: Vec<crate::capture::Capture>,
+    /// The status a run expects. `None` means the request states none, so a run cannot fail it.
+    ///
+    /// Its own field rather than a row in `assertions`, because every request wants to check the
+    /// status and a table row saying so would sit on every request in the collection.
+    #[serde(default)]
+    pub expect_status: Option<u16>,
+    /// What a run checks in the response body. Defaulted per field, for `captures`' reason.
+    #[serde(default)]
+    pub assertions: Vec<crate::assertion::Assertion>,
 }
 
 impl Default for RequestSpec {
@@ -260,6 +269,8 @@ impl Default for RequestSpec {
             body: Body::Empty,
             settings: RequestSettings::default(),
             captures: Vec::new(),
+            expect_status: None,
+            assertions: Vec::new(),
         }
     }
 }
@@ -295,6 +306,8 @@ impl RequestSpec {
             },
             settings: RequestSettings::default(),
             captures: Vec::new(),
+            expect_status: None,
+            assertions: Vec::new(),
         }
     }
 }

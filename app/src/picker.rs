@@ -92,6 +92,10 @@ pub enum Target {
     Environment(Option<String>),
     /// Show a retained response: `0` is live, `1` the run before it.
     Run(usize),
+    /// Run a flow, by name.
+    Flow(String),
+    /// Append the collection panel's selection to a flow, by name.
+    AddToFlow(String),
     /// Set the request's body type, and its raw sub-kind when it has one.
     BodyType(crate::request_view::BodyType, Option<zuno_core::RawKind>),
     /// A directory to move the selected request into.
@@ -118,6 +122,8 @@ impl Clone for Target {
             Self::Method(method) => Self::Method(method.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),
             Self::Run(offset) => Self::Run(*offset),
+            Self::Flow(name) => Self::Flow(name.clone()),
+            Self::AddToFlow(name) => Self::AddToFlow(name.clone()),
             Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),
             Self::Folder(path) => Self::Folder(path.clone()),
             Self::Workspace(id) => Self::Workspace(id.clone()),

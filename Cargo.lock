@@ -7723,6 +7723,7 @@ dependencies = [
 name = "zuno"
 version = "0.2.1"
 dependencies = [
+ "async-channel 2.5.0",
  "bytes",
  "gpui",
  "resvg",

@@ -9,18 +9,21 @@
 //! the picker, and body search. Listed by *what* rather than by milestone — the milestone tags
 //! this line used to carry stopped meaning anything once modules kept arriving after M1.
 
+pub mod assertion;
 pub mod capture;
 pub mod collection;
 pub mod curl;
 pub mod diff;
 pub mod engine;
 pub mod environment;
+pub mod flow;
 pub mod fuzzy;
 pub mod highlight;
 pub mod json;
 pub mod lines;
 pub mod openapi;
 pub mod request;
+pub mod runner;
 pub mod response;
 pub mod search;
 

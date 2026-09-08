@@ -9,6 +9,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
@@ -22,8 +24,11 @@ use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
-    AddCapture, CaptureValue, EditEnvironments, EnvConfirm, EnvDismiss, EnvNewEnvironment,
-    OpenDefaults,
+    AddAssertion, AddCapture, AssertValue, CaptureValue, CycleAssertOp, EditEnvironments,
+    EnvConfirm, EnvDismiss, EnvNewEnvironment, ShowAssertTab,
+    AddToFlow, EditFlows, FlowConfirm, FlowDismiss, FlowNew, FlowNext, FlowPrev, FlowRename,
+    FlowStepDown, FlowStepNext, FlowStepPrev,
+    FlowStepRemove, FlowStepUp, FlowTrash, OpenDefaults, RunDismiss, RunFlow, RunFolder,
     EnvNewVariable, EnvNext, ShowCaptureTab, ToggleCaptureSecret,
     EnvPrev, EnvRemoveVariable, EnvRenameEnvironment, EnvToggleSecret, EnvTrashEnvironment,
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
@@ -149,6 +154,8 @@ pub struct Workspace {
     close_confirm: Option<crate::close_panel::CloseConfirm>,
     new_workspace_panel: Option<WorkspacePanelState>,
     environment_panel: Option<EnvPanelState>,
+    run: Option<RunState>,
+    flows: Option<FlowPanelState>,
     /// The folder dialog behind New and Open. Held because dropping the task cancels it.
     workspace_prompt: Option<Task<()>>,
 }
@@ -177,6 +184,22 @@ struct ImportState {
 /// Same pairing again: the panel and the subscription that lets it be closed.
 struct WorkspacePanelState {
     panel: Entity<crate::workspace_panel::WorkspacePanel>,
+    _subscription: Subscription,
+}
+
+/// The flow editor and the subscription that lets a rename or a removal reach the workspace.
+struct FlowPanelState {
+    panel: Entity<crate::flow_panel::FlowPanel>,
+    _subscription: Subscription,
+}
+
+/// The run report, its subscription, and the flag that stops the run behind it.
+struct RunState {
+    panel: Entity<crate::run_panel::RunPanel>,
+    /// Read by the runner between steps *and* while a request is in flight, so a stuck request
+    /// does not hold the stop button hostage.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    _task: Task<()>,
     _subscription: Subscription,
 }
 
@@ -313,6 +336,8 @@ impl Workspace {
             close_confirm: None,
             new_workspace_panel: None,
             environment_panel: None,
+            run: None,
+            flows: None,
             workspace_prompt: None,
         };
 
@@ -461,6 +486,8 @@ impl Workspace {
             || self.close_confirm.is_some()
             || self.new_workspace_panel.is_some()
             || self.environment_panel.is_some()
+            || self.run.is_some()
+            || self.flows.is_some()
     }
 
     #[cfg(test)]
@@ -1290,7 +1317,19 @@ impl Workspace {
         // decision, so a folder's menu leaves them out rather than offering a control that can
         // only fail — the rule the request guard already followed from the other side.
         if directory {
+            // Named with its count for the delete prompt's reason, pointed the other way: "Run
+            // billing" with no number is how forty requests reach production.
+            let path = self.selected_node().map(|node| node.path.clone());
+            let run = match path.as_deref().map(collection::request_count) {
+                Some(1) => "Run 1 request".to_string(),
+                Some(n) if n > 1 => format!("Run {n} requests"),
+                // Nothing to run, and `RunFolder` says so rather than opening an empty report.
+                _ => "Run folder".to_string(),
+            };
+
             let rows = vec![
+                MenuItem::new(run, RunFolder, &focus, window).into(),
+                MenuRow::Separator,
                 MenuItem::new("Reveal in file manager", RevealRequest, &focus, window).into(),
                 MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
                 MenuRow::Separator,
@@ -2794,6 +2833,8 @@ impl Workspace {
                     self.set_status("The last workspace cannot be forgotten", cx);
                 }
             }
+            picker::Target::Flow(name) => self.start_flow(&name, window, cx),
+            picker::Target::AddToFlow(name) => self.add_selection_to_flow(&name, cx),
             picker::Target::File(path) => {
                 // Focus is left where `activate` put it — inside the new buffer. The panel
                 // shares this method and re-focuses itself afterwards; see
@@ -3184,6 +3225,402 @@ impl Workspace {
 
     fn show_capture_tab(&mut self, _: &ShowCaptureTab, _: &mut Window, cx: &mut Context<Self>) {
         self.show_request_tab(RequestTab::Capture, cx);
+    }
+
+    /// Run the folder the panel's selection sits in.
+    ///
+    /// **A folder, resolved from the selection rather than asked for.** A directory row runs
+    /// itself; a request row runs the folder holding it, because "run the thing next to what I
+    /// am looking at" is the gesture, and offering a request row a run of *one* request is a
+    /// worse version of `Ctrl+Enter`. With nothing selected it runs the whole collection, and the
+    /// report's title says which — so the answer to "what did that just do" is on screen.
+    fn run_folder(&mut self, _: &RunFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.set_status("No collection directory to run", cx);
+            return;
+        };
+        let Some(engine) = cx.engine() else { return };
+
+        let folder = match self.selected_node() {
+            Some(node) if matches!(node.kind, NodeKind::Directory) => node.path.clone(),
+            Some(node) => node.path.parent().map(Path::to_path_buf).unwrap_or(root.clone()),
+            None => root.clone(),
+        };
+
+        let steps = zuno_core::runner::steps_in_folder(&root, &folder);
+        if steps.is_empty() {
+            self.set_status("Nothing to run in there", cx);
+            return;
+        }
+
+        let subject = if folder == root {
+            crate::app_state::active_id(cx).unwrap_or_else(|| "collection".to_string())
+        } else {
+            crate::app_state::label(&folder)
+        };
+        self.begin_run(subject, root, engine, steps, window, cx);
+    }
+
+    /// Open the report and start the run behind it. Shared by the two producers, which differ
+    /// only in where their step list came from.
+    fn begin_run(
+        &mut self,
+        subject: String,
+        root: PathBuf,
+        engine: Arc<zuno_core::Engine>,
+        steps: Vec<zuno_core::runner::Step>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let total = steps.len();
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let panel = cx.new(|cx| {
+            crate::run_panel::RunPanel::new(subject, root.clone(), total, restore, window, cx)
+        });
+
+        let subscription = cx.subscribe_in(&panel, window, |workspace, _, event, window, cx| {
+            let crate::run_panel::RunEvent::Open(path) = event;
+            // Opening the request is what a failed row is *for*: the report says what broke and
+            // this is how you go and look at it.
+            let path = path.clone();
+            workspace.close_run(window, cx);
+            workspace.open_collection_file(path, window, cx);
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = self.spawn_run(&panel, engine, steps, root, &cancel, window, cx);
+
+        self.run = Some(RunState {
+            panel,
+            cancel,
+            _task: task,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn edit_flows(&mut self, _: &EditFlows, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        let panel = cx.new(|cx| crate::flow_panel::FlowPanel::new(root, restore, window, cx));
+        let subscription = cx.subscribe_in(&panel, window, |_, _, event, _, _| {
+            let crate::flow_panel::FlowEvent::Changed = event;
+            // Nothing in the workspace holds a flow by name — a run resolves one at the moment
+            // it starts — so this exists for the next thing that does, and to keep the panel
+            // from having to know that.
+        });
+
+        self.flows = Some(FlowPanelState {
+            panel,
+            _subscription: subscription,
+        });
+        cx.notify();
+    }
+
+    fn flow_panel(&self) -> Option<Entity<crate::flow_panel::FlowPanel>> {
+        self.flows.as_ref().map(|state| state.panel.clone())
+    }
+
+    fn flow_new(&mut self, _: &FlowNew, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.start_new(window, cx));
+    }
+
+    fn flow_rename(&mut self, _: &FlowRename, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.start_rename(window, cx));
+    }
+
+    fn flow_trash(&mut self, _: &FlowTrash, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.trash_selected(window, cx));
+    }
+
+    fn flow_next(&mut self, _: &FlowNext, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.select(1, cx));
+    }
+
+    fn flow_prev(&mut self, _: &FlowPrev, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.select(-1, cx));
+    }
+
+    fn flow_step_next(&mut self, _: &FlowStepNext, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.step_selection(1, cx));
+    }
+
+    fn flow_step_prev(&mut self, _: &FlowStepPrev, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.step_selection(-1, cx));
+    }
+
+    fn flow_step_up(&mut self, _: &FlowStepUp, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.move_step(-1, cx));
+    }
+
+    fn flow_step_down(&mut self, _: &FlowStepDown, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.move_step(1, cx));
+    }
+
+    fn flow_step_remove(&mut self, _: &FlowStepRemove, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.remove_step(cx));
+    }
+
+    fn flow_confirm(&mut self, _: &FlowConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        panel.update(cx, |panel, cx| panel.confirm(window, cx));
+    }
+
+    /// `escape` backs out of a name box if one is open, otherwise the panel — the same two-stage
+    /// rule the environment editor follows.
+    fn flow_dismiss(&mut self, _: &FlowDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.flow_panel() else { return };
+        if panel.update(cx, |panel, cx| panel.cancel(window, cx)) {
+            return;
+        }
+        let Some(state) = self.flows.take() else { return };
+        if let Some(focus) = state.panel.read(cx).restore_focus() {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn flow_panel_for_test(&self) -> Option<Entity<crate::flow_panel::FlowPanel>> {
+        self.flow_panel()
+    }
+
+    /// Choose a flow to run.
+    ///
+    /// A picker rather than a tree entry: flows are not requests, and putting them in the panel
+    /// would mean the tree stops being "the files in your collection" — the same argument that
+    /// keeps environments out of it.
+    fn run_flow(&mut self, _: &RunFlow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+
+        let mut items: Vec<picker::Item> = zuno_core::flow::scan(&root)
+            .into_iter()
+            .map(|flow| picker::Item {
+                label: SharedString::from(flow.name.clone()),
+                detail: SharedString::from(match flow.steps.len() {
+                    1 => "1 request".to_string(),
+                    n => format!("{n} requests"),
+                }),
+                target: picker::Target::Flow(flow.name),
+            })
+            .collect();
+
+        // Last, the way "Edit environments…" sits under the environments: the switcher is the
+        // surface you are already on when you want to change one.
+        items.push(picker::Item {
+            label: SharedString::from("Edit flows…"),
+            detail: SharedString::from("create, reorder or remove"),
+            target: picker::Target::Action(Box::new(EditFlows)),
+        });
+
+        self.show_picker(items, "No flows yet — choose \"Edit flows\" to make one", window, cx);
+    }
+
+    fn start_flow(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(engine) = cx.engine() else { return };
+        let Ok(flow) = zuno_core::flow::read(&root, name) else {
+            self.set_status(&format!("Could not read the flow {name:?}"), cx);
+            return;
+        };
+
+        let steps = zuno_core::runner::steps_for_flow(&root, &flow);
+        if steps.is_empty() {
+            self.set_status(&format!("{name} has no steps yet"), cx);
+            return;
+        }
+        self.begin_run(flow.name, root, engine, steps, window, cx);
+    }
+
+    /// Append the panel's selected request to a flow.
+    ///
+    /// Appended, never inserted: where a step goes is the flow editor's job, and a picker that
+    /// also asked "at which position" would be two questions in one gesture.
+    fn add_selection_to_flow(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+        let Some(node) = self.selected_node() else { return };
+        let Ok(relative) = node.path.strip_prefix(&root) else { return };
+        let relative = relative.display().to_string();
+
+        let mut flow = match zuno_core::flow::read(&root, name) {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.set_status(&format!("{error}"), cx);
+                return;
+            }
+        };
+        flow.steps.push(relative.clone());
+
+        match zuno_core::flow::save(&root, &flow) {
+            Ok(()) => self.set_status(&format!("Added {relative} to {name}"), cx),
+            Err(error) => self.set_status(&format!("{error}"), cx),
+        }
+    }
+
+    /// Offer the flows to add the selected request to.
+    fn add_to_flow(&mut self, _: &AddToFlow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() || self.selected_request().is_none() {
+            return;
+        }
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            return;
+        };
+
+        let items: Vec<picker::Item> = zuno_core::flow::scan(&root)
+            .into_iter()
+            .map(|flow| picker::Item {
+                label: SharedString::from(flow.name.clone()),
+                detail: SharedString::from(format!("{} requests", flow.steps.len())),
+                target: picker::Target::AddToFlow(flow.name),
+            })
+            .collect();
+
+        self.show_picker(items, "No flows yet — make one with Ctrl+Alt+R", window, cx);
+    }
+
+    /// Drive the run off-thread, handing each outcome back as it lands.
+    ///
+    /// `runner::run_with_progress` blocks — that is the whole design, and invariant 3 is why it
+    /// cannot be called here. The channel exists so the report fills in as the run goes: forty
+    /// requests showing nothing until they finish is indistinguishable from a hang.
+    fn spawn_run(
+        &self,
+        panel: &Entity<crate::run_panel::RunPanel>,
+        engine: Arc<zuno_core::Engine>,
+        steps: Vec<zuno_core::runner::Step>,
+        root: PathBuf,
+        cancel: &Arc<AtomicBool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let environment = self.environment.clone();
+        let (sender, receiver) = async_channel::unbounded();
+        let flag = Arc::clone(cancel);
+
+        let work = cx.background_executor().spawn(async move {
+            zuno_core::runner::run_with_progress(
+                &engine,
+                steps,
+                &root,
+                environment.as_deref(),
+                &flag,
+                |outcome| {
+                    let _ = sender.send_blocking(zuno_core::runner::Outcome {
+                        label: outcome.label.clone(),
+                        status: outcome.status,
+                        duration: outcome.duration,
+                        error: None,
+                        unresolved: outcome.unresolved.clone(),
+                        failures: outcome.failures.clone(),
+                        captured: outcome.captured.clone(),
+                    });
+                },
+            )
+            .cancelled
+        });
+
+        let panel = panel.clone();
+        cx.spawn_in(window, async move |_, cx| {
+            while let Ok(outcome) = receiver.recv().await {
+                let _ = panel.update(cx, |panel, cx| panel.push(outcome, cx));
+            }
+            let cancelled = work.await;
+            let _ = panel.update(cx, |panel, cx| panel.finish(cancelled, cx));
+        })
+    }
+
+    /// `escape` stops a run in flight, and closes a finished report. One action, because it means
+    /// "back out of this" at whichever stage you are at.
+    fn run_dismiss(&mut self, _: &RunDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.run.as_ref() else { return };
+        if state.panel.read(cx).running() {
+            state.cancel.store(true, Ordering::Relaxed);
+            return;
+        }
+        self.close_run(window, cx);
+    }
+
+    fn close_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.run.take() else { return };
+        state.cancel.store(true, Ordering::Relaxed);
+        if let Some(focus) = state.panel.read(cx).restore_focus() {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn run_panel_for_test(&self) -> Option<Entity<crate::run_panel::RunPanel>> {
+        self.run.as_ref().map(|state| state.panel.clone())
+    }
+
+    fn show_assert_tab(&mut self, _: &ShowAssertTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_request_tab(RequestTab::Assert, cx);
+    }
+
+    fn add_assertion(&mut self, _: &AddAssertion, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| {
+                view.add_row(RowKind::Assert, window, cx);
+            });
+        }
+    }
+
+    fn cycle_assert_op(&mut self, _: &CycleAssertOp, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        match view.read(cx).focused_row(window, cx) {
+            Some((RowKind::Assert, ix)) => {
+                view.update(cx, |view, cx| view.cycle_assert_op(ix, cx))
+            }
+            _ => self.set_status("Focus an assertion row first", cx),
+        }
+    }
+
+    /// Turn the selected response row into an assertion.
+    ///
+    /// The same gesture as `CaptureValue` and for the same reason: the path comes from `path_to`
+    /// rather than being typed twice, so a rule cannot quietly check a path that never matches.
+    fn assert_value(&mut self, _: &AssertValue, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        if view.read(cx).selected_body_row().is_none() {
+            self.set_status(&self.select_a_row_hint(window), cx);
+            return;
+        }
+        let Some(path) = view.read(cx).selected_body_path() else {
+            self.set_status("That row has no path to assert on", cx);
+            return;
+        };
+
+        view.update(cx, |view, cx| view.push_assertion(path, window, cx));
     }
 
     fn add_capture(&mut self, _: &AddCapture, window: &mut Window, cx: &mut Context<Self>) {
@@ -3611,6 +4048,12 @@ impl Workspace {
             items.push(context_menu::MenuItem::new(
                 "Capture as variable",
                 CaptureValue,
+                &focus,
+                window,
+            ));
+            items.push(context_menu::MenuItem::new(
+                "Assert on this",
+                AssertValue,
                 &focus,
                 window,
             ));
@@ -4085,6 +4528,7 @@ impl Workspace {
                 RowKind::Form => "form field",
                 RowKind::Multipart => "part",
                 RowKind::Capture => "capture",
+                RowKind::Assert => "assertion",
             };
             return SharedString::from(format!("{label} row {}", ix + 1));
         }
@@ -4152,6 +4596,27 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::workspace_dismiss))
             .on_action(cx.listener(Self::workspace_browse))
             .on_action(cx.listener(Self::show_capture_tab))
+            .on_action(cx.listener(Self::run_folder))
+            .on_action(cx.listener(Self::run_flow))
+            .on_action(cx.listener(Self::add_to_flow))
+            .on_action(cx.listener(Self::edit_flows))
+            .on_action(cx.listener(Self::flow_new))
+            .on_action(cx.listener(Self::flow_rename))
+            .on_action(cx.listener(Self::flow_trash))
+            .on_action(cx.listener(Self::flow_next))
+            .on_action(cx.listener(Self::flow_prev))
+            .on_action(cx.listener(Self::flow_step_next))
+            .on_action(cx.listener(Self::flow_step_prev))
+            .on_action(cx.listener(Self::flow_step_up))
+            .on_action(cx.listener(Self::flow_step_down))
+            .on_action(cx.listener(Self::flow_step_remove))
+            .on_action(cx.listener(Self::flow_confirm))
+            .on_action(cx.listener(Self::flow_dismiss))
+            .on_action(cx.listener(Self::run_dismiss))
+            .on_action(cx.listener(Self::show_assert_tab))
+            .on_action(cx.listener(Self::add_assertion))
+            .on_action(cx.listener(Self::cycle_assert_op))
+            .on_action(cx.listener(Self::assert_value))
             .on_action(cx.listener(Self::add_capture))
             .on_action(cx.listener(Self::toggle_capture_secret))
             .on_action(cx.listener(Self::capture_value))
@@ -4324,6 +4789,8 @@ impl Render for Workspace {
             .children(self.import.as_ref().map(|state| state.panel.clone()))
             .children(self.new_workspace_panel.as_ref().map(|state| state.panel.clone()))
             .children(self.environment_panel.as_ref().map(|state| state.panel.clone()))
+            .children(self.run.as_ref().map(|state| state.panel.clone()))
+            .children(self.flows.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
             // Built here rather than held as an `Entity`: it owns no input and no state beyond
             // which button is selected, so it is plain workspace state like `RenameState`.

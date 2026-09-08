@@ -96,6 +96,31 @@ actions!(
         // say so — a design arguing with itself.
         OpenDefaults,
         ShowCaptureTab,
+        ShowAssertTab,
+        // Running a folder. `RunDismiss` both cancels a run in flight and closes a finished
+        // report, because `escape` means "back out of this" at whichever stage you are at.
+        RunFolder,
+        RunDismiss,
+        // Flows: the ordered producer. A folder runs in filename order, which is right for a
+        // smoke test and wrong for a workflow — those cross resource folders by nature.
+        RunFlow,
+        AddToFlow,
+        EditFlows,
+        FlowNew,
+        FlowRename,
+        FlowTrash,
+        FlowNext,
+        FlowPrev,
+        FlowStepNext,
+        FlowStepPrev,
+        FlowStepUp,
+        FlowStepDown,
+        FlowStepRemove,
+        FlowConfirm,
+        FlowDismiss,
+        AddAssertion,
+        CycleAssertOp,
+        AssertValue,
         AddCapture,
         ToggleCaptureSecret,
         CaptureValue,

@@ -1565,6 +1565,157 @@ Decisions worth keeping:
 
 ---
 
+## 6e. The collection runner — assertions first
+
+Building in five slices; this section grows with them. **Slice 1: what a request expects.**
+
+An assertion is `capture::extract`'s comparison half. Both address a value with a JSONPath in
+`path_to`'s notation and both read it through the *same* function, so a path copied out of a
+response with `Alt+C` works in either and cannot drift between them.
+
+- **The status is not an assertion.** Every request wants to check it, so a design where it
+  competes for a row in the table puts a row saying the obvious on every request in the
+  collection. `expect_status: Option<u16>` is its own field; the table is for the body.
+- **Three operators — `exists`, `equals`, `contains` — and no `<` or `>`.** `extract` returns
+  text, so a numeric comparison needs a parse *and* a decision about whether `1.0` equals `1`.
+  That is a real semantic to commit to for a case nobody has asked for; adding one later is
+  additive, guessing now is permanent.
+- **Values compare unquoted**, the way `extract` returns them: assert `ok`, not `"ok"`. Anything
+  else would mean quoting by hand a value you can read on screen.
+- **A body assertion against a non-JSON response fails.** The tempting alternative — nothing to
+  check, so nothing failed — turns an endpoint that started returning HTML into a green run.
+- **`check_all` skips disabled and half-typed rows itself** rather than leaving it to callers.
+  The equivalent filter in the capture runner is written at its one call site, and a second
+  caller forgetting it would fail a run on a row you were still typing.
+
+`RequestSpec` carries both fields with a per-field `#[serde(default)]`, and `RequestView` holds
+rows for them **before the Assert tab exists** — `spec` derives from the inputs, so a field the
+view does not hold is destroyed on save, and a hand-written rule would be lost by opening the
+request. `assertions_survive_a_load_and_save_before_any_ui_can_edit_them` is that assertion,
+written against a file because nothing can author one yet.
+
+**Slice 2: the loop, and it is entirely in `zuno-core`.** `Engine::send` hands back an
+`async_channel::Receiver`, which has `recv_blocking` — so the runner is an ordinary synchronous
+loop with no async runtime and no GPUI. The app drives it on a background executor; `zuno run
+./collection` would drive it on its main thread, which is the reuse the crate split was for.
+
+- **The step list is the only input.** A folder expands through `collection::scan`, already sorted
+  by relative path; a flow names its steps explicitly. Neither the loop nor the report knows which
+  produced it, so the two producers cost one loop between them.
+- **The resolver is rebuilt per step and must never be hoisted.** The previous step's captures
+  were written to the environment *on disk*, and this step resolves against them. Hoisting it out
+  of the loop is the single change that makes a login-then-use flow silently send an empty token,
+  which is why `a_captured_value_reaches_the_next_step_on_the_wire` asserts the bytes the server
+  received rather than anything inside the process.
+- **A failed step publishes nothing**, for the reason a failed send does not in the app: an error
+  body has fields too, and one in `{{token}}` leaves every later step failing for a cause nothing
+  points at.
+- **Failures do not stop the run**, cancellation does. A run exists to say everything that is
+  wrong in one pass.
+- **The body is parsed, not sniffed.** A JSON body under `text/plain` is common enough that
+  asserting on it should work, and a non-JSON body fails at its first byte — so trying costs
+  nothing and refusing on a header costs a real case.
+
+**`capture::publish` moved into core in this slice, and moving it found a bug.** The app's capture
+path removed the committed entry for *every* secret name; the rule is that only a name which was
+not already secret loses it, because for one that was, the committed value is a separate
+placeholder. Written twice, invariant 10 was right in the environment editor and quietly wrong in
+the capture path — and the editor's test could not see it, since it covers the other writer. Three
+unit tests hold `publish` itself now.
+
+The same lift closed a second gap: a capture writing the *first* secret into an environment now
+arms `ensure_gitignored`, which previously only fired on an environment switch.
+
+**Slice 3: the Assert tab**, a fifth beside Capture and built the same way — a table of rules, the
+same authoring gesture from a response row (`Alt+Shift+A`, or "Assert on this" in its menu), and
+`path_to` as the source of the path so a rule cannot quietly check one that never matches.
+
+- **The expected status sits in the header, not the table**, for §6e's reason. It is a text box
+  rather than a stepper because you type `404` in three keystrokes, and a control that rejects `4`
+  on the way to `404` is one nobody can type in. **Parsed by `spec`, never mirrored** — an
+  unparseable box means "this request states no expectation", the same tolerance the URL gets.
+- **Three operators cycle rather than opening a picker.** A choice of three does not need a modal,
+  and the cell is its own mouse path.
+- **`exists` hides the value cell.** An empty box beside an operator that ignores it invites
+  typing into something discarded.
+
+**Building this found a bug in `is_dirty`, and the fix is structural.** It is a hand-written
+mirror of `spec` — deliberately, because the tab strip asks it per frame and `spec` clones the
+body — and `captures` was simply never added to it, so editing a capture left the tab clean and
+`Ctrl+W` closed without asking. It now **destructures `RequestSpec` with no `..`**, so a new field
+fails to compile until someone decides whether changing it makes a buffer dirty. Same discipline
+as `RequestView::load`'s exhaustive `Body` match, applied to the other end of the same problem.
+
+**Slice 4: running a folder.** `Ctrl+R` runs the folder the collection panel's selection sits in
+— a directory row runs itself, a request row runs the folder holding it, nothing selected runs the
+whole collection — and the report's title says which, so "what did that just do" is answered on
+screen rather than guessed.
+
+- **A panel, not a picker.** The picker is a chooser that closes when you pick. This is a report
+  you read, whose most important content is the *second* line of a failed row, and whose rows
+  happen also to open. Reusing the picker would have meant bending a one-line-per-row list around
+  a variable-height one.
+- **Rows arrive while the run is going.** `runner::run_with_progress` exists for exactly this:
+  forty requests showing nothing until they finish is indistinguishable from a hang. The outcomes
+  cross back on a channel, because `run` blocks and invariant 3 keeps it off the UI thread.
+- **`escape` is two-stage** — it stops a run in flight and closes a finished report — because it
+  means "back out of this" at whichever stage you are at.
+- **A cancelled report says "stopped early".** The counts alone read as a complete result, and
+  acting on "0 failed" when half the steps never ran is the worst thing this panel could cause.
+
+**Two bugs found by writing the tests, both in cancellation.**
+
+`Report::cancelled` was set only when the *loop* broke on the flag, so stopping during the last
+step left nothing to break out of and the report claimed it had finished. It reads the flag
+directly now — asserted with **zero steps**, the one shape where the loop cannot break and so only
+the flag can answer.
+
+Worse: `run_step` **blocked** on the event stream, so the cancel flag was only ever read between
+events — and a request that sends `Started` and then hangs produces none. The stop button did
+nothing on precisely the request you would most want to stop, under a comment claiming the
+opposite. It polls every 10ms now; reverting that makes `a_request_that_hangs_can_still_be_stopped`
+take **15 seconds instead of under one**, which is the assertion.
+
+That test lives in core rather than the app suite for a reason worth recording: **`run_until_parked`
+waits for background tasks, so no mid-run state is observable from the headless platform at all.**
+An app-level test of the two-stage `escape` was written, could not see the running state, and was
+deleted rather than weakened into one that passes for the wrong reason.
+
+**Slice 5: flows — the ordered producer.** A collection is organised by *resource* and a workflow
+runs *across* it: log in, create a user, read it, delete it. Those are two structures and one
+cannot encode the other, which is why filename order — right for a folder smoke test — is wrong
+here. `flows/` is a reserved directory holding a name and an ordered list of collection-relative
+paths, and `collection::scan` skips it by name for the reason `environments/` needed first.
+
+- **`runner::run` never learns which producer it got.** A folder expands through `scan`; a flow
+  resolves its step list. One loop, one report shape, one set of tests.
+- **A step whose file is gone is a *failure*, not a skip.** A flow quietly running three of its
+  four steps and reporting "3 passed, 0 failed" is the most dangerous shape a green run can have,
+  so `Step::spec` is an `Option` and the missing case gets its own line in the report.
+- **A step may repeat** — logging in again around a teardown is ordinary — which a list gives for
+  free and a set would not.
+- **The selection follows the step when you move it.** Moving something up three places is three
+  presses of the same key, and a cursor that stayed put would move a different step each time.
+- **The name is the filename**, not a field in it, so a `mv` cannot leave a stale one behind.
+- Flows stay **out of the collection tree**, like environments: the tree is the files in your
+  collection, and a picker is what holds the rest.
+- **A folder's row menu leads with running it**, named with its count for the delete prompt's
+  reason. `Ctrl+R` was the only path for a slice — a verb wired up and never offered.
+
+**And a keybinding clash that nothing was watching for.** `RunFlow` was given `ctrl-shift-r`,
+which `FocusResponse` has held since M1. That does not fail to compile and does not fail loudly:
+`binding_enabled` scores both context-less bindings at maximum depth, the tiebreak is registration
+order, and the later one silently wins. What noticed was two *unrelated* response tests going red
+— luck, not coverage, and the sixth time this ordering has decided behaviour here.
+
+`register_keymap` now builds its list through `bindings()` so a test can read it, and
+`no_two_global_bindings_claim_the_same_keystroke` fails with the offending pair named. Scoped
+bindings are deliberately excluded: sharing a keystroke across contexts is what contexts are
+*for*, and `ctrl-f` meaning the body in the editor and the response elsewhere is a design
+decision, not a collision.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains

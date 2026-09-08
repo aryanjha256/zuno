@@ -21,6 +21,7 @@ use gpui::{
 };
 use zuno_core::{
     Body, Engine, EngineError, Event, FormField, Header, Hits, JobId, Method, MultipartField,
+    assertion::{Assertion, Op},
     capture::Capture,
     MultipartValue, QueryParam, RawKind, RequestId, RequestSettings, RequestSpec, Resolver,
     ResponseData, ResponseDiff,
@@ -126,6 +127,33 @@ impl KeyValueRow {
     }
 }
 
+/// One editable assertion. `enabled` and `op` live here rather than in the inputs for
+/// `CaptureRow`'s reason: changing either must not disturb what you typed.
+pub struct AssertionRow {
+    pub enabled: bool,
+    pub path: Entity<TextInput>,
+    pub op: Op,
+    pub value: Entity<TextInput>,
+}
+
+impl AssertionRow {
+    fn new(assertion: &Assertion, cx: &mut Context<RequestView>) -> Self {
+        Self {
+            enabled: assertion.enabled,
+            path: cx.new(|cx| {
+                TextInput::new(assertion.path.clone(), "$.status", "AssertCell", cx)
+            }),
+            op: assertion.op,
+            value: cx.new(|cx| TextInput::new(assertion.value.clone(), "ok", "AssertCell", cx)),
+        }
+    }
+
+    fn is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.path.read(cx).focus_handle(cx).is_focused(window)
+            || self.value.read(cx).focus_handle(cx).is_focused(window)
+    }
+}
+
 /// Why captures are running.
 ///
 /// The only thing it decides is whether a refusal is reported. After a send, silence is right —
@@ -182,17 +210,20 @@ pub enum RequestTab {
     Body,
     /// What this request publishes into the environment after a successful send.
     Capture,
+    /// What a run checks in the response.
+    Assert,
 }
 
 impl RequestTab {
     /// Visual order, which is also cycle order — deliberately not most-recently-used. With
     /// three tabs in a fixed strip, MRU sends the same keystroke somewhere different each time
     /// and throws away the muscle memory the strip gives for free.
-    pub const ALL: [RequestTab; 4] = [
+    pub const ALL: [RequestTab; 5] = [
         RequestTab::Headers,
         RequestTab::Query,
         RequestTab::Body,
         RequestTab::Capture,
+        RequestTab::Assert,
     ];
 
     fn step(self, delta: isize) -> Self {
@@ -268,6 +299,8 @@ pub enum RowKind {
     /// A capture rule. Shares the enum so `ToggleRow` and `RemoveRow` reach it without a second
     /// pair of actions, and so the compiler names every site that has to decide about it.
     Capture,
+    /// An assertion, for the same reasons.
+    Assert,
 }
 
 /// How far one `left`/`right` press moves the response body.
@@ -332,6 +365,13 @@ pub struct RequestView {
     /// What this request publishes. Held as rows for the same reason every other table is:
     /// `spec` derives from the inputs, so anything not represented here is destroyed on save.
     pub captures: Vec<CaptureRow>,
+    /// What a run checks in the response. Rows for the same reason every other table is: `spec`
+    /// derives from the inputs, so anything not represented here is destroyed on save.
+    pub assertions: Vec<AssertionRow>,
+    /// The status a run expects, as typed. `spec` parses it rather than mirroring a parsed copy
+    /// alongside it, so what runs cannot disagree with what is on screen — and an empty or
+    /// unparseable box simply means "this request states no expectation".
+    pub expect_status: Entity<TextInput>,
     /// The file a binary body sends.
     ///
     /// Only the path is held — the bytes are read at the send boundary by `build.rs`, so a
@@ -420,6 +460,8 @@ impl RequestView {
             form: Vec::new(),
             multipart: Vec::new(),
             captures: Vec::new(),
+            assertions: Vec::new(),
+            expect_status: cx.new(|cx| TextInput::new("", "200", "ExpectStatus", cx)),
             capture_target: None,
             capture_task: None,
             binary_path: None,
@@ -550,6 +592,15 @@ impl RequestView {
             .iter()
             .map(|capture| CaptureRow::new(capture, cx))
             .collect();
+        self.assertions = spec
+            .assertions
+            .iter()
+            .map(|assertion| AssertionRow::new(assertion, cx))
+            .collect();
+        self.expect_status = cx.new(|cx| {
+            let text = spec.expect_status.map(|code| code.to_string()).unwrap_or_default();
+            TextInput::new(text, "200", "ExpectStatus", cx)
+        });
         self.settings = spec.settings;
 
         // A different request has no relationship to the last one's response.
@@ -662,6 +713,17 @@ impl RequestView {
     /// same guarantee: no staleness, because nothing is cached.
     pub fn spec(&self, cx: &App) -> RequestSpec {
         RequestSpec {
+            expect_status: self.expect_status_value(cx),
+            assertions: self
+                .assertions
+                .iter()
+                .map(|row| Assertion {
+                    enabled: row.enabled,
+                    path: row.path.read(cx).text().to_string(),
+                    op: row.op,
+                    value: row.value.read(cx).text().to_string(),
+                })
+                .collect(),
             captures: self
                 .captures
                 .iter()
@@ -708,14 +770,35 @@ impl RequestView {
     /// `id` is excluded. Collection files write 0 and it is reassigned on open (invariant 9), so
     /// it is never a difference the reader made.
     pub fn is_dirty(&self, cx: &App) -> bool {
-        let base = &self.baseline;
+        // **Destructured with no `..`, and that is the whole guard.** This is a hand-written
+        // mirror of `spec`, so a new `RequestSpec` field is simply forgotten here — `captures`
+        // was, and editing one left the tab clean, so `Ctrl+W` closed without asking and the
+        // rule was gone. Now adding a field fails to compile until someone decides whether
+        // changing it makes a buffer dirty.
+        let RequestSpec {
+            // Neither is edited here: a session-local handle, and a name derived from the URL.
+            id: _,
+            name: _,
+            method,
+            url,
+            query,
+            headers,
+            body,
+            settings,
+            captures,
+            expect_status,
+            assertions,
+        } = &self.baseline;
 
-        self.method != base.method
-            || self.settings != base.settings
-            || self.url.read(cx).text() != base.url
-            || !rows_match(&self.query, &base.query, |p| (p.enabled, &p.name, &p.value), cx)
-            || !rows_match(&self.headers, &base.headers, |h| (h.enabled, &h.name, &h.value), cx)
-            || !self.body_matches(&base.body, cx)
+        self.method != *method
+            || self.settings != *settings
+            || self.url.read(cx).text() != url
+            || !rows_match(&self.query, query, |p| (p.enabled, &p.name, &p.value), cx)
+            || !rows_match(&self.headers, headers, |h| (h.enabled, &h.name, &h.value), cx)
+            || !self.body_matches(body, cx)
+            || !self.captures_match(captures, cx)
+            || self.expect_status_value(cx) != *expect_status
+            || !self.assertions_match(assertions, cx)
     }
 
     /// `body()`'s mapping asked as a question instead of built as a value.
@@ -1201,18 +1284,18 @@ impl RequestView {
             return;
         }
 
-        let rules: Vec<(String, String, bool)> = self
+        let rules: Vec<Capture> = self
             .captures
             .iter()
-            .filter(|row| row.enabled)
-            .map(|row| {
-                (
-                    row.path.read(cx).text().to_string(),
-                    row.name.read(cx).text().trim().to_string(),
-                    row.secret,
-                )
+            .map(|row| Capture {
+                enabled: row.enabled,
+                path: row.path.read(cx).text().to_string(),
+                name: row.name.read(cx).text().to_string(),
+                secret: row.secret,
             })
-            .filter(|(path, name, _)| !path.is_empty() && !name.is_empty())
+            .filter(|rule| {
+                rule.enabled && !rule.path.trim().is_empty() && !rule.name.trim().is_empty()
+            })
             .collect();
         if rules.is_empty() {
             self.refuse(requested, "Give the capture a path and a variable name", cx);
@@ -1246,30 +1329,25 @@ impl RequestView {
                 Err(error) => return Err(format!("{error}")),
             };
 
-            let mut written = Vec::new();
-            let mut missed = Vec::new();
-            for (path, name, secret) in rules {
-                match zuno_core::capture::extract(&outline, &path) {
-                    Some(value) => {
-                        // Marking secret moves it between the two halves, so the other one has
-                        // to let go — otherwise a value that used to be committed stays there.
-                        if secret {
-                            file.committed.remove(&name);
-                            file.local.insert(name.clone(), value);
-                        } else {
-                            file.local.remove(&name);
-                            file.committed.insert(name.clone(), value);
-                        }
-                        written.push(name);
-                    }
-                    None => missed.push(path),
-                }
+            // Through `capture::publish` rather than written out here: the collection runner
+            // needs the same rule, and invariant 10 written twice can be right in one place and
+            // quietly wrong in the other. It was — this site removed the committed entry for
+            // *every* secret name, which deletes the placeholder half of the very pattern
+            // `EnvironmentFile` exists to keep.
+            let published = zuno_core::capture::publish(&mut file, &outline, &rules);
+
+            if let Err(error) = zuno_core::environment::save(&root, &file) {
+                return Err(format!("{error}"));
             }
 
-            match zuno_core::environment::save(&root, &file) {
-                Ok(()) => Ok((target, written, missed)),
-                Err(error) => Err(format!("{error}")),
-            }
+            // A capture writing the first secret into an environment has to arm the ignore rule
+            // the same way the editor does. It did not: `protect_secrets` only fires on a
+            // *switch*, so a token captured into a freshly-made environment sat in a file git
+            // was still watching until you happened to switch away and back.
+            let ignored = published.new_secret
+                && matches!(zuno_core::environment::ensure_gitignored(&root), Ok(true));
+
+            Ok((target, published.written, published.missed, ignored))
         });
 
         self.capture_task = Some(cx.spawn(async move |this, cx| {
@@ -1277,11 +1355,15 @@ impl RequestView {
             let _ = this.update(cx, |this, cx| {
                 this.status = Some(SharedString::from(match outcome {
                     Err(error) => error,
-                    Ok((target, written, missed)) if missed.is_empty() => {
-                        format!("Captured {} into {target}", written.join(", "))
+                    Ok((target, written, missed, ignored)) if missed.is_empty() => {
+                        let mut message = format!("Captured {} into {target}", written.join(", "));
+                        if ignored {
+                            message.push_str(" — added *.local.json to .gitignore");
+                        }
+                        message
                     }
                     // Named, not counted: "1 path did not match" makes you go and find which.
-                    Ok((_, _, missed)) => {
+                    Ok((_, _, missed, _)) => {
                         format!("No match for {}", missed.join(", "))
                     }
                 }));
@@ -1811,6 +1893,10 @@ impl RequestView {
                 self.push_capture(String::new(), String::new(), window, cx);
                 None
             }
+            RowKind::Assert => {
+                self.push_assertion(String::new(), window, cx);
+                None
+            }
         };
 
         if let Some(row) = row {
@@ -1843,10 +1929,13 @@ impl RequestView {
         {
             return Some((RowKind::Multipart, ix));
         }
-        self.captures
+        if let Some(ix) = self.captures.iter().position(|row| row.is_focused(window, cx)) {
+            return Some((RowKind::Capture, ix));
+        }
+        self.assertions
             .iter()
             .position(|row| row.is_focused(window, cx))
-            .map(|ix| (RowKind::Capture, ix))
+            .map(|ix| (RowKind::Assert, ix))
     }
 
     /// Flip a row's `enabled` flag. Multipart parts wrap their row, so this can't hand back
@@ -1870,6 +1959,13 @@ impl RequestView {
                 }
                 None => false,
             },
+            RowKind::Assert => match self.assertions.get_mut(ix) {
+                Some(row) => {
+                    row.enabled = !row.enabled;
+                    true
+                }
+                None => false,
+            },
         }
     }
 
@@ -1880,6 +1976,7 @@ impl RequestView {
             RowKind::Form => self.form.len(),
             RowKind::Multipart => self.multipart.len(),
             RowKind::Capture => self.captures.len(),
+            RowKind::Assert => self.assertions.len(),
         };
         if ix >= len {
             return false;
@@ -1890,6 +1987,7 @@ impl RequestView {
             RowKind::Form => drop(self.form.remove(ix)),
             RowKind::Multipart => drop(self.multipart.remove(ix)),
             RowKind::Capture => drop(self.captures.remove(ix)),
+            RowKind::Assert => drop(self.assertions.remove(ix)),
         }
         true
     }
@@ -1966,6 +2064,68 @@ impl RequestView {
     pub fn publish_captures(&mut self, environment: Option<String>, cx: &mut Context<Self>) {
         self.capture_target = environment;
         self.run_captures(CaptureTrigger::Requested, cx);
+    }
+
+    /// The typed expectation as a status code, or `None` when the box is empty or nonsense.
+    ///
+    /// Nonsense reads as "no expectation" rather than as an error, for the reason the URL stays
+    /// a raw `String`: people type through invalid states on the way to a valid one, and a box
+    /// that complains at `2` on the way to `200` is a box nobody can type in.
+    pub fn expect_status_value(&self, cx: &App) -> Option<u16> {
+        self.expect_status.read(cx).text().trim().parse().ok()
+    }
+
+    /// Add an assertion and move focus into whichever cell still needs typing.
+    pub fn push_assertion(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let prefilled = !path.is_empty();
+        self.assertions.push(AssertionRow::new(
+            &Assertion {
+                path,
+                ..Default::default()
+            },
+            cx,
+        ));
+
+        if let Some(row) = self.assertions.last() {
+            // Authoring from a response row fills the path, so the value is what is left to say.
+            let cell = if prefilled { &row.value } else { &row.path };
+            let handle = cell.read(cx).focus_handle(cx);
+            window.focus(&handle);
+        }
+        self.request_tab = RequestTab::Assert;
+        cx.notify();
+    }
+
+    /// Step a row's operator. Three of them, so a cycle is cheaper than a picker and lands in
+    /// one keystroke rather than three.
+    pub fn cycle_assert_op(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.assertions.get_mut(ix) else { return };
+        row.op = match row.op {
+            Op::Exists => Op::Equals,
+            Op::Equals => Op::Contains,
+            Op::Contains => Op::Exists,
+        };
+        cx.notify();
+    }
+
+    fn captures_match(&self, base: &[Capture], cx: &App) -> bool {
+        self.captures.len() == base.len()
+            && self.captures.iter().zip(base).all(|(row, was)| {
+                row.enabled == was.enabled
+                    && row.secret == was.secret
+                    && row.path.read(cx).text() == was.path
+                    && row.name.read(cx).text() == was.name
+            })
+    }
+
+    fn assertions_match(&self, base: &[Assertion], cx: &App) -> bool {
+        self.assertions.len() == base.len()
+            && self.assertions.iter().zip(base).all(|(row, was)| {
+                row.enabled == was.enabled
+                    && row.op == was.op
+                    && row.path.read(cx).text() == was.path
+                    && row.value.read(cx).text() == was.value
+            })
     }
 
     pub fn toggle_capture_secret(&mut self, ix: usize, cx: &mut Context<Self>) {

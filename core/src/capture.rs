@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::environment::EnvironmentFile;
 use crate::json::{JsonOutline, RowKind, unquote};
 
 /// One "take this out of the response and put it in the environment" rule.
@@ -39,6 +40,68 @@ impl Default for Capture {
             secret: true,
         }
     }
+}
+
+/// What one pass of `publish` did.
+pub struct Published {
+    /// Variable names written, in rule order.
+    pub written: Vec<String>,
+    /// Paths that matched nothing. Named rather than counted: "1 did not match" makes you go
+    /// and find which.
+    pub missed: Vec<String>,
+    /// Whether anything became secret that was not already — the `.gitignore` trigger.
+    pub new_secret: bool,
+}
+
+/// Apply a request's captures to an environment, in place.
+///
+/// **Here rather than at the call site, because the secret rule is invariant 10 and there are
+/// two callers now** — a request's own send, and a collection run. Written twice it can be right
+/// in one and quietly wrong in the other, which is the failure mode invariant 10 exists for.
+///
+/// The rule with the sharp edge: a secret name keeps its committed entry only when it was
+/// *already* secret. Then the committed value is a separate placeholder and must survive. For a
+/// name being marked secret now, the committed value **is** the thing being hidden, so carrying
+/// it across would copy the token into the sidecar and leave the original in the file that gets
+/// pushed.
+pub fn publish(
+    file: &mut EnvironmentFile,
+    outline: &JsonOutline,
+    captures: &[Capture],
+) -> Published {
+    let mut out = Published {
+        written: Vec::new(),
+        missed: Vec::new(),
+        new_secret: false,
+    };
+
+    for capture in captures {
+        let path = capture.path.trim();
+        let name = capture.name.trim();
+        if !capture.enabled || path.is_empty() || name.is_empty() {
+            continue;
+        }
+
+        let Some(value) = extract(outline, path) else {
+            out.missed.push(path.to_string());
+            continue;
+        };
+
+        if capture.secret {
+            let was_secret = file.local.contains_key(name);
+            out.new_secret |= !was_secret;
+            if !was_secret {
+                file.committed.remove(name);
+            }
+            file.local.insert(name.to_string(), value);
+        } else {
+            file.local.remove(name);
+            file.committed.insert(name.to_string(), value);
+        }
+        out.written.push(name.to_string());
+    }
+
+    out
 }
 
 enum Segment {
@@ -227,6 +290,84 @@ mod tests {
 
         // Without this the loop is vacuous if `path_to` ever starts returning `None` everywhere.
         assert_eq!(checked, 6, "every scalar in the fixture was checked");
+    }
+
+    fn file(committed: &[(&str, &str)], local: &[(&str, &str)]) -> EnvironmentFile {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        EnvironmentFile {
+            name: "dev".into(),
+            committed: map(committed),
+            local: map(local),
+        }
+    }
+
+    fn rule(path: &str, name: &str, secret: bool) -> Capture {
+        Capture {
+            path: path.into(),
+            name: name.into(),
+            secret,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn publishing_an_already_secret_name_leaves_its_committed_placeholder_alone() {
+        // **The distinction the app path got wrong.** It removed the committed entry for every
+        // secret name, which deletes the placeholder half of the pattern `EnvironmentFile`
+        // exists to keep — a value committed for whoever clones the repo, the real one local.
+        let doc = outline(r#"{"access_token":"rotated"}"#);
+        let mut env = file(&[("token", "ask-alice")], &[("token", "old")]);
+
+        publish(&mut env, &doc, &[rule("$.access_token", "token", true)]);
+
+        assert_eq!(env.local.get("token").map(String::as_str), Some("rotated"));
+        assert_eq!(
+            env.committed.get("token").map(String::as_str),
+            Some("ask-alice"),
+            "the placeholder is not the secret and must survive"
+        );
+    }
+
+    #[test]
+    fn publishing_a_newly_secret_name_takes_its_value_out_of_the_committed_file() {
+        // The other direction, and the one invariant 10 is actually about: the committed value
+        // *is* the thing being hidden, so leaving it there commits the token.
+        let doc = outline(r#"{"access_token":"s3cret"}"#);
+        let mut env = file(&[("token", "was-plain")], &[]);
+
+        let published = publish(&mut env, &doc, &[rule("$.access_token", "token", true)]);
+
+        assert!(!env.committed.contains_key("token"), "{:?}", env.committed);
+        assert_eq!(env.local.get("token").map(String::as_str), Some("s3cret"));
+        assert!(published.new_secret, "and it arms the gitignore offer");
+    }
+
+    #[test]
+    fn publishing_reports_what_landed_and_what_missed() {
+        let doc = outline(r#"{"id":"7"}"#);
+        let mut env = file(&[], &[]);
+
+        let published = publish(
+            &mut env,
+            &doc,
+            &[
+                rule("$.id", "id", false),
+                rule("$.nope", "token", true),
+                // Disabled and half-typed rows are skipped here, not by each caller.
+                Capture { enabled: false, ..rule("$.id", "other", false) },
+                rule("  ", "blank", false),
+            ],
+        );
+
+        assert_eq!(published.written, vec!["id".to_string()]);
+        assert_eq!(published.missed, vec!["$.nope".to_string()]);
+        assert!(!published.new_secret, "nothing secret actually landed");
+        assert_eq!(env.committed.get("id").map(String::as_str), Some("7"));
     }
 
     #[test]
