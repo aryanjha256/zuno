@@ -62,7 +62,7 @@ use crate::actions::{
     FlowConfirm, FlowDismiss, FlowNext, FlowPrev, FlowStepDown, FlowStepNext, FlowStepPrev,
     FlowStepRemove, FlowStepUp, OpenDefaults,
     RunDismiss, RunFlow, RunFolder,
-    DeleteRequest, ImportConfirm, ImportDismiss, ImportOpenApi,
+    DeleteRequest, ImportConfirm, ImportDismiss, ImportDocument,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
@@ -237,7 +237,7 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-m", AddMultipartField, None),
         // Paste-special: import a curl command from the clipboard.
         KeyBinding::new("ctrl-shift-v", ImportCurl, None),
-        KeyBinding::new("ctrl-shift-i", ImportOpenApi, None),
+        KeyBinding::new("ctrl-shift-i", ImportDocument, None),
         // Headers ⇄ Params ⇄ Body, cycling forward and back like `ctrl-tab` does for buffers.
         // Not `alt-tab`, which the compositor's window switcher takes before we ever see it;
         // `alt-q` sits beside `alt-r` for the response pane's equivalent.

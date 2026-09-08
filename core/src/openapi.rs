@@ -20,6 +20,7 @@
 
 use serde_json::Value;
 
+use crate::import::{Import, Imported};
 use crate::{Body, Header, Method, QueryParam, RawKind, RequestId, RequestSpec};
 
 /// How deep to follow a schema when inventing an example body.
@@ -31,8 +32,6 @@ const MAX_SCHEMA_DEPTH: usize = 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenApiError {
-    #[error("not valid JSON: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("not an OpenAPI document — no \"openapi\" version field")]
     NotOpenApi,
     #[error(
@@ -43,29 +42,11 @@ pub enum OpenApiError {
     NoPaths,
 }
 
-/// One operation, ready to be written into a collection.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Imported {
-    /// The operation's first tag, which becomes the folder it is filed under.
-    pub folder: Option<String>,
-    pub spec: RequestSpec,
-}
-
-/// Everything an import yielded, and everything it could not.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Import {
-    pub requests: Vec<Imported>,
-    /// `info.title`, for naming the folder the import lands in.
-    pub title: Option<String>,
-    /// What was skipped, in words. Surfaced rather than logged, for `curl.rs`'s reason: an
-    /// import that silently drops part of a document is worse than one that says so.
-    pub skipped: Vec<String>,
-}
-
 /// Read a spec.
-pub fn parse(bytes: &[u8]) -> Result<Import, OpenApiError> {
-    let root: Value = serde_json::from_slice(bytes)?;
-
+///
+/// Takes the parsed document rather than bytes: `import::parse` has already read the JSON in
+/// order to decide which parser to call, and a megabyte spec should not be parsed twice.
+pub fn parse(root: &Value) -> Result<Import, OpenApiError> {
     let version = root
         .get("openapi")
         .and_then(Value::as_str)
@@ -79,7 +60,7 @@ pub fn parse(bytes: &[u8]) -> Result<Import, OpenApiError> {
         .and_then(Value::as_object)
         .ok_or(OpenApiError::NoPaths)?;
 
-    let base = base_url(&root);
+    let base = base_url(root);
     let title = root
         .get("info")
         .and_then(|info| info.get("title"))
@@ -113,7 +94,7 @@ pub fn parse(bytes: &[u8]) -> Result<Import, OpenApiError> {
 
             import
                 .requests
-                .push(operation_to_request(&root, &base, path, method, operation, &shared, &mut import.skipped));
+                .push(operation_to_request(root, &base, path, method, operation, &shared, &mut import.skipped));
         }
     }
 
@@ -225,7 +206,8 @@ fn operation_to_request(
     }
 
     Imported {
-        folder,
+        // A tag is one level deep by construction; Postman is what needed the `Vec`.
+        folders: folder.into_iter().collect(),
         spec: RequestSpec {
             // Collection files always store 0; a live handle is assigned when a buffer opens.
             id: RequestId(0),
@@ -459,6 +441,11 @@ mod tests {
       }
     }"##;
 
+    /// `parse` takes an already-read document now, so every test reads its own.
+    fn read(document: &str) -> Result<Import, OpenApiError> {
+        parse(&serde_json::from_str(document).expect("test document is valid JSON"))
+    }
+
     fn find<'a>(import: &'a Import, name: &str) -> &'a Imported {
         import
             .requests
@@ -469,7 +456,7 @@ mod tests {
 
     #[test]
     fn every_operation_becomes_a_request_with_its_url_and_method() {
-        let import = parse(SPEC.as_bytes()).expect("parse");
+        let import = read(SPEC).expect("parse");
         assert_eq!(import.title.as_deref(), Some("Billing API"));
         assert_eq!(import.requests.len(), 4);
 
@@ -477,7 +464,7 @@ mod tests {
         assert_eq!(list.spec.method, Method::Get);
         // The server's trailing slash is trimmed, or every URL would carry a double one.
         assert_eq!(list.spec.url, "https://api.test/v1/invoices");
-        assert_eq!(list.folder.as_deref(), Some("invoices"));
+        assert_eq!(list.folders, vec!["invoices".to_string()]);
 
         // A path template keeps its braces. Rewriting `{id}` into Zuno's `{{id}}` would make
         // every imported request unsendable until the variable was defined.
@@ -489,13 +476,13 @@ mod tests {
 
     #[test]
     fn a_name_falls_back_from_operation_id_to_summary_to_the_route() {
-        let import = parse(SPEC.as_bytes()).expect("parse");
+        let import = read(SPEC).expect("parse");
         // `post /invoices` has no operationId, so its summary names it.
         find(&import, "Create an invoice");
         // And an operation with neither would be named for its route — asserted separately,
         // since every operation in SPEC has one of the two.
-        let bare = parse(
-            br#"{"openapi":"3.0.0","paths":{"/ping":{"get":{}}}}"#,
+        let bare = read(
+            r#"{"openapi":"3.0.0","paths":{"/ping":{"get":{}}}}"#,
         )
         .expect("parse");
         assert_eq!(bare.requests[0].spec.name, "GET /ping");
@@ -505,7 +492,7 @@ mod tests {
     fn only_required_parameters_arrive_enabled() {
         // An optional parameter is worth importing — it documents what the endpoint takes — but
         // sending every filter a spec mentions is not what "import this API" means.
-        let import = parse(SPEC.as_bytes()).expect("parse");
+        let import = read(SPEC).expect("parse");
         let list = find(&import, "listInvoices");
 
         let limit = list.spec.query.iter().find(|q| q.name == "limit").expect("limit");
@@ -521,7 +508,7 @@ mod tests {
     fn a_path_level_parameter_reaches_every_operation_under_it() {
         // Declared once on `/invoices` and inherited by both `get` and `post`. Read only from
         // the operation and the header is silently missing from every request under that path.
-        let import = parse(SPEC.as_bytes()).expect("parse");
+        let import = read(SPEC).expect("parse");
 
         for name in ["listInvoices", "Create an invoice"] {
             let request = find(&import, name);
@@ -538,7 +525,7 @@ mod tests {
 
     #[test]
     fn a_referenced_schema_becomes_a_body_with_the_right_shape() {
-        let import = parse(SPEC.as_bytes()).expect("parse");
+        let import = read(SPEC).expect("parse");
         let create = find(&import, "Create an invoice");
 
         let Body::Raw { text, kind } = &create.spec.body else {
@@ -569,7 +556,7 @@ mod tests {
     #[test]
     fn a_body_zuno_cannot_invent_is_skipped_by_name_rather_than_guessed() {
         // The `curl.rs` rule: never silently drop part of a document.
-        let import = parse(SPEC.as_bytes()).expect("parse");
+        let import = read(SPEC).expect("parse");
         assert_eq!(find(&import, "upload").spec.body, Body::Empty);
         assert!(
             import.skipped.iter().any(|note| note.contains("multipart/form-data")),
@@ -580,7 +567,7 @@ mod tests {
 
     #[test]
     fn an_authors_example_beats_a_generated_one() {
-        let spec = br##"{
+        let spec = r##"{
           "openapi": "3.1.0",
           "paths": { "/x": { "post": { "operationId": "x", "requestBody": { "content": {
             "application/json": {
@@ -590,7 +577,7 @@ mod tests {
           } } } } }
         }"##;
 
-        let import = parse(spec).expect("parse");
+        let import = read(spec).expect("parse");
         let Body::Raw { text, .. } = &import.requests[0].spec.body else {
             panic!("expected a raw body");
         };
@@ -602,8 +589,8 @@ mod tests {
     fn a_3_1_document_imports_the_same_as_a_3_0_one() {
         // The whole argument for not taking `openapiv3`, which covers 3.0 only. The parts this
         // module reads did not change between the two versions.
-        let import = parse(
-            br##"{"openapi":"3.1.0","servers":[{"url":"https://a.test"}],
+        let import = read(
+            r##"{"openapi":"3.1.0","servers":[{"url":"https://a.test"}],
                   "paths":{"/ping":{"get":{"operationId":"ping"}}}}"##,
         )
         .expect("a 3.1 document must import");
@@ -614,7 +601,7 @@ mod tests {
     fn a_reference_cycle_terminates_instead_of_recursing_forever() {
         // Legal and common: a User whose manager is a User. A depth cap handles this and the
         // merely enormous with one rule, where a visited-set would only handle the first.
-        let spec = br##"{
+        let spec = r##"{
           "openapi": "3.0.0",
           "components": { "schemas": { "User": { "type": "object", "properties": {
             "name": { "type": "string" },
@@ -625,7 +612,7 @@ mod tests {
           } } } }
         }"##;
 
-        let import = parse(spec).expect("parse");
+        let import = read(spec).expect("parse");
         let Body::Raw { text, .. } = &import.requests[0].spec.body else {
             panic!("expected a raw body");
         };
@@ -634,18 +621,20 @@ mod tests {
     }
 
     #[test]
-    fn swagger_2_and_plain_json_are_refused_with_different_messages() {
-        // A 2.0 document is a different shape, not an older version of this one, and saying so
-        // beats importing zero requests from a file that plainly describes an API.
-        let swagger = parse(br#"{"swagger":"2.0","paths":{}}"#);
-        assert!(matches!(swagger, Err(OpenApiError::NotOpenApi)));
-
-        let two_point_oh = parse(br#"{"openapi":"2.0","paths":{}}"#);
-        assert!(matches!(two_point_oh, Err(OpenApiError::UnsupportedVersion(_))));
-
-        assert!(matches!(parse(b"not json at all"), Err(OpenApiError::Json(_))));
+    fn a_document_this_parser_cannot_read_is_refused_by_reason() {
+        // Which format a file *is* is `import::parse`'s question, and the messages for the
+        // shapes we recognise but cannot read are asserted there. These are this parser's own
+        // refusals, reachable by calling it directly.
         assert!(matches!(
-            parse(br#"{"openapi":"3.0.0"}"#),
+            read(r#"{"swagger":"2.0","paths":{}}"#),
+            Err(OpenApiError::NotOpenApi)
+        ));
+        assert!(matches!(
+            read(r#"{"openapi":"2.0","paths":{}}"#),
+            Err(OpenApiError::UnsupportedVersion(_))
+        ));
+        assert!(matches!(
+            read(r#"{"openapi":"3.0.0"}"#),
             Err(OpenApiError::NoPaths)
         ));
     }

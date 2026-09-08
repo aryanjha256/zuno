@@ -508,8 +508,8 @@ fn tokenize(input: &str) -> Result<Vec<String>, CurlError> {
     Ok(tokens)
 }
 
-/// Standard base64. Written out rather than pulling a dependency for ~15 lines used on
-/// exactly one code path.
+/// Standard base64. Written out rather than pulling a dependency for ~15 lines, and shared with
+/// `postman.rs`, which lowers Postman's basic auth into the same header this parses.
 // ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
@@ -683,7 +683,7 @@ fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-fn base64(input: &[u8]) -> String {
+pub(crate) fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);

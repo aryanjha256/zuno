@@ -253,7 +253,8 @@ said to. Environments made it redundant, and a dedicated auth tab would now be a
   capability, and it writes the credential into the *committed* request file, which is precisely the
   leak the environment split exists to prevent.
 - **Basic** is the one genuine gap, and it points somewhere else. `core/src/curl.rs` has a tested
-  `base64`, so *importing* `-u user:pass` works; authoring it from scratch doesn't, because nothing
+  `base64` — now shared with the Postman importer, which lowers `basic` auth into the same header —
+  so *importing* `-u user:pass` works; authoring it from scratch doesn't, because nothing
   in the UI can encode. But the encoded value belongs in a `.local` file, not in a request header —
   so the useful thing is "hand me the credential to paste", not an auth tab. ~30 lines as a palette
   command over the picker's fallback row, whenever it's wanted.
@@ -545,6 +546,24 @@ cursors stayed separate, because a match and where you are standing are differen
 
   JSON only. Most published specs are YAML and the YAML crate landscape is a graveyard, so that
   is a limitation written down rather than hidden.
+
+- **Postman import — done, and it was the one that mattered most.** `Ctrl+Shift+I` is now
+  `ImportDocument` rather than `ImportOpenApi`: the document decides which parser reads it, so
+  there is no format to pick. A v2.x export becomes its folder tree, its requests, its auth
+  lowered into headers, and an environment named for the collection that is **selected** on
+  arrival — an export whose every URL starts `{{baseUrl}}` is otherwise unsendable.
+
+  **Why it jumped the queue.** Everything else in this audit improves the app for someone already
+  inside it; this decides who gets inside. Friends of the author agreed to migrate and named the
+  migration itself as the obstacle, which is the only kind of feedback that reorders a roadmap.
+  It was also cheap for its size: the modal, the fetch-or-read, folder allocation and the
+  skipped-notes channel all existed from OpenAPI import, so the slice was one parser and a sniff.
+
+  Postman's `{{var}}` syntax is already Zuno's, which is luck. What does *not* come across is
+  `event` scripts — JavaScript, named in the report rather than dropped silently. Recovering the
+  three common shapes (`pm.environment.set` → a capture, a status check → `expect_status`,
+  `pm.expect` → an assertion) onto what the runner already has is the next slice. Descriptions
+  have no field to land in and are reported once. See architecture.md §6f.
 
 - **Delete — done**, in the slice after the panel. Right-click a request or press `delete`, and
   a second menu names the file before anything is removed. `context_menu.rs` finally has the

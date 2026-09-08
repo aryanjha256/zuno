@@ -124,9 +124,10 @@ actions!(
         AddCapture,
         ToggleCaptureSecret,
         CaptureValue,
-        // Import a whole API at once. `ImportCurl` is one request per paste; this is the way a
-        // collection gets filled from what a team already has.
-        ImportOpenApi,
+        // Import a whole API at once — the document decides which parser reads it, so this
+        // is one verb rather than one per format. `ImportCurl` is one request per paste; this
+        // is the way a collection gets filled from what a team already has.
+        ImportDocument,
         ImportConfirm,
         ImportDismiss,
         // Buffers

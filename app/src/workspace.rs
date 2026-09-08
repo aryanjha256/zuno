@@ -48,7 +48,7 @@ use crate::actions::{
     WorkspaceConfirm, WorkspaceDismiss,
     CollectionExpandAll, CommitRename, ConfirmClose, CopyRequestPath,
     CopyRequestRelativePath, DuplicateRequest,
-    ImportConfirm, ImportDismiss, ImportOpenApi, MoveRequest, NewFolder, OpenRequestExternally,
+    ImportConfirm, ImportDismiss, ImportDocument, MoveRequest, NewFolder, OpenRequestExternally,
     RenameRequest, RevealRequest, TrashRequest,
 };
 use crate::engine::ActiveEngine;
@@ -2063,7 +2063,7 @@ impl Workspace {
         }));
     }
 
-    fn import_openapi(&mut self, _: &ImportOpenApi, window: &mut Window, cx: &mut Context<Self>) {
+    fn import_document(&mut self, _: &ImportDocument, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
         }
@@ -2183,7 +2183,10 @@ impl Workspace {
         }));
     }
 
-    /// Parse a fetched or read spec and write its requests into the collection.
+    /// Parse a fetched or read document and write what it yields into the collection.
+    ///
+    /// The document decides which parser reads it — `import::parse` sniffs the shape — so this
+    /// is written once for OpenAPI and Postman alike, and a third format adds nothing here.
     fn finish_import(
         &mut self,
         panel: &Entity<crate::import_panel::ImportPanel>,
@@ -2191,7 +2194,7 @@ impl Workspace {
         bytes: &[u8],
         cx: &mut Context<Self>,
     ) {
-        let import = match zuno_core::openapi::parse(bytes) {
+        let import = match zuno_core::import::parse(bytes) {
             Ok(import) => import,
             Err(error) => {
                 panel.update(cx, |panel, cx| panel.report(error.to_string(), cx));
@@ -2200,7 +2203,7 @@ impl Workspace {
         };
         if import.requests.is_empty() {
             panel.update(cx, |panel, cx| {
-                panel.report("The document has no operations to import", cx)
+                panel.report("The document has no requests to import", cx)
             });
             return;
         }
@@ -2217,12 +2220,15 @@ impl Workspace {
         let mut written = 0usize;
         let mut failures = 0usize;
         for request in &import.requests {
-            // The operation's tag becomes a folder inside the spec's own, so an API arrives
-            // grouped the way its author grouped it.
-            let directory = match &request.folder {
-                Some(tag) => base.join(collection::slug(tag)),
-                None => base.clone(),
-            };
+            // The document's own grouping — an OpenAPI tag, a Postman folder tree — becomes
+            // directories inside the import's, so an API arrives filed the way its author filed
+            // it. The parser has already capped the nesting at what `collection::scan` walks.
+            let directory = request
+                .folders
+                .iter()
+                .fold(base.clone(), |directory, folder| {
+                    directory.join(collection::slug(folder))
+                });
             // `allocate` creates the directory and picks a free name, so re-importing the same
             // spec adds `-2` files rather than overwriting a request someone has since edited.
             let spec = RequestSpec {
@@ -2237,12 +2243,17 @@ impl Workspace {
             }
         }
 
+        let variables = self.import_variables(root, &title, &import, cx);
+
         self.refresh_tree(cx);
         self.import = None;
 
         let mut message = format!("Imported {written} requests into {}", collection::slug(&title));
         if failures > 0 {
             message.push_str(&format!(" — {failures} could not be written"));
+        }
+        if let Some(note) = variables {
+            message.push_str(&note);
         }
         if !import.skipped.is_empty() {
             message.push_str(&format!(" — {} skipped", import.skipped.len()));
@@ -2252,6 +2263,49 @@ impl Workspace {
         }
         self.set_status(&message, cx);
         cx.notify();
+    }
+
+    /// Write an import's variables into an environment and select it.
+    ///
+    /// **Selected, not merely written.** A Postman collection whose every URL begins
+    /// `{{baseUrl}}` imports as a folder of requests that cannot be sent until an environment is
+    /// active, and asking someone to find the switcher first is the friction this whole feature
+    /// exists to remove. It overrides a selection that was already there, which is why the
+    /// status line names it — a silent switch is the failure mode, not the switch.
+    fn import_variables(
+        &mut self,
+        root: &Path,
+        title: &str,
+        import: &zuno_core::Import,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        if import.variables.is_empty() {
+            return None;
+        }
+
+        let merged = match environment::merge_imported(root, title, &import.variables) {
+            Ok(merged) => merged,
+            // The requests are already on disk, so this is a note on a successful import rather
+            // than a failure of one.
+            Err(error) => return Some(format!(" — variables: {error}")),
+        };
+
+        self.environment = Some(merged.name.clone());
+        // Persisted here for `Target::Environment`'s reason: choosing an environment and then
+        // closing the window should not forget which one.
+        crate::session::save(&self.session(cx), cx);
+        // An import can bring secrets across, and they must not be committable before the next
+        // send happens to notice.
+        self.protect_secrets(cx);
+
+        let mut note = format!(
+            " — {} variables in the {} environment, now selected",
+            merged.added, merged.name
+        );
+        if merged.kept > 0 {
+            note.push_str(&format!(" ({} already set were left alone)", merged.kept));
+        }
+        Some(note)
     }
 
     /// Open the rename box on the selected request.
@@ -4653,7 +4707,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel_rename))
             .on_action(cx.listener(Self::new_folder))
             .on_action(cx.listener(Self::move_request))
-            .on_action(cx.listener(Self::import_openapi))
+            .on_action(cx.listener(Self::import_document))
             .on_action(cx.listener(Self::import_confirm))
             .on_action(cx.listener(Self::import_dismiss))
             .on_action(cx.listener(Self::switch_environment))

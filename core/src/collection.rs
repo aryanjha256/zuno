@@ -180,7 +180,10 @@ pub struct Entry {
 
 /// How deep to walk. Guards against a symlink cycle turning a scan into an infinite loop,
 /// and against a pathological tree; nobody nests request folders eight deep on purpose.
-const MAX_DEPTH: usize = 8;
+///
+/// Public because an importer has to respect it: a Postman collection may nest arbitrarily, and
+/// writing a request below this depth would put it somewhere `scan` never looks.
+pub const MAX_DEPTH: usize = 8;
 
 /// Read every request in the collection, depth-first, sorted by relative path.
 ///

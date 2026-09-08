@@ -493,6 +493,60 @@ pub fn create(collection_root: &Path, label: &str) -> Result<String, Environment
     Ok(name)
 }
 
+/// What merging an import's variables into an environment did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Merged {
+    /// The environment's filename stem, for selecting it.
+    pub name: String,
+    pub added: usize,
+    /// Names the environment already had, which were left exactly as they were.
+    pub kept: usize,
+}
+
+/// Write an import's variables into an environment, creating it if it isn't there.
+///
+/// **Only names the environment does not already have are written.** Re-importing a collection
+/// has to fill in a variable it has gained since, and must not overwrite a `baseUrl` someone
+/// pointed at staging in the meantime — and there is no way to tell an edit from an original,
+/// so the existing value wins and the count is reported. The alternative, allocating
+/// `billing-2` the way request files do, is worse here: a second environment holding the same
+/// names is a thing to pick between rather than a thing to use.
+///
+/// Secrets go to the gitignored half, per invariant 10. Postman marks them itself, so the split
+/// survives the crossing rather than being guessed from the name.
+pub fn merge_imported(
+    collection_root: &Path,
+    label: &str,
+    variables: &[crate::import::Variable],
+) -> Result<Merged, EnvironmentError> {
+    let name = valid_name(label)?;
+    let mut file = read(collection_root, &name)?;
+
+    let mut merged = Merged {
+        name,
+        added: 0,
+        kept: 0,
+    };
+    for variable in variables {
+        // Held apart, not merged: a name may legitimately sit in both halves — a committed
+        // placeholder over a local value — and either one counts as already present.
+        if file.committed.contains_key(&variable.name) || file.local.contains_key(&variable.name) {
+            merged.kept += 1;
+            continue;
+        }
+        let half = if variable.secret {
+            &mut file.local
+        } else {
+            &mut file.committed
+        };
+        half.insert(variable.name.clone(), variable.value.clone());
+        merged.added += 1;
+    }
+
+    save(collection_root, &file)?;
+    Ok(merged)
+}
+
 /// Rename both halves, returning the new name.
 pub fn rename(
     collection_root: &Path,
@@ -1096,5 +1150,60 @@ mod tests {
         assert!(text.contains(IGNORE_RULE), "{text:?}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn merging_an_import_fills_gaps_and_never_overwrites_what_is_already_set() {
+        // Re-importing a collection has to bring across a variable it has gained since, and
+        // must not undo a `baseUrl` someone pointed at staging in the meantime. There is no way
+        // to tell an edit from an original, so the existing value wins.
+        let root = scratch("merge-import");
+        write_env(&root, "Billing.json", r#"{"baseUrl":"https://staging.test"}"#);
+
+        let variables = [
+            crate::import::Variable {
+                name: "baseUrl".to_string(),
+                value: "https://api.test".to_string(),
+                secret: false,
+            },
+            crate::import::Variable {
+                name: "apiKey".to_string(),
+                value: "sk-live-1".to_string(),
+                secret: true,
+            },
+        ];
+
+        let merged = merge_imported(&root, "Billing", &variables).expect("merge");
+        // `slug` does not lower-case, so the environment and the folder the import
+        // writes into carry the same name.
+        assert_eq!(merged.name, "Billing");
+        assert_eq!((merged.added, merged.kept), (1, 1));
+
+        let file = read(&root, "Billing").expect("read");
+        assert_eq!(
+            file.committed.get("baseUrl").map(String::as_str),
+            Some("https://staging.test"),
+            "an existing value must survive a re-import"
+        );
+        // Invariant 10: a secret Postman marked as one lands in the gitignored half, not
+        // beside the committed values.
+        assert_eq!(file.local.get("apiKey").map(String::as_str), Some("sk-live-1"));
+        assert!(!file.committed.contains_key("apiKey"));
+    }
+
+    #[test]
+    fn a_collection_named_for_a_reserved_environment_is_refused_rather_than_merged_into_it() {
+        // `globals` is every environment's base layer, so silently merging an import into it
+        // would change every other environment in the workspace.
+        let root = scratch("merge-reserved");
+        let variables = [crate::import::Variable {
+            name: "a".to_string(),
+            value: "1".to_string(),
+            secret: false,
+        }];
+        assert!(matches!(
+            merge_imported(&root, "globals", &variables),
+            Err(EnvironmentError::InvalidName(_))
+        ));
     }
 }

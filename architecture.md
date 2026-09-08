@@ -62,7 +62,9 @@ zuno/
 │       │   ├── mod.rs      ✅ JsonOutline, Row, Span, visible_rows
 │       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
+│       ├── import.rs       ✅ one Import shape; sniffs which parser reads a document
 │       ├── openapi.rs      ✅ OpenAPI 3.x -> requests, over serde_json::Value
+│       ├── postman.rs      ✅ Postman collection v2.x -> requests, folders, variables
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
@@ -83,7 +85,7 @@ zuno/
         ├── picker.rs        ✅ the modal picker: filter + ranked list
         ├── context_menu.rs  ✅ the anchored menu primitive: rows, separators, commands
         ├── collection_panel.rs ✅ the collection tree — the browser beside Ctrl+P's finder
-        ├── import_panel.rs  ✅ the OpenAPI import dialog: one field, URL or path
+        ├── import_panel.rs  ✅ the import dialog: one field, URL or path, no format picker
         ├── commands.rs      ✅ the command palette's curated action table
         ├── settings_panel.rs ✅ per-request engine settings, as a modal
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
@@ -1449,6 +1451,11 @@ and JSON-only is a real limitation recorded rather than hidden. Also absent: Ope
 a different document shape rather than an older version of this one, and refused with a message
 that says so.
 
+**What §6f changed here.** `Import` and `Imported` moved to `import.rs` when Postman arrived, and
+`Imported::folder` became `folders: Vec<String>` — a tag is one level deep, a Postman folder tree
+is not. `parse` also takes an already-read `serde_json::Value` now rather than bytes, because the
+sniff has to read the document first and a megabyte export should not be parsed twice.
+
 ---
 
 ## 6c. The environment editor — and the merge that could not be saved
@@ -1713,6 +1720,111 @@ order, and the later one silently wins. What noticed was two *unrelated* respons
 bindings are deliberately excluded: sharing a keystroke across contexts is what contexts are
 *for*, and `ctrl-f` meaning the body in the editor and the response elsewhere is a design
 decision, not a collision.
+
+---
+
+## 6f. Postman import — the friction that decides who uses Zuno
+
+Every other item in this document improves the app for someone already inside it. This one
+decides who gets inside. It was built because friends of the author agreed to migrate and then
+said the migration itself was the obstacle — nobody retypes eighty requests by hand.
+
+**One result shape, two parsers, one writer.** `core/src/import.rs` owns `Import`, `Imported` and
+`Variable`; `openapi.rs` and `postman.rs` are parsers that answer with them, and the half that
+creates directories, allocates free filenames, writes an environment and reports what was dropped
+is written once in `Workspace::finish_import`. A third format is a parser plus one sniff arm.
+
+**The format is sniffed, never chosen.** `import::parse` reads the document and decides:
+`openapi` present → OpenAPI, `item` present → Postman, and then arms for every shape we can
+*recognise but not read*. A second `Import from Postman` verb would make someone classify their
+own export before they could use it — friction of exactly the shape this feature removes. The
+cost is paid in refusals instead, and that is the better trade: "this is a Postman v1 collection —
+re-export it as v2.1" is a next step, and "unrecognised document" is a dead end. Swagger 2.0, v1
+collections, and Postman *environment* exports each get their own sentence.
+
+The action was `ImportOpenApi` and is now `ImportDocument`, because an action named for one format
+that reads two is the stale-confident-name failure CLAUDE.md's Lessons section is mostly about.
+
+**The Postman API wraps what the Postman app exports.** A share link answers
+`{"collection": {…}}`; a file exported from the app is the bare object. The envelope is unwrapped
+in the sniff rather than in `postman.rs`, because it is a property of the *transport* and not a
+version of the collection format. This shipped reading only the export, so pasting a share link —
+the path needing no export step at all, and therefore the one reached for first — refused a
+perfectly good collection. Found by pasting a real one.
+
+### What maps, and the calls made
+
+**Postman's variable syntax is already Zuno's.** `{{baseUrl}}` needs no rewriting in a URL, a
+header, a body or an auth token. It is the single largest reason this import is faithful rather
+than approximate, and it is luck rather than design.
+
+- **The item tree becomes directories**, nested as deep as it goes. `collection::MAX_DEPTH` is now
+  `pub` because the importer has to respect it: anything deeper is **flattened** into the deepest
+  folder that fits and named in `skipped`. A request written below the depth `scan` walks is on
+  disk and invisible — the tree cannot show it and the picker cannot find it — which is worse
+  than a folder in the wrong place.
+- **Auth is lowered into a header.** Zuno has no auth model on purpose (ROADMAP records auth
+  helpers as *dropped, not deferred*), and a header is what actually goes on the wire, so bearer,
+  basic and API-key all become one. `basic` shares `curl.rs`'s `base64`, which had been sitting
+  there tested with one caller. OAuth 2, SigV4, Digest, NTLM and Hawk are signing *procedures*
+  with no value to copy, so they are named in `skipped` rather than half-imported — a request
+  that looks complete and 401s is the worse outcome.
+- **Auth inheritance runs collection → folder → request**, and `{"type":"inherit"}` keeps the
+  parent's rather than reading as a type of its own. A request's own auth lives inside `request`,
+  **not** on the item — only a folder's sits on the item. Reading it from the item gave every
+  request in a folder the collection's credentials no matter what it declared, and the test that
+  caught it was written before the code was.
+- **The query is split off the URL.** `build.rs` merges enabled query rows into whatever the URL
+  text already carries, so leaving `?limit=10` in both places sends it twice. The `query` array
+  is preferred over the text when both exist, because Postman keeps *disabled* rows only there —
+  and a bare string URL is split the same way, so an imported request presents identically
+  whichever form the export used.
+- **A path variable with a value is substituted.** `/users/:id` with `id = 7` imports as
+  `/users/7`. A literal `:id` sends and 404s, which shows you what to fix; `{{id}}` would refuse
+  to send at all. That is §6b's rule about server variables pointing the other way, for the same
+  reason — the wall is what to avoid.
+- **A GraphQL body imports as the JSON it would have been sent as.** GraphQL over HTTP *is* a
+  JSON body, so `{"query":…,"variables":…}` is the faithful import and Zuno needs no GraphQL
+  model, no second body type, and the query stays editable as the text it already was. Postman
+  stores `variables` as a *string* of JSON; sending that verbatim would put a quoted string where
+  the server expects an object.
+- **A disabled row imports muted, not missing.** Importing it enabled sends a header someone
+  switched off; dropping it loses the fact that they had it. Postman stores the negative
+  (`disabled: true`), which is one inversion to get wrong per row type.
+- **A `raw` body with no `options` is sniffed, not defaulted.** Postman's documented default
+  language is `text`, but an export carrying no `options` at all is usually an older one whose
+  bodies are JSON regardless, so the text decides.
+
+### Variables become an environment, and it is selected
+
+Collection-level `variable[]` goes to `environment::merge_imported`, named for the collection
+through the same `collection::slug` as its folder so the two agree on screen.
+
+**Only names the environment does not already have are written.** Re-importing has to bring
+across a variable the collection gained and must not undo a `baseUrl` someone pointed at staging
+— and there is no way to tell an edit from an original, so the existing value wins and the count
+is reported. Allocating `billing-2` the way request *files* do would be worse here: a second
+environment holding the same names is a thing to pick between rather than a thing to use.
+
+Postman marks its own secrets (`type: "secret"`), which lands exactly on invariant 10's file
+split, so the marking survives the crossing instead of being guessed from the name.
+
+And the environment is **selected**, overriding whatever was active. An export whose every URL
+begins `{{baseUrl}}` otherwise imports as a folder of requests that cannot be sent, and asking
+someone to find the switcher first is the friction this feature exists to remove. The status line
+names the switch, because a *silent* switch is the failure mode rather than the switch itself.
+
+### Scripts are named, not dropped
+
+`event` blocks are JavaScript and no importer will ever run them. Each is reported by request,
+event type and line count, because a collection whose 80 requests arrive without their 80 tests
+gets read as "the import doesn't work" rather than "the import worked and the tests didn't come".
+
+The three shapes that make up most real Postman scripts map onto things Zuno built in §6d and
+§6e — `pm.environment.set` onto a capture, a status check onto `expect_status`, `pm.expect` onto
+an assertion — so recovering them is a pattern-match over `exec` lines rather than a JS engine.
+That is the next slice. Descriptions have no `RequestSpec` field at all and are counted and
+reported once rather than per request.
 
 ---
 

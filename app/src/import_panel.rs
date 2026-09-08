@@ -1,4 +1,4 @@
-//! The OpenAPI import modal: one field, taking a URL or a file path.
+//! The import modal: one field, taking a URL or a file path.
 //!
 //! **A modal rather than another strip of chrome.** Rename got away with an inline box because a
 //! tree row *is* a text field's worth of space; an import needs a field, a hint, and somewhere to
@@ -13,6 +13,11 @@
 //! **One field for both sources, deliberately.** A URL/file radio pair would be a mode to choose
 //! before typing, to describe a difference the text itself already carries: `http` at the front
 //! or not. Paste a link or a path and press Enter.
+//!
+//! **And no format picker either, for the stronger version of the same reason.** Which format a
+//! document is written in is a property of the document, and `import::parse` reads it — asking
+//! someone to classify their own export before they can use it is the friction importing exists
+//! to remove.
 
 use gpui::{
     AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
@@ -54,7 +59,7 @@ impl ImportPanel {
         let source = cx.new(|cx| {
             TextInput::new(
                 "",
-                "https://api.example.com/openapi.json, or a path to a .json file",
+                "A path to a Postman export or OpenAPI spec, or a URL to fetch one from",
                 "ImportSource",
                 cx,
             )

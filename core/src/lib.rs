@@ -5,7 +5,8 @@
 //! knows about rendering, colors, or key bindings.
 //!
 //! Landed so far: the request and response models, the HTTP engine, the JSON outline and line
-//! index, response diffing, curl import, the collection format, environments, fuzzy matching for
+//! index, response diffing, curl import, document import (OpenAPI and Postman, behind one sniff),
+//! the collection format, environments, assertions and the collection runner, fuzzy matching for
 //! the picker, and body search. Listed by *what* rather than by milestone — the milestone tags
 //! this line used to carry stopped meaning anything once modules kept arriving after M1.
 
@@ -19,9 +20,11 @@ pub mod environment;
 pub mod flow;
 pub mod fuzzy;
 pub mod highlight;
+pub mod import;
 pub mod json;
 pub mod lines;
 pub mod openapi;
+pub mod postman;
 pub mod request;
 pub mod runner;
 pub mod response;
@@ -29,6 +32,7 @@ pub mod search;
 
 pub use collection::CollectionError;
 pub use environment::{Environment, EnvironmentError, Resolver};
+pub use import::{Import, ImportError, Imported};
 pub use curl::{CurlError, CurlImport};
 pub use diff::ResponseDiff;
 pub use engine::{Engine, EngineError, Event, JobId};

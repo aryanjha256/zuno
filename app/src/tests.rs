@@ -10440,6 +10440,104 @@ async fn creating_a_flow_from_the_editor_makes_it_runnable(cx: &mut TestAppConte
     remove_scratch(&mut cx, &root);
 }
 
+
+#[gpui::test]
+async fn a_postman_export_imports_as_a_tree_with_its_environment_selected(cx: &mut TestAppContext) {
+    // The whole friction this feature removes, end to end through the real modal: a friend's
+    // export on disk becomes folders, requests and a selected environment. Only reachable here
+    // — the parser is unit-tested, but writing nested directories and switching the environment
+    // are the workspace's half, and neither had any coverage.
+    let dir = scratch_dir("postman-import");
+    let root = dir.join("collections");
+    let session = dir.join("config").join("session.json");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::create_dir_all(session.parent().unwrap()).expect("mkdir");
+
+    let export = dir.join("export.json");
+    std::fs::write(
+        &export,
+        r##"{
+          "info": {
+            "name": "Team API",
+            "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+          },
+          "variable": [{ "key": "baseUrl", "value": "https://api.team.test" }],
+          "item": [
+            {
+              "name": "Auth",
+              "item": [
+                {
+                  "name": "Login",
+                  "request": { "method": "POST", "url": "{{baseUrl}}/login" }
+                }
+              ]
+            },
+            { "name": "Health", "request": "{{baseUrl}}/health" }
+          ]
+        }"##,
+    )
+    .expect("write export");
+
+    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.simulate_input(export.to_str().expect("path"));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // Postman's folders become directories, so the collection arrives filed the way it was
+    // organised rather than as a flat list of eight names.
+    let rows = tree_rows(&window, &mut cx);
+    assert!(
+        rows.contains(&(0, "Team-API".to_string(), true)),
+        "the import needs its own folder: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(1, "Auth".to_string(), true)),
+        "a Postman folder must become a directory: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(1, "Health".to_string(), false)),
+        "a top-level request stays at the top: {rows:?}"
+    );
+    assert!(
+        rows.contains(&(2, "Login".to_string(), false)),
+        "a foldered request sits under it: {rows:?}"
+    );
+
+    // Nested one deeper than the folder above it, which is the part a flat import loses.
+    assert!(
+        std::fs::read_to_string(root.join("Team-API").join("Auth").join("Login.json"))
+            .expect("Login on disk")
+            .contains("{{baseUrl}}/login"),
+        "the request must be written inside its folder"
+    );
+
+    // Selected, not merely written: every URL in this export starts `{{baseUrl}}`, so an
+    // unselected environment is a folder of requests that cannot be sent.
+    let environment = window
+        .update(&mut cx, |workspace, _, _| workspace.active_environment())
+        .expect("window");
+    // Named through `collection::slug` like the folder, so the two agree on screen.
+    assert_eq!(environment.as_deref(), Some("Team-API"));
+    assert!(
+        std::fs::read_to_string(root.join("environments").join("Team-API.json"))
+            .expect("environment on disk")
+            .contains("https://api.team.test")
+    );
+
+    // And it says so, because a silent environment switch is the failure mode rather than the
+    // switch itself.
+    let status = cx.update(|_, cx| view.read(cx).status.clone());
+    let status = status.expect("the import reports what it did");
+    assert!(
+        status.contains("2 requests") && status.contains("now selected"),
+        "the report must name both halves: {status:?}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
 #[gpui::test]
 async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext) {
     // **The class of bug nothing else here can see.** Two context-less bindings on one keystroke

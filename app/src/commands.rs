@@ -46,7 +46,7 @@ pub fn palette() -> Vec<Command> {
         command("Cancel request", CancelRequest),
         command("Save request to collection", SaveRequest),
         command("Import request from curl on the clipboard", ImportCurl),
-        command("Import from an OpenAPI spec", ImportOpenApi),
+        command("Import a Postman collection or an OpenAPI spec", ImportDocument),
         // Navigation.
         command("Find request", OpenRequest),
         command("Show or hide the collection panel", ToggleCollectionPanel),
