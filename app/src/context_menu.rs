@@ -269,7 +269,7 @@ impl Render for ContextMenu {
                             .flex_none()
                             .my_1()
                             .h(px(1.))
-                            .bg(theme.border)
+                            .bg(theme.text_faint.opacity(0.35))
                             .into_any_element();
                     }
                     MenuRow::Item(item) => item,
@@ -289,7 +289,7 @@ impl Render for ContextMenu {
                     .px_2();
 
                 if ix == selected {
-                    row = row.bg(theme.bg_hover);
+                    row = row.bg(theme.bg_hover).rounded_sm();
                 }
 
                 row
@@ -364,9 +364,12 @@ impl Render for ContextMenu {
                             .flex()
                             .flex_col()
                             .min_w(px(MIN_WIDTH))
+                            .rounded_md()
+                            .p_1()
                             .bg(theme.bg_elevated)
                             .border_1()
                             .border_color(theme.border)
+                            .shadow_md()
                             // Swallow clicks, or choosing a row also hits the catcher behind
                             // it and the menu dismisses before the choice is read.
                             .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {
