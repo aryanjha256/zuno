@@ -1200,10 +1200,9 @@ trade New folder already makes with an abandoned empty folder, and `delete` hand
 
 **And it shipped with a folder glyph on a new request.** The inline row's *placement* was
 generalised for both kinds and its *glyph* was not — `new_folder_cell` hardcoded `Icon::Folder`,
-and reading the placement would never have shown that. Not a paint problem: the decision is a
-pure `new_node_icon(kind)` now, tested against the glyph a real request row carries, which is the
-same split `ui::glyph` got after every icon in the app rendered invisible. Reported by the human
-after testing, which is the expensive way to find it.
+and reading the placement would never have shown that. Reported by the human after testing, which
+is the expensive way to find it. Now that the two kinds of row no longer share a column,
+`new_node_cell` calls the same cell constructor the row does.
 
 **A vacuous test, caught on the way.** `Icon::ALL` is hand-written, so adding an `Icon::FilePlus`
 variant did not add it to the list the two icon tests iterate — both passed without ever loading
@@ -1384,13 +1383,14 @@ font, and a pure function over a string is something a unit test can check. Both
 are silent — zero puts a tooltip on every row, an enormous value on none — so the test asserts a
 bounded range rather than a value.
 
-**Directories carry a folder icon, in the method column's slot.** Not a column of its own: give
-it one and a folder name and the request name below it indent differently for no reason a reader
-could name. It opens with the row — redundant against the chevron, and conventional enough that
-the redundancy reads as polish rather than noise. Requests carry a per-method glyph in the same
-slot, tinted by `method_color`. One glyph for all of them was tried first and read as noise
-repeated down the tree; per method also keeps HEAD and OPTIONS apart, which colour alone cannot
-since both resolve to `method_other`.
+**Requests carry the method's name, not a pictograph.** `DELETE` and `OPTIONS` are cut to `DEL`
+and `OPT`, the only two that don't fit `METHOD_WIDTH`. HEAD and OPTIONS share `method_other`, so
+the text is the only thing telling them apart — which is what the test asserts.
+
+**Directories carry a folder icon in a narrower column of their own.** Sharing the method column
+kept both kinds of name at the same x, which stopped being worth it once that column grew to hold
+a label. `name_budget` returns more room for a folder name now, and its test asserts that
+inequality rather than the old equality.
 
 **The header is a menu button, and the empty state has three cases.** Opening a directory that
 holds other things showed "Nothing saved yet", which is the message for an *empty collection* —
@@ -1402,6 +1402,12 @@ failure recurring, since a binding and a palette row both satisfy the convention
 neither can be seen. The panel header carries them now, as `ui::menu_button`: a word with a
 trailing chevron, the mirror of `icon_text_action` whose glyph leads. Without the chevron the
 header was muted text that happened to be clickable.
+
+**And it was `flex_none`, which took the four controls beside it off the panel.** `flex: none`
+pins `flex-shrink: 0`, so a long workspace name in a `justify_between` row pushes New request,
+New folder, Collapse and Expand out — four controls with no mouse path left. §12's picker label
+was the same bug. The test asserts each control's bounds against *the panel's* width, since an
+off-screen button still has bounds that agree with the bug.
 
 ### Folder verbs — and the guard that had to be inverted
 

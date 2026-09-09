@@ -33,15 +33,20 @@ use crate::ui::{Icon, glyph, icon_button};
 use crate::workspace::Workspace;
 
 /// Fixed, as `uniform_list` requires: it measures one item and assumes the rest agree.
-const ROW_HEIGHT: f32 = 22.0;
+const ROW_HEIGHT: f32 = 25.0;
 /// One level of nesting. Deliberately small — a collection nested four deep should still
 /// leave most of a narrow panel for the name.
 const INDENT: f32 = 12.0;
 /// The chevron's column, reserved on *every* row including requests, so names at one depth
 /// line up whether or not their neighbour is a directory.
 const CHEVRON: f32 = 14.0;
-/// The kind column — a folder glyph, or a method-tinted one. Fixed so names line up across rows.
-const METHOD_WIDTH: f32 = 16.0;
+/// The glyph column, reserved on both kinds so names line up.
+const GLYPH_WIDTH: f32 = 16.0;
+
+/// The method label's column, where the pictograph's used to sit — before the name, so a
+/// request and a sibling folder still start their names at the same x. Sized for `PATCH` in
+/// mono at `text_xs`: 5 chars at a 0.6em advance, plus slack.
+const METHOD_WIDTH: f32 = 38.0;
 
 /// The title strip's height. Named because the workspace menu anchors just below it.
 pub const HEADER_HEIGHT: f32 = 28.0;
@@ -116,6 +121,12 @@ pub fn render(
     // own bounds agree with the width bug this asserts against, so only the container can
     // tell a full-width row from a label-width one.
     .debug_selector(|| "collection-tree".to_string())
+    // Rows ran flush against the header's rule and the panel's bottom edge, which is most of
+    // what read as cramped: the first name touched a border and the tree had no margin of its
+    // own inside the panel. On the list rather than on the rows, so `ROW_HEIGHT` still describes
+    // exactly one row — `scroll_to_item` and the selection both address rows by index.
+    .pt_1()
+    .pb_2()
     .flex_1();
 
     div()
@@ -222,21 +233,6 @@ fn header(
 /// it describes the destination; a box sitting one indent inside `billing`, as its last child,
 /// *is* the destination — which is what every editor does and what a reader already knows how to
 /// read. It costs an index translation in the list closure and nothing else.
-/// The glyph the inline box carries: the one the row it is about to become will carry.
-///
-/// **A pure function so it can be tested**, because the paint cannot be. A folder glyph on a
-/// new *request* is what shipped — the row's placement was generalised for both kinds and its
-/// glyph was not, and no amount of reading the placement would have found that. Separating the
-/// decision from the paint is the same fix `ui::glyph` got after every icon in the app rendered
-/// invisible.
-pub(crate) fn new_node_icon(kind: crate::workspace::NewNode) -> Icon {
-    match kind {
-        crate::workspace::NewNode::Folder => Icon::Folder,
-        // A request row shows its *method*, and a new request starts on the default one.
-        crate::workspace::NewNode::Request => method_icon(&zuno_core::Method::default()),
-    }
-}
-
 fn new_node_cell(
     kind: crate::workspace::NewNode,
     depth: u16,
@@ -259,16 +255,18 @@ fn new_node_cell(
         // about to become. The chevron slot is reserved and empty: there is nothing to expand
         // yet, and drawing a chevron that toggles nothing is a dead control.
         .child(div().flex_none().w(px(CHEVRON)))
-        // **The glyph the row it becomes will carry**, not a fixed one: a request row shows its
-        // method, so the box shows `GET`'s — which is the method a new request starts with. A
-        // folder glyph here is what shipped, because generalising *where* the row goes said
-        // nothing about what it draws.
-        .child(div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
-            new_node_icon(kind),
-            theme.text_faint,
-            theme.text_faint,
-            13.,
-        )))
+        // **What the row it becomes will carry**, not a fixed glyph: a request row shows its
+        // method, so the box shows `GET` — the method a new request starts on. A folder glyph
+        // here is what shipped, because generalising *where* the row goes said nothing about
+        // what it draws.
+        .child(match kind {
+            crate::workspace::NewNode::Folder => {
+                glyph_cell().child(glyph(Icon::Folder, theme.text_faint, theme.text_faint, 13.))
+            }
+            crate::workspace::NewNode::Request => {
+                method_cell(&zuno_core::Method::default(), theme)
+            }
+        })
         .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(input))
 }
 
@@ -316,27 +314,47 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
 /// `5.95` is `TAB_LABEL_WIDTH / TAB_LABEL_CHARS` — the same measured advance the tab strip is
 /// tuned to, since both draw `text_xs` in the UI font.
 pub(crate) fn name_budget(depth: u16, is_directory: bool) -> usize {
-    // 6 left pad, the chevron column, two 4px gaps, the method-or-folder column, 8 right pad.
-    let chrome = 6. + CHEVRON + 4. + METHOD_WIDTH + 4. + 8. + f32::from(depth) * INDENT;
-    let _ = is_directory; // Both kinds reserve the same columns, which is why names line up.
+    // 6 left pad, the chevron column, two 4px gaps, the kind column, 8 right pad. A folder's
+    // kind column is the glyph's own width, so a folder name has more room than a request's —
+    // which is the trade for the glyph sitting beside its name instead of a column away.
+    let kind = if is_directory { GLYPH_WIDTH } else { METHOD_WIDTH };
+    let chrome = 6. + CHEVRON + 4. + kind + 4. + 8. + f32::from(depth) * INDENT;
     (((WIDTH - chrome) / 5.95).max(0.)) as usize
 }
 
-/// The glyph for a method. Exhaustive with no catch-all, so a new `Method` is a compile error.
+/// The method's name. Replaced a pictograph per method, whose worst arm was a trash can for
+/// DELETE — the row menu's *Move to trash* glyph, on a request.
 ///
-/// Shape carries the verb and colour carries it again, which is what lets HEAD and OPTIONS stay
-/// apart despite sharing `method_other`.
-pub(crate) fn method_icon(method: &Method) -> Icon {
+/// Exhaustive with no catch-all, so a new `Method` is a compile error rather than a blank cell.
+pub(crate) fn method_label(method: &Method) -> String {
     match method {
-        Method::Get => Icon::Eye,
-        Method::Post => Icon::PlusCircle,
-        Method::Put => Icon::RotateCw,
-        Method::Patch => Icon::Pencil,
-        Method::Delete => Icon::Trash,
-        Method::Head => Icon::Info,
-        Method::Options => Icon::CircleEllipsis,
-        Method::Other(_) => Icon::Asterisk,
+        Method::Get => "GET".to_string(),
+        Method::Post => "POST".to_string(),
+        Method::Put => "PUT".to_string(),
+        Method::Patch => "PATCH".to_string(),
+        Method::Delete => "DEL".to_string(),
+        Method::Head => "HEAD".to_string(),
+        Method::Options => "OPT".to_string(),
+        // An empty custom verb is unreachable through the picker, but it would leave the
+        // column blank rather than odd-looking.
+        Method::Other(verb) if verb.is_empty() => "?".to_string(),
+        Method::Other(verb) => verb.chars().take(5).collect::<String>().to_uppercase(),
     }
+}
+
+fn method_cell(method: &Method, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .w(px(METHOD_WIDTH))
+        .font_family(theme.mono.clone())
+        .text_color(theme.method_color(method))
+        .child(method_label(method))
+}
+
+/// The folder glyph's slot: its own narrow width, so the icon sits beside its name. Sharing the
+/// method column put 25px of nothing between them.
+fn glyph_cell() -> Div {
+    div().flex_none().w(px(GLYPH_WIDTH)).flex().items_center()
 }
 
 /// One row's name: a single line, clipped, with the full text on hover when it does not fit.
@@ -452,11 +470,8 @@ fn row(
                     10.,
                 )),
             )
-            // **The folder icon sits in the method column's slot**, so a folder name and a
-            // request name below it start at the same x. Give it its own narrow column instead
-            // and the two kinds of row indent differently for no reason a reader could name.
             .child(
-                div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
+                glyph_cell().child(glyph(
                     if expanded {
                         Icon::FolderOpen
                     } else {
@@ -485,18 +500,11 @@ fn row(
             // The chevron's column is held open on a request row too, so a request and a
             // sibling directory start their names at the same x.
             .child(div().flex_none().w(px(CHEVRON)))
-            .child(
-                div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
-                    method_icon(method),
-                    theme.method_color(method),
-                    theme.method_color(method),
-                    13.,
-                )),
-            )
+            .child(method_cell(method, theme))
+            // The rename box takes the name's place rather than overlaying the row, so the
+            // method and the indentation stay put and the name appears to become editable
+            // where it already was.
             .child(match renaming {
-                // The rename box takes the name's place rather than overlaying the row, so the
-                // method and the indentation stay put and the name appears to become editable
-                // where it already was.
                 Some(input) => div()
                     .flex_1()
                     .min_w(px(0.))
@@ -542,15 +550,18 @@ mod tests {
             assert!(deeper > 0, "a name must never be budgeted to nothing");
         }
 
-        // Directories reserve the same columns, which is what makes the names line up.
-        assert_eq!(name_budget(2, true), name_budget(2, false));
+        // A folder's glyph column is narrower than a request's method column, so its name has
+        // more room. Asserted rather than assumed: the two used to be equal, and a reader
+        // comparing them is the only way to notice the columns diverged.
+        assert!(name_budget(2, true) > name_budget(2, false));
     }
 
     #[test]
-    fn every_method_gets_its_own_glyph() {
+    fn every_method_gets_its_own_label_and_all_of_them_fit_the_column() {
         // A duplicated arm is a copy-paste away and shows on screen only if a reader happens to
         // have both verbs in the tree. HEAD and OPTIONS are the pair that matters: they share
-        // `method_other`, so the shape is the only thing telling them apart.
+        // `method_other`, so the *label* is the only thing telling them apart — which is the
+        // same argument the pictographs were held to, now that the label replaced them.
         let methods = [
             Method::Get,
             Method::Post,
@@ -562,14 +573,27 @@ mod tests {
             Method::Other("REPORT".into()),
         ];
 
-        let mut seen = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         for method in &methods {
-            let icon = method_icon(method);
+            let label = method_label(method);
+            assert!(!label.is_empty(), "{method:?} has no label");
             assert!(
-                !seen.contains(&icon),
-                "{method:?} reuses the glyph of an earlier method"
+                !seen.contains(&label),
+                "{method:?} reuses the label of an earlier method"
             );
-            seen.push(icon);
+            // `METHOD_WIDTH` is set by the longest label, so a new arm that overflows it would
+            // clip on screen and nowhere else. Mono's advance is 0.6em, and the column draws at
+            // `text_xs`.
+            let width = label.chars().count() as f32 * 12. * 0.6;
+            assert!(
+                width <= METHOD_WIDTH,
+                "{method:?} label {label:?} needs {width}px of a {METHOD_WIDTH}px column"
+            );
+            seen.push(label);
         }
+
+        // An empty custom verb is not reachable through the picker, but it must not leave the
+        // column blank either.
+        assert_eq!(method_label(&Method::Other(String::new())), "?");
     }
 }

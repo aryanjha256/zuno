@@ -10941,27 +10941,38 @@ async fn creating_a_request_beside_one_uses_its_folder_and_never_overwrites(cx: 
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+#[gpui::test]
+async fn a_long_workspace_name_does_not_push_the_panel_controls_off_its_edge(cx: &mut TestAppContext) {
+    // The header is `justify_between`, and `menu_button` was `flex_none` — so `flex-shrink: 0`
+    // let the name grow past the panel and carry New request, New folder, Collapse and Expand
+    // off the edge with it. Four controls with no mouse path left, which is the failure this
+    // codebase has shipped twice before (the panel's own hide button, the picker's dead rows).
+    //
+    // Asserted against the *panel's* width, not the button's own bounds: an off-screen button
+    // still has bounds, and they agree with the bug.
+    let dir = scratch_dir("panel-header-overflow");
+    let root = dir.join("a-collection-with-a-deliberately-very-long-directory-name");
+    std::fs::create_dir_all(&root).expect("mkdir");
 
-#[test]
-fn the_new_node_box_carries_the_glyph_of_the_row_it_becomes() {
-    // A folder glyph on a new *request* shipped, because generalising the row's placement for
-    // both kinds said nothing about what it draws. The paint is not observable headlessly; the
-    // decision behind it is, so it lives in a pure function and this pins it.
-    use crate::collection_panel::new_node_icon;
-    use crate::workspace::NewNode;
+    let (_window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
 
-    assert_eq!(new_node_icon(NewNode::Folder), crate::ui::Icon::Folder);
-    assert_ne!(
-        new_node_icon(NewNode::Request),
-        crate::ui::Icon::Folder,
-        "a request box must not draw a folder"
-    );
-    // And it must be the glyph a real request row would carry for that method, rather than any
-    // non-folder icon that happens to differ.
-    assert_eq!(
-        new_node_icon(NewNode::Request),
-        crate::collection_panel::method_icon(&zuno_core::Method::default())
-    );
+    let panel = cx.debug_bounds("collection-panel").expect("the panel");
+    for control in [
+        "collection-new-request",
+        "collection-new-folder",
+        "collection-collapse-all",
+        "collection-expand-all",
+    ] {
+        let bounds = cx.debug_bounds(control).unwrap_or_else(|| panic!("{control} is not drawn"));
+        assert!(
+            bounds.origin.x >= panel.origin.x
+                && bounds.origin.x + bounds.size.width <= panel.origin.x + panel.size.width,
+            "{control} sits outside the panel: {bounds:?} against {panel:?}"
+        );
+    }
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
 #[gpui::test]

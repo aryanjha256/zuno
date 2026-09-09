@@ -617,7 +617,12 @@ pub fn menu_button<A: gpui::Action + Clone + 'static>(
         .flex_row()
         .items_center()
         .gap_1()
-        .flex_none()
+        // **Shrinkable, not `flex_none`.** `flex: none` pins `flex-shrink: 0`, so a long
+        // workspace name grew this button past the panel and pushed every control beside it
+        // off the edge — new request, new folder, collapse and expand all simply gone, with no
+        // mouse path to any of them. A name is content and has to give; its neighbours are
+        // controls and must not.
+        .flex_shrink()
         .min_w(px(0.))
         .px_1()
         .rounded_sm()
@@ -633,8 +638,10 @@ pub fn menu_button<A: gpui::Action + Clone + 'static>(
                 window.dispatch_action(action.boxed_clone(), cx);
             },
         )
-        .child(div().whitespace_nowrap().overflow_hidden().child(text))
-        .child(glyph(Icon::ChevronDown, tint, tint, GLYPH_INLINE))
+        // **The name gives and the chevron does not.** The name is content and clips; the
+        // chevron is the only thing saying this opens a menu, so it keeps its width.
+        .child(div().flex_shrink().min_w(px(0.)).whitespace_nowrap().overflow_hidden().child(text))
+        .child(div().flex_none().child(glyph(Icon::ChevronDown, tint, tint, GLYPH_INLINE)))
 }
 
 /// An icon *and* a word, dispatching one action.
