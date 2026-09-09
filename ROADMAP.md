@@ -649,6 +649,11 @@ cursors stayed separate, because a match and where you are standing are differen
   reveal`; see item 2 at the top of this audit. `Ctrl+S` still cannot target one, on purpose:
   saving into whatever the panel happens to have selected depends on state you are not looking at
   when you press the key.
+
+  **And it mostly stopped mattering**, because a request can now be *created* in a folder —
+  `Ctrl+N` in the panel, a row on both menus, an icon in the header. It is born with a path, so
+  `Ctrl+S` overwrites it. Filing a request used to be new-tab, save-to-root, move; the residual
+  case is a scratch `Ctrl+T` buffer, which is still Save-then-Move. See architecture.md §6a.
 - ~~**The collection root cannot be changed.**~~ **Done** by workspaces — item 1 at the top of
   this audit — so a collection can live in the repo it describes, and the git argument the
   one-file-per-request format is built on is reachable from inside the app.

@@ -25,7 +25,7 @@ use zuno_core::Method;
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
-    CollectionCollapseAll, CollectionExpandAll, NewFolder, OpenCollectionMenu, OpenWorkspaceMenu,
+    CollectionCollapseAll, CollectionExpandAll, NewFolder, NewRequest, OpenCollectionMenu, OpenWorkspaceMenu,
 };
 use gpui::Action as _;
 use crate::theme::Theme;
@@ -71,7 +71,7 @@ pub fn render(
     // row at or past the insertion point shifts down by one. Rendering it as a real row rather
     // than splicing a placeholder into `tree_visible` keeps that index — which the selection, the
     // fold walk and `scroll_to_item` all address — meaning exactly one thing.
-    let pending = workspace.new_folder_row();
+    let pending = workspace.new_node_row();
     let row_theme = theme.clone();
     let count = visible.len() + usize::from(pending.is_some());
     // A `uniform_list` render closure is handed a bare `&mut App`, not a `Context<Workspace>`,
@@ -82,13 +82,13 @@ pub fn render(
     let list = uniform_list("collection-tree", count, move |range, _window, _cx| {
         range
             .map(|visible_ix| {
-                if let Some((insert_at, depth, input)) = &pending {
+                if let Some((insert_at, depth, kind, input)) = &pending {
                     if visible_ix == *insert_at {
-                        return new_folder_cell(*depth, input.clone(), &row_theme);
+                        return new_node_cell(*kind, *depth, input.clone(), &row_theme);
                     }
                 }
                 let shifted = match &pending {
-                    Some((insert_at, _, _)) if visible_ix > *insert_at => visible_ix - 1,
+                    Some((insert_at, ..)) if visible_ix > *insert_at => visible_ix - 1,
                     _ => visible_ix,
                 };
                 let Some(&row_ix) = visible.get(shifted) else {
@@ -178,6 +178,16 @@ fn header(
                 // No hide button here. It was a `×`, and a control that can only *hide* the
                 // panel it lives in takes itself away with it — there was no mouse path back.
                 // The toggle sits in the titlebar, where it stays reachable in both states.
+                // Before New folder, because it is the commoner verb by far — a collection is
+                // mostly requests, and until this landed the only way to make one was a scratch
+                // tab that then had to be saved to the root and moved.
+                .child(icon_button(
+                    "collection-new-request",
+                    Icon::FilePlus,
+                    "New request",
+                    NewRequest,
+                    theme,
+                ))
                 .child(icon_button(
                     "collection-new-folder",
                     Icon::FolderPlus,
@@ -212,7 +222,23 @@ fn header(
 /// it describes the destination; a box sitting one indent inside `billing`, as its last child,
 /// *is* the destination — which is what every editor does and what a reader already knows how to
 /// read. It costs an index translation in the list closure and nothing else.
-fn new_folder_cell(
+/// The glyph the inline box carries: the one the row it is about to become will carry.
+///
+/// **A pure function so it can be tested**, because the paint cannot be. A folder glyph on a
+/// new *request* is what shipped — the row's placement was generalised for both kinds and its
+/// glyph was not, and no amount of reading the placement would have found that. Separating the
+/// decision from the paint is the same fix `ui::glyph` got after every icon in the app rendered
+/// invisible.
+pub(crate) fn new_node_icon(kind: crate::workspace::NewNode) -> Icon {
+    match kind {
+        crate::workspace::NewNode::Folder => Icon::Folder,
+        // A request row shows its *method*, and a new request starts on the default one.
+        crate::workspace::NewNode::Request => method_icon(&zuno_core::Method::default()),
+    }
+}
+
+fn new_node_cell(
+    kind: crate::workspace::NewNode,
     depth: u16,
     input: Entity<crate::input::TextInput>,
     theme: &Theme,
@@ -233,8 +259,12 @@ fn new_folder_cell(
         // about to become. The chevron slot is reserved and empty: there is nothing to expand
         // yet, and drawing a chevron that toggles nothing is a dead control.
         .child(div().flex_none().w(px(CHEVRON)))
+        // **The glyph the row it becomes will carry**, not a fixed one: a request row shows its
+        // method, so the box shows `GET`'s — which is the method a new request starts with. A
+        // folder glyph here is what shipped, because generalising *where* the row goes said
+        // nothing about what it draws.
         .child(div().flex_none().w(px(METHOD_WIDTH)).child(glyph(
-            Icon::Folder,
+            new_node_icon(kind),
             theme.text_faint,
             theme.text_faint,
             13.,
@@ -296,7 +326,7 @@ pub(crate) fn name_budget(depth: u16, is_directory: bool) -> usize {
 ///
 /// Shape carries the verb and colour carries it again, which is what lets HEAD and OPTIONS stay
 /// apart despite sharing `method_other`.
-fn method_icon(method: &Method) -> Icon {
+pub(crate) fn method_icon(method: &Method) -> Icon {
     match method {
         Method::Get => Icon::Eye,
         Method::Post => Icon::PlusCircle,

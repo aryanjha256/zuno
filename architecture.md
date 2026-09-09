@@ -1166,6 +1166,52 @@ requests you have open would be worse than the duplicate. So the rule lives in
 cannot cover, since that filter is only as fresh as the scan behind it. Two buffers over one file
 also means two `path`s pointing at it and a last-write-wins race on `Ctrl+S`.
 
+### New request — and why saving needed no change
+
+A folder could be created at any depth from the panel header or a row menu; a **request** could
+only be created as a scratch tab (`Ctrl+T`, or the `+` in the tab strip). So the gesture a tree
+most invites on a folder offered you another folder but not the thing folders hold, and filing a
+request took three steps: new tab, save (to the root), move.
+
+`Ctrl+N` in the panel, a `New request` row on both a folder *and* a request (where it means
+"beside this one", the way New folder already did), and an icon in the panel header.
+
+**The gesture is New folder's, exactly** — the same inline box, drawn at the same computed row and
+depth, expanding a collapsed parent first, cancelled by focus-out. `NewFolderState` became
+`NewNodeState` with a `kind` rather than growing a twin: the fiddly half is the row placement (a
+collapsed parent, a *visible* index, the depth), and having that twice is having it drift.
+
+**The point is that the request is born with a path.** `create_request` opens it through
+`open_collection_file`, which is where a buffer *remembers its file* — so the next `Ctrl+S`
+overwrites this request rather than deriving a fresh name at the root. That is the whole reason
+this slice needed no change to saving, and it is the invisible half: the file landing in the right
+folder is obvious on screen, and whether the buffer remembers it is not.
+`a_request_created_in_a_folder_saves_back_into_that_folder` asserts the second save, not the
+creation, and fails against a version that opens a plain buffer.
+
+**`Ctrl+S` is unchanged, deliberately.** A destination picker on a never-saved buffer's first save
+was considered and dropped for this slice — the common case is now "the request already knows where
+it lives", and Save-then-Move still covers a scratch tab. What stays rejected for the original
+reason is `Ctrl+S` reading the *panel's selection*: that is state you are not looking at when you
+press the key.
+
+The cost, stated: an abandoned empty request sits in the tree and in git. That is the identical
+trade New folder already makes with an abandoned empty folder, and `delete` handles both.
+
+**And it shipped with a folder glyph on a new request.** The inline row's *placement* was
+generalised for both kinds and its *glyph* was not — `new_folder_cell` hardcoded `Icon::Folder`,
+and reading the placement would never have shown that. Not a paint problem: the decision is a
+pure `new_node_icon(kind)` now, tested against the glyph a real request row carries, which is the
+same split `ui::glyph` got after every icon in the app rendered invisible. Reported by the human
+after testing, which is the expensive way to find it.
+
+**A vacuous test, caught on the way.** `Icon::ALL` is hand-written, so adding an `Icon::FilePlus`
+variant did not add it to the list the two icon tests iterate — both passed without ever loading
+the new asset, which had no `Assets::load` arm at all. Putting it in `ALL` turned them red
+immediately. Worth recording because it is the sixth "a weak assertion reads exactly like a strong
+one": the test was correct, comprehensive-looking, and enumerating a list that a new variant does
+not join.
+
 ### Delete — two actions, because a file has no undo
 
 `DeleteRequest` only *asks*; `ConfirmDeleteRequest` is the only thing that removes anything.

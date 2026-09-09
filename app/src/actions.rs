@@ -62,6 +62,9 @@ actions!(
         CancelRename,
         // Organising, as distinct from editing. Until these existed every `Ctrl+S` landed flat
         // at the collection root and nothing could put a request anywhere else.
+        // A request created *where you are*, rather than a scratch tab that then has to be
+        // saved to the root and moved. `NewTab` is still the scratch-buffer verb.
+        NewRequest,
         NewFolder,
         MoveRequest,
         // Workspaces. A workspace is a collection directory; the registry in `app.json` is

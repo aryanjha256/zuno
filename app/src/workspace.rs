@@ -49,7 +49,7 @@ use crate::actions::{
     CollectionExpandAll, CommitRename, ConfirmClose, CopyRequestPath,
     CopyRequestRelativePath, DuplicateRequest,
     FormatBody, ImportConfirm, ImportDismiss, ImportDocument, MinifyBody, MoveRequest,
-    NewFolder, OpenRequestExternally,
+    NewFolder, NewRequest, OpenRequestExternally,
     RenameRequest, RevealRequest, TrashRequest,
 };
 use crate::engine::ActiveEngine;
@@ -140,7 +140,7 @@ pub struct Workspace {
     /// mean anywhere else.
     renaming: Option<RenameState>,
     /// The pending new folder, while its name is being typed.
-    new_folder: Option<NewFolderState>,
+    new_node: Option<NewNodeState>,
     /// The OpenAPI import modal, while it's open.
     import: Option<ImportState>,
     /// Holding the task is what keeps a spec fetch alive; dropping it cancels.
@@ -220,7 +220,11 @@ struct EnvPanelState {
 /// selection clamp and every index translation to serve one transient input. This is a single
 /// input drawn under the panel's header, labelled with where the folder will land — which also
 /// says the destination outright instead of asking the reader to count indent levels.
-struct NewFolderState {
+struct NewNodeState {
+    /// Which verb opened the box. One state and one row for both, rather than a second field
+    /// and a second copy of the row-placement rules — those are the fiddly half (a collapsed
+    /// parent, a visible index, the depth) and having them twice is having them drift.
+    kind: NewNode,
     parent: PathBuf,
     /// Where the box sits in the list, as a *visible* index — the row it displaces.
     insert_at: usize,
@@ -228,6 +232,12 @@ struct NewFolderState {
     depth: u16,
     input: Entity<crate::input::TextInput>,
     _blur: Subscription,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum NewNode {
+    Request,
+    Folder,
 }
 
 /// The settings panel and the subscription that lets it close, for the same reason
@@ -334,7 +344,7 @@ impl Workspace {
             panel_focus: cx.focus_handle(),
             tree_scan: None,
             renaming: None,
-            new_folder: None,
+            new_node: None,
             import: None,
             import_task: None,
             collection_menu_at: None,
@@ -1338,6 +1348,9 @@ impl Workspace {
                 MenuItem::new("Reveal in file manager", RevealRequest, &focus, window).into(),
                 MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
                 MenuRow::Separator,
+                // Before New folder: a folder is a thing you put requests in, so the verb the
+                // gesture most invites is the one that puts a request in it.
+                MenuItem::new("New request", NewRequest, &focus, window).into(),
                 MenuItem::new("New folder", NewFolder, &focus, window).into(),
                 MenuRow::Separator,
                 MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
@@ -1357,6 +1370,9 @@ impl Workspace {
             MenuItem::new("Open in default app", OpenRequestExternally, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Duplicate", DuplicateRequest, &focus, window).into(),
+            // Both mean "beside this one": `begin_new_node` takes a request row's *parent*, the
+            // way New folder already did, so right-clicking a request is a way to add a sibling.
+            MenuItem::new("New request", NewRequest, &focus, window).into(),
             MenuItem::new("New folder", NewFolder, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
@@ -1667,10 +1683,24 @@ impl Workspace {
     /// The parent follows the selection, the file-tree convention: inside a selected directory,
     /// beside a selected request, at the root when nothing is selected.
     fn new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_new_node(NewNode::Folder, window, cx);
+    }
+
+    /// Create a request in the folder the panel has selected.
+    ///
+    /// **The gesture is New folder's, exactly**, down to the inline box and where it sits. The
+    /// difference someone feels is that the request is *born* with a path, so `Ctrl+S` overwrites
+    /// it instead of deriving a name at the root — which is why this needed no change to saving.
+    /// `NewTab` remains the scratch-buffer verb for when you do not yet know where it belongs.
+    fn new_request(&mut self, _: &NewRequest, window: &mut Window, cx: &mut Context<Self>) {
+        self.begin_new_node(NewNode::Request, window, cx);
+    }
+
+    fn begin_new_node(&mut self, kind: NewNode, window: &mut Window, cx: &mut Context<Self>) {
         self.close_row_menu(window, cx);
 
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
-            self.set_status("No collection directory — nowhere to put a folder", cx);
+            self.set_status("No collection directory — nowhere to put it", cx);
             return;
         };
 
@@ -1687,15 +1717,20 @@ impl Workspace {
         }
         let (insert_at, depth) = self.new_folder_position(&parent, &root);
 
+        let placeholder = match kind {
+            NewNode::Request => "request name",
+            NewNode::Folder => "folder name",
+        };
         let input = cx.new(|cx| {
-            crate::input::TextInput::new("", "folder name", "CollectionRename", cx)
+            crate::input::TextInput::new("", placeholder, "CollectionRename", cx)
         });
         let handle = input.read(cx).focus_handle(cx);
         let blur = window.on_focus_out(&handle, cx, |_, window, cx| {
             window.dispatch_action(Box::new(CancelRename), cx);
         });
 
-        self.new_folder = Some(NewFolderState {
+        self.new_node = Some(NewNodeState {
+            kind,
             parent,
             insert_at,
             depth,
@@ -1745,9 +1780,17 @@ impl Workspace {
     }
 
     /// The pending new folder's position, indent and input, if one is open.
-    pub(crate) fn new_folder_row(&self) -> Option<(usize, u16, Entity<crate::input::TextInput>)> {
-        let state = self.new_folder.as_ref()?;
-        Some((state.insert_at, state.depth, state.input.clone()))
+    /// The inline box: where it sits, how deep, what it will become, and the input itself.
+    ///
+    /// **The kind is in here because the row has to *look* like what it is about to be.** It was
+    /// left out at first, so creating a request drew a folder glyph — the placement was
+    /// generalised and the glyph was not, which is a bug no amount of looking at the placement
+    /// would have found.
+    pub(crate) fn new_node_row(
+        &self,
+    ) -> Option<(usize, u16, NewNode, Entity<crate::input::TextInput>)> {
+        let state = self.new_node.as_ref()?;
+        Some((state.insert_at, state.depth, state.kind, state.input.clone()))
     }
 
     /// Open the OpenAPI import modal.
@@ -2527,21 +2570,76 @@ impl Workspace {
         // Idempotent: committing drops the state and then moves focus, which fires the blur
         // listener, which dispatches this. Without the `take` that would be a second cancel
         // racing the commit it followed.
-        let closed = self.renaming.take().is_some() | self.new_folder.take().is_some();
+        let closed = self.renaming.take().is_some() | self.new_node.take().is_some();
         if closed {
             window.focus(&self.panel_focus);
             cx.notify();
         }
     }
 
+    /// Write an empty request into `parent` and open it.
+    ///
+    /// **The defaults are stamped in**, the way an import stamps them: a request created here is
+    /// a real file from the first moment, so it has to start where `Ctrl+T` starts rather than
+    /// from `RequestSpec::default()`'s bare state.
+    ///
+    /// `allocate` picks the filename, so naming two requests `Login` gives `Login-2.json` rather
+    /// than overwriting the first — a derived name is not an identity.
+    ///
+    /// Opening it through `open_collection_file` rather than `open` is what makes the whole slice
+    /// work: that path is where a buffer *remembers its file*, and remembering is what makes the
+    /// next `Ctrl+S` overwrite this request instead of deriving a fresh name at the root.
+    fn create_request(
+        &mut self,
+        parent: &Path,
+        label: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let spec = RequestSpec {
+            id: RequestId(0),
+            name: label.to_string(),
+            settings: crate::app_state::defaults(cx),
+            ..RequestSpec::default()
+        };
+
+        let written = collection::allocate(parent, label)
+            .and_then(|path| collection::write(&path, &spec).map(|()| path));
+
+        match written {
+            Ok(path) => {
+                let shown = crate::collections::root(cx)
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                // The tree first: it is how you see the request landed, and
+                // `open_collection_file` reads a path that has to already be scanned.
+                self.refresh_tree(cx);
+                self.open_collection_file(path, window, cx);
+                self.set_status(&format!("Created {shown}"), cx);
+            }
+            Err(error) => self.set_status(&format!("Could not create: {error}"), cx),
+        }
+    }
+
     fn commit_rename(&mut self, _: &CommitRename, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(state) = self.new_folder.take() {
+        if let Some(state) = self.new_node.take() {
             let typed = state.input.read(cx).text().to_string();
             window.focus(&self.panel_focus);
+
             if typed.trim().is_empty() {
-                self.set_status("A folder needs a name", cx);
-            } else {
-                match collection::create_folder(&state.parent, &typed) {
+                let what = match state.kind {
+                    NewNode::Request => "A request needs a name",
+                    NewNode::Folder => "A folder needs a name",
+                };
+                self.set_status(what, cx);
+                cx.notify();
+                return;
+            }
+
+            match state.kind {
+                NewNode::Folder => match collection::create_folder(&state.parent, &typed) {
                     Ok(made) => {
                         let name = made
                             .file_name()
@@ -2551,7 +2649,8 @@ impl Workspace {
                         self.set_status(&format!("Created {name}"), cx);
                     }
                     Err(error) => self.set_status(&format!("Could not create: {error}"), cx),
-                }
+                },
+                NewNode::Request => self.create_request(&state.parent, &typed, window, cx),
             }
             cx.notify();
             return;
@@ -4883,6 +4982,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::commit_rename))
             .on_action(cx.listener(Self::cancel_rename))
             .on_action(cx.listener(Self::new_folder))
+            .on_action(cx.listener(Self::new_request))
             .on_action(cx.listener(Self::move_request))
             .on_action(cx.listener(Self::import_document))
             .on_action(cx.listener(Self::format_body))

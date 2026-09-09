@@ -63,7 +63,7 @@ use crate::actions::{
     FlowStepRemove, FlowStepUp, OpenDefaults,
     RunDismiss, RunFlow, RunFolder,
     DeleteRequest, FormatBody, ImportConfirm, ImportDismiss, ImportDocument, MinifyBody,
-    NewFolder, RenameRequest, ToggleCollectionPanel,
+    NewFolder, NewRequest, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
 use crate::theme::Theme;
@@ -212,6 +212,7 @@ fn bindings() -> Vec<KeyBinding> {
         // The file-manager convention for a new folder, and free here: `ctrl-shift-n` is
         // otherwise unused, and `ctrl-n` is not bound at all.
         KeyBinding::new("ctrl-shift-n", NewFolder, Some("CollectionPanel")),
+        KeyBinding::new("ctrl-n", NewRequest, Some("CollectionPanel")),
         // --- Buffers (global) ---
         //
         // `ctrl-tab` is a distinct keystroke from bare `tab` above, so tab-cycling focus

@@ -4722,6 +4722,7 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("action-copy-curl", "zuno::CopyAsCurl"),
         ("action-settings", "zuno::OpenSettings"),
         ("action-new-tab", "zuno::NewTab"),
+        ("collection-new-request", "zuno::NewRequest"),
         ("environment-badge", "zuno::SwitchEnvironment"),
         ("hint-find", "zuno::OpenRequest"),
         ("hint-commands", "zuno::OpenPalette"),
@@ -8226,6 +8227,7 @@ async fn the_row_menu_offers_every_verb_in_its_intended_order(cx: &mut TestAppCo
             "Open in default app",
             "---",
             "Duplicate",
+            "New request",
             "New folder",
             "---",
             "Copy path",
@@ -9121,7 +9123,7 @@ async fn the_new_folder_box_lands_as_the_first_row_inside_its_parent(cx: &mut Te
     let position = |cx: &mut VisualTestContext| {
         window
             .update(cx, |workspace, _, _| {
-                workspace.new_folder_row().map(|(at, depth, _)| (at, depth))
+                workspace.new_node_row().map(|(at, depth, ..)| (at, depth))
             })
             .expect("window")
     };
@@ -10825,6 +10827,140 @@ async fn a_body_that_is_not_json_is_refused_with_a_reason_and_left_alone(cx: &mu
     assert!(
         status.contains("JSON only"),
         "and the refusal must point at what to change: {status:?}"
+    );
+}
+
+
+#[gpui::test]
+async fn a_request_created_in_a_folder_saves_back_into_that_folder(cx: &mut TestAppContext) {
+    // The point of the whole slice, and the half that is invisible: creating the file inside the
+    // folder is easy to see, and whether the *buffer remembers it* is not. Without that, `Ctrl+S`
+    // derives a fresh name at the collection root and you get a second copy — which is exactly
+    // the three-step detour this verb exists to remove, reappearing at the save.
+    let dir = scratch_dir("new-request-in-folder");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    // Select the folder row, then create in it through the real keystroke.
+    let folder = cx.debug_bounds("collection-row-0").expect("the folder row");
+    cx.simulate_click(folder.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-n");
+    cx.simulate_input("Refunds");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let written = root.join("billing").join("Refunds.json");
+    assert!(written.exists(), "the request must land inside the folder");
+
+    // It opened, and the buffer knows its file.
+    let view = active_view(&window, &mut cx);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).path.clone()),
+        Some(written.clone()),
+        "the new request must open as a buffer that remembers its path"
+    );
+
+    // Now edit and save: it must overwrite, not spawn `Refunds.json` at the root.
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input("https://a.test/refunds");
+    cx.simulate_keystrokes("ctrl-s");
+    cx.run_until_parked();
+
+    assert_eq!(
+        zuno_core::collection::read(&written).expect("read back").url,
+        "https://a.test/refunds",
+        "Ctrl+S has to overwrite the request it was created as"
+    );
+    assert!(
+        !root.join("Refunds.json").exists(),
+        "and must not derive a second copy at the collection root"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+#[gpui::test]
+async fn creating_a_request_beside_one_uses_its_folder_and_never_overwrites(cx: &mut TestAppContext) {
+    // A request row's menu means "beside this one", the way New folder already did — and two
+    // requests given the same name must not collapse into one file, because a derived name is
+    // not an identity.
+    let dir = scratch_dir("new-request-sibling");
+    let root = dir.join("collections");
+    seed_request(&root, "billing/invoices.json", "https://a.test/invoices");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    // Row 1 is the request inside the folder.
+    let request = cx.debug_bounds("collection-row-1").expect("the request row");
+    right_click(&mut cx, request.center());
+    let labels = window
+        .update(&mut cx, |workspace, _, cx| workspace.menu_labels(cx))
+        .expect("window");
+    assert!(
+        labels.contains(&"New request".to_string()),
+        "a request row must offer it too: {labels:?}"
+    );
+
+    // Clicked, not dispatched: the row is the thing under test, and its index comes from the
+    // order asserted above.
+    let ix = labels
+        .iter()
+        .position(|label| label == "New request")
+        .expect("the row exists");
+    let selector: &'static str = format!("menu-row-{ix}").leak();
+    let row = cx.debug_bounds(selector).expect("the New request row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cx.simulate_input("invoices");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        root.join("billing").join("invoices-2.json").exists(),
+        "a colliding name must allocate beside the original, not overwrite it"
+    );
+    assert_eq!(
+        zuno_core::collection::read(&root.join("billing").join("invoices.json"))
+            .expect("the original")
+            .url,
+        "https://a.test/invoices",
+        "the original must be untouched"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+
+#[test]
+fn the_new_node_box_carries_the_glyph_of_the_row_it_becomes() {
+    // A folder glyph on a new *request* shipped, because generalising the row's placement for
+    // both kinds said nothing about what it draws. The paint is not observable headlessly; the
+    // decision behind it is, so it lives in a pure function and this pins it.
+    use crate::collection_panel::new_node_icon;
+    use crate::workspace::NewNode;
+
+    assert_eq!(new_node_icon(NewNode::Folder), crate::ui::Icon::Folder);
+    assert_ne!(
+        new_node_icon(NewNode::Request),
+        crate::ui::Icon::Folder,
+        "a request box must not draw a folder"
+    );
+    // And it must be the glyph a real request row would carry for that method, rather than any
+    // non-folder icon that happens to differ.
+    assert_eq!(
+        new_node_icon(NewNode::Request),
+        crate::collection_panel::method_icon(&zuno_core::Method::default())
     );
 }
 
