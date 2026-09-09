@@ -18,6 +18,7 @@
 //! hand-written tokenizer instead.
 
 mod flatten;
+pub mod format;
 
 use bytes::Bytes;
 

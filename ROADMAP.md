@@ -657,7 +657,18 @@ cursors stayed separate, because a match and where you are standing are differen
   the failure direction `CLAUDE.md` calls the most expensive: a doc asserting a gap the code no
   longer has sends a reader hunting for something that isn't there. Found by re-reading this list
   to answer "what's left", which is the only thing that ever catches it.
-- **No body prettify.** Paste minified JSON and you live with it.
+- ~~**No body prettify.**~~ **Done.** `Alt+Shift+F` formats the request body, `Alt+Shift+M`
+  minifies it, and `Ctrl+Z` undoes either because the rewrite goes through the ordinary edit path.
+
+  The interesting part is what it is *not* built on. `serde_json::to_string_pretty` reorders object
+  keys alphabetically — `serde_json = "1"` has no `preserve_order` — so it would silently rewrite a
+  body whose key order is deliberate. `json/format.rs` walks the outline `flatten` already builds
+  and copies each token from its byte span, so only whitespace is its decision. JSON only; XML and
+  HTML stay deferred on the same argument as their highlighting. See architecture.md §6g.
+
+  **A planned second half was dropped after reading the docs properly**: making `Ctrl+Shift+C`
+  copy the formatted outline. "Copy gives the raw bytes" is listed above under *decisions worth
+  keeping*, with a reason and a test, and it was misread here as a gap. See architecture.md §6g.
 
 **6. Discoverability — done, and it should not have taken this long.** Only six of ~40 actions were
 reachable by mouse; nine had no affordance at all, including three shipped in the two slices before

@@ -1762,7 +1762,6 @@ impl RequestView {
 
     /// Test-only, like `Workspace::tab_count`: nothing in the UI reads the kind directly, it
     /// reads the label derived from it.
-    #[cfg(test)]
     pub fn body_kind(&self) -> RawKind {
         self.body_kind
     }

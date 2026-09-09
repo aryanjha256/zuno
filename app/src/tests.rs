@@ -10742,6 +10742,92 @@ async fn a_recovered_script_arrives_on_the_request_it_came_from(cx: &mut TestApp
     remove_scratch(&mut cx, &session);
 }
 
+
+#[gpui::test]
+async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAppContext) {
+    // The undo is half the feature: reformatting someone's body is only a safe verb because the
+    // rewrite goes through `Editor::replace_range`, which is the ordinary edit path. If it ever
+    // stopped doing so, formatting would become destructive and nothing else would say so.
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.simulate_input(r#"{"b":1,"a":[2,3]}"#);
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("alt-shift-f");
+    cx.run_until_parked();
+
+    let formatted = cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string());
+    assert_eq!(
+        formatted,
+        "{\n  \"b\": 1,\n  \"a\": [\n    2,\n    3\n  ]\n}",
+        "the body must be reformatted in place, with key order kept"
+    );
+
+    cx.simulate_keystrokes("ctrl-z");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        r#"{"b":1,"a":[2,3]}"#,
+        "a format has to be undoable"
+    );
+
+    // And minify is the inverse, from the formatted text.
+    cx.simulate_keystrokes("alt-shift-f");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("alt-shift-m");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        r#"{"b":1,"a":[2,3]}"#
+    );
+}
+
+#[gpui::test]
+async fn a_body_that_is_not_json_is_refused_with_a_reason_and_left_alone(cx: &mut TestAppContext) {
+    // Both refusals matter, and for the same reason: the verb must never half-rewrite a body.
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.simulate_input(r#"{"a":1,}"#);
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("alt-shift-f");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        r#"{"a":1,}"#,
+        "a broken body must be left exactly as it was"
+    );
+    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    assert!(
+        status.contains("Not valid JSON") && status.contains("line 1"),
+        "the position is what makes a syntax error actionable: {status:?}"
+    );
+
+    // A body labelled something else is refused by *label*, not by whether it happens to parse —
+    // so the verb's behaviour can be read off the chip on screen.
+    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.simulate_input(r#"{"a":1}"#);
+    view.update(&mut cx, |view, cx| view.set_body_kind(zuno_core::RawKind::Xml, cx));
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("alt-shift-f");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        r#"{"a":1}"#,
+        "an XML-labelled body must not be reformatted as JSON"
+    );
+    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    assert!(
+        status.contains("JSON only"),
+        "and the refusal must point at what to change: {status:?}"
+    );
+}
+
 #[gpui::test]
 async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext) {
     // **The class of bug nothing else here can see.** Two context-less bindings on one keystroke

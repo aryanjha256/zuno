@@ -48,7 +48,8 @@ use crate::actions::{
     WorkspaceConfirm, WorkspaceDismiss,
     CollectionExpandAll, CommitRename, ConfirmClose, CopyRequestPath,
     CopyRequestRelativePath, DuplicateRequest,
-    ImportConfirm, ImportDismiss, ImportDocument, MoveRequest, NewFolder, OpenRequestExternally,
+    FormatBody, ImportConfirm, ImportDismiss, ImportDocument, MinifyBody, MoveRequest,
+    NewFolder, OpenRequestExternally,
     RenameRequest, RevealRequest, TrashRequest,
 };
 use crate::engine::ActiveEngine;
@@ -144,6 +145,9 @@ pub struct Workspace {
     import: Option<ImportState>,
     /// Holding the task is what keeps a spec fetch alive; dropping it cancels.
     import_task: Option<Task<()>>,
+    /// Held for the same reason every other task field is: dropping a `Task` cancels it, so a
+    /// format that outlived its own local would silently never land.
+    body_format: Option<Task<()>>,
     /// Where the panel was right-clicked, in window coordinates.
     ///
     /// Kept rather than taken when the first menu opens, because the confirmation is a *second*
@@ -314,6 +318,7 @@ impl Workspace {
             settings: None,
             menu: None,
             response_save: None,
+            body_format: None,
             session_save: None,
             body_file_prompt: None,
             globals_active: globals_has_values(cx),
@@ -2381,6 +2386,103 @@ impl Workspace {
         self.import = None;
         self.set_status(&message, cx);
         cx.notify();
+    }
+
+    fn format_body(&mut self, _: &FormatBody, window: &mut Window, cx: &mut Context<Self>) {
+        self.rewrite_body(true, window, cx);
+    }
+
+    fn minify_body(&mut self, _: &MinifyBody, window: &mut Window, cx: &mut Context<Self>) {
+        self.rewrite_body(false, window, cx);
+    }
+
+    /// Re-emit the request body as formatted or minified JSON.
+    ///
+    /// **Gated on the body *kind*, not on whether the text happens to parse.** The chip on screen
+    /// says JSON or XML, and a verb that quietly works on a body labelled XML — or refuses one
+    /// labelled Text that holds JSON — is a verb whose behaviour you cannot read off the screen.
+    /// "This body is XML" points at what to change; "not valid JSON" about an XML body does not.
+    ///
+    /// The rewrite goes through `Editor::replace_range`, so it lands on the ordinary edit path
+    /// and **`Ctrl+Z` undoes it** — which is what makes reformatting someone's body a safe verb
+    /// rather than one that needs a confirmation.
+    fn rewrite_body(&mut self, indent: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+
+        if view.read(cx).body_type != crate::request_view::BodyType::Raw {
+            self.set_status("Formatting needs a raw body", cx);
+            return;
+        }
+        if view.read(cx).body_kind() != zuno_core::RawKind::Json {
+            self.set_status(
+                &format!(
+                    "Formatting is JSON only — this body is {}",
+                    view.read(cx).body_label()
+                ),
+                cx,
+            );
+            return;
+        }
+
+        let before = view.read(cx).body_editor.read(cx).text().to_string();
+        if before.trim().is_empty() {
+            self.set_status("The body is empty", cx);
+            return;
+        }
+
+        // Invariant 3: the parse goes to the background executor. A pasted body is usually small,
+        // but "usually" is not a size the invariant admits, and a 10MB paste is exactly the case
+        // where a frozen window would be noticed.
+        let source = bytes::Bytes::from(before.clone());
+        let parse = cx.background_executor().spawn(async move {
+            zuno_core::JsonOutline::parse(source).map(|outline| {
+                if indent {
+                    zuno_core::json::format::pretty(&outline)
+                } else {
+                    zuno_core::json::format::minify(&outline)
+                }
+            })
+        });
+
+        // `window.spawn` rather than `cx.spawn`, because `Editor::replace_range` needs a real
+        // `&mut Window` — it goes through the ordinary edit path, which is what buys the undo.
+        let workspace = cx.entity();
+        self.body_format = Some(window.spawn(cx, async move |cx| {
+            let formatted = parse.await;
+
+            let _ = cx.update(|window, cx| workspace.update(cx, |workspace, cx| match formatted {
+                Ok(text) => {
+                    // Typing continued while this was in flight, so the result describes a buffer
+                    // that no longer exists. Replacing it would discard those keystrokes.
+                    if view.read(cx).body_editor.read(cx).text() != before {
+                        return;
+                    }
+                    if text == before {
+                        workspace.set_status("The body is already formatted", cx);
+                        return;
+                    }
+
+                    let end = before.len();
+                    let size = format_bytes(text.len() as u64);
+                    view.update(cx, |view, cx| {
+                        view.body_editor.update(cx, |editor, cx| {
+                            editor.replace_range(0..end, &text, window, cx);
+                        });
+                    });
+                    let verb = if indent { "Formatted" } else { "Minified" };
+                    workspace.set_status(&format!("{verb} the body — {size}"), cx);
+                }
+                // `flatten` names the byte offset, which is the only thing that makes a syntax
+                // error actionable in a body you did not write.
+                Err(error) => {
+                    let (line, col) = zuno_core::json::line_col(before.as_bytes(), error.offset);
+                    workspace.set_status(
+                        &format!("Not valid JSON — {} at line {line}, column {col}", error.message),
+                        cx,
+                    );
+                }
+            }));
+        }));
     }
 
     /// Open the rename box on the selected request.
@@ -4783,6 +4885,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_folder))
             .on_action(cx.listener(Self::move_request))
             .on_action(cx.listener(Self::import_document))
+            .on_action(cx.listener(Self::format_body))
+            .on_action(cx.listener(Self::minify_body))
             .on_action(cx.listener(Self::import_confirm))
             .on_action(cx.listener(Self::import_dismiss))
             .on_action(cx.listener(Self::switch_environment))

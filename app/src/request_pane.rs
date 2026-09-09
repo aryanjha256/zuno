@@ -244,6 +244,21 @@ fn body_header(view: &RequestView, lines: usize, theme: &Theme) -> Div {
                     BodyType::Multipart => Some(add_control(RowKind::Multipart, theme)),
                     _ => None,
                 })
+                // Offered only where it applies, rather than shown greyed out: the verb is
+                // JSON-only, and a control that is present-but-dead teaches nothing.
+                .children(
+                    (view.body_type == BodyType::Raw
+                        && view.body_kind() == zuno_core::RawKind::Json)
+                        .then(|| {
+                            crate::ui::text_action(
+                                "action-format-body",
+                                "Format".into(),
+                                "Format the body as JSON",
+                                crate::actions::FormatBody,
+                                theme,
+                            )
+                        }),
+                )
                 .child(
                     div()
                         .id("body-kind")

@@ -62,7 +62,7 @@ use crate::actions::{
     FlowConfirm, FlowDismiss, FlowNext, FlowPrev, FlowStepDown, FlowStepNext, FlowStepPrev,
     FlowStepRemove, FlowStepUp, OpenDefaults,
     RunDismiss, RunFlow, RunFolder,
-    DeleteRequest, ImportConfirm, ImportDismiss, ImportDocument,
+    DeleteRequest, FormatBody, ImportConfirm, ImportDismiss, ImportDocument, MinifyBody,
     NewFolder, RenameRequest, ToggleCollectionPanel,
 };
 use crate::input::{editor, text_input};
@@ -248,6 +248,8 @@ fn bindings() -> Vec<KeyBinding> {
         // bindings; `alt-r` is free where `ctrl-shift-r` already focuses this pane.
         KeyBinding::new("alt-r", ToggleResponseView, None),
         KeyBinding::new("alt-f", FoldAll, None),
+        KeyBinding::new("alt-shift-f", FormatBody, None),
+        KeyBinding::new("alt-shift-m", MinifyBody, None),
         KeyBinding::new("alt-e", UnfoldAll, None),
         // Moving a selection through the body. Scoped to the pane rather than global: `up` and
         // `down` are the editor's and the picker's too, and a context predicate matches only the

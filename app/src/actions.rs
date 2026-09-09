@@ -124,6 +124,11 @@ actions!(
         AddCapture,
         ToggleCaptureSecret,
         CaptureValue,
+        // Format the request body. JSON only, and JSON is the only thing `json::flatten`
+        // structures — XML and HTML prettify is a different job, deferred with their
+        // highlighting.
+        FormatBody,
+        MinifyBody,
         // Import a whole API at once — the document decides which parser reads it, so this
         // is one verb rather than one per format. `ImportCurl` is one request per paste; this
         // is the way a collection gets filled from what a team already has.

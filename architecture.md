@@ -60,7 +60,8 @@ zuno/
 │       │   └── run.rs      ✅ execution, streaming, event emission
 │       ├── json/           ✅
 │       │   ├── mod.rs      ✅ JsonOutline, Row, Span, visible_rows
-│       │   └── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
+│       │   ├── flatten.rs  ✅ iterative tokenizer -> Vec<Row>
+│       │   └── format.rs   ✅ outline -> pretty/minified text, copying byte spans
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
 │       ├── import.rs       ✅ one Import shape; sniffs which parser reads a document
 │       ├── openapi.rs      ✅ OpenAPI 3.x -> requests, over serde_json::Value
@@ -1914,6 +1915,71 @@ never closes and refuse the rest of the script.
 The import reports how many rules it recovered, ahead of the skipped count: "12 skipped" alone
 reads as "the scripts were lost" when most of what mattered in them is now on the requests.
 Descriptions still have no `RequestSpec` field and are counted and reported once.
+
+---
+
+## 6g. Body prettify — a formatter that copies bytes
+
+Zuno could *display* pretty JSON and not *produce* it: the response viewer renders a formatted
+outline, and nothing turned JSON bytes back into formatted text. `Alt+Shift+F` formats the request
+body, `Alt+Shift+M` minifies it.
+
+**`serde_json::to_string_pretty` was the obvious answer and is wrong — measured, not assumed.**
+`serde_json = "1"` carries no `preserve_order`, so `Value`'s objects are a `BTreeMap`:
+
+```
+in : {"zebra":1,"apple":2,"big":12345678901234567890,"exact":1.0}
+out: {"apple":2,"big":12345678901234567890,"exact":1.0,"zebra":1}
+```
+
+Silently reordering a request body is not formatting it. Key order is often deliberate, and a
+canonicalising signature scheme makes it load-bearing. (Numbers and escapes survive fine; ordering
+alone disqualifies it.) Enabling `preserve_order` would fix that symptom and change `Value`
+behaviour crate-wide, including the order `openapi.rs` walks `paths`.
+
+**So `json/format.rs` walks the outline `flatten` already builds and copies each token from its
+`Span`.** Only the whitespace *between* tokens is this module's decision — key order, number text
+and escape sequences survive because nothing in it is in a position to change them. Three things
+come free from building on `flatten` rather than beside it:
+
+- **Invalid JSON is refused by the parse**, so there is no path that half-formats a broken
+  document. The error carries a byte offset, which `json::line_col` turns into the line and column
+  that make a syntax error in someone else's body actionable.
+- **The parse is already a background-executor job** for the response viewer, so invariant 3 needed
+  no new arrangement.
+- **A scalar at the root works** — `"hello"`, `42`, `{}`, `[]` — because `flatten` emits a single
+  row for those and the walk had to handle a document that is not a container.
+
+Two details that read as arbitrary and are not: an empty container goes on one line (`{\n}` is what
+a naive walk emits and it reads as a mistake), and there is **no trailing newline**, because this
+lands in an editor buffer where a blank last line is something the person then has to delete.
+
+**The rewrite goes through `Editor::replace_range`, so `Ctrl+Z` undoes it.** That is what makes
+reformatting someone's body a safe verb rather than one needing a confirmation, and the app test
+asserts the undo rather than only the format — if the rewrite ever stopped using the ordinary edit
+path, formatting would become destructive and nothing else would say so.
+
+**Gated on the body *kind*, not on whether the text happens to parse.** The chip on screen says
+JSON or XML, and a verb that quietly works on a body labelled XML — or refuses one labelled Text
+that holds JSON — is a verb whose behaviour you cannot read off the screen. "This body is XML"
+points at what to change. The `Format` label in the body header appears only where the verb
+applies, rather than greyed out: a present-but-dead control teaches nothing.
+
+### Copy stays raw, and that was my mistake to check
+
+The slice was planned with a second consumer — making `Ctrl+Shift+C` copy the formatted outline
+instead of the raw bytes, on the strength of ROADMAP's line *"Copy gives the raw bytes, not the
+pretty-printed outline on screen."* That line sits under **"Three decisions worth keeping"**, with
+its reason stated (what you paste into a fixture or a bug report has to be what came back) and a
+test enforcing it — `ctrl_shift_c_copies_the_response_body_verbatim`. It was read as a gap. It is a
+decision, and a better-argued one than the change: reformatting the thing you are reporting
+quietly changes it.
+
+Reverted. The two failing tests are what caught it, which is the value of asserting a decision
+rather than only a behaviour. **CLAUDE.md's heuristic held exactly** — when two readings disagree,
+trust the one that names its rejected alternative.
+
+XML and HTML prettify stay out, on the same argument as their highlighting.
 
 ---
 
