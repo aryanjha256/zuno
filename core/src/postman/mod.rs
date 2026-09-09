@@ -20,6 +20,8 @@
 //! settings Zuno models differently; and request descriptions, for which `RequestSpec` has no
 //! field — counted and reported once rather than per request.
 
+pub mod script;
+
 use serde_json::{Map, Value};
 
 use crate::import::{EnvironmentImport, Import, Imported, Variable};
@@ -80,9 +82,9 @@ pub fn parse(root: &Value) -> Result<Import, PostmanError> {
     };
     let mut descriptions = 0usize;
 
-    // The collection's own auth is the root of the inheritance chain, and its own scripts run
-    // around every request in it.
-    note_scripts(root, "the collection", &mut import.skipped);
+    // The collection's own auth is the root of the inheritance chain. Its scripts run around
+    // every request in it and are noted rather than recovered — see `recover_scripts`.
+    note_inherited_scripts(root, "the collection", &mut import.skipped);
     walk(items, &[], root.get("auth"), &mut import, &mut descriptions);
 
     if import.requests.is_empty() {
@@ -193,7 +195,7 @@ fn walk(
         // A folder is an item with children; a request is an item with a `request`. Both keys
         // present is not a shape Postman writes, and children are the more informative half.
         if let Some(children) = item.get("item").and_then(Value::as_array) {
-            note_scripts(&Value::Object(item.clone()), &name, &mut import.skipped);
+            note_inherited_scripts(&Value::Object(item.clone()), &name, &mut import.skipped);
 
             let mut nested = folders.to_vec();
             if nested.len() >= MAX_FOLDER_DEPTH {
@@ -215,12 +217,17 @@ fn walk(
             continue;
         };
 
-        note_scripts(&Value::Object(item.clone()), &name, &mut import.skipped);
         match request_from(&name, request, auth, &mut import.skipped) {
-            Some(spec) => import.requests.push(Imported {
-                folders: folders.to_vec(),
-                spec,
-            }),
+            Some(mut spec) => {
+                import
+                    .skipped
+                    .extend(recover_scripts(item, &name, &mut spec));
+                import.recovered += script_rules(&spec);
+                import.requests.push(Imported {
+                    folders: folders.to_vec(),
+                    spec,
+                })
+            }
             None => import
                 .skipped
                 .push(format!("{name}: its request is not readable")),
@@ -648,28 +655,88 @@ fn auth_effect(auth: &Value, name: &str, skipped: &mut Vec<String>) -> Option<Au
     }
 }
 
-/// Name a request's scripts so a person knows their tests did not come across.
-///
-/// Reported rather than dropped, and by name rather than in full: the lines are still in the
-/// file they were exported from, and recovering the common shapes — `pm.environment.set` into a
-/// capture, a status check into `expect_status`, `pm.expect` into an assertion — is its own
-/// slice. What must not happen is a silent loss of the half of a collection that makes it a
-/// suite rather than a list.
-fn note_scripts(item: &Value, name: &str, skipped: &mut Vec<String>) {
+/// Note a collection's or folder's scripts. They apply to everything beneath them, which is
+/// exactly why they are not recovered — see `recover_scripts`.
+fn note_inherited_scripts(item: &Value, name: &str, skipped: &mut Vec<String>) {
     for event in array(item.get("event")) {
-        if flag(event, "disabled") {
+        let Some(lines) = exec_lines(event) else {
             continue;
-        }
-        let lines = array(event.get("script").and_then(|script| script.get("exec"))).len();
-        if lines == 0 {
-            continue;
-        }
+        };
         let listen = event
             .get("listen")
             .and_then(Value::as_str)
             .unwrap_or("script");
-        skipped.push(format!("{name}: {listen} script, {lines} lines"));
+        skipped.push(format!(
+            "{name}: {listen} script, {} lines — applies to everything under it, so it is not \
+             copied onto each request",
+            lines.len()
+        ));
     }
+}
+
+/// How many rules a recovered spec ended up with, for the import's own count.
+fn script_rules(spec: &RequestSpec) -> usize {
+    usize::from(spec.expect_status.is_some()) + spec.captures.len() + spec.assertions.len()
+}
+
+/// A script's `exec` lines, if it has any and is switched on.
+fn exec_lines(event: &Value) -> Option<Vec<String>> {
+    if flag(event, "disabled") {
+        return None;
+    }
+    let lines: Vec<String> = array(event.get("script").and_then(|script| script.get("exec")))
+        .iter()
+        .map(scalar)
+        .collect();
+    (!lines.is_empty()).then_some(lines)
+}
+
+/// Recover what a request's own `test` scripts were checking, and note the rest.
+///
+/// **Only the request's own.** A collection- or folder-level script runs after every request
+/// beneath it in Postman, so copying it into all forty would be the faithful reading — and it is
+/// the wrong call here, because Zuno has no inheritance to represent it: forty requests would
+/// each declare a rule none of them wrote, with nothing on screen saying where it came from. A
+/// lossy copy that looks authoritative is worse than a note. Those stay in `skipped`.
+///
+/// A `prerequest` script is setup that runs *before* a response exists, so there is nothing in it
+/// to recover — `pm.environment.set("ts", Date.now())` is dynamic state, not a capture.
+fn recover_scripts(item: &Map<String, Value>, name: &str, spec: &mut RequestSpec) -> Vec<String> {
+    let mut notes = Vec::new();
+
+    for event in array(item.get("event")) {
+        let Some(lines) = exec_lines(event) else {
+            continue;
+        };
+        let listen = event
+            .get("listen")
+            .and_then(Value::as_str)
+            .unwrap_or("script");
+
+        if listen != "test" {
+            notes.push(format!("{name}: {listen} script, {} lines", lines.len()));
+            continue;
+        }
+
+        let recovered = script::recover(&lines);
+        // First one wins, for `script::recover`'s reason: two scripts asserting different
+        // statuses is a contradiction Zuno's one slot cannot hold.
+        if spec.expect_status.is_none() {
+            spec.expect_status = recovered.expect_status;
+        }
+        spec.captures.extend(recovered.captures);
+        spec.assertions.extend(recovered.assertions);
+
+        if !recovered.unread.is_empty() {
+            notes.push(format!(
+                "{name}: {} script lines not recovered — {}",
+                recovered.unread.len(),
+                recovered.unread.join(" / ")
+            ));
+        }
+    }
+
+    notes
 }
 
 /// An array field, or nothing — Postman omits empty ones and occasionally writes `null`.
@@ -742,7 +809,17 @@ mod tests {
               "event": [
                 {
                   "listen": "test",
-                  "script": { "exec": ["pm.test('ok', () => {})", "pm.response.json()"] }
+                  "script": {
+                    "exec": [
+                      "pm.test(\"Status code is 200\", function () {",
+                      "    pm.response.to.have.status(200);",
+                      "});",
+                      "var jsonData = pm.response.json();",
+                      "pm.environment.set(\"invoiceId\", jsonData.data[0].id);",
+                      "pm.expect(jsonData.status).to.eql(\"open\");",
+                      "console.log(jsonData);"
+                    ]
+                  }
                 }
               ]
             },
@@ -1028,13 +1105,51 @@ mod tests {
     }
 
     #[test]
-    fn scripts_are_named_rather_than_dropped_silently() {
-        // The half of a collection that makes it a suite rather than a list. Recovering the
-        // common shapes is its own slice; losing them without a word is the thing that must not
-        // happen in this one.
+    fn a_test_script_becomes_the_rules_it_was_checking() {
+        // The half of a collection that makes it a suite rather than a list, and the whole
+        // argument for this slice: what Postman spent three lines and a callback asserting is
+        // one `expect_status`, one capture and one assertion here.
         let import = imported();
-        assert!(noted(&import, "List: test script, 2 lines"), "{:?}", import.skipped);
-        assert!(noted(&import, "the collection: prerequest script"), "{:?}", import.skipped);
+        let list = &find(&import, "List").spec;
+
+        assert_eq!(list.expect_status, Some(200));
+
+        assert_eq!(list.captures.len(), 1, "{:?}", list.captures);
+        assert_eq!(list.captures[0].name, "invoiceId");
+        // Through a *local variable* bound to the parsed body, which is how the two-line form
+        // that most real collections use is written.
+        assert_eq!(list.captures[0].path, "$.data[0].id");
+        // Secret by default, because the failure directions are not symmetric — invariant 10.
+        assert!(list.captures[0].secret);
+
+        assert_eq!(list.assertions.len(), 1, "{:?}", list.assertions);
+        assert_eq!(list.assertions[0].path, "$.status");
+        assert_eq!(list.assertions[0].op, crate::assertion::Op::Equals);
+        assert_eq!(list.assertions[0].value, "open");
+
+        assert_eq!(import.recovered, 3);
+    }
+
+    #[test]
+    fn a_line_that_was_not_recovered_is_named_and_a_shared_script_is_not_copied() {
+        let import = imported();
+
+        // Reported verbatim: a rule Zuno invented is worse than one it admits it could not read,
+        // and the person needs to know which line to go and look at.
+        assert!(
+            noted(&import, "console.log(jsonData)"),
+            "an unread line must be named: {:?}",
+            import.skipped
+        );
+
+        // A collection- or folder-level script applies to everything beneath it, so copying it
+        // onto forty requests would have each declare a rule none of them wrote.
+        assert!(
+            noted(&import, "the collection: prerequest script")
+                && noted(&import, "not copied onto each request"),
+            "{:?}",
+            import.skipped
+        );
     }
 
     #[test]

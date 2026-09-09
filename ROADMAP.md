@@ -564,11 +564,20 @@ cursors stayed separate, because a match and where you are standing are differen
   name — and a *globals* export lands on Zuno's globals, which is the one place the two models
   agree exactly rather than approximately.
 
-  Postman's `{{var}}` syntax is already Zuno's, which is luck. What does *not* come across is
-  `event` scripts — JavaScript, named in the report rather than dropped silently. Recovering the
-  three common shapes (`pm.environment.set` → a capture, a status check → `expect_status`,
-  `pm.expect` → an assertion) onto what the runner already has is the next slice. Descriptions
-  have no field to land in and are reported once. See architecture.md §6f.
+  Postman's `{{var}}` syntax is already Zuno's, which is luck.
+
+  **Test scripts are recovered too**, which is the part that turns an imported collection back
+  into a suite: `pm.environment.set` → a capture, a status check → `expect_status`,
+  `pm.expect(…).to.eql` → an assertion, following a local variable bound to the response body
+  because that is how real scripts are written. A shape with no faithful translation — a numeric
+  comparison, truthiness, a computed index, a guarded statement — is **refused and reported
+  verbatim**, never approximated: a rule Zuno invented fails a run for a reason that is nowhere
+  in the collection. Descriptions have no field to land in and are reported once.
+
+  Still reported rather than recovered, and both deliberately: **collection- and folder-level
+  scripts**, which apply to everything beneath them and would otherwise stamp forty requests with
+  a rule none of them declared; and **`prerequest` scripts**, which run before a response exists.
+  Reversing the first is a small change if it turns out to matter. See architecture.md §6f.
 
 - **Delete — done**, in the slice after the panel. Right-click a request or press `delete`, and
   a second menu names the file before anything is removed. `context_menu.rs` finally has the

@@ -10671,6 +10671,77 @@ async fn a_postman_globals_export_lands_on_the_base_layer_and_selects_nothing(
     remove_scratch(&mut cx, &session);
 }
 
+
+#[gpui::test]
+async fn a_recovered_script_arrives_on_the_request_it_came_from(cx: &mut TestAppContext) {
+    // The rules have to survive the write to disk and the read back, which is the half the
+    // parser's own tests cannot see: `captures`, `expect_status` and `assertions` are all
+    // `#[serde(default)]` fields, so a serialisation mistake here is silent and looks exactly
+    // like a script that recovered nothing.
+    let dir = scratch_dir("postman-script-import");
+    let root = dir.join("collections");
+    let session = dir.join("config").join("session.json");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::create_dir_all(session.parent().unwrap()).expect("mkdir");
+
+    let export = dir.join("suite.json");
+    std::fs::write(
+        &export,
+        r#"{
+          "info": { "name": "Suite" },
+          "item": [
+            {
+              "name": "Login",
+              "request": { "method": "POST", "url": "https://a.test/login" },
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "exec": [
+                      "pm.test(\"ok\", function () {",
+                      "    pm.response.to.have.status(200);",
+                      "});",
+                      "var jsonData = pm.response.json();",
+                      "pm.environment.set(\"token\", jsonData.access_token);",
+                      "pm.expect(jsonData.role).to.eql(\"admin\");"
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }"#,
+    )
+    .expect("write export");
+
+    let (_window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.simulate_input(export.to_str().expect("path"));
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let written = root.join("Suite").join("Login.json");
+    let spec = zuno_core::collection::read(&written).expect("the written request");
+
+    assert_eq!(spec.expect_status, Some(200));
+    assert_eq!(spec.captures.len(), 1, "{:?}", spec.captures);
+    assert_eq!(spec.captures[0].name, "token");
+    assert_eq!(spec.captures[0].path, "$.access_token");
+    assert_eq!(spec.assertions.len(), 1, "{:?}", spec.assertions);
+    assert_eq!(spec.assertions[0].path, "$.role");
+    assert_eq!(spec.assertions[0].value, "admin");
+
+    // And the report says so, because "3 skipped" on its own reads as "the scripts were lost".
+    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    assert!(
+        status.contains("recovered 3 rules"),
+        "the import must say the scripts were read: {status:?}"
+    );
+
+    remove_scratch(&mut cx, &session);
+}
+
 #[gpui::test]
 async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext) {
     // **The class of bug nothing else here can see.** Two context-less bindings on one keystroke

@@ -2259,6 +2259,14 @@ impl Workspace {
         if let Some(note) = variables {
             message.push_str(&note);
         }
+        // Said before the skipped count, because otherwise "12 skipped" reads as "the scripts
+        // were lost" when most of what mattered in them is now on the requests.
+        if import.recovered > 0 {
+            message.push_str(&format!(
+                " — recovered {} rules from test scripts",
+                import.recovered
+            ));
+        }
         if !import.skipped.is_empty() {
             message.push_str(&format!(" — {} skipped", import.skipped.len()));
             for note in &import.skipped {

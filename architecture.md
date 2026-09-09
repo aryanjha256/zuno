@@ -64,7 +64,9 @@ zuno/
 │       ├── lines.rs        ✅ LineIndex for the raw-text fallback
 │       ├── import.rs       ✅ one Import shape; sniffs which parser reads a document
 │       ├── openapi.rs      ✅ OpenAPI 3.x -> requests, over serde_json::Value
-│       ├── postman.rs      ✅ Postman collection v2.x -> requests, folders, variables
+│       ├── postman/         ✅
+│       │   ├── mod.rs       ✅ Postman collection v2.x -> requests, folders, variables
+│       │   └── script.rs    ✅ test scripts -> captures, assertions, expect_status
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
@@ -1845,17 +1847,73 @@ export, which is the shape of half the bugs in this file.
 An export with nothing live in it is refused rather than creating an empty environment and
 reporting success.
 
-### Scripts are named, not dropped
+### Scripts — recovered where the shape is exact, reported everywhere else
 
-`event` blocks are JavaScript and no importer will ever run them. Each is reported by request,
-event type and line count, because a collection whose 80 requests arrive without their 80 tests
-gets read as "the import doesn't work" rather than "the import worked and the tests didn't come".
+`event` blocks are JavaScript and no importer will ever run them. But the three shapes that make
+up most real ones map onto what §6d and §6e built — `pm.environment.set` onto a `Capture`, a
+status check onto `expect_status`, `pm.expect(…).to.eql` onto an `Assertion` — so
+`postman/script.rs` is a pattern matcher over a closed set of forms. `postman.rs` became a
+directory for it, the way `json/` and `engine/` are: walking JSON and matching JavaScript are
+different jobs.
 
-The three shapes that make up most real Postman scripts map onto things Zuno built in §6d and
-§6e — `pm.environment.set` onto a capture, a status check onto `expect_status`, `pm.expect` onto
-an assertion — so recovering them is a pattern-match over `exec` lines rather than a JS engine.
-That is the next slice. Descriptions have no `RequestSpec` field at all and are counted and
-reported once rather than per request.
+**The governing rule is that a wrong recovery is far worse than no recovery.** A rule nobody
+wrote makes a run fail — or worse, pass — for a reason that is nowhere in the collection, and the
+person has no way to know Zuno invented it. So every form is matched whole or not at all, and
+anything unmatched is reported verbatim. Concretely refused, each with a test asserting the
+refusal:
+
+| Real line | Why there is no faithful translation |
+|---|---|
+`pm.expect(d.items.length).to.be.above(0)` | `Op` is Exists/Equals/Contains on purpose — §6e's note on why there is no `<` |
+`pm.expect(pm.response.responseTime).to.be.below(500)` | not the response body |
+`pm.expect(d.count).to.be.ok` | truthiness fails on `0`, `""`, `false`; `Exists` passes on all three |
+`pm.expect(d.items[i].id)` | a computed index has no single answer |
+`pm.environment.set("n", d.length)` | `.length` is a JavaScript property, not a member of the body |
+`status("Created")` | `expect_status` holds a number, and a name-to-code table is a table of guesses |
+
+**Three calls worth recording, because each had a cheaper wrong answer.**
+
+- **A local variable bound to the body is followed.** The common real capture is two lines —
+  `var jsonData = pm.response.json();` then `pm.environment.set("t", jsonData.token)` — so the
+  path lives on a variable. One pass collecting those names is the difference between recovering
+  a fraction of real captures and most of them, and it is bounded: a name is either bound to the
+  parsed body or it is not a path this can follow. `JSON.parse(responseBody)` is recognised too,
+  since older collections are full of it.
+- **A guarded statement is refused, not recovered without its guard.**
+  `if (pm.response.code === 200) { pm.environment.set("token", d.token) }` is extremely common
+  and Zuno has no condition on a capture. Often the guard is *redundant* here — a capture that
+  matches nothing writes nothing and is reported — but "often" is not a basis for inventing
+  rules, and the conservative call is the reversible one: the block is reported, so re-adding it
+  is a click. This was found by a break-test, not by design: the first version recovered the
+  one-line form silently, which is exactly the failure the module's own doc comment forbids.
+
+  The guard is tracked as **one flag per open brace**, not as a depth counter, because a
+  `pm.test(…, function () {` wrapper opens a block too and has to be transparent. Counting it as
+  a guard refuses the check inside every well-written script there is — which the first attempt
+  did.
+- **`.length` is refused, and it is the trap in this whole module**, because it reads exactly like
+  a key. `pm.environment.set("user_count", response.length)` is an ordinary line, and it shipped
+  translating to `$.length` — a capture that matches nothing on an array, or captures the wrong
+  value on an object that happens to carry a `length` member. A body genuinely keyed `length`
+  loses its capture and is reported, which is the right side of that trade. **Found by running a
+  real collection through, not by reading the code** — the third time on this feature that a real
+  document beat a synthetic fixture, after the API envelope and the request-level `auth`.
+- **Only the request's own `test` scripts are recovered.** A collection- or folder-level script
+  runs after everything beneath it, so copying it into all forty requests would be the faithful
+  reading of Postman — and the wrong call here, because Zuno has no inheritance to represent it:
+  forty requests would each declare a rule none of them wrote, with nothing on screen saying
+  where it came from. A lossy copy that looks authoritative is worse than a note. `prerequest`
+  scripts are not mined either: they run *before* a response exists, so
+  `pm.environment.set("ts", Date.now())` is dynamic state and not a capture.
+
+Comment stripping is quote-aware, because `pm.expect(d.url).to.eql("https://a.test")` puts a
+`//` inside a string in the most ordinary way there is, and truncating there turns a good match
+into an unread line. Same for brace counting — `to.eql("{}")` would otherwise open a block that
+never closes and refuse the rest of the script.
+
+The import reports how many rules it recovered, ahead of the skipped count: "12 skipped" alone
+reads as "the scripts were lost" when most of what mattered in them is now on the requests.
+Descriptions still have no `RequestSpec` field and are counted and reported once.
 
 ---
 

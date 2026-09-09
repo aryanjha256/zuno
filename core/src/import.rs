@@ -87,6 +87,11 @@ pub struct Import {
     /// import whose every URL starts `{{baseUrl}}` and that carries no `baseUrl` is an import
     /// you cannot send, which is not an import.
     pub variables: Vec<Variable>,
+    /// How many `expect_status`, capture and assertion rules were recovered from Postman test
+    /// scripts. A count rather than a list, because the rules themselves are on the requests and
+    /// visible in the Assert tab — this exists so the report can say the scripts were read at
+    /// all, rather than leaving "12 skipped" to imply nothing came across.
+    pub recovered: usize,
     /// What was dropped, in words. Surfaced rather than logged: an import that silently loses
     /// part of a document is worse than one that says so.
     pub skipped: Vec<String>,
