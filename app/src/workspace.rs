@@ -4416,10 +4416,32 @@ impl Workspace {
         // app menu belongs to the window rather than to any pane.
         let focus = self.focus_handle.clone();
         let repo = env!("CARGO_PKG_REPOSITORY");
+        // **Grouped by what each row acts on**, widening outward: a buffer, then the collection,
+        // then the workspace, then what is on screen, then the app. It was three unrelated verbs
+        // and a help section, which said nothing about the app's shape — a menu is the one place
+        // that structure is legible, since the palette is a flat searchable list on purpose.
         vec![
+            MenuItem::new("New tab", NewTab, &focus, window).into(),
+            MenuItem::new("New request", NewRequest, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("Import a collection or spec", ImportDocument, &focus, window).into(),
+            MenuItem::new("Import from curl", ImportCurl, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("New workspace", NewWorkspace, &focus, window).into(),
+            MenuItem::new("Open workspace", OpenWorkspace, &focus, window).into(),
+            MenuRow::Separator,
             MenuItem::new("Find request", OpenRequest, &focus, window).into(),
             MenuItem::new("Command palette", OpenPalette, &focus, window).into(),
+            MenuRow::Separator,
+            // The two toggles. Both already have a titlebar icon, and a menu row is the
+            // discoverable path to a keystroke an icon can only hint at.
+            MenuItem::new("Collection panel", ToggleCollectionPanel, &focus, window).into(),
+            MenuItem::new("Toggle theme", ToggleTheme, &focus, window).into(),
+            MenuRow::Separator,
+            // Request-scoped above app-scoped, and named apart: one edits the buffer in front of
+            // you, the other edits what a new one starts from.
             MenuItem::new("Request settings", OpenSettings, &focus, window).into(),
+            MenuItem::new("Default request settings", OpenDefaults, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::url("Documentation", "", repo).into(),
             // Prefilled with the version and platform, because the two facts every bug report
