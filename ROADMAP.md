@@ -645,12 +645,18 @@ cursors stayed separate, because a match and where you are standing are differen
   a row by existing now. The lesson is not about folders: **two features that are each correct
   can still fail to meet**, and nothing in a per-feature test suite looks at the seam.
 
-- **No renaming or deleting a *folder***, and `Ctrl+S` cannot target one.
-- **The collection root cannot be changed.** One XDG path, set at startup, with no runtime
-  setter. So the git argument the one-file-per-request format is *built on* — commit it, review
-  it in a pull request — is unreachable from inside the app, because the collection lives in
-  `~/.local/share` rather than in your repo. Bigger than anything else left on this list, and it
-  appears nowhere above because the audit only ever looked inward.
+- ~~**No renaming or deleting a *folder***~~ — **done** in `folder rename, delete, trash and
+  reveal`; see item 2 at the top of this audit. `Ctrl+S` still cannot target one, on purpose:
+  saving into whatever the panel happens to have selected depends on state you are not looking at
+  when you press the key.
+- ~~**The collection root cannot be changed.**~~ **Done** by workspaces — item 1 at the top of
+  this audit — so a collection can live in the repo it describes, and the git argument the
+  one-file-per-request format is built on is reachable from inside the app.
+
+  Both bullets sat here unstruck for several slices *after* the work that closed them, which is
+  the failure direction `CLAUDE.md` calls the most expensive: a doc asserting a gap the code no
+  longer has sends a reader hunting for something that isn't there. Found by re-reading this list
+  to answer "what's left", which is the only thing that ever catches it.
 - **No body prettify.** Paste minified JSON and you live with it.
 
 **6. Discoverability — done, and it should not have taken this long.** Only six of ~40 actions were
