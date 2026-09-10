@@ -2417,6 +2417,49 @@ async fn a_freshly_loaded_request_is_clean_for_every_body_type(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn closing_a_batch_asks_once_for_all_the_dirty_ones(cx: &mut TestAppContext) {
+    // **One prompt, not one per buffer.** Closing several tabs with three unsaved would
+    // otherwise stack three modals with no way to see how many were coming — and the previous
+    // pass shipped the safe interim instead, which kept the dirty ones open.
+    let (window, _v, mut cx) = boot(cx, None, None);
+
+    for host in ["https://one.test", "https://two.test"] {
+        cx.simulate_keystrokes("ctrl-t");
+        cx.simulate_input(host);
+        cx.run_until_parked();
+    }
+    // Three buffers: the original is clean, two were typed into.
+    assert_eq!(tabs_of(&window, &mut cx).0, 3);
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Close all tabs");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        tabs_of(&window, &mut cx).0,
+        3,
+        "closing a batch with unsaved work must ask, not close"
+    );
+    assert!(
+        cx.debug_bounds("close-discard").is_some(),
+        "and it must be one prompt covering the batch"
+    );
+
+    // `left`, not `right`: the order is Save · Don't save · Cancel and the default is Cancel,
+    // so stepping right wraps to Save all — which, with no collection directory in the harness,
+    // fails every write and correctly leaves those buffers open.
+    cx.simulate_keystrokes("left enter");
+    cx.run_until_parked();
+    assert_eq!(tabs_of(&window, &mut cx).0, 1);
+    assert_eq!(
+        tabs_of(&window, &mut cx).1.url,
+        zuno_core::RequestSpec::default().url,
+        "and the survivor is a fresh buffer, not one of the discarded ones"
+    );
+}
+
+#[gpui::test]
 async fn closing_a_dirty_buffer_asks_and_cancelling_keeps_it(cx: &mut TestAppContext) {
     // The data-loss path this whole slice exists for: quitting preserves every buffer through
     // the session envelope, and `Ctrl+W` preserved none.
@@ -7917,6 +7960,49 @@ async fn a_new_tab_is_scrolled_into_view_rather_than_appearing_off_screen(
             .expect("window"),
         "the newest tab must end up inside the strip, not past its right edge"
     );
+}
+
+#[gpui::test]
+async fn closing_other_tabs_keeps_the_right_one(cx: &mut TestAppContext) {
+    // **The off-by-one this is really about.** Every close renumbers `views`, so a list of
+    // indices aims at whatever slid into each slot — targets are entity ids, looked up fresh.
+    // Asserted by which buffer *survives*, since a handler that closed the wrong ones would
+    // still leave a plausible count behind.
+    let (window, first, mut cx) = boot(cx, None, None);
+    cx.simulate_keystrokes("ctrl-t");
+    let second = active_view(&window, &mut cx);
+    cx.simulate_keystrokes("ctrl-t");
+    let third = active_view(&window, &mut cx);
+    cx.simulate_keystrokes("ctrl-t");
+
+    // Land on the second of four, then close the other three.
+    window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+    cx.simulate_keystrokes("ctrl-shift-tab ctrl-shift-tab");
+    assert_eq!(
+        active_view(&window, &mut cx).entity_id(),
+        second.entity_id(),
+        "the test needs to be standing on the second tab"
+    );
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Close other tabs");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tab_count())
+            .expect("window"),
+        1
+    );
+    assert_eq!(
+        active_view(&window, &mut cx).entity_id(),
+        second.entity_id(),
+        "and the survivor is the one that was active, not whatever ended up at its index"
+    );
+    let _ = (first, third);
 }
 
 #[gpui::test]

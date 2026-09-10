@@ -42,7 +42,7 @@ use crate::actions::{
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
-    RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
@@ -146,6 +146,9 @@ pub struct Workspace {
     ///
     /// Cached rather than read in `render` — env vars cannot change under a running process,
     /// and the status bar asks this every frame. Same shape as `globals_active`.
+    /// Where a tab was right-clicked. Taken by `OpenTabMenu`, so a stale anchor cannot place
+    /// a later menu.
+    tab_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     system_proxy: Option<String>,
     pub(crate) tab_scroll: ScrollHandle,
     /// The running chevron animation. Held so a second click **replaces** it — dropping a
@@ -373,6 +376,7 @@ impl Workspace {
             panel_width: session_width,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
+            tab_menu_anchor: None,
             system_proxy: [
                 "HTTP_PROXY",
                 "http_proxy",
@@ -860,15 +864,6 @@ impl Workspace {
             return;
         };
 
-        // `force_close_tab` and `save_request` both act on the *active* buffer, and the prompt
-        // records the one it was opened for. A modal owns the keyboard, so the two cannot
-        // diverge — this refuses rather than trusting that, since acting on the wrong buffer
-        // here would discard a request nobody was asked about.
-        if self.active_ix != state.ix {
-            cx.notify();
-            return;
-        }
-
         match state.choice {
             Choice::Cancel => {
                 if let Some(focus) = state.restore_focus {
@@ -876,55 +871,64 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            Choice::Save => {
-                // Taken *before* saving: `save_request` acts on the active buffer, and the
-                // prompt is modal, so that is still the one being closed.
-                self.save_request(&SaveRequest, window, cx);
-                // Saving can fail — no collection directory, an unwritable file — and it says
-                // so in the status bar. Closing anyway would discard the work the person just
-                // asked to keep, so the buffer stays and the message stands.
-                let saved = self
-                    .active()
-                    .is_some_and(|view| !view.read(cx).is_dirty(cx));
-                if saved {
-                    self.force_close_tab(window, cx);
-                } else {
-                    cx.notify();
-                }
-            }
-            Choice::Discard => self.force_close_tab(window, cx),
+            // The old `active_ix != state.ix` guard is gone because it cannot be needed any
+            // more: `close_targets` resolves each buffer by id, so acting on the wrong one is
+            // not expressible rather than merely checked for.
+            Choice::Save => self.close_targets(state.targets, true, window, cx),
+            Choice::Discard => self.close_targets(state.targets, false, window, cx),
         }
     }
 
-    /// Ask before discarding. **This closes nothing** — `force_close_tab` is the only thing
-    /// that does, the same split `DeleteRequest`/`ConfirmDeleteRequest` uses and for the same
-    /// reason: closing a tab is irreversible, and quitting is not, because the session envelope
-    /// keeps every open buffer while `Ctrl+W` kept none.
+    /// Close each target, optionally saving the dirty ones first.
+    ///
+    /// A failed save **keeps that buffer open** — the rule the single-buffer prompt already
+    /// followed, and it matters more in a batch: closing anyway would discard exactly the work
+    /// the person asked to keep, for the one request whose write failed.
+    fn close_targets(
+        &mut self,
+        targets: Vec<gpui::EntityId>,
+        save_dirty: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut kept = 0;
+        for id in targets {
+            let Some(ix) = self.views.iter().position(|view| view.entity_id() == id) else {
+                continue;
+            };
+            // `save_request` and `force_close_tab` both act on the active buffer, so each
+            // target becomes active in turn.
+            self.activate(ix, window, cx);
+
+            if save_dirty && self.views[ix].read(cx).is_dirty(cx) {
+                self.save_request(&SaveRequest, window, cx);
+                let saved = self
+                    .active()
+                    .is_some_and(|view| !view.read(cx).is_dirty(cx));
+                if !saved {
+                    kept += 1;
+                    continue;
+                }
+            }
+            self.force_close_tab(window, cx);
+        }
+
+        if kept > 0 {
+            let what = if kept == 1 { "request" } else { "requests" };
+            self.set_status(&format!("Could not save {kept} {what}; left open"), cx);
+        }
+    }
+
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.views.is_empty() || self.modal_open() {
             return;
         }
-
-        let dirty = self
-            .active()
-            .is_some_and(|view| view.read(cx).is_dirty(cx));
-
-        if dirty {
-            let label = self
-                .active()
-                .map(|view| view.read(cx).label(cx))
-                .unwrap_or_else(|| SharedString::from("This request"));
-            let restore = Some(window.focused(cx).unwrap_or_else(|| self.focus_handle.clone()));
-            let state =
-                crate::close_panel::CloseConfirm::new(self.active_ix, label, restore, cx);
-            let focus = state.focus_handle.clone();
-            self.close_confirm = Some(state);
-            window.focus(&focus);
-            cx.notify();
+        // One funnel with the batch verbs, so the prompt cannot behave differently depending on
+        // how many tabs you asked to close.
+        let Some(id) = self.active().map(|view| view.entity_id()) else {
             return;
-        }
-
-        self.force_close_tab(window, cx);
+        };
+        self.close_many(vec![id], window, cx);
     }
 
     fn force_close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -957,6 +961,158 @@ impl Workspace {
         // which now points at what was to the right — the behaviour every editor has.
         let next = self.active_ix.min(self.views.len() - 1);
         self.activate(next, window, cx);
+    }
+
+    /// Close every target, asking once first if any of them have unsaved changes.
+    ///
+    /// **One prompt for the whole batch**, not one per dirty buffer: closing ten tabs with four
+    /// unsaved would otherwise stack four modals with no way to see how many were coming. The
+    /// prompt names the request when exactly one is unsaved and counts them otherwise.
+    ///
+    /// Targets are entity ids, not indices — every close renumbers `views`, so a list of indices
+    /// would aim at whatever slid into each slot. Resolving the position fresh per target also
+    /// makes the order irrelevant.
+    fn close_many(
+        &mut self,
+        targets: Vec<gpui::EntityId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dirty: Vec<gpui::EntityId> = targets
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.views
+                    .iter()
+                    .find(|view| view.entity_id() == *id)
+                    .is_some_and(|view| view.read(cx).is_dirty(cx))
+            })
+            .collect();
+
+        if dirty.is_empty() {
+            self.close_targets(targets, false, window, cx);
+            return;
+        }
+
+        let label = match dirty.as_slice() {
+            [only] => self
+                .views
+                .iter()
+                .find(|view| view.entity_id() == *only)
+                .map(|view| view.read(cx).label(cx))
+                .unwrap_or_else(|| SharedString::from("This request")),
+            // Unused when more than one is unsaved: the panel counts them instead.
+            _ => SharedString::from("These requests"),
+        };
+
+        let restore = Some(window.focused(cx).unwrap_or_else(|| self.focus_handle.clone()));
+        let state = crate::close_panel::CloseConfirm::new(
+            targets,
+            dirty.len(),
+            label,
+            restore,
+            cx,
+        );
+        let focus = state.focus_handle.clone();
+        self.close_confirm = Some(state);
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    /// The ids of every buffer except the active one.
+    fn other_tab_ids(&self) -> Vec<gpui::EntityId> {
+        self.views
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| *ix != self.active_ix)
+            .map(|(_, view)| view.entity_id())
+            .collect()
+    }
+
+    fn close_other_tabs(&mut self, _: &CloseOtherTabs, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let targets = self.other_tab_ids();
+        self.close_many(targets, window, cx);
+    }
+
+    fn close_tabs_to_the_right(
+        &mut self,
+        _: &CloseTabsToTheRight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let targets = self
+            .views
+            .iter()
+            .skip(self.active_ix + 1)
+            .map(|view| view.entity_id())
+            .collect();
+        self.close_many(targets, window, cx);
+    }
+
+    fn close_all_tabs(&mut self, _: &CloseAllTabs, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        // No special case for emptiness: `force_close_tab` opens a fresh buffer when the last
+        // one goes.
+        let targets = self.views.iter().map(|view| view.entity_id()).collect();
+        self.close_many(targets, window, cx);
+    }
+
+    /// The tab strip's context menu.
+    ///
+    /// Right-click activates the tab first, so every row here acts on the active buffer and
+    /// `Close` needs no action of its own — the same two steps the `×` and middle-click take.
+    fn open_tab_menu(&mut self, _: &OpenTabMenu, window: &mut Window, cx: &mut Context<Self>) {
+        // Consumed either way, or a refused open would place the next menu at this click.
+        let at = self.tab_menu_anchor.take();
+        if self.modal_open() {
+            return;
+        }
+        let Some(at) = at else { return };
+
+        let focus = self.focus_handle.clone();
+        let mut items = vec![context_menu::MenuItem::new("Close", CloseTab, &focus, window)];
+
+        // Rows adapt rather than grey out, the rule the response row menu follows: neither of
+        // these means anything at one buffer, and "to the right" means nothing on the last tab.
+        if self.views.len() > 1 {
+            items.push(context_menu::MenuItem::new(
+                "Close others",
+                CloseOtherTabs,
+                &focus,
+                window,
+            ));
+        }
+        if self.active_ix + 1 < self.views.len() {
+            items.push(context_menu::MenuItem::new(
+                "Close to the right",
+                CloseTabsToTheRight,
+                &focus,
+                window,
+            ));
+        }
+        items.push(context_menu::MenuItem::new(
+            "Close all",
+            CloseAllTabs,
+            &focus,
+            window,
+        ));
+
+        let mut rows: Vec<context_menu::MenuRow> =
+            items.into_iter().map(Into::into).collect();
+        rows.push(context_menu::MenuRow::Separator);
+        rows.push(
+            context_menu::MenuItem::new("Copy as curl", CopyAsCurl, &focus, window).into(),
+        );
+
+        self.show_menu(rows, at, Some(focus), window, cx);
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -5394,6 +5550,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::set_proxy))
             .on_action(cx.listener(Self::remove_proxy))
+            .on_action(cx.listener(Self::open_tab_menu))
+            .on_action(cx.listener(Self::close_other_tabs))
+            .on_action(cx.listener(Self::close_tabs_to_the_right))
+            .on_action(cx.listener(Self::close_all_tabs))
             .on_action(cx.listener(Self::next_response_tab))
             .on_action(cx.listener(Self::prev_response_tab))
             .on_action(cx.listener(Self::show_response_body))
@@ -5843,6 +6003,17 @@ fn tab_strip(
                         MouseButton::Left,
                         cx.listener(move |workspace, _: &MouseDownEvent, window, cx| {
                             workspace.activate(ix, window, cx);
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |workspace, event: &MouseDownEvent, window, cx| {
+                            // Activate first, so the menu's rows can all act on the active
+                            // buffer. `position` is already in window coordinates, which is
+                            // what `anchored()` wants.
+                            workspace.activate(ix, window, cx);
+                            workspace.tab_menu_anchor = Some(event.position);
+                            window.dispatch_action(Box::new(OpenTabMenu), cx);
                         }),
                     )
                     // Middle-click closes, the convention every browser and editor shares.

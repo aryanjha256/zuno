@@ -66,6 +66,9 @@ pub fn palette() -> Vec<Command> {
         command("Switch environment", SwitchEnvironment),
         command("Set proxy", SetProxy),
         command("Remove a saved proxy", RemoveProxy),
+        command("Close other tabs", CloseOtherTabs),
+        command("Close tabs to the right", CloseTabsToTheRight),
+        command("Close all tabs", CloseAllTabs),
         command("Edit environments", EditEnvironments),
         command("New tab", NewTab),
         command("Close tab", CloseTab),
@@ -261,6 +264,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     // to put it. Everything inside it is offered directly above, which is the point: the menu is
     // the *mouse* path to verbs the keyboard already reaches.
     ("zuno::OpenRowMenu", "needs a click position; its items are all offered directly"),
+    ("zuno::OpenTabMenu", "needs a click position; its items are all offered directly"),
     ("zuno::MenuNext", "only valid inside the row menu"),
     ("zuno::MenuPrev", "only valid inside the row menu"),
     ("zuno::MenuConfirm", "only valid inside the row menu"),

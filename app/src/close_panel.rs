@@ -7,7 +7,7 @@
 //! where you right-clicked, and a close can arrive from a keystroke with no anchor at all.
 
 use gpui::{
-    App, FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    App, EntityId, FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, Styled, div, px,
 };
 
@@ -28,11 +28,12 @@ pub enum Choice {
 impl Choice {
     const ORDER: [Choice; 3] = [Choice::Save, Choice::Discard, Choice::Cancel];
 
-    fn label(self) -> &'static str {
-        match self {
-            Choice::Save => "Save",
-            Choice::Discard => "Don't save",
-            Choice::Cancel => "Cancel",
+    fn label(self, many: bool) -> &'static str {
+        match (self, many) {
+            (Choice::Save, false) => "Save",
+            (Choice::Save, true) => "Save all",
+            (Choice::Discard, _) => "Don't save",
+            (Choice::Cancel, _) => "Cancel",
         }
     }
 
@@ -52,9 +53,16 @@ impl Choice {
 }
 
 pub struct CloseConfirm {
-    /// The buffer to close. An index rather than an `Entity` so a buffer closed underneath the
-    /// prompt cannot be resurrected by it — the handler re-checks the index.
-    pub ix: usize,
+    /// Every buffer this prompt will close, by entity id.
+    ///
+    /// **Ids rather than indices**, and it is the same reason `close_many` uses them: each close
+    /// renumbers `views`, so a stored index would aim at whatever slid into that slot. An id
+    /// that is no longer in `views` is simply skipped, which is also the guard the old single
+    /// index needed a separate check for.
+    pub targets: Vec<EntityId>,
+    /// How many of `targets` have unsaved changes. Drives the wording and the button labels.
+    pub unsaved: usize,
+    /// Named only when exactly one is unsaved — past that a count reads better than a list.
     pub label: SharedString,
     pub choice: Choice,
     /// Where focus was, so dismissing puts it back. Same guard the picker, settings and import
@@ -64,9 +72,16 @@ pub struct CloseConfirm {
 }
 
 impl CloseConfirm {
-    pub fn new(ix: usize, label: SharedString, restore_focus: Option<FocusHandle>, cx: &mut App) -> Self {
+    pub fn new(
+        targets: Vec<EntityId>,
+        unsaved: usize,
+        label: SharedString,
+        restore_focus: Option<FocusHandle>,
+        cx: &mut App,
+    ) -> Self {
         Self {
-            ix,
+            targets,
+            unsaved,
             label,
             // Cancel, not Save: the safe default is the one that changes nothing, and Enter is
             // the key most likely to be pressed reflexively.
@@ -83,6 +98,7 @@ impl CloseConfirm {
 
 pub fn render(state: &CloseConfirm, theme: &Theme, cx: &mut gpui::Context<Workspace>) -> impl IntoElement {
     let selected = state.choice;
+    let many = state.unsaved > 1;
 
     div()
         .id("close-confirm-scrim")
@@ -111,10 +127,11 @@ pub fn render(state: &CloseConfirm, theme: &Theme, cx: &mut gpui::Context<Worksp
                     div()
                         .text_sm()
                         .text_color(theme.text)
-                        .child(SharedString::from(format!(
-                            "{} has unsaved changes.",
-                            state.label
-                        ))),
+                        .child(SharedString::from(if state.unsaved == 1 {
+                            format!("{} has unsaved changes.", state.label)
+                        } else {
+                            format!("{} requests have unsaved changes.", state.unsaved)
+                        })),
                 )
                 .child(
                     div()
@@ -130,9 +147,9 @@ pub fn render(state: &CloseConfirm, theme: &Theme, cx: &mut gpui::Context<Worksp
                         .gap_2()
                         // Spelled out rather than mapped over `ORDER`: `array::map` wants an
                         // `FnMut` and each button borrows `cx` mutably to build its listener.
-                        .child(button(Choice::Save, selected, theme, cx))
-                        .child(button(Choice::Discard, selected, theme, cx))
-                        .child(button(Choice::Cancel, selected, theme, cx)),
+                        .child(button(Choice::Save, selected, many, theme, cx))
+                        .child(button(Choice::Discard, selected, many, theme, cx))
+                        .child(button(Choice::Cancel, selected, many, theme, cx)),
                 ),
         )
 }
@@ -143,6 +160,7 @@ pub fn render(state: &CloseConfirm, theme: &Theme, cx: &mut gpui::Context<Worksp
 fn button(
     choice: Choice,
     selected: Choice,
+    many: bool,
     theme: &Theme,
     cx: &mut gpui::Context<Workspace>,
 ) -> impl IntoElement + use<> {
@@ -171,5 +189,5 @@ fn button(
                 window.dispatch_action(Box::new(ConfirmClose), cx);
             }),
         )
-        .child(choice.label())
+        .child(choice.label(many))
 }
