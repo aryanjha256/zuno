@@ -11,11 +11,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    ClipboardItem, Styled, Subscription, Task, UniformListScrollHandle, Window, div, px,
+    ClipboardItem, ScrollHandle, Styled, Subscription, Task, UniformListScrollHandle, Window,
+    div, point, px,
 };
 use zuno_core::{
     Environment, RawKind, RequestId, RequestSpec, Resolver, collection, curl, environment,
@@ -133,6 +135,20 @@ pub struct Workspace {
     /// (architecture.md §6). Translation happens at render and scroll, nowhere else.
     pub(crate) panel_selection: Option<usize>,
     pub(crate) panel_scroll: UniformListScrollHandle,
+    /// The tab strip's horizontal scroll, held so the chevrons can drive it.
+    ///
+    /// The strip has scrolled since it was built, but only by wheel — with nothing on screen
+    /// saying so, a tab past the right edge was unreachable by mouse. A handle is the only way
+    /// in: `set_offset` needs one, and gpui re-clamps `offset.x` to `[-max, 0]` in its own
+    /// prepaint, so a caller writing to it needs no clamp of its own.
+    pub(crate) tab_scroll: ScrollHandle,
+    /// The running chevron animation. Held so a second click **replaces** it — dropping a
+    /// `Task` cancels it, so two animations can never fight over the same offset.
+    tab_scroll_anim: Option<Task<()>>,
+    /// Where the running animation is heading, so rapid clicks accumulate rather than restart.
+    /// Three quick presses travel three tabs; reading the live offset instead would make each
+    /// click re-aim at wherever the last one had got to.
+    tab_scroll_target: Option<f32>,
     /// Deliberately **not** a tab stop, unlike `response_focus`. `Tab` currently walks the
     /// active request's inputs, and a pane-level stop painted before all of them would turn
     /// the first `Tab` from "url → method" into "panel → url" for every existing user. The
@@ -351,6 +367,9 @@ impl Workspace {
             panel_width: session_width,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
+            tab_scroll_anim: None,
+            tab_scroll_target: None,
             panel_focus: cx.focus_handle(),
             tree_scan: None,
             renaming: None,
@@ -923,6 +942,60 @@ impl Workspace {
     /// restored onto a smaller screen, or a window since dragged narrow — is reined in on the
     /// frame that draws it instead of eating the request pane until someone resizes the panel
     /// again. Every reader goes through this: the panel, the handle, and the menu anchor.
+    /// Scroll the tab strip by `delta`, eased rather than jumped.
+    ///
+    /// **Why animate at all:** a wheel scroll is already continuous, so a chevron that teleports
+    /// the strip reads as a different mechanism from the one it is standing in for. The chevrons
+    /// are triggers for the same scroll, so they should feel like it.
+    ///
+    /// Interpolation runs from the offset captured *now* toward an absolute target, rather than
+    /// adding a small delta each tick. Stepping incrementally would drift: gpui re-clamps
+    /// `offset.x` to `[-max, 0]` during its own prepaint, so at either end the increments would
+    /// be silently eaten and the animation would never reach a fixed point.
+    fn nudge_tabs(&mut self, delta: f32, cx: &mut Context<Self>) {
+        /// Long enough to read as motion, short enough not to sit between you and the tab you
+        /// are aiming at.
+        const TRAVEL: Duration = Duration::from_millis(140);
+        /// Roughly a frame. `timer` is not a frame clock, so the eased position is computed from
+        /// elapsed wall time and this only decides how often it is recomputed — a slow tick
+        /// makes the motion coarse, never wrong or longer.
+        const TICK: Duration = Duration::from_millis(8);
+
+        let from = f32::from(self.tab_scroll.offset().x);
+        // Accumulate onto the in-flight target, not onto the live offset, so a second click
+        // mid-animation adds a tab instead of re-aiming at wherever this one had reached.
+        let target = self.tab_scroll_target.unwrap_or(from) + delta;
+        self.tab_scroll_target = Some(target);
+
+        let scroll = self.tab_scroll.clone();
+        self.tab_scroll_anim = Some(cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+
+            loop {
+                let elapsed = started.elapsed().as_secs_f32() / TRAVEL.as_secs_f32();
+                let t = elapsed.min(1.);
+                // Ease-out cubic: leaves immediately and settles, which is what makes a short
+                // travel feel deliberate rather than clipped.
+                let eased = 1. - (1. - t).powi(3);
+                let at = scroll.offset();
+                scroll.set_offset(point(px(from + (target - from) * eased), at.y));
+
+                // The offset is not view state, so nothing repaints on its own.
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+                if t >= 1. {
+                    break;
+                }
+                cx.background_executor().timer(TICK).await;
+            }
+
+            // Cleared only on completion. A cancelled task leaves the target in place, which is
+            // right: the click that cancelled it has already set its own.
+            this.update(cx, |this, _| this.tab_scroll_target = None).ok();
+        }));
+    }
+
     pub(crate) fn clamped_panel_width(&self, window: &Window) -> f32 {
         crate::collection_panel::clamp_width(
             self.panel_width,
@@ -5175,7 +5248,14 @@ impl Render for Workspace {
             //
             // The status bar still spans the window, which is the same convention rather than an
             // inconsistency: it describes the application, the strip describes one pane.
-            .child(
+            .child({
+                // What the editor column will actually get: the row is the window less the
+                // panel, and the column takes the rest. Zero when the panel is hidden.
+                let panel_width = if self.panel_visible {
+                    self.clamped_panel_width(window)
+                } else {
+                    0.
+                };
                 div()
                     .flex_1()
                     .flex()
@@ -5201,15 +5281,25 @@ impl Render for Workspace {
                             // and the two together overflow instead.
                             .min_w(px(0.))
                             .overflow_hidden()
-                            .children(tab_strip(tabs, &theme, cx))
+                            // Width the strip will actually get: the row is the window less
+                            // the panel, and the editor column takes the rest. Computed here
+                            // rather than read off the scroll handle, whose extent is written
+                            // during prepaint and is therefore a frame behind (§6).
+                            .children(tab_strip(
+                                tabs,
+                                &self.tab_scroll,
+                                f32::from(window.viewport_size().width) - panel_width,
+                                &theme,
+                                cx,
+                            ))
                             .children(self.active()),
                     )
                     // Last, so hit-testing gives the seam to the handle rather than to
                     // whichever pane it overlaps.
                     .children(self.panel_visible.then(|| {
                         crate::collection_panel::resize_handle(self, &theme, window, cx)
-                    })),
-            )
+                    }))
+            })
             .child(status_bar(
                 focused_region,
                 status_message,
@@ -5258,13 +5348,102 @@ const TAB_CLOSE_WIDTH: f32 = 16.;
 const TAB_CHROME_WIDTH: f32 = 12. * 2. + 4. + 1.;
 const TAB_WIDTH: f32 = TAB_LABEL_WIDTH + TAB_CLOSE_WIDTH + TAB_CHROME_WIDTH;
 
+/// Width of one scroll chevron.
+const TAB_CHEVRON_WIDTH: f32 = 20.;
+
+/// Whether the tabs need more room than the strip has.
+///
+/// A pure function so the threshold can be checked without a window — the alternative is
+/// asking the scroll handle, whose extent is written during prepaint and so reads a frame
+/// behind (§6). Being wrong here has two different costs: too eager shows a chevron with
+/// nothing to reach, too shy leaves a tab unreachable by mouse. It deliberately does **not**
+/// reserve the chevrons' own width, which would be circular — if the tabs fit, no chevrons
+/// appear and none are needed; if they do not, the chevrons appear and there is still
+/// something to scroll to.
+fn tabs_overflow(tab_count: usize, available_width: f32) -> bool {
+    tab_count as f32 * TAB_WIDTH > available_width
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use super::*;
+
+    #[test]
+    fn the_chevrons_appear_exactly_when_a_tab_is_out_of_reach() {
+        // Both directions matter and they fail differently. Too shy and a tab past the right
+        // edge has no mouse path at all, which is the bug the chevrons exist to fix. Too eager
+        // and they are dead controls, which this codebase keeps finding one way or another.
+        let two = 2. * TAB_WIDTH;
+
+        assert!(!tabs_overflow(2, two), "two tabs in exactly their own width fit");
+        assert!(!tabs_overflow(2, two + 1.), "and fit with room to spare");
+        assert!(tabs_overflow(2, two - 1.), "a pixel short is out of reach");
+
+        // The case that motivated this: a normal window and enough tabs to run past it.
+        assert!(tabs_overflow(12, 900.));
+        assert!(!tabs_overflow(3, 900.));
+    }
+}
+
+/// One end's scroll chevron.
+///
+/// **Deliberately not a `ui::icon_button`**, which dispatches an action and titles itself with
+/// that action's keystroke. Scrolling a viewport is not a verb: there is no keybinding to teach,
+/// and inventing an action would need either a command-palette row nobody would search for or an
+/// `EXCLUDED` entry explaining why it is not one. It is chrome for the strip, in the same family
+/// as the response body's scroll indicator — the difference being that this one is meant to be
+/// clicked, so it takes a pointer cursor and a hover.
+///
+/// **Always live, never dimmed.** Knowing you are already at an end means reading the scroll
+/// extent, which is a frame behind; a chevron that greys out one tab early reads as broken,
+/// while a click that cannot move simply does nothing — gpui clamps `offset.x` to `[-max, 0]`
+/// in its own prepaint.
+fn scroll_chevron(
+    id: &'static str,
+    icon: crate::ui::Icon,
+    delta: f32,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    // Copied out rather than captured: a closure holding `theme` would borrow it for the
+    // element's whole life, which `impl IntoElement + use<>` cannot express.
+    let hover_bg = theme.bg_hover;
+
+    div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        // `ui::glyph` reaches its hover colour through the group, since `hover` on a parent does
+        // not inherit into an `svg()` any more than `text_color` does.
+        .group(crate::ui::ICON_GROUP)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(TAB_CHEVRON_WIDTH))
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover_bg))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |workspace, _: &MouseDownEvent, _, cx| {
+                workspace.nudge_tabs(delta, cx);
+            }),
+        )
+        .child(crate::ui::glyph(icon, theme.text_muted, theme.text, 12.))
+}
+
 /// The strip of open buffers.
 ///
 /// Hidden entirely at one buffer: a single tab is a row of chrome that says nothing, and
 /// the window title already names the request. It appears the moment there's a choice to
 /// make, which is also the moment it starts carrying information.
+///
+/// **The chevrons are pinned siblings, not children of the scrolling box**, so they stay put
+/// while the tabs move between them. Inside the scroll container they would slide away with the
+/// content, which is the one thing a scroll control must not do.
 fn tab_strip(
     tabs: Vec<(usize, SharedString, bool, bool)>,
+    scroll: &ScrollHandle,
+    available_width: f32,
     theme: &Theme,
     cx: &mut Context<Workspace>,
 ) -> Option<impl IntoElement> {
@@ -5272,21 +5451,50 @@ fn tab_strip(
         return None;
     }
 
+    // One tab per click: each press brings exactly one more into view, so holding it walks the
+    // strip. A screenful would be faster and leaves nothing on screen to orient by.
+    let overflowing = tabs_overflow(tabs.len(), available_width);
+
     Some(
         div()
-            .id("tab-strip")
             .flex()
             .flex_row()
-            .items_center()
+            // **No `items_center` here, deliberately.** gpui leaves `align_items` as `None`,
+            // which taffy reads as `stretch` — so the chevrons grow to the strip's full height
+            // and their hit area is the whole end of the row rather than a 12px box floating in
+            // it. That is also what fixes the hover: a full-height button looks like one. The
+            // scrolling box below keeps its own `items_center` for the tabs.
             .flex_none()
             .w_full()
-            // Many tabs must scroll rather than squeeze every label into illegibility.
-            // `overflow_x_scroll` lives on `StatefulInteractiveElement`, hence the `.id()`.
-            .overflow_x_scroll()
+            // The strip's own surface and its bottom rule live out here now, so they run the
+            // full width behind the chevrons rather than stopping where the tabs do.
             .bg(theme.bg_panel)
             .border_b_1()
             .border_color(theme.border)
-            .children(tabs.into_iter().map(|(ix, label, active, dirty)| {
+            .children(overflowing.then(|| {
+                scroll_chevron(
+                    "tab-scroll-left",
+                    crate::ui::Icon::ChevronLeft,
+                    TAB_WIDTH,
+                    theme,
+                    cx,
+                )
+            }))
+            .child(
+                div()
+                    .id("tab-strip")
+                    // The handle is the only way to scroll this from a click; omitting it leaves
+                    // `set_offset` writing to a state nothing reads.
+                    .track_scroll(scroll)
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    // Many tabs must scroll rather than squeeze every label into illegibility.
+                    // `overflow_x_scroll` lives on `StatefulInteractiveElement`, hence `.id()`.
+                    .overflow_x_scroll()
+                    .children(tabs.into_iter().map(|(ix, label, active, dirty)| {
                 div()
                     .id(("tab", ix))
                     // So a test can click a real tab. The click handler sits out here while the
@@ -5429,6 +5637,17 @@ fn tab_strip(
                                     )),
                             ),
                     )
+            })),
+            )
+            .children(overflowing.then(|| {
+                scroll_chevron(
+                    "tab-scroll-right",
+                    crate::ui::Icon::ChevronRight,
+                    // Negative: gpui's offset grows more negative as content moves left.
+                    -TAB_WIDTH,
+                    theme,
+                    cx,
+                )
             })),
     )
 }
