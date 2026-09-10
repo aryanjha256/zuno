@@ -598,9 +598,90 @@ impl Workspace {
         self.active_ix = ix;
 
         let url_focus = view.read(cx).url_focus(cx);
+        // Captured here rather than re-read below, so the borrow of `self.views` ends before
+        // the two `&mut self` calls.
+        let file = view.read(cx).path.clone();
         window.focus(&url_focus);
+
+        // **Both of these live here because `activate` is the one funnel.** Every switch —
+        // the four verbs, a tab click, middle-click, the picker, the collection panel — already
+        // comes through it (§12), so a switching path added later inherits them instead of
+        // having to remember.
+        self.reveal_active_tab(window, cx);
+        self.follow_active_in_panel(file, cx);
+
         // Unlike `focus_region`, this needs the notify: the strip and the title change
         // even when `window.focus` finds the handle already focused.
+        cx.notify();
+    }
+
+    /// Bring the active tab into the strip's viewport.
+    ///
+    /// **Why it is not enough that the strip scrolls.** A new buffer is appended, so once the
+    /// tabs overflow, `Ctrl+T` puts the new tab past the right edge and nothing on screen
+    /// changes — pressing it repeatedly looks like a dead key. The same applies to `Ctrl+Tab`
+    /// onto a tab that is already off-screen, which is why this is on every activation rather
+    /// than on tab creation.
+    ///
+    /// Animated through the same easing the chevrons use: noticing that something happened is
+    /// the entire point, and a jump is easier to miss than a slide.
+    fn reveal_active_tab(&mut self, window: &Window, cx: &mut Context<Self>) {
+        // The strip is not drawn at one buffer, so there is nothing to reveal.
+        if self.views.len() < 2 {
+            return;
+        }
+
+        let panel = if self.panel_visible {
+            self.clamped_panel_width(window)
+        } else {
+            0.
+        };
+        let available = f32::from(window.viewport_size().width) - panel;
+
+        if let Some(target) = reveal_offset(
+            self.active_ix,
+            self.views.len(),
+            available,
+            f32::from(self.tab_scroll.offset().x),
+        ) {
+            self.animate_tabs_to(target, cx);
+        }
+    }
+
+    /// Move the panel's selection onto the active buffer's file.
+    ///
+    /// The panel already drives the strip — clicking a row activates that buffer — and this is
+    /// the other direction, which was missing: switching tabs left the tree highlighting
+    /// whatever had last been clicked in it.
+    fn follow_active_in_panel(&mut self, file: Option<PathBuf>, cx: &mut Context<Self>) {
+        // **A buffer with no file leaves the selection alone rather than clearing it.** The
+        // panel keeps your place in a large tree, and — the reason that matters — New request
+        // and New folder both read this selection to decide where they create things, so
+        // clearing it on every scratch tab would silently move them to the collection root.
+        let Some(file) = file else { return };
+        let Some(ix) = self.tree.iter().position(|node| node.path == file) else {
+            return;
+        };
+
+        // Expand first, then select. A selection on a row nothing paints is a cursor the reader
+        // has lost — `rebuild_tree_visible` says so, and collapse-all had to learn it. Ancestors
+        // rather than the file itself: `skip(1)` drops the file, whose own path is never a fold
+        // key.
+        let mut unfolded = false;
+        for ancestor in file.ancestors().skip(1) {
+            unfolded |= self.collapsed.remove(ancestor);
+        }
+        if unfolded {
+            self.rebuild_tree_visible();
+        }
+
+        self.panel_selection = Some(ix);
+        // `uniform_list` addresses items by *visible* index, so the row index has to be
+        // translated — with anything folded above the target the two diverge.
+        if let Some(pos) = self.tree_visible.iter().position(|&v| v == ix) {
+            self.panel_scroll
+                .scroll_to_item(pos, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 
@@ -622,6 +703,27 @@ impl Workspace {
                 )
             })
             .collect()
+    }
+
+    /// Whether the active tab is inside the strip's viewport, for tests.
+    ///
+    /// Asks `reveal_offset` the same question `activate` does, from live state — so it pins the
+    /// *wiring*, that `activate` actually reveals, while `reveal_offset`'s own unit tests pin
+    /// the arithmetic. Neither would catch the other's failure alone.
+    #[cfg(test)]
+    pub(crate) fn active_tab_in_view(&self, window: &Window) -> bool {
+        let panel = if self.panel_visible {
+            self.clamped_panel_width(window)
+        } else {
+            0.
+        };
+        reveal_offset(
+            self.active_ix,
+            self.views.len(),
+            f32::from(window.viewport_size().width) - panel,
+            f32::from(self.tab_scroll.offset().x),
+        )
+        .is_none()
     }
 
     /// The selected row's name, for tests. `None` when nothing is selected.
@@ -953,6 +1055,17 @@ impl Workspace {
     /// `offset.x` to `[-max, 0]` during its own prepaint, so at either end the increments would
     /// be silently eaten and the animation would never reach a fixed point.
     fn nudge_tabs(&mut self, delta: f32, cx: &mut Context<Self>) {
+        // Accumulate onto the in-flight target, not onto the live offset, so a second click
+        // mid-animation adds a tab instead of re-aiming at wherever this one had reached.
+        let base = self
+            .tab_scroll_target
+            .unwrap_or_else(|| f32::from(self.tab_scroll.offset().x));
+        self.animate_tabs_to(base + delta, cx);
+    }
+
+    /// Ease the strip's offset to `target`. Shared by the chevrons and by `reveal_active_tab`,
+    /// so both feel like the same mechanism.
+    fn animate_tabs_to(&mut self, target: f32, cx: &mut Context<Self>) {
         /// Long enough to read as motion, short enough not to sit between you and the tab you
         /// are aiming at.
         const TRAVEL: Duration = Duration::from_millis(140);
@@ -962,9 +1075,6 @@ impl Workspace {
         const TICK: Duration = Duration::from_millis(8);
 
         let from = f32::from(self.tab_scroll.offset().x);
-        // Accumulate onto the in-flight target, not onto the live offset, so a second click
-        // mid-animation adds a tab instead of re-aiming at wherever this one had reached.
-        let target = self.tab_scroll_target.unwrap_or(from) + delta;
         self.tab_scroll_target = Some(target);
 
         let scroll = self.tab_scroll.clone();
@@ -5364,9 +5474,97 @@ fn tabs_overflow(tab_count: usize, available_width: f32) -> bool {
     tab_count as f32 * TAB_WIDTH > available_width
 }
 
+/// The offset that brings tab `active_ix` into view, or `None` when it is already there.
+///
+/// **Pure, and computed rather than measured.** Asking the scroll handle for that tab's bounds
+/// would be a frame behind — and worse, on the frame a *newly created* tab first appears it has
+/// no bounds at all, which is exactly the case this exists for. Tabs are a fixed width, so
+/// arithmetic knows where the nth one is before anything is laid out.
+///
+/// Returning `None` for "already visible" is what keeps `activate` from firing an animation on
+/// every ordinary tab click.
+fn reveal_offset(
+    active_ix: usize,
+    tab_count: usize,
+    available_width: f32,
+    current_offset: f32,
+) -> Option<f32> {
+    if !tabs_overflow(tab_count, available_width) {
+        return None;
+    }
+
+    // The tab area is the strip less both chevrons, which are drawn exactly when it overflows.
+    // Floored at one tab: a window narrow enough for the chevrons to eat the whole strip would
+    // otherwise produce a negative viewport and scroll nonsense.
+    let viewport = (available_width - 2. * TAB_CHEVRON_WIDTH).max(TAB_WIDTH);
+
+    let left = active_ix as f32 * TAB_WIDTH;
+    let right = left + TAB_WIDTH;
+    // gpui's offset is <= 0 and grows more negative as content moves left, so the first visible
+    // pixel of content is at `-offset`.
+    let shown_left = -current_offset;
+    let shown_right = shown_left + viewport;
+
+    if left < shown_left {
+        // Off the left edge: bring its leading edge to the left of the viewport.
+        Some(-left)
+    } else if right > shown_right {
+        // Off the right edge: bring its trailing edge to the right of the viewport, which is
+        // the smaller move and keeps the tabs before it on screen.
+        Some(-(right - viewport))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod strip_tests {
     use super::*;
+
+    /// A strip wide enough for three tabs, so the fourth is the one out of reach.
+    fn three_wide() -> f32 {
+        3. * TAB_WIDTH + 2. * TAB_CHEVRON_WIDTH
+    }
+
+    #[test]
+    fn a_tab_already_in_view_is_left_alone() {
+        // This is what keeps an ordinary tab click from firing an animation, and what stops
+        // `activate` fighting a scroll the reader just made with the wheel.
+        assert_eq!(reveal_offset(1, 10, three_wide(), 0.), None);
+        assert_eq!(reveal_offset(0, 2, 4_000., 0.), None, "no overflow, nothing to do");
+    }
+
+    #[test]
+    fn a_new_tab_past_the_right_edge_is_pulled_into_view() {
+        // The reported bug: Ctrl+T appends, so the new tab lands off the right edge and
+        // pressing it repeatedly looks like a dead key.
+        let offset = reveal_offset(3, 4, three_wide(), 0.).expect("tab 3 is off the right edge");
+
+        // Its trailing edge should sit exactly at the viewport's right edge, which is the
+        // smallest move that reveals it — asserted as a position, not as "the value changed".
+        let viewport = three_wide() - 2. * TAB_CHEVRON_WIDTH;
+        assert_eq!(offset, -(4. * TAB_WIDTH - viewport));
+
+        // And from there it really is inside the window.
+        assert_eq!(reveal_offset(3, 4, three_wide(), offset), None);
+    }
+
+    #[test]
+    fn a_tab_off_the_left_edge_is_pulled_back() {
+        // Ctrl+Shift+Tab backwards past the visible range, or clicking a tab in the picker.
+        // Scrolled far right, then asked for tab 0.
+        let offset = reveal_offset(0, 10, three_wide(), -5. * TAB_WIDTH)
+            .expect("tab 0 is off the left edge");
+        assert_eq!(offset, 0., "its leading edge goes to the left of the viewport");
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_the_chevrons_still_scrolls_somewhere_sane() {
+        // The chevrons could otherwise eat the whole strip and leave a negative viewport,
+        // which would put the offset on the wrong side of zero and scroll the tabs away.
+        let offset = reveal_offset(5, 6, TAB_CHEVRON_WIDTH * 2. + 4., 0.).expect("overflowing");
+        assert!(offset <= 0., "gpui's offsets are never positive: {offset}");
+    }
 
     #[test]
     fn the_chevrons_appear_exactly_when_a_tab_is_out_of_reach() {

@@ -7787,6 +7787,125 @@ async fn clicking_a_request_in_the_panel_opens_it_as_a_buffer(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+async fn a_new_tab_is_scrolled_into_view_rather_than_appearing_off_screen(
+    cx: &mut TestAppContext,
+) {
+    // The reported bug: a new buffer is appended, so once the tabs overflow, Ctrl+T puts the
+    // new tab past the right edge and nothing visibly happens — holding the key looks like a
+    // dead shortcut.
+    //
+    // Enough tabs to overflow whatever width the headless window has, read at runtime rather
+    // than assumed: a hardcoded count would silently stop testing anything if the platform's
+    // default window grew.
+    let (window, _view, mut cx) = boot(cx, None, None);
+
+    let needed = cx.update(|window, _| {
+        (f32::from(window.viewport_size().width) / crate::workspace::tab_label_width()).ceil()
+            as usize
+            + 2
+    });
+    for _ in 0..needed {
+        cx.simulate_keystrokes("ctrl-t");
+    }
+
+    // `wait_for` rather than `run_until_parked`: the reveal is eased over ~140ms through real
+    // timers, and a parked executor is not a finished animation.
+    // **The clock has to be advanced by hand.** The reveal is eased over ~140ms through
+    // `BackgroundExecutor::timer`, and gpui's test dispatcher runs on a *simulated* clock — so
+    // neither `run_until_parked` nor a real `thread::sleep` moves the animation on. Without
+    // this the offset sits one tick from where it started, which reads exactly like a reveal
+    // that never fired.
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(300));
+    cx.run_until_parked();
+
+    assert!(
+        window
+            .update(&mut cx, |workspace, window, _| workspace
+                .active_tab_in_view(window))
+            .expect("window"),
+        "the newest tab must end up inside the strip, not past its right edge"
+    );
+}
+
+#[gpui::test]
+async fn switching_buffers_moves_the_panel_selection_to_that_request(cx: &mut TestAppContext) {
+    // The sync only ever ran one way. Clicking a panel row activates that buffer and the strip
+    // follows; switching buffers left the tree highlighting whatever had last been clicked in
+    // it. `activate` is the funnel, so every switching path gets this — the assertion drives
+    // `ctrl-shift-tab` rather than a click for exactly that reason.
+    let dir = scratch_dir("panel-follows-tabs");
+    let root = dir.join("collections");
+    seed_request(&root, "alpha.json", "https://a.test/alpha");
+    seed_request(&root, "beta.json", "https://a.test/beta");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (tree_rows(&window, cx).len() >= 2).then_some(())
+    });
+
+    // Open both, re-reading the bounds between clicks: the strip appears with the second
+    // buffer and shifts the panel down, which is what made an earlier test pass against its
+    // own bug.
+    let row = cx.debug_bounds("collection-row-0").expect("alpha's row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let row = cx.debug_bounds("collection-row-1").expect("beta's row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("beta".to_string()),
+        "the row just clicked is selected"
+    );
+
+    // The direction that was missing: move buffers by keyboard, with the panel untouched.
+    cx.simulate_keystrokes("ctrl-shift-tab");
+    cx.run_until_parked();
+
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("alpha".to_string()),
+        "switching buffers must drag the panel selection with it"
+    );
+}
+
+#[gpui::test]
+async fn a_scratch_buffer_leaves_the_panel_selection_where_it_was(cx: &mut TestAppContext) {
+    // The deliberate half of the rule. A buffer with no file has nothing to point at, and
+    // clearing the selection would silently move where New request and New folder create
+    // things — they read this selection to decide.
+    let dir = scratch_dir("panel-keeps-selection");
+    let root = dir.join("collections");
+    seed_request(&root, "alpha.json", "https://a.test/alpha");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    let row = cx.debug_bounds("collection-row-0").expect("alpha's row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-t");
+    cx.run_until_parked();
+
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tree_selection())
+            .expect("window"),
+        Some("alpha".to_string()),
+        "a fileless buffer must not clear the selection"
+    );
+}
+
+#[gpui::test]
 async fn clicking_a_request_twice_activates_it_rather_than_opening_a_second_copy(
     cx: &mut TestAppContext,
 ) {

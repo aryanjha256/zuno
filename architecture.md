@@ -1105,6 +1105,25 @@ Decisions worth keeping:
   the "click and keybinding are different verbs" failure, from a direction no convention
   catches. Staying is also the better of the two: browsing means opening several in a row, and
   that needs the arrow keys to keep working.
+- **The selection follows the active buffer, not only the other way round.** Clicking a row
+  activated that buffer and the strip followed; switching buffers left the tree highlighting
+  whatever had last been clicked in it. The fix lives in `Workspace::activate` — the one funnel
+  every switch already goes through — so the four verbs, a tab click, middle-click, the picker
+  and the panel all inherit it. Three decisions in it:
+
+  A buffer with **no file leaves the selection alone** rather than clearing it. Beyond keeping
+  your place in a large tree, the reason that matters is that New request and New folder *read*
+  this selection to decide where they create things, so clearing it on every `Ctrl+T` would
+  silently move them to the collection root. Break-testing the alternative fails seven tests,
+  which is that side effect measured.
+
+  A file inside a **collapsed folder expands it**, ancestors first and then the selection —
+  because a selection on a row nothing paints is a cursor the reader has lost, which is
+  `rebuild_tree_visible`'s own warning and the thing collapse-all had to learn. The cost is
+  accepted: switching tabs can unfold a folder you deliberately closed.
+
+  It **never moves focus.** Focus belongs wherever the switch put it.
+
 - **The rows had to be `w_full`.** Third time. `uniform_list` hands a row the list's width as
   *available space*, and taffy only stretches a root node to fill it for `display: block`; a
   `.flex()` row sizes to its content. The picker (§12) and the response body (§6) both shipped
@@ -2963,6 +2982,39 @@ Three decisions worth recording, since each had a plausible alternative:
   elements away; neither `flex_1().min_w(0)` nor an explicit `.w()` made it fire here.
   `zuno_core::request::elide` now shortens the label before it ever reaches an element, and
   `truncate()` stays underneath purely as a backstop for pathologically wide glyphs.
+
+- **The strip scrolls, and now says so and drives itself.** `overflow_x_scroll` was the whole of
+  it for several milestones: the tabs scrolled by wheel with nothing on screen indicating it, so
+  a tab past the right edge had no mouse path at all. Two halves fixed that.
+
+  A **chevron at each end**, drawn only when `tabs_overflow` says the tabs want more room than
+  the strip has — computed from the window less the panel rather than read off the scroll
+  handle, whose extent is written during prepaint and is therefore a frame behind. They are
+  *pinned siblings* of the scrolling box, not children of it: inside it they would slide away
+  with the content, which is the one thing a scroll control must not do. Deliberately not
+  `ui::icon_button`, which titles itself with its action's keystroke — scrolling a viewport is
+  not a verb, and inventing an action would need a palette row nobody would search for. They are
+  never dimmed at the ends, for the frame-behind reason again: a chevron greyed out one tab early
+  reads as broken, while a click that cannot move simply does nothing.
+
+  And **`activate` reveals the active tab**, eased through the same animation the chevrons use.
+  Without it a new buffer appended past the right edge and `Ctrl+T` produced no visible change —
+  holding the key looked like a dead shortcut. On every activation rather than on creation, since
+  `Ctrl+Tab` onto an off-screen tab has the same problem. `reveal_offset` is pure and returns
+  `None` for "already visible", which is what stops an ordinary tab click firing an animation.
+
+  Two things the animation forced. It interpolates from the captured offset toward an **absolute
+  target** rather than adding a delta per tick, because gpui re-clamps `offset.x` to `[-max, 0]`
+  in its own prepaint — incremental steps get eaten at either end and never reach a fixed point.
+  And the running `Task` is held so a second click replaces it, since dropping a `Task` cancels
+  it and two animations must never fight over one offset; the target accumulates so three quick
+  presses travel three tabs.
+
+  **Testing it needed a fact about the harness** now in CLAUDE.md: the test dispatcher's clock is
+  simulated, so a `timer()`-driven animation does not advance under `run_until_parked` and must
+  be stepped with `advance_clock`. The arithmetic is unit-tested on `reveal_offset` and the
+  *wiring* separately, through `active_tab_in_view` — neither catches the other's failure, which
+  is why both exist.
 
   **The deciding argument was testability, not elegance.** Shaped text has no width the headless
   platform can read: a block wrapper stretches to its parent, and a flex wrapper hands the text
