@@ -2317,6 +2317,107 @@ browsing the history shows that run's timing rather than the live one, with no r
 
 ---
 
+## 6i. The proxy — a default nobody chose
+
+reqwest 0.13's `ClientBuilder` starts with `auto_sys_proxy: true`, and hyper-util's matcher reads
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`. So every request Zuno has ever sent went
+through the system proxy when one was configured, with nothing on screen saying so and no way to
+override it. That is precisely what `RequestSettings::cookie_store`'s own comment says a
+behaviour like this must not be — *"visible and switchable rather than silently hardcoded on"* —
+and it was the same shape one dependency down.
+
+Found by reading the vendored source rather than by using the app, which is why §11 never listed
+it: that table records capability Zuno *built* and did not surface, and this was inherited.
+
+### Three states, because two cannot say it
+
+`ProxyMode` is `System | Off | Url(String)`. An `Option<String>` was the obvious model and cannot
+express this: `None` would have to mean both "whatever the environment says" and "nothing", and
+those are different requests on the wire. Same correction `Connection` needed in §6h, arrived at
+for the same reason.
+
+**`Off` has to call `.no_proxy()`.** Merely not setting a proxy leaves `auto_sys_proxy` on, so
+"off" would go on quietly using the env var — `Engine::clear_cookies`' problem exactly, one
+setting over. `Url` needs no such call, because `ClientBuilder::proxy` clears the flag itself.
+
+The default is `System`, which is what Zuno already did. Changing it would silently stop working
+for anyone behind a corporate proxy, and that failure presents as a network problem rather than
+as a setting.
+
+### App-level, and that decides three other things
+
+It lives in `app.json`, not in `RequestSettings`. A proxy is a property of this machine and its
+network rather than of any request — and `app.json` is never committed, so a URL carrying
+`user:pass@` cannot reach a collection file the way a `RequestSettings` field would (invariant
+10). Putting it in the request would have meant resolving `{{vars}}` in it so the password could
+live in `dev.local.json`; app-level makes that whole question disappear.
+
+Three consequences, each of which shortened the slice:
+
+- **No curl representation at all**, in either direction. `-x`/`--proxy` stays reported-and-
+  ignored on import, and the exporter emits nothing — for the reason §10 already gives about the
+  cookie jar: it is process-level machine config, not part of the request, and exporting it would
+  hand someone a command that behaves differently from the one you ran.
+- **`ClientKey` carries the mode and lost `Copy`** (a `String` in the enum). Worth it: with the
+  mode in the key, changing the proxy misses the cache by construction, where a key without it
+  would leave every cached client quietly routing through the old proxy until somebody remembered
+  to evict. `changing_the_proxy_misses_the_client_cache` pins it.
+- **`Engine::set_proxy` is a command, not a lock.** It lands on the engine thread in order with
+  the sends around it, and an in-flight job keeps the client it already has — `clear_cookies`'
+  rule, right for the same reason. `app_state::set_proxy` is the one funnel that tells both the
+  file and the engine, because a saved value the engine never heard about is a status bar naming
+  a proxy nothing uses.
+
+### The picker, and why not the settings panel
+
+`Ctrl+,` would have been the obvious home and it does not work: `settings_panel`'s rows are
+toggles, a stepper and an action row — it holds **no `TextInput` at all** — and its arrow keys
+move between rows, so a URL field would have to fight that model. A proxy needs a URL.
+
+So it is the ninth `Target` on the picker, which already answers "pick one of these, or type your
+own": `System` and `Off` are rows, and `set_fallback` offers the typed text, exactly the trick
+that lets an unknown verb become `Method::Other`. `ProxyMode::from_input` decides whether the
+query could work — in core, where it is unit-tested — so the picker cannot offer a row that fails
+at the next send. It fills in a missing scheme, because `localhost:3128` is what people type, and
+it **refuses `socks5`**: a legal proxy scheme that reqwest rejects without its `socks` feature,
+so offering it would produce a mode that cannot send.
+
+Still no `PickerDelegate` trait. Nine consumers, all drawing as label plus dimmed detail.
+
+### The badge is the half that earns it
+
+The switch says what *will* happen; the badge says what *is* happening, and the second is the
+whole reason this was worth fixing rather than documenting. `proxy_badge_label` is pure and shows
+a badge only when a proxy is actually in effect: nothing for `Off`, nothing for `System` with an
+empty environment — since those two behave identically — and always for an explicit URL. It takes
+the environment's value as an argument rather than reading it, both so it is unit-testable and
+because `std::env::set_var` is `unsafe` under edition 2024 and racy across parallel tests. The
+env read itself happens **once at boot** and is cached on `Workspace`, the way `globals_active`
+is: the status bar asks every frame and env vars cannot change under a running process.
+
+### What is asserted, and the one thing that is not
+
+The routing is proved over a real socket, with the test server standing in as the proxy and never
+forwarding: a proxied plain-HTTP request carries an **absolute-form** request line
+(`GET http://host/path HTTP/1.1`), so the captured text alone proves where the request went.
+`a_request_goes_through_the_configured_proxy` aims at a `.invalid` host for that reason — if the
+setting were ignored, it fails to connect rather than quietly passing. Deleting the `Url` arm
+fails it.
+
+**`Off`'s `no_proxy()` call is not covered, and break-testing is what showed that.** Removing it
+leaves `with_the_proxy_off_a_request_goes_straight_to_the_server` passing — it has to, because no
+`HTTP_PROXY` is set in the test process, so `Off` and `System` are indistinguishable there. The
+call only matters when the environment has one, and forcing that needs an env var, which is the
+wall above. So that one line is held by review; the test holds the two things it can, the request
+form and that the proxy port is never touched. Written down rather than papered over, the way §6a
+does for `trash`.
+
+`HTTPS` through a proxy is `CONNECT` plus a TLS tunnel, and is not driven at all — a socket test
+faking that would be asserting its own fixture. The configuration path is shared with HTTP, so
+what is untested is reqwest's tunnelling rather than Zuno's decision.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains
@@ -2780,9 +2881,12 @@ nothing: `Editor` now also takes a wheel delta, which §6's horizontal-scrolling
 would land on the wrong character. The `overflow_hidden` clip is what makes it safe to paint
 outside the box, so the two fixes are one mechanism.
 
-In the editor the clamp uses the *cursor's* line width rather than the widest visible line —
-the latter would make the scroll limit jitter as you scroll vertically, and would mean measuring
-every line to know how far right the content goes.
+In the editor the clamp used the *cursor's* line width at first, on the reasoning that the widest
+*visible* line would make the limit jitter as you scroll vertically. The first half of that
+survived and the conclusion did not: §6's horizontal-scrolling slice found that bounding by the
+cursor's line is two opposite bugs — a caret on `{` gives a maximum of zero, so any scroll snaps
+home, and once that line scrolls out of view there is no bound at all. It clamps against the
+**document's** widest line now, which is stable in the way the visible one is not.
 
 **Still deliberately absent:** tabs, collections, the `Ctrl+P` / `Ctrl+K` palettes, environments
 and variables, syntax highlighting, a method dropdown, a settings panel, and a history browser.
@@ -2813,9 +2917,21 @@ UI work, not engine work.
 | ~~Response history~~ | **Reachable.** `Ctrl+H` lists every retained run; choosing one shows it and re-indexes its body. Until then the retention was *write-only* — nothing read it, not even the diff |
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 
-**Nothing remains.** `Ctrl+,` closed five, the method picker a sixth, `Ctrl+H` a seventh, and body
-authoring took form, binary, and multipart — the last of which was the only item here that ever
-needed engine work rather than UI.
+**Nothing remains** *of the items this table ever listed.* `Ctrl+,` closed five, the method picker
+a sixth, `Ctrl+H` a seventh, and body authoring took form, binary, and multipart — the last of
+which was the only item here that ever needed engine work rather than UI.
+
+> **And then a §11-shaped item turned up that §11 had never listed: the proxy.** reqwest 0.13
+> builds every client with `auto_sys_proxy: true`, so Zuno had honoured `HTTP_PROXY` on every
+> request since M1.2 — honoured on every request, invisible, unreachable, which is this
+> section's definition exactly. It is closed now (§6i).
+>
+> Worth recording because of *how* it was missed rather than that it was. This table was written
+> by looking at what Zuno had built and not surfaced; a behaviour inherited from a dependency's
+> default was built by nobody, so it cast no shadow here. That is the same blind spot ROADMAP
+> names about its own audit — the one that hid OpenAPI import and the collection runner — one
+> layer further out: **§11 can only see capability someone chose to add.** The way it was found
+> was reading the vendored `reqwest` source, not reading Zuno.
 
 The section stays as the record of *how* the gap opened: the engine was built ahead of the views,
 which is a reasonable order and a predictable debt. Two things it left behind are worth keeping in
@@ -2944,12 +3060,15 @@ Two consequences worth knowing before touching either:
 lives in core precisely so a future CLI can read and write collections, which means core has to
 serialize rather than only model.
 
-Still open: **nothing about the format.** Reach is mostly closed now — `Ctrl+P` opens a saved
-request into a buffer, and §6a's panel browses the tree — but the collection is still
-*read-mostly* from Zuno's side: no delete, no rename, no folder authoring beyond `mkdir`. And
-the root itself is a single XDG path with no runtime setter (`collections.rs` sets it at startup
-and in a test-only override), so the git argument this format is built on is not reachable from
-inside the app: a collection you can commit lives in `~/.local/share`, not in your repo.
+~~Still open: nothing about the format.~~ **Nothing is open here any more, and this paragraph
+outlived its subject by several slices.** It said the collection was "read-mostly from Zuno's
+side: no delete, no rename, no folder authoring beyond `mkdir`", and that the root was a single
+XDG path with no runtime setter — so the git argument the format is built on was unreachable from
+inside the app. Every clause of that is now false: §6a has delete, trash, rename, duplicate, move,
+New folder and New request, and workspaces (below) let a collection live in the repo it
+describes. Struck rather than deleted because it is the direction CLAUDE.md calls the most
+expensive — a doc asserting a gap the code no longer has sends the next reader hunting for
+something that is not there.
 
 **Tabs — decided and built.** `Workspace` owns `Vec<Entity<RequestView>>` with an `active_ix`,
 restores every saved buffer, and persists all of them on quit and on send.
@@ -3224,10 +3343,11 @@ Two ordering facts worth keeping, both verified against the vendored source rath
   and focus disagreeing so you type into the request you just left. That is why the picker closes
   before acting, and `choosing_a_buffer_leaves_focus_in_that_buffer` is the guard.
 
-**Global settings defaults** (new, deferred deliberately). Nothing can change what a *new* request
-starts with: `new_tab` builds `RequestSpec::default()`, so `RequestSettings::default()` is hardcoded
-in Rust — 30s timeout, TLS verification on, cookies on, 10 hops. Work against a dev box with a
-self-signed certificate and you turn TLS verification off on every new request, forever.
+~~**Global settings defaults** (new, deferred deliberately).~~ **Shipped**, and §11's tail already
+recorded it while this paragraph went on describing the gap — two sections of one document
+disagreeing, which is worse than either being wrong alone. `app.json` holds one `RequestSettings`
+that a new buffer starts from, reached by `Ctrl+Shift+,` or the titlebar gear. What follows is the
+reasoning that got it there, kept because the correction is the useful part.
 
 An earlier note here claimed this needed the same scope model as environments. That was too strong,
 and the correction matters because it changes the cost. **Two separable problems:**
@@ -3243,9 +3363,12 @@ whether saving defaults is an explicit action (recommended — a panel that sile
 *future* request is a nasty surprise) and whether the shipped values stay as they are (recommended —
 they match Postman and browsers, and the config file is the place to disagree).
 
-**The cookie jar's visibility** (new). It's on and invisible. Options: a status-bar
-indicator, a per-request toggle, or a jar viewer. Leaning toward an indicator plus a toggle in the
-settings panel that several other items in §11 also need — that section lists them.
+~~**The cookie jar's visibility** (new). It's on and invisible.~~ **Answered, and it got the
+indicator *and* the toggle** — the `cookies on` badge in the status bar plus the `Ctrl+,` row,
+which is what §11's own entry describes. The third option, a jar viewer, stays unbuilt for a
+reason worth keeping: reqwest owns the store behind `cookie_store(true)` and exposes no way to
+enumerate it, so a viewer needs a lower-level client. The same badge argument was reused whole
+for the proxy in §6i — the toggle says what will happen, the badge says what is happening.
 
 ---
 
@@ -3272,13 +3395,23 @@ different lengths … it's just wrong." §7 and two comments in `editor.rs` desc
 behaviour as a deliberate choice with a named rejected alternative. Reading the code settles it in
 §7's favour, so the entry is gone.
 
-The clamp is `max_offset = cursor_line.width - viewport + caret`. Land on a short line and the view
-returns to x=0 — which is the only correct thing a cursor-following viewport can do: the cursor sits
-at x≈20 on a 50px line in a 500px viewport, so staying scrolled right would push it off-screen to
-the left. The rejected per-document clamp would leave `h_offset = 20`, scrolling away the start of a
-line that fits entirely. And scrolling with the wheel doesn't move it at all: when the cursor's line
-falls outside the viewport the lookup returns `None` and the offset is left alone, which is exactly
-what the "widest *visible* line" alternative would have broken.
+The clamp *was* `max_offset = cursor_line.width - viewport + caret`, and the retraction above is
+still right about the entry being a phantom defect: returning the view to x=0 on a short line is
+the only correct thing a cursor-following viewport can do, since the caret would otherwise sit
+off-screen to the left.
+
+**But the code has moved on, and this paragraph had to as well.** §6's horizontal-scrolling slice
+found the per-line clamp was two bugs from one wrong reference: a caret parked on `{` gives a
+maximum of zero, so any trackpad scroll snapped home on the next frame; and when the cursor's line
+scrolled out of view the clamp never ran at all, so the text could be pushed arbitrarily into
+blank space. It bounds against the **document's** widest line now — the option this paragraph
+called "the rejected per-document clamp" — while the caret-following behaviour it defends is
+unchanged, because prepaint only overrides the offset when the caret has actually moved.
+
+So the entry has now been wrong in both directions: first asserting a defect the code never had,
+then defending a mechanism the code had replaced. The heuristic that resolved it the first time —
+trust the section that names a rejected alternative — is what made it *durable enough to go stale*,
+which is the failure mode this file's §13 is otherwise about.
 
 Worth recording as its own failure mode, because it is the mirror of the one this project already
 tracks. The lessons in `CLAUDE.md` are about **code drifting away from a correct comment**. This was

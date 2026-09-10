@@ -19,10 +19,15 @@
 //! Only the lines intersecting the viewport are shaped, using the scroll handle's offset.
 //! Pasting a 50,000-line body should cost a scroll-region shape, not 50,000 of them.
 //!
-//! Soft-wrap is off (§7). Long lines scroll horizontally instead of wrapping, with the
-//! offset following the cursor — clamped against the *cursor's* line width rather than the
-//! widest visible line, which would jitter as you scroll vertically. That avoids having to
-//! measure every line just to know how far right the content goes.
+//! Soft-wrap is off (§7). Long lines scroll horizontally instead of wrapping, with the offset
+//! following the cursor — clamped against the **document's widest line**. §7 rejected the
+//! *widest visible* line because it jitters as you scroll vertically; the widest line in the
+//! document is stable, which is what makes it usable as a limit.
+//!
+//! This comment described the *cursor's* line until the horizontal-scrolling slice, and the
+//! prepaint's own comment explains why that was two opposite bugs at once. Corrected here
+//! because a stale confident note three hundred lines above the code is how the next reader
+//! inherits the wrong model.
 
 use std::ops::Range;
 

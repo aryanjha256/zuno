@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 809 tests, ~20s
+cargo test --workspace                   # 815 tests, ~20s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -195,6 +195,13 @@ async fn something(cx: &mut TestAppContext) {
 Enabled by `gpui = { features = ["test-support"] }` as a **dev**-dependency, so `cargo build`
 keeps the default feature set (`cargo test` recompiles GPUI once, ~35s).
 
+**`boot` does not install the workspace registry.** It sets the session and collection globals
+directly, so anything reading `app_state` — the request defaults, the theme, the proxy — sees a
+missing global and silently falls back to a default. A test that needs one calls
+`app_state::install_at(cx, None, ..)` itself; `None` keeps the write in memory, per invariant 6.
+Costs a debug cycle every time, because the symptom is a setting that reads back as its default
+with no error anywhere.
+
 Two patterns worth reusing:
 
 - **`wait_for(cx, what, probe)`** — the engine runs on its own OS thread, so `run_until_parked()`
@@ -316,6 +323,42 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   sentence describing it. **"Verify, don't remember" applies to our own comments, not just to
   recalled GPUI APIs** — and when a comment explains why a call is load-bearing, that is precisely
   the moment to check the call is there.
+
+## Ship mode is the default
+
+**Read this before "Finishing a slice" and before the traps table.** Both of those describe the
+*audit* mode. Running audit mode on every task — a border side, a one-field setting — is how a
+twenty-minute change becomes fifty, and it has already made this repo's owner consider dropping
+the assistant entirely. That is a worse outcome than any bug the ceremony would have caught. This
+codebase is already densely covered; the checklist is for the slices that earn it.
+
+**Ship mode, unless asked otherwise:**
+
+1. Implement. Read the surrounding code *first* — six compile-error rounds in one task is writing
+   before reading, and it is the half with no excuse.
+2. `cargo check --workspace --all-targets`.
+3. A test **only** where the failure would be invisible: a dead hitbox, a silent no-op, a wrong
+   default, a lost setting. Not for a colour, a border, a label, or arithmetic the compiler
+   already checks.
+4. **One** break-test, on the core behaviour. Not one per mechanism.
+5. The full suite **once**, at the end. `cargo check` between edits, never the suite.
+6. Report in about three lines: what changed, what needs a human's eyes, the test count.
+
+**What ship mode excludes:** new architecture.md sections, unrequested doc cleanup, correcting
+stale claims noticed on the way (mention them in one line and move on), and second design
+alternatives.
+
+**Estimate before spending.** If a task looks like it will exceed ship mode, say the rough cost
+*before* starting and let the human decide. "Small" is a budget, not a figure of speech.
+
+**Ask about what the user will see or lose; decide the mechanics alone.** Whether a setting is
+discoverable from a cold start, whether switching a mode throws away what they typed, what a
+control is called — those are theirs, and the conventions below say so. Which module a type lives
+in, how a cache is keyed, whether to use a task-local — those are not worth a round trip.
+
+**Audit mode is by request** — "Finishing a slice", break-everything, doc sections. Take it
+unasked only where a mistake destroys work that cannot be recovered: a session or collection
+format, a serde shape, anything that writes over a user's saved files.
 
 ## Design tweaks — the fast path
 

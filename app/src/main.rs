@@ -113,6 +113,12 @@ fn main() {
         if let Err(error) = engine::install(cx) {
             eprintln!("[zuno] could not start the HTTP engine: {error}");
         }
+        // The saved proxy has to be handed over *after* the engine exists: it lives in
+        // `app.json` while the clients that honour it are built on the engine thread, and a
+        // setting the engine never heard about is a status bar naming a proxy nothing uses.
+        if let Some(engine) = crate::engine::ActiveEngine::engine(cx as &gpui::App) {
+            engine.set_proxy(app_state::proxy(cx));
+        }
         // Without this, closing the last window leaves the process running with nothing
         // on screen — GPUI does not quit on last-window-close by default. Quitting here
         // is also what makes `Workspace`'s `on_app_quit` save hook fire on that path.

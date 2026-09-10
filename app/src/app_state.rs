@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
-use zuno_core::RequestSettings;
+use zuno_core::{ProxyMode, RequestSettings};
 
+use crate::engine::ActiveEngine as _;
 use crate::theme::Appearance;
 
 /// The id of the workspace that has always existed: the XDG collections directory.
@@ -55,6 +56,20 @@ struct AppFile {
     /// deserialize, so a required field here would throw away every existing install's registry.
     #[serde(default)]
     defaults: RequestSettings,
+    /// Where requests are routed. **App-level, not per request**, for two reasons: a proxy is a
+    /// property of this machine and its network rather than of any request, and `app.json` is
+    /// never committed — so a URL carrying `user:pass@` cannot leak into a collection file the
+    /// way a `RequestSettings` field would (invariant 10).
+    ///
+    /// Defaulted per field for the reason above it: `read` discards an `app.json` it cannot
+    /// deserialize, and a required field here would throw away every existing install's
+    /// registry.
+    #[serde(default)]
+    proxy: ProxyMode,
+    /// Proxies the user has entered, kept so switching to System or Off does not throw them
+    /// away. A list, not a last-value: people have more than one and should not retype either.
+    #[serde(default)]
+    proxies: Vec<String>,
 }
 
 pub struct AppState {
@@ -70,6 +85,8 @@ impl AppState {
         AppFile {
             version: CURRENT_VERSION,
             defaults: RequestSettings::default(),
+            proxy: ProxyMode::default(),
+            proxies: Vec::new(),
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.to_string()),
             workspaces: default_workspace
@@ -325,6 +342,8 @@ pub fn install_at(cx: &mut App, dir: Option<PathBuf>, workspaces: Vec<WorkspaceE
     let file = AppFile {
         version: CURRENT_VERSION,
         defaults: RequestSettings::default(),
+        proxy: ProxyMode::default(),
+        proxies: Vec::new(),
         theme: Appearance::Dark,
         last: workspaces.first().map(|entry| entry.id.clone()),
         workspaces,
@@ -393,6 +412,70 @@ pub fn set_defaults(cx: &mut App, settings: RequestSettings) {
         return;
     }
     state.file.defaults = settings;
+    save(cx);
+}
+
+/// Where requests are currently routed.
+pub fn proxy(cx: &App) -> ProxyMode {
+    cx.try_global::<AppState>()
+        .map(|state| state.file.proxy.clone())
+        .unwrap_or_default()
+}
+
+/// Every proxy the user has entered, in the order they were added.
+pub fn proxies(cx: &App) -> Vec<String> {
+    cx.try_global::<AppState>()
+        .map(|state| state.file.proxies.clone())
+        .unwrap_or_default()
+}
+
+/// Forget a saved proxy.
+///
+/// Removing the one in use switches to `System` — leaving `proxy` naming an entry that is no
+/// longer offered would be a mode with no way back to it.
+pub fn remove_proxy(cx: &mut App, url: &str) {
+    if cx.try_global::<AppState>().is_none() {
+        return;
+    }
+    let in_use = proxy(cx) == ProxyMode::Url(url.to_string());
+    let state = cx.global_mut::<AppState>();
+    state.file.proxies.retain(|saved| saved != url);
+    if in_use {
+        state.file.proxy = ProxyMode::System;
+    }
+    if in_use {
+        if let Some(engine) = cx.engine() {
+            engine.set_proxy(ProxyMode::System);
+        }
+    }
+    save(cx);
+}
+
+/// Change where requests are routed, and tell the engine.
+///
+/// **The engine has to be told separately**, and that is the whole hazard here: the setting
+/// lives in `app.json` while the clients that honour it are built on the engine thread. Routing
+/// both through this one function is what stops the two disagreeing — a saved value the engine
+/// never heard about is a status bar naming a proxy that nothing uses.
+pub fn set_proxy(cx: &mut App, mode: ProxyMode) {
+    if let Some(engine) = cx.engine() {
+        engine.set_proxy(mode.clone());
+    }
+    if cx.try_global::<AppState>().is_none() {
+        return;
+    }
+    let state = cx.global_mut::<AppState>();
+    // Recorded even when the mode is unchanged: a URL typed twice should still be in the list.
+    if let ProxyMode::Url(url) = &mode
+        && !state.file.proxies.iter().any(|saved| saved == url)
+    {
+        state.file.proxies.push(url.clone());
+    }
+    if state.file.proxy == mode {
+        save(cx);
+        return;
+    }
+    state.file.proxy = mode;
     save(cx);
 }
 
@@ -477,6 +560,8 @@ mod tests {
             file: AppFile {
                 version: CURRENT_VERSION,
                 defaults: RequestSettings::default(),
+                proxy: ProxyMode::default(),
+                proxies: Vec::new(),
                 theme: Appearance::Dark,
                 last: Some("gone".into()),
                 workspaces: vec![WorkspaceEntry {
@@ -495,6 +580,8 @@ mod tests {
             file: AppFile {
                 version: CURRENT_VERSION,
                 defaults: RequestSettings::default(),
+                proxy: ProxyMode::default(),
+                proxies: Vec::new(),
                 theme: Appearance::Dark,
                 last: None,
                 workspaces: Vec::new(),
@@ -510,6 +597,8 @@ mod tests {
         let file = AppFile {
             version: CURRENT_VERSION,
             defaults: RequestSettings::default(),
+            proxy: ProxyMode::default(),
+            proxies: Vec::new(),
             theme: Appearance::Light,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![WorkspaceEntry {
@@ -549,6 +638,8 @@ mod tests {
         let file = AppFile {
             version: CURRENT_VERSION,
             defaults: RequestSettings::default(),
+            proxy: ProxyMode::default(),
+            proxies: Vec::new(),
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![

@@ -20,7 +20,8 @@ use gpui::{
     div, point, px,
 };
 use zuno_core::{
-    Environment, RawKind, RequestId, RequestSpec, Resolver, collection, curl, environment,
+    Environment, ProxyMode, RawKind, RequestId, RequestSpec, Resolver, collection, curl,
+    environment,
 };
 use zuno_core::collection::{Node, NodeKind};
 
@@ -41,7 +42,7 @@ use crate::actions::{
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
-    ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
@@ -141,6 +142,11 @@ pub struct Workspace {
     /// saying so, a tab past the right edge was unreachable by mouse. A handle is the only way
     /// in: `set_offset` needs one, and gpui re-clamps `offset.x` to `[-max, 0]` in its own
     /// prepaint, so a caller writing to it needs no clamp of its own.
+    /// The proxy the environment names, read **once at boot**.
+    ///
+    /// Cached rather than read in `render` — env vars cannot change under a running process,
+    /// and the status bar asks this every frame. Same shape as `globals_active`.
+    system_proxy: Option<String>,
     pub(crate) tab_scroll: ScrollHandle,
     /// The running chevron animation. Held so a second click **replaces** it — dropping a
     /// `Task` cancels it, so two animations can never fight over the same offset.
@@ -367,6 +373,17 @@ impl Workspace {
             panel_width: session_width,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
+            system_proxy: [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .into_iter()
+            .find_map(|name| std::env::var(name).ok())
+            .filter(|value| !value.trim().is_empty()),
             tab_scroll: ScrollHandle::new(),
             tab_scroll_anim: None,
             tab_scroll_target: None,
@@ -3334,6 +3351,17 @@ impl Workspace {
                 self.protect_secrets(cx);
                 cx.notify();
             }
+            picker::Target::Proxy(mode) => {
+                let label = mode.label().to_string();
+                crate::app_state::set_proxy(cx, mode);
+                // Named rather than silent, for the reason the environment switch is: a change
+                // to where every request goes is the one thing that must not happen quietly.
+                self.set_status(&format!("Proxy: {label}"), cx);
+            }
+            picker::Target::RemoveProxy(url) => {
+                crate::app_state::remove_proxy(cx, &url);
+                self.set_status(&format!("Removed proxy {url}"), cx);
+            }
             picker::Target::BodyType(body_type, kind) => {
                 let Some(view) = self.active() else { return };
                 view.update(cx, |view, cx| {
@@ -3731,6 +3759,73 @@ impl Workspace {
 
         let picker = self.show_picker(items, "No methods", window, cx);
         picker.update(cx, |picker, cx| picker.set_fallback(custom_method_row, cx));
+    }
+
+    /// Choose where requests are routed.
+    ///
+    /// The picker rather than the settings panel because that panel holds no `TextInput` at all
+    /// and a proxy needs a URL. Its placeholder is what says you can type one.
+    fn set_proxy(&mut self, _: &SetProxy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let current = crate::app_state::proxy(cx);
+
+        let detail = |is_current: bool, note: &str| {
+            SharedString::from(if is_current {
+                format!("current · {note}")
+            } else {
+                note.to_string()
+            })
+        };
+
+        let mut items = vec![
+            picker::Item {
+                label: SharedString::from("System"),
+                detail: detail(
+                    current == ProxyMode::System,
+                    "reads HTTP_PROXY and NO_PROXY",
+                ),
+                target: picker::Target::Proxy(ProxyMode::System),
+            },
+            picker::Item {
+                label: SharedString::from("Off"),
+                detail: detail(current == ProxyMode::Off, "ignores the environment"),
+                target: picker::Target::Proxy(ProxyMode::Off),
+            },
+        ];
+
+        // Every saved proxy, not just the one in use — switching to System or Off used to
+        // discard the URL entirely, so the only way back was retyping it.
+        items.extend(crate::app_state::proxies(cx).into_iter().map(|url| {
+            let is_current = current == ProxyMode::Url(url.clone());
+            picker::Item {
+                label: SharedString::from(url.clone()),
+                detail: detail(is_current, "saved"),
+                target: picker::Target::Proxy(ProxyMode::Url(url)),
+            }
+        }));
+
+        let picker = self.show_picker(items, "Type a proxy URL, or pick one", window, cx);
+        picker.update(cx, |picker, cx| picker.set_fallback(typed_proxy_row, cx));
+    }
+
+    /// Forget a saved proxy. Mirrors `Forget workspace`: a verb of its own over a list of what
+    /// can be removed, rather than a delete gesture the picker would have to learn.
+    fn remove_proxy(&mut self, _: &RemoveProxy, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let items = crate::app_state::proxies(cx)
+            .into_iter()
+            .map(|url| picker::Item {
+                label: SharedString::from(url.clone()),
+                detail: SharedString::default(),
+                target: picker::Target::RemoveProxy(url),
+            })
+            .collect();
+
+        self.show_picker(items, "No saved proxies", window, cx);
     }
 
     fn add_header(&mut self, _: &AddHeader, window: &mut Window, cx: &mut Context<Self>) {
@@ -5155,6 +5250,10 @@ impl Render for Workspace {
         let focused_region = self.focused_region(window, cx);
         let status_message = self.status_message(cx);
         let cookies = self.cookies_enabled(cx);
+        let proxy_badge = proxy_badge_label(
+            &crate::app_state::proxy(cx),
+            self.system_proxy.as_deref(),
+        );
         let (badge, resolving) =
             environment_badge(self.environment.as_deref(), self.globals_active);
         let title = self
@@ -5293,6 +5392,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_multipart_field))
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::set_proxy))
+            .on_action(cx.listener(Self::remove_proxy))
             .on_action(cx.listener(Self::next_response_tab))
             .on_action(cx.listener(Self::prev_response_tab))
             .on_action(cx.listener(Self::show_response_body))
@@ -5414,6 +5515,7 @@ impl Render for Workspace {
                 focused_region,
                 status_message,
                 cookies,
+                proxy_badge,
                 badge,
                 resolving,
                 &theme,
@@ -5524,6 +5626,32 @@ mod strip_tests {
     /// A strip wide enough for three tabs, so the fourth is the one out of reach.
     fn three_wide() -> f32 {
         3. * TAB_WIDTH + 2. * TAB_CHEVRON_WIDTH
+    }
+
+    #[test]
+    fn the_proxy_badge_always_says_something() {
+        // It used to be `Option` and hid itself in the default state, which left the feature
+        // with no visible surface at all.
+        let label = |mode: ProxyMode, env: Option<&str>| {
+            proxy_badge_label(&mode, env).to_string()
+        };
+
+        assert_eq!(label(ProxyMode::System, None), "proxy system");
+        assert_eq!(label(ProxyMode::Off, None), "proxy off");
+        assert_eq!(
+            label(ProxyMode::Off, Some("http://ignored:8080")),
+            "proxy off",
+            "off ignores the environment, so naming it would be a lie"
+        );
+        // The mode being System and a proxy actually being used are different facts.
+        assert_eq!(
+            label(ProxyMode::System, Some("http://corp:3128")),
+            "proxy corp:3128 · env"
+        );
+        assert_eq!(
+            label(ProxyMode::Url("https://p.test:8443".into()), None),
+            "proxy p.test:8443"
+        );
     }
 
     #[test]
@@ -5915,6 +6043,50 @@ fn format_bytes(bytes: u64) -> String {
 /// Returns `None` rather than offering a row that would fail: the engine rejects anything
 /// outside RFC 9110's `tchar` set with `InvalidMethod`, and offering `Use "foo bar"` only to
 /// fail at send is worse than not offering it.
+/// What the status bar says about the proxy. **Always something.**
+///
+/// It was `Option`, shown only when a proxy was in effect — so in the default state there was
+/// no badge, no icon and no hint the feature existed, reachable only by a palette row nobody
+/// would think to search for. That is the discoverability rule below, broken by the thing that
+/// was meant to satisfy it.
+///
+/// `system` and the environment's value are distinguished, because "the mode is System" and "a
+/// proxy is actually being used" are different facts and only one of them is a warning.
+///
+/// Takes the environment's value as an argument rather than reading it, so it is unit-testable:
+/// `std::env::set_var` is `unsafe` under edition 2024 and racy across parallel tests.
+fn proxy_badge_label(mode: &ProxyMode, system: Option<&str>) -> SharedString {
+    let host = |value: &str| {
+        value
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string()
+    };
+
+    SharedString::from(match mode {
+        ProxyMode::Off => "proxy off".to_string(),
+        ProxyMode::System => match system {
+            Some(value) => format!("proxy {} · env", host(value)),
+            None => "proxy system".to_string(),
+        },
+        ProxyMode::Url(url) => format!("proxy {}", host(url)),
+    })
+}
+
+/// Offer the typed text as a proxy, when it could be one.
+///
+/// `ProxyMode::from_input` decides, in core, where it is unit-tested — so the picker cannot
+/// offer a row that fails at the next send, which is the dead-control shape one layer down.
+fn typed_proxy_row(query: &str) -> Option<picker::Item> {
+    let mode = ProxyMode::from_input(query)?;
+    Some(picker::Item {
+        label: SharedString::from(mode.label().to_string()),
+        detail: SharedString::from("use this proxy"),
+        target: picker::Target::Proxy(mode),
+    })
+}
+
 fn custom_method_row(query: &str) -> Option<picker::Item> {
     let verb = query.trim();
     if verb.is_empty() || !verb.bytes().all(is_tchar) {
@@ -6135,6 +6307,7 @@ fn status_bar(
     focused_region: SharedString,
     message: Option<SharedString>,
     cookies: bool,
+    proxy: SharedString,
     environment: SharedString,
     resolving: bool,
     theme: &Theme,
@@ -6233,13 +6406,63 @@ fn status_bar(
                 ))
                 .children(cookies.then(|| {
                     div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
                         .flex_none()
                         .px_1()
                         .rounded_sm()
                         .bg(theme.bg_elevated)
                         .text_color(theme.accent)
+                        // `GLYPH_INLINE`, not `GLYPH`: beside a word the larger size is 25%
+                        // taller than the text.
+                        .child(crate::ui::glyph(
+                            crate::ui::Icon::Cookie,
+                            theme.accent,
+                            theme.accent,
+                            crate::ui::GLYPH_INLINE,
+                        ))
                         .child("cookies on")
                 }))
+                // **The half that actually earns this feature.** The toggle says what *will*
+                // happen; the badge says what *is* happening — which is the cookie jar's own
+                // lesson, and the whole reason a silently-honoured `HTTP_PROXY` was worth
+                // fixing rather than just documenting.
+                .child({
+                    div()
+                        .id("proxy-badge")
+                        .debug_selector(|| "proxy-badge".to_string())
+                        // The glyph cannot be reached by an ancestor's `hover`, so the badge is
+                        // the group and the icon brightens through it.
+                        .group(crate::ui::ICON_GROUP)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .bg(theme.bg_elevated)
+                        .text_color(theme.accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.bg_hover))
+                        // A one-click switch, like the environment badge beside it, rather than
+                        // a label you have to find a command for.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &MouseDownEvent, window, cx| {
+                                window.dispatch_action(Box::new(SetProxy), cx);
+                            },
+                        )
+                        .child(crate::ui::glyph(
+                            crate::ui::Icon::Waypoints,
+                            theme.accent,
+                            theme.text,
+                            crate::ui::GLYPH_INLINE,
+                        ))
+                        .child(proxy)
+                })
                 .child(
                     div()
                         .flex()

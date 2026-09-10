@@ -22,6 +22,8 @@ actions!(
         // Navigation
         OpenRequest,
         SwitchEnvironment,
+        SetProxy,
+        RemoveProxy,
         ShowHistory,
         OpenPalette,
         OpenAppMenu,

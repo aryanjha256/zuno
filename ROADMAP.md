@@ -63,9 +63,17 @@ it, and **both were invisible to the audit because it only ever looked inward**:
    right-click menu offers everything that works on a directory. Still absent: duplicating or
    moving a *folder*, and `Ctrl+S` cannot target one. See architecture.md §6a.
 
-Then the two named-not-planned items (scripting, request chaining) that would decide the ceiling,
-and the three capabilities item 4 now names that these documents had never mentioned at all —
-OpenAPI import, GraphQL, a collection runner. Read the audit, not the milestone headings.
+What is left after those two: **scripting**, which is the one item that would decide the ceiling
+and the one still blocked on a decision rather than on work — it needs a language and a sandbox
+chosen before anything else. And **GraphQL**, the last of the three capabilities item 4 found by
+comparing Zuno against what an API client is expected to do; the other two, OpenAPI import and
+the collection runner, have since shipped, as has request chaining, which this paragraph listed
+as unplanned for several slices after it landed. Read the audit, not the milestone headings.
+
+Worth noting what GraphQL now needs, since §6f argues part of it away: GraphQL over HTTP *is* a
+JSON body, so nothing is missing to *send* one. What is absent is authoring — a query editor,
+a variables pane, schema introspection — which is a different and much larger question than
+"support GraphQL".
 
 > **Test counts, once and not repeated.** `CLAUDE.md` carries the live total. Where a number appears
 > below it describes that milestone as shipped and is deliberately not updated — the same rule
@@ -540,6 +548,44 @@ cursors stayed separate, because a match and where you are standing are differen
   and a **collection runner with assertions** appeared nowhere in these documents — not in the
   audit, not in "named, not planned", not in the non-goals. The first of them has since landed.
 
+- **The collection runner — done**, and it is the third of the three capabilities the audit
+  found missing from these documents entirely.
+
+  Moved here from *Named, not planned*, where its write-up had been pasted into the middle of
+  that section's bullet list — splitting Scripting from Client certificates and presenting a
+  shipped feature as an unplanned one. A formatting slip rather than a stale claim, and the same
+  cost: a reader scanning for what is left found it under the heading that means "not
+  committed".
+
+  Assertions live on the request beside its captures — `expect_status` plus a table of
+  `path · operator · value`, authored from a response row with `Alt+Shift+A` so the path comes
+  from `path_to` rather than being typed twice.
+
+  Two producers feed one loop. `Ctrl+R` runs the folder your panel selection sits in, in filename
+  order, which is the smoke test over a feature. `Ctrl+Alt+R` runs a **flow**: a named, ordered list
+  of requests in a reserved `flows/` directory, which is the case folder order cannot express —
+  a collection is organised by resource and a workflow runs across it. The report fills in as the
+  run goes, names what each failure was, and clicking a row opens that request.
+
+  The run loop is entirely in `zuno-core` with no GPUI and no async runtime, which is what the crate
+  split was for: it is what `zuno run ./collection` would call.
+
+- **The proxy — done, and it was not a feature request but a correctness problem.** reqwest 0.13
+  builds every client with `auto_sys_proxy: true`, so Zuno has routed every request through
+  `HTTP_PROXY` since M1.2 — invisibly, with no way to override it. `Ctrl+K` → *Set proxy* now
+  picks System / Off / a URL you type, and a status-bar badge names it whenever one is in effect.
+
+  **It is the first item found by reading a dependency's source rather than Zuno's.** That is why
+  architecture.md §11 never listed it despite it matching §11's definition exactly: that table
+  records capability *Zuno* built and did not surface, and this was inherited from a default
+  nobody chose. Same blind spot this audit already admits to, one layer further out.
+
+  App-level in `app.json` rather than per request, which decided three things at once: a URL
+  carrying `user:pass@` cannot reach a committed collection file, the settings panel was ruled
+  out (it holds no text input, so the picker took it as its ninth consumer), and curl gets no
+  `-x` in either direction — for the reason the cookie jar gets no flag either. See
+  architecture.md §6i.
+
 - **The timing timeline — done, and it is the first item here where the *engine* was the
   missing half.** `Alt+R` reaches a third response tab showing where a request's time went: DNS,
   connect + TLS, waiting and download, as contiguous segments on one time axis with a marker at
@@ -788,21 +834,10 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
-**The collection runner — done**, and it is the third of the three capabilities the audit found
-missing from these documents entirely. Assertions live on the request beside its captures —
-`expect_status` plus a table of `path · operator · value`, authored from a response row with
-`Alt+Shift+A` so the path comes from `path_to` rather than being typed twice.
-
-Two producers feed one loop. `Ctrl+R` runs the folder your panel selection sits in, in filename
-order, which is the smoke test over a feature. `Ctrl+Alt+R` runs a **flow**: a named, ordered list
-of requests in a reserved `flows/` directory, which is the case folder order cannot express —
-a collection is organised by resource and a workflow runs across it. The report fills in as the
-run goes, names what each failure was, and clicking a row opens that request.
-
-The run loop is entirely in `zuno-core` with no GPUI and no async runtime, which is what the crate
-split was for: it is what `zuno run ./collection` would call.
-
-- **Client certificates.** `RequestSettings` has room; reqwest supports it.
+- **Client certificates.** reqwest supports them. "`RequestSettings` has room" is what this
+  line used to say, which reads as though a field were already there — none is, and the proxy
+  slice suggests none should be: a certificate is a path on this machine, so it belongs in
+  `app.json` beside the proxy rather than in a committed request file (architecture.md §6i).
 - **Inline body diff.** The summary diff answers "did my change do anything?". A structural diff
   over `Row` spans is probably better than a text diff, now that the JSON outline exists.
 - **gRPC / WebSocket / SSE.** Each is a different transport and a different response viewer. Not

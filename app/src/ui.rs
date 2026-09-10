@@ -81,6 +81,8 @@ pub enum Icon {
     PanelLeftClose,
     Lock,
     LockOpen,
+    Cookie,
+    Waypoints,
 }
 
 impl Icon {
@@ -96,6 +98,8 @@ impl Icon {
             Icon::Settings => "icons/settings.svg",
             Icon::Plus => "icons/plus.svg",
             Icon::Globe => "icons/globe.svg",
+            Icon::Cookie => "icons/cookie.svg",
+            Icon::Waypoints => "icons/waypoints.svg",
             Icon::Eye => "icons/eye.svg",
             Icon::PlusCircle => "icons/plus-circle.svg",
             Icon::RotateCw => "icons/rotate-cw.svg",
@@ -141,6 +145,8 @@ impl Icon {
         Icon::Settings,
         Icon::Plus,
         Icon::Globe,
+        Icon::Cookie,
+        Icon::Waypoints,
         Icon::Eye,
         Icon::PlusCircle,
         Icon::RotateCw,
@@ -187,6 +193,8 @@ impl AssetSource for Assets {
             "icons/settings.svg" => include_bytes!("../assets/icons/settings.svg"),
             "icons/plus.svg" => include_bytes!("../assets/icons/plus.svg"),
             "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
+            "icons/cookie.svg" => include_bytes!("../assets/icons/cookie.svg"),
+            "icons/waypoints.svg" => include_bytes!("../assets/icons/waypoints.svg"),
             "icons/eye.svg" => include_bytes!("../assets/icons/eye.svg"),
             "icons/plus-circle.svg" => include_bytes!("../assets/icons/plus-circle.svg"),
             "icons/rotate-cw.svg" => include_bytes!("../assets/icons/rotate-cw.svg"),

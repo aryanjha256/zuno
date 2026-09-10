@@ -98,6 +98,13 @@ pub enum Target {
     AddToFlow(String),
     /// Set the request's body type, and its raw sub-kind when it has one.
     BodyType(crate::request_view::BodyType, Option<zuno_core::RawKind>),
+    /// Where requests are routed. The ninth consumer, and the one that made the picker the
+    /// right surface rather than the settings panel: the panel has no text input at all, and a
+    /// proxy needs a URL. `set_fallback` already offers the query as a candidate — the same
+    /// trick that lets an unknown verb become `Method::Other`.
+    Proxy(zuno_core::ProxyMode),
+    /// Forget a saved proxy, by URL.
+    RemoveProxy(String),
     /// A directory to move the selected request into.
     ///
     /// The eighth consumer, and still no `PickerDelegate` trait: it draws as label plus dimmed
@@ -120,6 +127,8 @@ impl Clone for Target {
             Self::File(path) => Self::File(path.clone()),
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Method(method) => Self::Method(method.clone()),
+            Self::Proxy(mode) => Self::Proxy(mode.clone()),
+            Self::RemoveProxy(url) => Self::RemoveProxy(url.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),
             Self::Run(offset) => Self::Run(*offset),
             Self::Flow(name) => Self::Flow(name.clone()),

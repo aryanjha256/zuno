@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use zuno_core::{
     Body, Connection, Engine, EngineError, Event, Header, Method, MultipartField, MultipartValue,
-    PhaseKind, RawKind, RequestSpec,
+    PhaseKind, ProxyMode, RawKind, RequestSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -956,4 +956,95 @@ fn resolving_a_hostname_is_reported_as_a_dns_phase() {
         timing.phases().iter().any(|p| p.kind == PhaseKind::Dns),
         "and it must reach the phases the pane draws: {timing:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Proxying
+// ---------------------------------------------------------------------------
+
+/// Stand in for a proxy: accept one connection, capture the request text, answer it.
+///
+/// **This never forwards anything**, which is what makes the test hermetic. A proxied plain-HTTP
+/// request carries an **absolute-form** request line — `GET http://host/path HTTP/1.1` rather
+/// than `GET /path` — so the captured text alone proves the request was routed here instead of
+/// to the host it names. Nothing has to resolve or reach that host.
+fn serve_as_proxy() -> (String, JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let handle = std::thread::spawn(move || {
+        let Some(mut stream) = accept_before(&listener, SERVER_DEADLINE) else {
+            return String::new();
+        };
+        let request = read_request(&mut stream);
+        let _ = stream.write_all(OK_JSON.as_bytes());
+        let _ = stream.flush();
+        request
+    });
+
+    (format!("http://{addr}"), handle)
+}
+
+#[test]
+fn a_request_goes_through_the_configured_proxy() {
+    // The capability that was missing: reqwest has honoured `HTTP_PROXY` on every request since
+    // M1.2 with no way to see or override it, and nothing could route a request deliberately.
+    let (proxy, proxy_server) = serve_as_proxy();
+    let engine = Engine::new().expect("engine");
+
+    // Both are commands on one channel, so this lands before the send.
+    engine.set_proxy(ProxyMode::Url(proxy));
+
+    // A host that must never be resolved: if the proxy setting were ignored, this fails to
+    // connect instead of quietly passing.
+    let events = drain(&engine.send(spec_for("http://zuno-proxy.invalid/thing".to_string())).1);
+
+    let seen = proxy_server.join().expect("proxy thread");
+    assert!(
+        seen.starts_with("GET http://zuno-proxy.invalid/thing HTTP/1.1\r\n"),
+        "the proxy should have received an absolute-form request line, got:\n{seen}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(event, Event::Done { .. })),
+        "and the proxy's own response should come back: {events:?}"
+    );
+}
+
+#[test]
+fn with_the_proxy_off_a_request_goes_straight_to_the_server() {
+    // `Off` must reach the server directly, in **origin form**, and leave the proxy untouched.
+    //
+    // **What this does not cover, found by break-testing:** deleting `Off`'s `no_proxy()` call
+    // leaves it passing. It has to — no `HTTP_PROXY` is set in this process, so `Off` and
+    // `System` are indistinguishable here, and that call only matters when the environment has
+    // one. Setting an env var to force it is `unsafe` under edition 2024 and racy across
+    // parallel tests, which is the same wall the XDG trash hit (architecture.md §6a). So the
+    // one line that makes "off" mean off is held by review, and this test holds the two things
+    // it actually can: the request form, and that the proxy port is never touched.
+    let (target, target_server) = serve_once(OK_JSON);
+    let unused = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let unused_addr = unused.local_addr().expect("addr");
+
+    let engine = Engine::new().expect("engine");
+    engine.set_proxy(ProxyMode::Off);
+
+    let events = drain(&engine.send(spec_for(format!("{target}/thing"))).1);
+
+    let seen = target_server.join().expect("server thread");
+    assert!(
+        seen.starts_with("GET /thing HTTP/1.1\r\n"),
+        "a direct request is origin-form, got:\n{seen}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(event, Event::Done { .. })),
+        "{events:?}"
+    );
+
+    // Nothing should ever have knocked on the proxy's door. Short deadline: this is asserting an
+    // absence, so it must not spend twenty seconds proving it.
+    assert!(
+        accept_before(&unused, Duration::from_millis(200)).is_none(),
+        "the proxy port must see no connection at all when the proxy is off"
+    );
+    let _ = unused_addr;
 }

@@ -610,6 +610,97 @@ async fn choosing_a_method_sets_it_on_the_request(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn typing_a_proxy_sets_it_and_the_status_bar_says_so(cx: &mut TestAppContext) {
+    // The capability that was missing entirely: reqwest has honoured `HTTP_PROXY` on every
+    // request since M1.2, invisibly, and nothing could route a request deliberately.
+    //
+    // Driven through the palette rather than by calling the handler, because the picker *is*
+    // the surface — the settings panel holds no text input, and a proxy needs a URL.
+    let (window, _view, mut cx) = boot(cx, None, None);
+    // `boot` sets the session and collection globals directly and never installs the registry,
+    // so the proxy would have nowhere to be stored. `None` for the directory keeps the write
+    // in memory, per invariant 6.
+    cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Set proxy");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // System and Off are always offered; the typed value arrives as the derived row.
+    cx.simulate_input("127.0.0.1:8080");
+    // The query filters `System` and `Off` out, so the derived row is the only one left and is
+    // already selected — unlike the method picker, where `purge` still leaves seven verbs and
+    // the derived row has to be walked to.
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 1, "only the typed candidate should survive: {rows:?}");
+    assert!(
+        rows[0].contains("127.0.0.1:8080"),
+        "a bare host:port should be offered, since that is what people type: {rows:?}"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| crate::app_state::proxy(cx)),
+        zuno_core::ProxyMode::Url("http://127.0.0.1:8080".to_string()),
+        "the scheme is filled in, because reqwest needs one"
+    );
+
+    assert!(
+        cx.debug_bounds("proxy-badge").is_some(),
+        "an explicit proxy must show in the status bar"
+    );
+
+    // **Switching away must not throw the URL away.** It used to: the row existed only while
+    // that proxy was current, so choosing System deleted it and the only way back was retyping.
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Set proxy");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_input("System");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| crate::app_state::proxy(cx)),
+        zuno_core::ProxyMode::System
+    );
+    assert_eq!(
+        cx.update(|_, cx| crate::app_state::proxies(cx)),
+        vec!["http://127.0.0.1:8080".to_string()],
+        "the proxy you entered has to survive switching away from it"
+    );
+
+    // And it is still offered, so you can go back to it without typing.
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Set proxy");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let rows = picker_rows(&window, &mut cx);
+    assert!(
+        rows.iter().any(|row| row.contains("127.0.0.1:8080")),
+        "the saved proxy should be a row: {rows:?}"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    // Removing it is a verb of its own, like Forget workspace.
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Remove a saved proxy");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_, cx| crate::app_state::proxies(cx)).is_empty(),
+        "and removing it must actually forget it"
+    );
+}
+
+#[gpui::test]
 async fn typing_an_unknown_verb_offers_it_as_a_custom_method(cx: &mut TestAppContext) {
     // Closes the last of §11's non-body gaps. `Method::Other` was always sendable — core
     // has tests for it — but nothing in the UI could produce one.

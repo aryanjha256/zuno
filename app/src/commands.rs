@@ -64,6 +64,8 @@ pub fn palette() -> Vec<Command> {
         command("Collapse all folders", CollectionCollapseAll),
         command("Expand all folders", CollectionExpandAll),
         command("Switch environment", SwitchEnvironment),
+        command("Set proxy", SetProxy),
+        command("Remove a saved proxy", RemoveProxy),
         command("Edit environments", EditEnvironments),
         command("New tab", NewTab),
         command("Close tab", CloseTab),

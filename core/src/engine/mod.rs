@@ -27,7 +27,9 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use url::Url;
 
 pub use error::EngineError;
 
@@ -36,6 +38,79 @@ use crate::response::{HttpVersion, ResponseData};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(pub u64);
+
+/// How requests reach the network.
+///
+/// **Three states, because `Option<String>` cannot express this one.** `None` would have to
+/// mean both "use whatever the environment says" and "use nothing", and those are different
+/// requests on the wire — the same overloading `Connection` was split up to avoid.
+///
+/// The reason this type exists at all is that the middle state was already happening, invisibly:
+/// reqwest 0.13 builds every client with `auto_sys_proxy: true`, and hyper-util's matcher reads
+/// `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`. So Zuno has always honoured a system
+/// proxy with nothing on screen saying so and no way to override it — which is exactly what
+/// `RequestSettings::cookie_store`'s own comment says a behaviour like this must not be.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    /// Whatever `HTTP_PROXY` and friends say. The default, because it is what Zuno already did:
+    /// changing it would silently stop working for anyone behind a corporate proxy today, and
+    /// that failure presents as a network problem rather than as a setting.
+    #[default]
+    System,
+    /// No proxy, and the environment ignored.
+    ///
+    /// **Needs `.no_proxy()` rather than merely omitting one.** Leaving the builder alone keeps
+    /// `auto_sys_proxy` on, so "off" would go on quietly using the env var — the confusion
+    /// `Engine::clear_cookies` had to exist to prevent, one setting over.
+    Off,
+    /// An explicit proxy. `ClientBuilder::proxy` clears `auto_sys_proxy` itself, so this needs
+    /// no second call.
+    Url(String),
+}
+
+impl ProxyMode {
+    /// Turn typed text into a mode, or `None` when it cannot be one.
+    ///
+    /// Pure, so the picker can offer the query as a candidate only when it would actually work —
+    /// the same shape as the method picker offering an unknown verb as `Method::Other` rather
+    /// than letting a send fail later.
+    ///
+    /// A **bare `host:port` gets an `http://`**, because that is what people type and reqwest
+    /// needs a scheme. Only `http` and `https` are accepted: `socks5` is a legal proxy scheme
+    /// that reqwest rejects without its `socks` feature, which is not enabled — so offering it
+    /// would produce a mode that fails at the next send.
+    pub fn from_input(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return None;
+        }
+
+        let candidate = if text.contains("://") {
+            text.to_string()
+        } else {
+            format!("http://{text}")
+        };
+
+        let url = Url::parse(&candidate).ok()?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return None;
+        }
+        // A URL with no host is not somewhere a request can be sent.
+        url.host_str()?;
+
+        Some(ProxyMode::Url(candidate))
+    }
+
+    /// What to show in the status bar and the picker.
+    pub fn label(&self) -> &str {
+        match self {
+            ProxyMode::System => "system",
+            ProxyMode::Off => "off",
+            ProxyMode::Url(url) => url,
+        }
+    }
+}
 
 /// What the UI learns while a request is in flight.
 ///
@@ -101,6 +176,8 @@ enum Command {
     },
     /// Throw away every cached client, and with them every cookie jar.
     ClearCookies,
+    /// Change where requests are routed. Future clients are built with it.
+    SetProxy(ProxyMode),
 }
 
 pub struct Engine {
@@ -177,6 +254,16 @@ impl Engine {
     pub fn clear_cookies(&self) {
         let _ = self.commands.send(Command::ClearCookies);
     }
+
+    /// Route future requests through `mode`.
+    ///
+    /// Sent as a command rather than held behind a lock, so it lands on the engine thread in
+    /// order with the sends around it. An **in-flight job keeps the client it already has**,
+    /// which is `clear_cookies`' rule and right for the same reason: changing a setting should
+    /// not sabotage a response you are waiting on.
+    pub fn set_proxy(&self, mode: ProxyMode) {
+        let _ = self.commands.send(Command::SetProxy(mode));
+    }
 }
 
 /// The engine thread's main loop.
@@ -199,6 +286,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
     runtime.block_on(async move {
         let mut clients = ClientCache::default();
         let mut jobs: HashMap<JobId, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut proxy = ProxyMode::default();
 
         while let Some(command) = commands.recv().await {
             // Opportunistic reaping: without this the map grows for the life of the
@@ -206,7 +294,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
             jobs.retain(|_, handle| !handle.is_finished());
 
             match command {
-                Command::Send { job, spec, events } => match clients.get(&spec.settings) {
+                Command::Send { job, spec, events } => match clients.get(&spec.settings, &proxy) {
                     Ok(client) => {
                         jobs.insert(
                             job,
@@ -233,29 +321,42 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                 // you want: clearing cookies shouldn't sabotage a response you're waiting
                 // on.
                 Command::ClearCookies => clients.clear(),
+                // No `clear()` needed: the mode is part of `ClientKey`, so a changed proxy
+                // simply misses the cache rather than relying on anyone remembering to evict.
+                Command::SetProxy(mode) => proxy = mode,
             }
         }
     });
 }
 
 /// The settings that reqwest can only configure per *client*, not per request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// **`Clone` rather than `Copy`**, since the proxy carries a URL. Worth the loss: with the mode
+/// in the key, changing the proxy misses the cache by construction, where a key without it would
+/// leave every cached client quietly routing through the old one until somebody remembered to
+/// evict — the class of hazard this codebase keeps turning into funnels.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ClientKey {
     verify_tls: bool,
     follow_redirects: bool,
     max_redirects: u8,
     accept_encodings: bool,
     cookie_store: bool,
+    /// Not a `RequestSettings` field: a proxy is a property of the machine and its network, not
+    /// of a request. Keeping it out of `RequestSpec` is also what keeps a URL carrying
+    /// `user:pass@` from being serialized into a committed collection file (invariant 10).
+    proxy: ProxyMode,
 }
 
-impl From<&RequestSettings> for ClientKey {
-    fn from(settings: &RequestSettings) -> Self {
+impl ClientKey {
+    fn new(settings: &RequestSettings, proxy: &ProxyMode) -> Self {
         Self {
             verify_tls: settings.verify_tls,
             follow_redirects: settings.follow_redirects,
             max_redirects: settings.max_redirects,
             accept_encodings: settings.accept_encodings,
             cookie_store: settings.cookie_store,
+            proxy: proxy.clone(),
         }
     }
 }
@@ -276,15 +377,19 @@ impl ClientCache {
         self.clients.clear();
     }
 
-    fn get(&mut self, settings: &RequestSettings) -> Result<Client, EngineError> {
-        let key = ClientKey::from(settings);
+    fn get(
+        &mut self,
+        settings: &RequestSettings,
+        proxy: &ProxyMode,
+    ) -> Result<Client, EngineError> {
+        let key = ClientKey::new(settings, proxy);
 
         if let Some(client) = self.clients.get(&key) {
             return Ok(client.clone());
         }
 
         let client = build_client(&key)?;
-        self.clients.insert(key, client.clone());
+        self.clients.insert(key.clone(), client.clone());
         Ok(client)
     }
 }
@@ -296,7 +401,7 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         reqwest::redirect::Policy::none()
     };
 
-    Client::builder()
+    let builder = Client::builder()
         .user_agent(concat!("zuno/", env!("CARGO_PKG_VERSION")))
         .danger_accept_invalid_certs(!key.verify_tls)
         .redirect(redirect)
@@ -311,11 +416,26 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         .brotli(key.accept_encodings)
         .deflate(key.accept_encodings)
         .zstd(key.accept_encodings)
-        .cookie_store(key.cookie_store)
-        .build()
-        .map_err(|error| EngineError::Build {
-            reason: error.to_string(),
-        })
+        .cookie_store(key.cookie_store);
+
+    let builder = match &key.proxy {
+        // Nothing to do: reqwest's default already reads the environment.
+        ProxyMode::System => builder,
+        ProxyMode::Off => builder.no_proxy(),
+        ProxyMode::Url(url) => builder.proxy(
+            // **Reported, not swallowed.** `from_input` is what stops an unusable URL being
+            // chosen through the picker, but `app.json` can be hand-edited — and a proxy that
+            // is silently ignored sends the request straight to the network under a status bar
+            // claiming otherwise, which is the one outcome worse than refusing.
+            reqwest::Proxy::all(url.as_str()).map_err(|error| EngineError::Build {
+                reason: format!("proxy {url}: {error}"),
+            })?,
+        ),
+    };
+
+    builder.build().map_err(|error| EngineError::Build {
+        reason: error.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -345,9 +465,59 @@ mod tests {
 
         // Timeout is applied per request, so it must not fragment the client cache
         // (and with it, the connection pool).
-        assert_eq!(ClientKey::from(&a), ClientKey::from(&b));
+        let system = ProxyMode::System;
+        assert_eq!(
+            ClientKey::new(&a, &system),
+            ClientKey::new(&b, &system)
+        );
 
         b.verify_tls = false;
-        assert_ne!(ClientKey::from(&a), ClientKey::from(&b));
+        assert_ne!(
+            ClientKey::new(&a, &system),
+            ClientKey::new(&b, &system)
+        );
+    }
+
+    #[test]
+    fn changing_the_proxy_misses_the_client_cache() {
+        // The reason the mode is in the key at all. Without it, every cached client would keep
+        // routing through the old proxy until something remembered to evict them — and nothing
+        // on screen would say so.
+        let settings = RequestSettings::default();
+        assert_ne!(
+            ClientKey::new(&settings, &ProxyMode::System),
+            ClientKey::new(&settings, &ProxyMode::Off)
+        );
+        assert_ne!(
+            ClientKey::new(&settings, &ProxyMode::Off),
+            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()))
+        );
+    }
+
+    #[test]
+    fn typed_text_becomes_a_proxy_only_when_it_could_work() {
+        // Drives the picker's fallback row: offering a candidate that fails at the next send
+        // is the dead-control shape, one layer down.
+        assert_eq!(
+            ProxyMode::from_input("http://127.0.0.1:8080"),
+            Some(ProxyMode::Url("http://127.0.0.1:8080".into()))
+        );
+        // A bare host:port is what people type, and reqwest needs a scheme.
+        assert_eq!(
+            ProxyMode::from_input("localhost:3128"),
+            Some(ProxyMode::Url("http://localhost:3128".into()))
+        );
+        assert_eq!(
+            ProxyMode::from_input("  https://proxy.corp  "),
+            Some(ProxyMode::Url("https://proxy.corp".into())),
+            "trimmed, since a pasted value carries whitespace"
+        );
+
+        assert_eq!(ProxyMode::from_input(""), None);
+        assert_eq!(ProxyMode::from_input("   "), None);
+        // Legal as a proxy scheme, and rejected by reqwest without its `socks` feature — so
+        // offering it would produce a mode that cannot send.
+        assert_eq!(ProxyMode::from_input("socks5://127.0.0.1:1080"), None);
+        assert_eq!(ProxyMode::from_input("http://"), None, "no host");
     }
 }
