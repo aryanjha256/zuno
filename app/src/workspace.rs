@@ -5253,9 +5253,9 @@ pub(crate) fn tab_label_width() -> f32 {
 }
 /// `size(px(16.))` on the close button below.
 const TAB_CLOSE_WIDTH: f32 = 16.;
-/// `px_3` either side, `gap_1` between label and button, `border_x_2` either side on the inner
-/// element, and the 1px `border_r_1` dividing one tab from the next.
-const TAB_CHROME_WIDTH: f32 = 12. * 2. + 4. + 2. * 2. + 1.;
+/// `px_3` either side, `gap_1` between label and button, and the 1px `border_r_1` dividing one
+/// tab from the next. The active marker is `border_t_2`, so it costs height rather than width.
+const TAB_CHROME_WIDTH: f32 = 12. * 2. + 4. + 1.;
 const TAB_WIDTH: f32 = TAB_LABEL_WIDTH + TAB_CLOSE_WIDTH + TAB_CHROME_WIDTH;
 
 /// The strip of open buffers.
@@ -5322,7 +5322,7 @@ fn tab_strip(
                     )
                     // The active marker is a *nested* element, and it has to be. A div carries
                     // one `border_color` for all four sides — widths are per-side, colour is
-                    // not — so the accent bracket and the neutral divider above cannot share an
+                    // not — so the accent marker and the neutral divider above cannot share an
                     // element. They did, and the second call silently won: the active tab drew
                     // its right divider in accent, and every inactive tab drew its divider in
                     // `bg_panel`, which is to say not at all. Two colours, two elements.
@@ -5335,10 +5335,10 @@ fn tab_strip(
                             .size_full()
                             .px_3()
                             .py_1()
-                            // Accent down both edges rather than a top rule. Inactive tabs
-                            // keep the width and paint it in the strip's own background, so
-                            // switching never reflows the label by 4px.
-                            .border_x_2()
+                            // Accent along the top edge. Inactive tabs keep the width and
+                            // paint it in the strip's own background, so switching never
+                            // reflows the label by 2px.
+                            .border_t_2()
                             .border_color(if active { theme.accent } else { theme.bg_panel })
                             .bg(if active { theme.bg } else { theme.bg_panel })
                             .text_xs()
