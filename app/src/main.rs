@@ -50,7 +50,7 @@ use crate::actions::{
     OpenAppMenu, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
-    SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
+    NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue,
     FindInBody, FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
@@ -247,7 +247,12 @@ fn bindings() -> Vec<KeyBinding> {
         // --- Response viewer ---
         // Body ⇄ headers. `alt-` rather than `ctrl-`, to sit with the other two viewer
         // bindings; `alt-r` is free where `ctrl-shift-r` already focuses this pane.
-        KeyBinding::new("alt-r", ToggleResponseView, None),
+        // `alt-r`/`alt-shift-r` mirrors the request pane's `alt-q`/`alt-shift-q`. The three
+        // `ShowResponse*` verbs are deliberately **unbound**, exactly as the request pane's
+        // `Show*Tab` trio is: they exist for the palette and for the tabs' own clicks, and
+        // three more keystrokes would be three more chances at the clash §6e records.
+        KeyBinding::new("alt-r", NextResponseTab, None),
+        KeyBinding::new("alt-shift-r", PrevResponseTab, None),
         KeyBinding::new("alt-f", FoldAll, None),
         KeyBinding::new("alt-shift-f", FormatBody, None),
         KeyBinding::new("alt-shift-m", MinifyBody, None),

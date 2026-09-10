@@ -31,9 +31,15 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   been missing from every body surface; and syntax highlighting for JSON in the request editor and
   the raw response view — plus per-character search highlighting in the raw view and the JSON
   outline; and find-and-replace in the request body, which is what made `Ctrl+F` mean something
-  everywhere rather than everywhere except the surface you type into. Most recently the
-  **collection panel** — a browsable tree of what you have saved, which until now nothing in the
-  app could show you.
+  everywhere rather than everywhere except the surface you type into; the **collection panel** —
+  a browsable tree of what you have saved, which until then nothing in the app could show you.
+  Most recently the **timing timeline**, a third response tab breaking a request into DNS,
+  connect + TLS, waiting and download along one time axis — the first item on that audit where
+  the engine, not the UI, was the half that was missing.
+
+  Adding to this list rather than leaving it is deliberate: the paragraph below is about this
+  exact list going stale, and a slice that updates architecture.md and skips the file owning
+  *order* is how that happens.
 
   This list had gone two slices stale — the request-pane tabs and the editing set were both shipped
   and both absent from it — which is the rot the note at the top of this file predicts. Worth
@@ -533,6 +539,39 @@ cursors stayed separate, because a match and where you are standing are differen
   client is expected to do rather than against what Zuno has: **OpenAPI import**, **GraphQL**,
   and a **collection runner with assertions** appeared nowhere in these documents — not in the
   audit, not in "named, not planned", not in the non-goals. The first of them has since landed.
+
+- **The timing timeline — done, and it is the first item here where the *engine* was the
+  missing half.** `Alt+R` reaches a third response tab showing where a request's time went: DNS,
+  connect + TLS, waiting and download, as contiguous segments on one time axis with a marker at
+  first byte.
+
+  **It took two attempts at the drawing**, and the first was rejected on sight for a structural
+  reason rather than a cosmetic one: it had no axis. Four bars on four grey tracks, no ticks and
+  no elapsed labels, so there was nowhere to read "where did 50 ms fall" — a proportion chart
+  wearing a timeline's name. No test could have caught it; every assertion was about arithmetic
+  and the arithmetic was correct. Found by opening the window, like §5's layout bugs and the
+  picker's dead rows, which makes this the standing category's latest entry rather than a
+  surprise.
+
+  Every other entry in this audit is UI work over capability that already existed — that is what
+  principle 3 is about and §11 is the record of. This one inverts it. The chart is a few bars and
+  some arithmetic; `Timing` had carried `dns`/`connect`/`tls` as `Option`s since M1.2 with
+  `run.rs` hardcoding all three to `None`, under a comment saying reqwest could not supply them.
+  Half wrong: two `ClientBuilder` hooks are enough, and only splitting TCP from TLS needs the
+  custom connector that comment named. So there is no `tls` field now rather than a permanently
+  empty one.
+
+  **Found the way three capabilities before it were** — by comparing against what an API client
+  is expected to do, not by reading Zuno. "Waterfall", "timeline" and "phase" appeared nowhere in
+  any of these three documents, which is the fourth time that comparison has produced something
+  this audit could not see from inside. The category is real; it is worth running deliberately
+  rather than waiting to trip over the next one.
+
+  The design decision worth keeping is that a **pooled connection is a state and not three
+  zeroes**. Clients are cached per `ClientKey` so a resend reuses its socket, which means the
+  common case has no lookup and no handshake — and a zero-width DNS bar claims the lookup was
+  instant when the truth is it never ran. `Connection` is an enum for that reason, and the pane
+  says which. See architecture.md §6h.
 
 - **OpenAPI import — done.** `Ctrl+Shift+I` takes a spec URL or a file path and fills the
   collection: one folder named for the spec, each operation's tag a folder inside it. This is

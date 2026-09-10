@@ -16,7 +16,8 @@
 //! | `{version: 1, active, tabs: [RequestSpec]}` | tabs, first slice | tabs with no collection path |
 //! | `{version: 2, active, tabs: [{spec, path}]}` | collections | tabs, no environment |
 //! | `{version: 3, …, environment}` | environments | current |
-//! | `{version: 4, …, collection_panel}` | the collection panel | current |
+//! | `{version: 4, …, collection_panel}` | the collection panel | tabs, with a fixed-width panel |
+//! | `{version: 5, …, panel_width}` | a resizable panel | current |
 //!
 //! Those migrations are the reason the version exists, and each one is covered by a test —
 //! there is no separate migration step to forget to run.
@@ -31,9 +32,14 @@ use gpui::{App, Global, Task};
 use serde::{Deserialize, Serialize};
 use zuno_core::RequestSpec;
 
+/// What a session written before the panel could be resized adopts, and what a fresh window
+/// starts with. Taken from `collection_panel` rather than restated, so the default and the
+/// double-click reset target cannot drift into two different numbers.
+use crate::collection_panel::DEFAULT_WIDTH;
+
 /// Bumped when the on-disk shape changes. A file claiming a *newer* version is refused
 /// rather than guessed at — see `parse`.
-const CURRENT_VERSION: u32 = 4;
+const CURRENT_VERSION: u32 = 5;
 
 /// One open buffer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +83,12 @@ pub struct Session {
     /// defaulted because a panel you dismissed reappearing on every launch is the kind of
     /// small disobedience that makes an app feel like it isn't listening.
     pub collection_panel: bool,
+    /// How wide the collection panel is, in pixels.
+    ///
+    /// Stored unclamped, and read back through `collection_panel::clamp_width`: the ceiling
+    /// depends on the window, so a width that was legal on a wide monitor has to be reined in
+    /// when the same session opens on a laptop rather than rejected at load.
+    pub panel_width: f32,
 }
 
 impl Session {
@@ -85,6 +97,7 @@ impl Session {
         active: usize,
         environment: Option<String>,
         collection_panel: bool,
+        panel_width: f32,
     ) -> Self {
         Self {
             version: CURRENT_VERSION,
@@ -92,12 +105,13 @@ impl Session {
             tabs,
             environment,
             collection_panel,
+            panel_width,
         }
     }
 
     /// The shape M1 persisted, expressed in the current format.
     pub fn single(spec: RequestSpec) -> Self {
-        Self::new(vec![Tab::scratch(spec)], 0, None, DEFAULT_PANEL)
+        Self::new(vec![Tab::scratch(spec)], 0, None, DEFAULT_PANEL, DEFAULT_WIDTH)
     }
 }
 
@@ -139,6 +153,17 @@ struct SessionV3 {
     active: usize,
     tabs: Vec<Tab>,
     environment: Option<String>,
+}
+
+/// `{version: 4, active, tabs, environment, collection_panel}` — the panel before it could be
+/// resized, so no window had a width to remember. Spelled out rather than defaulted for the
+/// same reason as every arm above it.
+#[derive(Deserialize)]
+struct SessionV4 {
+    active: usize,
+    tabs: Vec<Tab>,
+    environment: Option<String>,
+    collection_panel: bool,
 }
 
 /// What a session written before the panel existed adopts, and what a fresh window starts with.
@@ -191,16 +216,27 @@ pub fn load(cx: &App) -> Option<Session> {
 fn parse(bytes: &[u8]) -> Result<Session, String> {
     let mut session = match serde_json::from_slice::<VersionProbe>(bytes) {
         Ok(probe) => match probe.version {
-            4 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            5 => serde_json::from_slice::<Session>(bytes).map_err(|error| error.to_string())?,
+            4 => {
+                let v4 =
+                    serde_json::from_slice::<SessionV4>(bytes).map_err(|error| error.to_string())?;
+                Session::new(
+                    v4.tabs,
+                    v4.active,
+                    v4.environment,
+                    v4.collection_panel,
+                    DEFAULT_WIDTH,
+                )
+            }
             3 => {
                 let v3 =
                     serde_json::from_slice::<SessionV3>(bytes).map_err(|error| error.to_string())?;
-                Session::new(v3.tabs, v3.active, v3.environment, DEFAULT_PANEL)
+                Session::new(v3.tabs, v3.active, v3.environment, DEFAULT_PANEL, DEFAULT_WIDTH)
             }
             2 => {
                 let v2 =
                     serde_json::from_slice::<SessionV2>(bytes).map_err(|error| error.to_string())?;
-                Session::new(v2.tabs, v2.active, None, DEFAULT_PANEL)
+                Session::new(v2.tabs, v2.active, None, DEFAULT_PANEL, DEFAULT_WIDTH)
             }
             1 => {
                 let v1 =
@@ -210,6 +246,7 @@ fn parse(bytes: &[u8]) -> Result<Session, String> {
                     v1.active,
                     None,
                     DEFAULT_PANEL,
+                    DEFAULT_WIDTH,
                 )
             }
             newer => {
@@ -334,6 +371,9 @@ mod tests {
             2,
             Some("dev".to_string()),
             false,
+            // Not the default: a round trip that writes 232 and reads 232 would hold with the
+            // field dropped from the struct entirely.
+            340.0,
         );
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
@@ -388,6 +428,38 @@ mod tests {
     }
 
     #[test]
+    fn a_v4_envelope_migrates_and_adopts_the_default_panel_width() {
+        // Written before the panel could be resized. Every other field is already in its
+        // current shape, so this arm exists purely to supply the width — which is exactly the
+        // case a `#[serde(default)]` would have handled invisibly, and invariant 8 forbids for
+        // the reason the assertion below spells out: a defaulted `0.0` is indistinguishable
+        // from a window that genuinely had no panel, and would collapse it.
+        let json = format!(
+            r#"{{"version":4,"active":1,"tabs":[{{"spec":{},"path":null}},{{"spec":{},"path":"/c/two.json"}}],"environment":"dev","collection_panel":false}}"#,
+            serde_json::to_string(&named("one")).expect("serialize"),
+            serde_json::to_string(&named("two")).expect("serialize"),
+        );
+
+        let session = parse(json.as_bytes()).expect("a v4 envelope must still load");
+        assert_eq!(session.tabs.len(), 2, "both buffers must survive");
+        assert_eq!(session.active, 1);
+        assert_eq!(session.environment.as_deref(), Some("dev"));
+        assert_eq!(
+            session.tabs[1].path,
+            Some(PathBuf::from("/c/two.json")),
+            "the collection file each buffer came from must survive"
+        );
+        assert!(
+            !session.collection_panel,
+            "a v4 file *does* have an opinion about the panel and it must be obeyed"
+        );
+        assert_eq!(
+            session.panel_width, DEFAULT_WIDTH,
+            "but no opinion about its width, so it takes today's default"
+        );
+    }
+
+    #[test]
     fn a_v3_envelope_migrates_and_adopts_the_default_panel() {
         // Written before the collection panel existed, so the file has no opinion about it and
         // must adopt today's default rather than a bare `false` — which is what a
@@ -418,7 +490,7 @@ mod tests {
         // The half a defaulted field could not express: v4 says `false` because the reader
         // dismissed it, and that has to be obeyed rather than overwritten by the default the
         // migration above applies.
-        let session = Session::new(vec![Tab::scratch(named("only"))], 0, None, false);
+        let session = Session::new(vec![Tab::scratch(named("only"))], 0, None, false, DEFAULT_WIDTH);
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
         let parsed = parse(&json).expect("a v4 envelope must load");
@@ -432,7 +504,7 @@ mod tests {
     fn an_active_index_past_the_end_is_clamped_rather_than_panicking() {
         // A truncated or hand-edited file. Left alone, this indexes out of bounds at the
         // first render.
-        let session = Session::new(vec![Tab::scratch(named("only"))], 7, None, DEFAULT_PANEL);
+        let session = Session::new(vec![Tab::scratch(named("only"))], 7, None, DEFAULT_PANEL, DEFAULT_WIDTH);
         let json = serde_json::to_vec_pretty(&session).expect("serialize");
 
         let back = parse(&json).expect("parse");

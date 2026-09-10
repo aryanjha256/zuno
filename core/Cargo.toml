@@ -23,3 +23,7 @@ serde_json.workspace = true
 # Trashing a request is a collection-file operation, so it lives beside `remove` rather than
 # in the app — a future CLI deleting a request wants the same choice a person does.
 trash.workspace = true
+# Timing a connection needs a tower `Layer` around reqwest's connector; reqwest does not
+# re-export the traits. See `engine/probe.rs`.
+tower-layer.workspace = true
+tower-service.workspace = true

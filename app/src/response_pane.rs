@@ -16,16 +16,16 @@ use gpui::{
     AnyElement, Context, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ListHorizontalSizingBehavior, ParentElement, Pixels, SharedString, StatefulInteractiveElement,
     Styled, UniformListScrollHandle,
-    Window, div, px, uniform_list,
+    Window, div, px, relative, uniform_list,
 };
 use zuno_core::{
-    EngineError, Header, JsonOutline, LineIndex, ResponseData, ResponseDiff, Row, RowKind,
-    ScalarKind, StatusClass,
+    Connection, EngineError, Header, JsonOutline, LineIndex, Phase, PhaseKind, ResponseData,
+    ResponseDiff, Row, RowKind, ScalarKind, StatusClass, Timing,
 };
 
 use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
-    ShowHistory, ToggleFold, UnfoldAll,
+    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming, ToggleFold, UnfoldAll,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
@@ -101,6 +101,7 @@ pub fn render(
                 ResponseView::Headers => {
                     pane.child(headers_region(&response.headers, &view.headers_scroll, theme))
                 }
+                ResponseView::Timing => pane.child(timing_region(response.timing, theme)),
             }
         }
         None => pane.child(empty_state(theme, window)),
@@ -113,15 +114,17 @@ pub fn render(
 
 /// The tab bar over the response detail.
 ///
-/// A tab dispatches `ToggleResponseView` rather than setting the view directly, so the click
-/// and `Alt+R` run one path — the "actions, not direct calls" convention.
+/// Each tab dispatches its own action rather than setting the view directly, so the click and
+/// the palette row run one path — the "actions, not direct calls" convention.
 ///
-/// **Only the inactive tab is clickable, and that is load-bearing rather than cosmetic.** The
-/// action *cycles*, so a handler on both tabs would make clicking the tab you are already on
-/// switch away from it — a control that does the opposite of what its label says. Leaving the
-/// active tab inert makes "click a tab, land on that tab" true, and it works only because
-/// there are exactly two: cycling from the one inactive tab always arrives at it. A third tab
-/// would have to split this into per-tab actions.
+/// **The third tab is why these are per-tab actions.** This comment used to end "a third tab
+/// would have to split this into per-tab actions", and the Timing tab is that third: one
+/// cycling handler works for two tabs because the single inactive one is always a step away,
+/// but clicking Timing while on Body is two steps and a cycling click lands on Headers. Same
+/// correction `section_tabs` already made for the request pane, predicted in the same words.
+///
+/// The active tab stays inert, which still earns its keep for a different reason than before:
+/// a click dispatching its own tab is harmless, but it advertises a change that never comes.
 fn view_tabs(
     view: &RequestView,
     header_count: usize,
@@ -144,6 +147,7 @@ fn view_tabs(
             "response-tab-body",
             "Body".to_string(),
             active == ResponseView::Body,
+            ShowResponseBody,
             theme,
             cx,
         ))
@@ -154,6 +158,18 @@ fn view_tabs(
             "response-tab-headers",
             format!("Headers {header_count}"),
             active == ResponseView::Headers,
+            ShowResponseHeaders,
+            theme,
+            cx,
+        ))
+        // No number on this one. The equivalent would be the total, which is already in the
+        // status line above the strip — repeating it here would be the only tab label that
+        // duplicates something two rows up.
+        .child(view_tab(
+            "response-tab-timing",
+            "Timing".to_string(),
+            active == ResponseView::Timing,
+            ShowResponseTiming,
             theme,
             cx,
         ))
@@ -211,13 +227,16 @@ fn response_actions(theme: &Theme) -> Div {
         ))
 }
 
-fn view_tab(
+fn view_tab<A: gpui::Action + Clone + 'static>(
     id: &'static str,
     label: String,
     active: bool,
+    action: A,
     theme: &Theme,
     cx: &mut Context<RequestView>,
-) -> impl IntoElement + use<> {
+    // `use<A>`, not `use<>`: the return has to mention every type parameter in scope
+    // (CLAUDE.md). `use<>` is only for a helper that is non-generic *and* borrows nothing.
+) -> impl IntoElement + use<A> {
     let tab = div()
         .id(id)
         .debug_selector(move || id.to_string())
@@ -242,8 +261,8 @@ fn view_tab(
         .hover(|style| style.text_color(theme.text))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|_, _: &MouseDownEvent, window, cx| {
-                window.dispatch_action(Box::new(crate::actions::ToggleResponseView), cx);
+            cx.listener(move |_, _: &MouseDownEvent, window, cx| {
+                window.dispatch_action(Box::new(action.clone()), cx);
             }),
         )
 }
@@ -398,6 +417,368 @@ fn headers_region(
         .child(headers_table(headers, theme))
         .into_any_element()
 }
+
+// ---------------------------------------------------------------------------
+// Timing: the timeline
+// ---------------------------------------------------------------------------
+
+/// Height of the axis strip: a 1px rule with 4px tick marks standing on it.
+///
+/// The ticks sit *inside* this box rather than overhanging a 1px rule with a negative `top`.
+/// Same result, and it does not depend on gpui painting outside a parent's bounds.
+const AXIS_HEIGHT: Pixels = px(5.);
+
+/// Height of the band the segments and the first-byte marker are drawn in.
+const TRACK_HEIGHT: Pixels = px(22.);
+
+/// Thickness of a phase segment. Square-cornered on purpose — a rounded 10px bar was the first
+/// attempt and read as decoration next to the app's other surfaces.
+const SEGMENT_HEIGHT: Pixels = px(6.);
+
+/// A segment narrower than this is drawn at this width instead.
+///
+/// **A deliberate small lie, and the same one browsers tell.** A 2.4 ms lookup inside a 142 ms
+/// request is 1.7% of the track, which rounds to nothing — so the row would carry a label, a
+/// duration, and no mark at all, which reads as a rendering fault rather than as "that was
+/// quick". The legend below always carries the true number.
+const SEGMENT_MIN_WIDTH: Pixels = px(2.);
+
+/// Axis and share labels. Smaller than `text_xs` because they are the chart's furniture rather
+/// than its content — the durations in the legend stay at `text_xs`.
+const AXIS_TEXT: Pixels = px(10.);
+
+/// Width of the legend's duration column, sized for `format_duration`'s widest output. Fixed
+/// rather than hugging its content, so the numbers form a column instead of a ragged edge that
+/// moves as a run gets slower.
+const LEGEND_TIME_WIDTH: Pixels = px(68.);
+
+/// Width of the legend's share column.
+const LEGEND_SHARE_WIDTH: Pixels = px(46.);
+
+/// Where a request's time went, on one time axis.
+///
+/// **The axis is what makes this a timeline rather than a proportion chart**, and its absence is
+/// what was wrong with the first version: four bars with no ticks and no elapsed labels, so
+/// there was no way to see where 50 ms fell. One axis, ticks from `axis_ticks`, the phases as
+/// contiguous segments on a single line, and a marker at first byte — the one landmark a single
+/// request has.
+///
+/// **The arithmetic is deliberately elsewhere.** `Timing::phases` returns the segments already
+/// offset and already summing to `total`, and `axis_ticks` decides the scale; this function only
+/// turns durations into fractions. Both are pure functions with unit tests, which is the only
+/// kind of check available — nothing headless can observe a paint.
+fn timing_region(timing: Timing, theme: &Theme) -> AnyElement {
+    let phases = timing.phases();
+    let total = timing.total;
+
+    // A zero total is a response that arrived inside the clock's resolution. Dividing would
+    // give NaN, which taffy turns into a layout nobody can read.
+    let at = move |part: Duration| -> f32 {
+        if total.is_zero() {
+            0.0
+        } else {
+            (part.as_secs_f64() / total.as_secs_f64()) as f32
+        }
+    };
+
+    let ticks = zuno_core::axis_ticks(total);
+
+    div()
+        .id("response-timing")
+        .debug_selector(|| "response-timing".to_string())
+        .flex_1()
+        .min_h(px(0.))
+        // Vertical only. There are at most four segments and four legend rows, but the
+        // connection note wraps on a narrow pane, so the content can still exceed the height.
+        .overflow_y_scroll()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .px_3()
+                .py_2()
+                .child(timing_summary(timing, theme))
+                .child(axis_labels(&ticks, theme, &at))
+                .child(axis_rule(&ticks, theme, &at))
+                .child(timeline_track(&phases, &ticks, timing.ttfb, theme, &at))
+                .child(first_byte_label(timing, theme, &at))
+                .child(legend(&phases, total, theme)),
+        )
+        .into_any_element()
+}
+
+/// The line above the axis: the total, and what the connection did.
+///
+/// **The connection note is the honest half of this tab.** A pooled connection draws two
+/// segments instead of four, and with nothing saying why, the missing lookup and handshake read
+/// as a measurement that failed. The socket count is here for the same reason: reqwest surfaces
+/// only the final response of a redirect chain, so the extra hops' setup lands in `Waiting` and
+/// would otherwise read as a slow server.
+fn timing_summary(timing: Timing, theme: &Theme) -> Div {
+    let note = match timing.connection {
+        // Singular and plural spelled out rather than `{n} socket(s)`, which nothing else in
+        // the app does either.
+        Connection::Opened { sockets: 1, .. } => "one connection opened".to_string(),
+        Connection::Opened { sockets, .. } => {
+            format!("{sockets} connections opened — redirects were followed")
+        }
+        Connection::Pooled => {
+            "connection reused — nothing looked up or negotiated".to_string()
+        }
+        // Not four zeroes, and not silence either. A `Timing` reaches this state only when it
+        // was built without a probe, and saying so beats a chart that looks complete.
+        Connection::Unknown => "the connection was not measured".to_string(),
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_baseline()
+        .gap_2()
+        .pb_2()
+        .child(
+            div()
+                .flex_none()
+                .text_xs()
+                .font_family(theme.mono.clone())
+                .text_color(theme.text)
+                .child(format!("{} total", format_duration(timing.total))),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_size(AXIS_TEXT)
+                .text_color(theme.text_faint)
+                .child(note),
+        )
+}
+
+/// The tick labels.
+///
+/// **Every label is left-aligned at its own tick, and that is a gpui constraint rather than a
+/// taste.** There is no transform in 0.2.2, so a label cannot be centred on a position without
+/// knowing its own width — and reading a width at render time is a frame behind (§6). Left
+/// alignment needs no measurement, and it is how a ruler is labelled anyway.
+///
+/// It also settles the thing the mock could not: **the total is not a tick.** It takes no
+/// `total` for that reason — `axis_ticks` drops anything crowding the end so no label can run
+/// off the right edge, and the total is already named in the summary line above.
+fn axis_labels(ticks: &[Duration], theme: &Theme, at: &impl Fn(Duration) -> f32) -> Div {
+    div()
+        .relative()
+        .h(px(14.))
+        .text_size(AXIS_TEXT)
+        .font_family(theme.mono.clone())
+        .text_color(theme.text_faint)
+        .children(ticks.iter().map(|tick| {
+            // Bare `0` rather than `format_duration`'s `0.00 ms`, which is four characters of
+            // noise on the one tick whose value is never in question.
+            let label = if tick.is_zero() {
+                "0".to_string()
+            } else {
+                format_duration(*tick)
+            };
+            div()
+                .absolute()
+                .top_0()
+                .left(relative(at(*tick)))
+                .whitespace_nowrap()
+                .child(label)
+        }))
+}
+
+/// A 1px rule with a tick standing on it at each labelled position.
+fn axis_rule(ticks: &[Duration], theme: &Theme, at: &impl Fn(Duration) -> f32) -> Div {
+    div()
+        .relative()
+        .h(AXIS_HEIGHT)
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(1.))
+                .bg(theme.border),
+        )
+        .children(ticks.iter().map(|tick| {
+            div()
+                .absolute()
+                .bottom_0()
+                .left(relative(at(*tick)))
+                .w(px(1.))
+                .h(px(4.))
+                .bg(theme.border)
+        }))
+}
+
+/// The segments, the gridlines behind them, and the first-byte marker.
+fn timeline_track(
+    phases: &[Phase],
+    ticks: &[Duration],
+    ttfb: Duration,
+    theme: &Theme,
+    at: &impl Fn(Duration) -> f32,
+) -> Div {
+    div()
+        .relative()
+        .h(TRACK_HEIGHT)
+        // Gridlines carry the axis down through the band, which is what lets a segment's
+        // position be read against a number. `border` rather than `text_faint`: this is a
+        // divider, and §12's note is that the two are different jobs.
+        .children(
+            ticks
+                .iter()
+                .filter(|tick| !tick.is_zero())
+                .map(|tick| {
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(relative(at(*tick)))
+                        .w(px(1.))
+                        .bg(theme.border)
+                }),
+        )
+        .children(phases.iter().map(|phase| {
+            div()
+                .absolute()
+                .top((TRACK_HEIGHT - SEGMENT_HEIGHT) / 2.)
+                .left(relative(at(phase.start)))
+                .w(relative(at(phase.duration)))
+                .min_w(SEGMENT_MIN_WIDTH)
+                .h(SEGMENT_HEIGHT)
+                .bg(phase_colour(phase.kind, theme))
+        }))
+        // Stronger than a gridline and weaker than the text, because it is a landmark rather
+        // than either. Drawn last so it reads on top of the segment it divides.
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(relative(at(ttfb)))
+                .w(px(1.))
+                .bg(theme.text_muted),
+        )
+}
+
+/// The `first byte` caption under the marker.
+///
+/// **It flips side rather than clipping.** With no transform available the caption is pinned by
+/// one edge, and pinning the left edge at the marker pushes it off the pane whenever TTFB is
+/// late — which is the ordinary case, since the download is usually the short phase. So it is
+/// pinned by its *right* edge and sits before the line, and only for an unusually early first
+/// byte does it flip to the other side. A caption clipped at the pane edge is the dead-control
+/// shape this codebase keeps finding, one step down.
+fn first_byte_label(timing: Timing, theme: &Theme, at: &impl Fn(Duration) -> f32) -> Div {
+    let fraction = at(timing.ttfb);
+    let caption = div()
+        .absolute()
+        .top_0()
+        .whitespace_nowrap()
+        .text_size(AXIS_TEXT)
+        .text_color(theme.text_muted)
+        .child("first byte");
+
+    div().relative().h(px(14.)).child(if fraction < 0.5 {
+        caption.left(relative(fraction)).pl_1()
+    } else {
+        caption.right(relative(1.0 - fraction)).pr_1()
+    })
+}
+
+/// The numbers, in a column that can be compared.
+///
+/// Share-of-total is here because that is the question the tab is opened to answer — "where did
+/// the time go" is a proportion, and reading it off bar widths is exactly what a reader should
+/// not have to do.
+fn legend(phases: &[Phase], total: Duration, theme: &Theme) -> Div {
+    let last = phases.len().saturating_sub(1);
+
+    div()
+        .flex()
+        .flex_col()
+        .mt_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .children(phases.iter().enumerate().map(|(ix, phase)| {
+            let share = if total.is_zero() {
+                0.0
+            } else {
+                phase.duration.as_secs_f64() / total.as_secs_f64() * 100.0
+            };
+
+            div()
+                .debug_selector(|| "phase-row".to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .py_1()
+                // Every row but the last carries a rule, so the block reads as a table
+                // rather than as a boxed card — and the last row keeps the border *width*
+                // in the pane's own colour rather than dropping it, or the rows would be
+                // 1px shorter than each other. Same idiom as `view_tab`'s inactive tab.
+                .border_b_1()
+                .border_color(if ix == last { theme.bg } else { theme.border })
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(8.))
+                        .h(px(8.))
+                        .bg(phase_colour(phase.kind, theme)),
+                )
+                .child(
+                    // `whitespace_nowrap` for CLAUDE.md's reason: text wraps by default, and a
+                    // name reflowing onto a second line is not what a too-long name should look
+                    // like. These names are fixed and short, so this is a guard rather than a
+                    // fix.
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child(phase.kind.as_str()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(LEGEND_TIME_WIDTH)
+                        .text_xs()
+                        .text_right()
+                        .font_family(theme.mono.clone())
+                        .text_color(theme.text)
+                        .child(format_duration(phase.duration)),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .w(LEGEND_SHARE_WIDTH)
+                        .text_size(AXIS_TEXT)
+                        .text_right()
+                        .font_family(theme.mono.clone())
+                        .text_color(theme.text_faint)
+                        .child(format!("{share:.1}%")),
+                )
+        }))
+}
+
+/// One colour per phase, from the theme's own group.
+///
+/// A `match` rather than an index, so a fifth `PhaseKind` fails to build until someone picks its
+/// colour — the discipline `RequestView::load` uses on `Body`.
+fn phase_colour(kind: PhaseKind, theme: &Theme) -> gpui::Hsla {
+    match kind {
+        PhaseKind::Dns => theme.timeline.dns,
+        PhaseKind::Connect => theme.timeline.connect,
+        PhaseKind::Wait => theme.timeline.wait,
+        PhaseKind::Download => theme.timeline.download,
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // In flight

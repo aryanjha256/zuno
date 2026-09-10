@@ -233,7 +233,7 @@ impl RequestTab {
     }
 }
 
-/// Which half of a response the pane shows.
+/// Which section of a response the pane shows.
 ///
 /// Split into tabs because the headers table is unbounded and the pane clips: a response
 /// with two dozen headers pushed the body region off the bottom edge, and with no scroll
@@ -244,6 +244,26 @@ pub enum ResponseView {
     #[default]
     Body,
     Headers,
+    /// Where the time went, on one time axis. Third, so the two answers you came for keep
+    /// their positions — this is the tab you visit when one of them was slow.
+    Timing,
+}
+
+impl ResponseView {
+    /// Visual order, which is also cycle order — not most-recently-used, for the reason
+    /// `RequestTab::ALL` states: MRU on a fixed strip sends one keystroke somewhere
+    /// different each time and throws away the muscle memory the strip gives for free.
+    pub const ALL: [ResponseView; 3] = [
+        ResponseView::Body,
+        ResponseView::Headers,
+        ResponseView::Timing,
+    ];
+
+    fn step(self, delta: isize) -> Self {
+        let at = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(at + delta).rem_euclid(len) as usize]
+    }
 }
 
 /// The find bar's state. Present only while the bar is open.
@@ -660,12 +680,23 @@ impl RequestView {
         }
     }
 
-    pub fn toggle_response_view(&mut self, cx: &mut Context<Self>) {
-        self.response_view = match self.response_view {
-            ResponseView::Body => ResponseView::Headers,
-            ResponseView::Headers => ResponseView::Body,
-        };
+    pub fn cycle_response_view(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.response_view = self.response_view.step(delta);
         cx.notify();
+    }
+
+    /// Show one section by name, which is what a tab click and a palette row both mean.
+    ///
+    /// **Three tabs need this and two did not.** With two, one cycling action served both
+    /// because the single inactive tab was always one step away; with three, clicking
+    /// Timing while on Body is two steps and a cycling handler lands on Headers instead —
+    /// a control that does something other than what its label says. Same correction the
+    /// request pane's strip already made.
+    pub fn show_response_view(&mut self, view: ResponseView, cx: &mut Context<Self>) {
+        if self.response_view != view {
+            self.response_view = view;
+            cx.notify();
+        }
     }
 
     /// Every run that can be shown, newest first, as `(offset, response)`.

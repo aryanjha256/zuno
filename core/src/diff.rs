@@ -135,7 +135,7 @@ mod tests {
 
     use super::*;
     use crate::request::Header;
-    use crate::response::{HttpVersion, SizeInfo, Timing};
+    use crate::response::{Connection, HttpVersion, SizeInfo, Timing};
 
     fn response(status: u16, headers: Vec<Header>, body: &'static str, total_ms: u64) -> ResponseData {
         ResponseData {
@@ -145,9 +145,9 @@ mod tests {
             headers,
             body: Bytes::from_static(body.as_bytes()),
             timing: Timing {
-                dns: None,
-                connect: None,
-                tls: None,
+                // The diff reads only `total`, so how the connection was obtained is
+                // irrelevant here — left unmeasured rather than invented.
+                connection: Connection::Unknown,
                 ttfb: Duration::from_millis(total_ms / 2),
                 total: Duration::from_millis(total_ms),
             },

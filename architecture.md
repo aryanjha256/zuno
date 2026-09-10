@@ -300,9 +300,13 @@ it's what lets the JSON viewer hold *byte spans* instead of copied strings (§6)
   different names is an implementation detail. Duplicates of the *same* name do stay in
   received order, so `collect_headers` stable-sorts by name: deterministic and readable,
   without scrambling duplicates. True wire order needs a lower-level client than reqwest.
-- **`Timing.dns` / `connect` / `tls` stay `None`.** reqwest exposes no per-stage connection
-  timings; getting them needs a custom hyper connector. `ttfb` and `total` are real. This is
-  exactly why those three were typed as `Option` from the start rather than `Duration`.
+- ~~**`Timing.dns` / `connect` / `tls` stay `None`.**~~ **Two of the three are real now, and the
+  third does not exist.** This bullet said reqwest exposes no per-stage timings and that getting
+  them needs a custom hyper connector. Half right, and the half that was wrong was expensive: two
+  hooks on `ClientBuilder` — `dns_resolver` and `connector_layer` — are enough for the lookup and
+  for the connection, and neither is a connector. What genuinely does need one is splitting TCP
+  connect from the TLS handshake, so those two are now **one** span rather than a `tls` field that
+  could never be filled. `Timing` carries a `Connection` instead of three `Option`s; see §6h.
 - **The wire size is unknowable, so the compression ratio cannot be shown.** This section used to
   claim the opposite — that "wire vs decoded" is how you spot whether compression happened. It
   isn't. reqwest 0.13 delegates decompression to `tower-http`, which removes `Content-Encoding` and
@@ -356,6 +360,16 @@ pub enum Event {
     Failed(EngineError),
 }
 ```
+
+> **`Connected` was never built, and the timeline did not need it.** It is in this sketch
+> because M1.2 assumed per-stage timings would arrive as their own event; nothing ever emitted
+> one, and no reader noticed for several milestones because the fields it would carry were
+> hardcoded `None`. When §6h finally measured them, an event turned out to be the wrong shape
+> anyway: a redirect chain opens its sockets across the *whole* send, so a `Connected` fired
+> once — necessarily before `Head` — would report the first hop's setup and leave the rest
+> misattributed. The counters are read at `Done` instead. Left in the sketch with this note
+> rather than quietly deleted, since "why is there no Connected event" is a reasonable question
+> to have answered.
 
 **Why a stream of events and not a single `Task<Result<ResponseData>>`?** Because the *feel*
 lives in the intermediate states. `Head` lets the status line and headers paint at TTFB
@@ -536,6 +550,19 @@ request to get. Four decisions:
   both would make clicking the tab you're already on switch *away* from it. Leaving the active
   tab inert makes "click a tab, land on that tab" true — and it works only because there are
   exactly two. A third tab has to split this into per-tab actions.
+
+  **There are three now, and that last sentence was the whole cost of adding one.** The Timing
+  tab (§6h) split `ToggleResponseView` into `NextResponseTab`/`PrevResponseTab` plus a
+  `ShowResponse*` verb per tab, exactly as the request pane's strip already had to. The active
+  tab stays inert, now for the weaker of the two reasons: a click dispatching its own tab is
+  harmless, it merely advertises a change that never comes.
+
+  It also turned a test from decoration into coverage without touching its assertions.
+  `clicking_the_headers_tab_switches_the_response_view` carried a comment admitting it could not
+  tell a dispatch from a direct call, because with two tabs and a cycling action both routes end
+  in the same state. Timing is *two* steps from Body, so a cycling handler lands on Headers and
+  the new block fails with exactly that — the same shape as the `curl -L` case in CLAUDE.md's
+  Lessons, where the thing that made the old test vacuous was itself the defect.
 
 The Headers tab scrolls rather than virtualizing. Header counts are tens, and `uniform_list`
 would impose the fixed row height that the rest of this section is built on, which is the wrong
@@ -1089,6 +1116,47 @@ Decisions worth keeping:
   rides in the session envelope (v4). Spelled out as its own `SessionV3` rather than given a
   serde default, per invariant 8 — a default cannot tell "written by an older Zuno" from
   "written by this one, with the panel hidden", and those two want opposite answers.
+- **Resizable, and the clamp runs at render rather than at the drag.** The width joins the
+  visibility flag in the envelope (v5, with a spelled-out `SessionV4` for the same reason), and
+  is stored **unclamped**: the ceiling is `min(600, 50% of the viewport)`, so clamping on the way
+  in would permanently shrink a width just because the window happened to be narrow when it was
+  set. Reading it back through `clamp_width` instead means a 600px panel restored onto a laptop —
+  or a window since dragged narrower — is reined in on the frame that draws it. Clamping only on
+  input leaves the panel eating the request pane with nothing to notice.
+
+  **The drag is `on_drag`/`on_drag_move`, not `on_mouse_down`/`on_mouse_move`,** and the obvious
+  pair is not a style choice but a bug: a `div`'s move listener is gated on `hitbox.is_hovered`,
+  so the drag dies the moment the pointer outruns the 5px strip — which a fast drag does inside
+  one frame, making it work when you drag slowly and feel broken when you don't. `on_drag_move`
+  fires in the capture phase for every move anywhere in the window while the drag is live.
+  Rejected alternative: a full-window transparent overlay painted during the drag, so the move
+  listener always has a hovered hitbox. It works, and it is one more element plus a piece of
+  state that has to be torn down; gpui clears `active_drag` itself, so the typed-payload route
+  has no end-of-drag flag to forget.
+
+  **The pointer maps to a width absolutely, never by accumulating deltas**, and the first
+  version got this wrong in a way worth recording because of how it presented. It added
+  `position.x - bounds.center().x` to the panel's *current* width, which reads as
+  self-correcting and is not: `DragMoveEvent::bounds` is last frame's hitbox, while the current
+  width has already been advanced by every earlier event in the same batch — and a mouse
+  reporting at 500Hz against a 60Hz window delivers six or seven moves per frame. Each one
+  re-added the whole travel from a reference that had not moved, the frame painted the
+  overshoot, and the next batch measured back from there and pulled it in. The report was
+  **"it flickers — you see the current and past frames at once"**, not "the width is wrong",
+  so it reads as a vsync or rendering fault rather than as arithmetic. `width_from_drag` pairs
+  the stale bounds with the width *those bounds were painted at* — captured in the closure at
+  render, deliberately not re-read — which recovers the row's left edge, a value that does not
+  move during a drag.
+
+  This is the "a frame behind" rule (§6's scrollbar) arriving from a direction that looks safe,
+  because an *event* feels current even when the bounds attached to it are not.
+
+  **The handle is absolutely positioned over the seam, not a sibling in the row**, so a strip
+  wide enough to hit costs neither the panel nor the panes any width. It is emitted last,
+  because paint order is what decides hit-testing between overlapping siblings. Hover and drag
+  paint over the panel's right border — which is also its focus ring — and that override is
+  deliberate: hover is transient and only visible while the pointer is on the seam, while focus
+  stays legible on the panel's other three edges.
 - **Collapse-all is the new fold path `rebuild_tree_visible` warned about.** That comment says
   the panel needs no selection clamp because every fold path selects the directory before folding
   it, and that a new one must do the same. This is that new one: it folds the whole tree at once,
@@ -1148,9 +1216,11 @@ describes one pane.
 
 Two consequences, and the second is the one worth holding:
 
-- The editor column carries `min_w(0)`. The panel is a fixed width, so the panes are what must
-  give when the window narrows; without it the column's content sets a floor and the two
-  together overflow instead.
+- The editor column carries `min_w(0)`. The panel is `flex_none` at a width it sets itself, so
+  the panes are what must give when the window narrows; without it the column's content sets a
+  floor and the two together overflow instead. This is also why the panel's own width is clamped
+  to a fraction of the viewport rather than only to a constant — `flex_none` means nothing else
+  will stop it.
 - **The panel no longer moves when the strip appears.** The strip hides itself at one buffer, so
   under the old layout opening a second one pushed the whole panel down — which is exactly what
   made `clicking_a_request_twice_activates_it_rather_than_opening_a_second_copy` read stale
@@ -2035,6 +2105,199 @@ XML and HTML prettify stay out, on the same argument as their highlighting.
 
 ---
 
+## 6h. The timing timeline — where the engine was the missing half
+
+Every other feature in this document had the engine ahead of the views: §11 exists to track
+capability that was built and unreachable. **This one is the first inversion.** A timeline is an
+axis, a few segments and some arithmetic; what was missing was anything to draw. `Timing` carried `dns`,
+`connect` and `tls` as `Option<Duration>` from M1.2 and `run.rs` hardcoded all three to `None`
+for four milestones, under a comment saying reqwest could not provide them.
+
+That comment was half wrong, and the half that was wrong is the interesting part — see §3.2.
+Two hooks on `ClientBuilder` are enough, and neither is the custom connector it named:
+`dns_resolver` takes a `reqwest::dns::Resolve`, and `connector_layer` takes a tower `Layer`
+around the connector service where one `call` is one connection. What actually does need a
+hand-built connector is separating the TCP connect from the TLS handshake, which is why there is
+no `tls` field any more rather than an empty one.
+
+### Three states, not three `Option`s
+
+The old shape could not distinguish **"this stage did not happen"** from **"this stage cannot be
+measured"** from **"nobody looked"**, and all three rendered identically as a blank. Two comments
+in the tree gave *different* reasons for the same `None` — `response.rs` said a reused connection
+skips them, `run.rs` said reqwest does not expose them — and each was true of a situation the type
+could not tell apart from the other. That is the CLAUDE.md failure mode where a confident comment
+stops being checked, arrived at from both ends at once.
+
+It matters because of what a chart asserts. A zero-width DNS bar says the lookup took no
+measurable time; on a pooled connection the truth is that no lookup ran. So `Connection` is an
+enum — `Opened { dns, connect, sockets }`, `Pooled`, `Unknown` — and `Pooled` is the *common*
+case, not an edge one: clients are cached per `ClientKey` precisely so a resend reuses its
+socket (§10, M1.2). The state the timeline shows most often is the one the old type could not
+express.
+
+`Unknown` is reachable only through `Timing::default()`, and it is kept rather than collapsed
+into `Pooled` for the reason `SizeInfo::declared` is an `Option`: "not measured" and "measured as
+nothing" are different claims, and the pane says which.
+
+### Four phases, computed in core
+
+`Timing::phases()` returns `Vec<Phase>` with each bar's offset already accumulated, contiguous,
+summing to exactly `total`. **Deliberately not in the pane.** A chart computing its own offsets is
+one that can disagree with the number printed above it, and this is arithmetic a unit test can
+hold — where a paint is not observable at all. Stages that did not happen are *absent* rather
+than zero-length, so a pooled connection yields two phases and not four with two empty.
+
+`Wait` covers everything between the connection being ready and the first response byte: our own
+request build, the upload, and the server's thinking. Splitting a "request sent" bar out of it
+would need a measurement inside the upload that nothing takes, so the phase is named for what it
+actually contains instead of being divided on a guess. A clamp against `ttfb` should never bind —
+`ttfb` is wall time around the whole send while the connection spans are nested inside it — and
+exists so that a bookkeeping error presents as a wrong number rather than as bars running past
+the end of their own track. `phases_stay_inside_the_total_when_the_setup_spans_overlap` pins it
+with a deliberately impossible `Timing`.
+
+### Attribution, which is the only hard part
+
+The client is shared by every job, so the resolver and the layer are shared too and a measurement
+has to find its way back to one request. A **tokio task-local** does it: `run::execute` installs a
+fresh `Probe` for the job's task and both hooks write into whatever probe their task is under.
+
+That works because of *where* hyper polls the connector, and this is the fact the whole design
+rests on: `hyper_util`'s legacy client does `future::select(checkout, connect).await` inside
+`connection_for`, so **both halves are polled by the caller's task** rather than a spawned one.
+Read out of `hyper-util-0.1.20/src/client/legacy/client.rs` rather than assumed — "verify, don't
+remember" is not only about gpui. If a later version spawns the connect instead, `try_with` starts
+failing and every connection silently reads as `Pooled`, which is what
+`a_second_request_reuses_its_socket_and_says_so` fails on.
+
+Two races, and both resolve the right way:
+
+- **The pool can win that `select`.** A half-built connection is then spawned to finish in the
+  background — outside the task-local, so nothing is recorded, which is correct because the
+  request did travel on a pooled socket. It does mean a lookup can be recorded for a connection
+  that was abandoned, so `Probe::connection` keys entirely off whether a *socket* completed and
+  ignores a stray DNS measurement.
+- **Redirects can open several.** Both counters sum rather than keeping the first, because the
+  elapsed time really did contain all of them and attributing only the first would move the rest
+  into `Wait`, where it reads as a slow server. reqwest surfaces only the final response, so
+  `sockets` is carried out to the pane: it is the only way the extra round trips are visible at
+  all, and the summary line says "3 connections opened — redirects were followed" rather than
+  leaving the number unexplained.
+
+The layer's span *contains* the lookup, since the connector calls the resolver itself, so
+`connect` is a subtraction. Done once in `Probe::connection` rather than in the pane, for the
+reason the phases are: two places doing it is two places to disagree.
+
+### The axis, and the redesign that produced it
+
+**The first version shipped and was rejected on sight**, which is worth recording because the
+fault was structural rather than cosmetic: it drew four bars, each on its own grey track, with
+**no axis at all** — no ticks, no elapsed labels, no reference of any kind. So there was no way to
+see where 50 ms fell. It was a proportion chart wearing a timeline's name, and the four stacked
+track boxes were doing the work one hairline should do.
+
+Found the way §5's layout bugs and the picker's dead rows were found: by opening the window. No
+test could have caught it — every assertion was about arithmetic, and the arithmetic was right.
+Worth pairing with §2's note that nothing headless observes a paint: what that means in practice
+is that *composition* is unfalsifiable here, so it has to be looked at, and looked at early.
+
+The rebuild is one axis with the phases as contiguous segments on a single line, plus a marker at
+first byte — the one landmark a single request has. **The cascade was dropped because its offsets
+carry no information.** The phases are strictly sequential and contiguous, so each segment's start
+is determined by the previous one's end; four rows spend four times the height restating what one
+row already says. A browser's waterfall earns its rows because it shows *many* requests, which can
+genuinely overlap. One request cannot overlap itself.
+
+`core::axis_ticks` decides the scale, in core beside `phases` and for the same reason — a pure
+function a unit test can hold. Two decisions in it:
+
+- **Round the leading digit up to 1, 2 or 5 × a power of ten.** Rounding *down* looks equally
+  reasonable and yields twice the ticks asked for: a 142 ms span wants a step near 28 ms, and
+  rounding that down to 20 gives seven labels on an axis sized for four. Break-tested — both
+  count assertions fail on the down-rounding version.
+- **Drop a tick that crowds the end.** The total is drawn separately, in the summary line, so a
+  tick at 95% stacks two numbers and leaves the edge label nowhere to go. `no_tick_crowds_the_
+  end_of_the_axis` holds it, and **the first version of that test was vacuous** — with every span
+  in its list the step was large enough that the tick past the limit also landed past the total,
+  so the loop stopped on its own and the assertion passed whether or not the limit existed. A
+  105 ms span is the one input the limit actually decides, and it was added after break-testing
+  found the gap. Seventh of these.
+
+**Two label placements are decided by gpui rather than by taste**, and both are the same
+constraint: 0.2.2 has no transform, so an element cannot be centred on a position without knowing
+its own width — and reading a width at render time is a frame behind (§6's decoration note).
+
+- **Tick labels are left-aligned at their tick**, ruler-style, which needs no measurement. This is
+  also *why* `axis_ticks` excludes the total: with left alignment a label at the far right would
+  run off the pane, and dropping it is better than clipping it.
+- **The `first byte` caption is pinned by its right edge** and sits *before* the marker, because
+  TTFB is late in the ordinary case — the download is usually the short phase — so pinning the
+  left edge would push the caption off the pane on nearly every response. It flips to left-pinned
+  below the midpoint, for the unusual early-first-byte case. A caption clipped at the pane edge is
+  the dead-control shape this codebase keeps finding, one step down.
+
+Two smaller notes. The segments are square-cornered and 6px, against the first version's rounded
+10px, which read as decoration next to every other surface in the app. And a segment narrower than
+`SEGMENT_MIN_WIDTH` is drawn at that width — **a deliberate small lie**, the same one browsers
+tell: a 2.4 ms lookup inside 142 ms is 1.7% of the track and rounds to nothing, so the phase would
+have a label, a duration and no mark, which reads as a rendering fault rather than as "that was
+quick". The legend always carries the true number.
+
+The legend's last row keeps its border *width* in the pane's own colour rather than dropping the
+border, or the rows would differ in height by a pixel — `view_tab`'s idiom, and the reason the
+codebase reaches for a conditional colour where a `FluentBuilder::when` would also have worked.
+
+### What is asserted, and what a person has to look at
+
+The mechanisms are separable and each was broken on purpose:
+
+| Reverted | Fails |
+|---|---|
+`record_socket` never called | both socket tests, and the DNS one — everything reads as `Pooled` |
+`record_dns` never called | `resolving_a_hostname_is_reported_as_a_dns_phase`, and nothing else |
+`connection()` never returns `Pooled` | `a_second_request_reuses_its_socket_and_says_so`, at the socket level |
+the two `ClientBuilder` hooks removed | `a_send_through_the_app_reports_a_measured_connection` |
+every tab dispatches the cycle | `clicking_the_headers_tab_switches_the_response_view` |
+`axis_ticks` rounds the step **down** | `axis_ticks_round_up_to_nice_numbers` and the tick-count range test |
+`CROWD_LIMIT` raised to `1.0` | `no_tick_crowds_the_end_of_the_axis` — but only after 105 ms joined its inputs |
+
+`a_second_request_reuses_its_socket_and_says_so` is the one worth reading. Its server accepts
+**once** and serves **twice**, deliberately without `Connection: close` — the inverse of
+`serve_twice_setting_a_cookie`, whose close header is what gives each request its own socket. It
+returns how many requests it served, and that number is the load-bearing half: only one `accept`
+happened, so "served 2" is independent proof both requests travelled on one socket. Reading our
+own probe back would only prove the probe agrees with itself.
+
+The DNS test binds its listener to `localhost` by *name* rather than to `127.0.0.1`, so whatever
+that resolves to on this machine is what is being listened on and the test does not depend on
+whether `::1` or `127.0.0.1` comes back first. Still no network — this is `getaddrinfo` against
+`/etc/hosts`. It asserts `is_some()` and never `> 0`, because a warm lookup genuinely lands inside
+a nanosecond and a test demanding a positive duration would fail for being fast.
+
+**The segment colours are the part no test should hold.** A `TimelineTheme` groups the four, beside
+`SyntaxTheme` and for its reason — one module reads them and what matters is that they work
+together. Deliberately *not* the `status_*` tokens, which was the expedient option: a phase of a
+request and a class of HTTP status are unrelated, and borrowing one palette for the other means
+retuning "redirect orange" restyles the chart.
+
+The first version of that test demanded 1.6:1 of luminance between every pair, so the chart would
+survive greyscale. **The premise was false and the test was corrected rather than the palette.**
+Every phase carries its own row, its own label and its own duration, so colour is reinforcement
+and not the channel identifying anything — demanding a luminance ramp across four bars would have
+forced four muddy shades to satisfy a requirement nothing has. What is left is the failure an eye
+cannot catch in review: two tokens accidentally *equal* from a copy-paste between palettes, which
+makes the chart monochrome with no line of code looking wrong. Plus 3:1 against every surface,
+where the non-obvious pairing is `bg_elevated` — that is the bar's own track and a different value
+in each theme, so a colour tuned against the pane can still sink into the track it sits in.
+Whether the four *read* well together is a paint, and a person looking at the window is the only
+instrument for it.
+
+One thing came free: the tab reads `view.displayed()` like every other region in the pane, so
+browsing the history shows that run's timing rather than the live one, with no rule of its own.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains
@@ -2210,6 +2473,14 @@ serde_json   = "1"          # promoted from dev-dep when the collection format l
 # `coinit_*` flag is Windows COM configuration. Hand-rolling the XDG spec was rejected — the
 # same-filesystem case is easy and the cases that decide whether a restore works are not.
 trash        = { version = "5", default-features = false }
+
+# The two tower traits, and only those two, for the connector layer that times a connection
+# (§6h). `tower` itself would do — it is already in the tree — but these are what it re-exports
+# and they carry no features to choose. Both are already in `Cargo.lock` at 0.3.3 via reqwest,
+# so declaring them adds **no** crate to the graph. Checked with `cargo info`, per the rule
+# above, rather than written from memory.
+tower-layer   = "0.3.3"
+tower-service = "0.3.3"
 
 # `ropey` and `criterion` were listed here for a long time and neither is a dependency.
 # The rope was dropped deliberately (§7); the perf floor is an ordinary `#[test]` asserting

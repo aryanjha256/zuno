@@ -15,6 +15,7 @@ use reqwest::Client;
 
 use crate::engine::build;
 use crate::engine::error::EngineError;
+use crate::engine::probe::Probe;
 use crate::engine::{Event, JobId};
 use crate::request::{Header, RequestSpec};
 use crate::response::{HttpVersion, ResponseData, SizeInfo, Timing};
@@ -56,6 +57,25 @@ pub async fn execute(
     spec: RequestSpec,
     events: Sender<Event>,
     max_body_bytes: usize,
+) {
+    // Install this job's connection probe for the duration of the task. The client — and with
+    // it the resolver and the connector layer — is shared across jobs, so a task-local is what
+    // makes a measurement belong to *this* request. See `probe.rs`.
+    let probe = Probe::new();
+    Probe::scope(
+        probe.clone(),
+        run(job, client, spec, events, max_body_bytes, probe.clone()),
+    )
+    .await
+}
+
+async fn run(
+    job: JobId,
+    client: Client,
+    spec: RequestSpec,
+    events: Sender<Event>,
+    max_body_bytes: usize,
+    probe: std::sync::Arc<Probe>,
 ) {
     let started = Instant::now();
     let timeout = spec.settings.timeout;
@@ -179,12 +199,10 @@ pub async fn execute(
             headers,
             body: Bytes::from(buffer),
             timing: Timing {
-                // reqwest doesn't expose per-stage connection timings; getting DNS,
-                // connect, and TLS separately needs a custom hyper connector. The
-                // model already types them as Option for exactly this reason.
-                dns: None,
-                connect: None,
-                tls: None,
+                // Read here rather than at `Head`: a redirect chain opens its sockets across
+                // the whole send, so asking at TTFB would report only the first hop's setup
+                // and leave the rest misattributed to `Wait`.
+                connection: probe.connection(),
                 ttfb,
                 total,
             },

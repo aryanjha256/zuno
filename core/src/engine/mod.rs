@@ -18,6 +18,7 @@
 
 pub mod build;
 pub mod error;
+mod probe;
 mod run;
 
 use std::collections::HashMap;
@@ -299,6 +300,13 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         .user_agent(concat!("zuno/", env!("CARGO_PKG_VERSION")))
         .danger_accept_invalid_certs(!key.verify_tls)
         .redirect(redirect)
+        // The two hooks that fill in `Timing`'s connection stages. They are installed on
+        // *every* client rather than behind a setting, because they cost one `Instant::now`
+        // per connection and the alternative is a timeline that is blank until someone finds
+        // a toggle. See `probe.rs` for why a shared client can still attribute a measurement
+        // to one job.
+        .dns_resolver(probe::TimedResolver)
+        .connector_layer(probe::TimedConnect)
         .gzip(key.accept_encodings)
         .brotli(key.accept_encodings)
         .deflate(key.accept_encodings)

@@ -77,8 +77,31 @@ pub struct Theme {
     /// gone now that M1.3 shipped and every field is used.
     pub syntax: SyntaxTheme,
 
+    /// Segment colours for the response pane's Timing tab.
+    ///
+    /// Its own group rather than four loose fields, following `SyntaxTheme`'s precedent: one
+    /// module reads them and they are decided together, because what matters is that the four
+    /// are *distinguishable from each other*, not what any one of them is.
+    ///
+    /// Deliberately **not** the `status_*` tokens, which was the expedient option. A phase of a
+    /// request and a class of HTTP status are unrelated things, and borrowing one palette for
+    /// the other means retuning "redirect orange" silently restyles the timeline.
+    pub timeline: TimelineTheme,
+
     /// Resolved at startup from what the OS actually has installed.
     pub mono: SharedString,
+}
+
+/// Segment colours for the timing timeline, one per `PhaseKind`.
+#[derive(Debug, Clone)]
+pub struct TimelineTheme {
+    pub dns: Hsla,
+    pub connect: Hsla,
+    /// The server's share, and usually the longest bar — so it is the calmest colour rather
+    /// than the loudest. A chart where the normal case shouts has nothing left to say
+    /// when something is actually wrong.
+    pub wait: Hsla,
+    pub download: Hsla,
 }
 
 /// Token colors for the response viewer.
@@ -143,6 +166,13 @@ impl Theme {
                 punct: rgb(0x7b7b84).into(),
             },
 
+            timeline: TimelineTheme {
+                dns: rgb(0xb98ee6).into(),
+                connect: rgb(0xe0b070).into(),
+                wait: rgb(0x5b8db8).into(),
+                download: rgb(0xa8cf85).into(),
+            },
+
             mono,
         }
     }
@@ -187,6 +217,13 @@ impl Theme {
                 number: rgb(0x8a5a00).into(),
                 literal: rgb(0x7040a8).into(),
                 punct: rgb(0x8b8b94).into(),
+            },
+
+            timeline: TimelineTheme {
+                dns: rgb(0x7040a8).into(),
+                connect: rgb(0x8a5a00).into(),
+                wait: rgb(0x1f5f9e).into(),
+                download: rgb(0x2f7a24).into(),
             },
 
             mono,
@@ -307,6 +344,18 @@ mod tests {
         ]
     }
 
+    /// The four segments, named. Hand-written like `Icon::ALL`, and with the same hazard: a fifth
+    /// phase would have to be added here too or these tests would pass without seeing it.
+    /// `PhaseKind::as_str` is the match that makes a new variant a compile error; this is not.
+    fn timeline_segments(theme: &Theme) -> [(&'static str, Hsla); 4] {
+        [
+            ("dns", theme.timeline.dns),
+            ("connect", theme.timeline.connect),
+            ("wait", theme.timeline.wait),
+            ("download", theme.timeline.download),
+        ]
+    }
+
     #[test]
     fn text_tokens_are_readable_on_every_surface() {
         // Floors rather than exact values, so retuning the palette doesn't churn this test —
@@ -356,6 +405,61 @@ mod tests {
                  each step must be visible, not nominal",
                 theme.appearance
             );
+        }
+    }
+
+    #[test]
+    fn every_timeline_segment_reads_against_the_surfaces_it_is_drawn_on() {
+        // **3.0:1, WCAG's floor for a non-text UI component** rather than the 4.5 demanded of
+        // text above: these are filled rects, not glyphs. The pairing that is not obvious by
+        // eye is `bg_elevated` — that is the bar's own track, and it is a different value in
+        // each theme, so a colour tuned against the pane background can still sink into the
+        // track it sits in.
+        const FLOOR: f32 = 3.0;
+
+        for theme in [Theme::dark("mono".into()), Theme::light("mono".into())] {
+            for (name, color) in timeline_segments(&theme) {
+                for (surface_name, surface) in surfaces(&theme) {
+                    let ratio = contrast(color, surface);
+                    assert!(
+                        ratio >= FLOOR,
+                        "{:?}: timeline {name} on {surface_name} is {ratio:.2}:1, below \
+                         {FLOOR}:1",
+                        theme.appearance
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_timeline_segments_are_the_same_colour() {
+        // **Deliberately only inequality, and the weaker claim is the correct one here.**
+        //
+        // The first version of this test demanded 1.6:1 of *luminance* between every pair, on
+        // the reasoning that a chart should survive being read in greyscale. That premise is
+        // false for this chart: every phase carries its own row, its own label and its own
+        // duration, so the colour is reinforcement rather than the only channel identifying it.
+        // Demanding a luminance ramp across four bars would have forced four muddy shades to
+        // satisfy a requirement nothing actually has — and the honest fix was to correct the
+        // test rather than retune the palette until it went green.
+        //
+        // What is left is the failure an eye cannot catch in review: two tokens accidentally
+        // *equal*, from a copy-paste between the two palettes, which makes the chart
+        // monochrome without any line of code looking wrong. Whether the four read well
+        // together is a paint, and nothing headless can observe a paint — that check is a
+        // person looking at the window.
+        for theme in [Theme::dark("mono".into()), Theme::light("mono".into())] {
+            let bars = timeline_segments(&theme);
+            for (at, (name, color)) in bars.iter().enumerate() {
+                for (other_name, other) in bars.iter().skip(at + 1) {
+                    assert_ne!(
+                        color, other,
+                        "{:?}: timeline {name} and {other_name} are the same colour",
+                        theme.appearance
+                    );
+                }
+            }
         }
     }
 

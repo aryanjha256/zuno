@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 771 tests, ~20s
+cargo test --workspace                   # 801 tests, ~20s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -153,6 +153,8 @@ Anything reading a scroll handle's `max_offset`/`bounds` at render time is **a f
 Focusing an unpainted handle does **not** kill globally-bound actions — assert on **typing** | The two rows above are right that focus must move when an element stops being painted, and slightly too strong about the symptom. `window.rs` resolves the focused id to a dispatch node and falls back to `dispatch_tree.root_node_id()` when the frame has none — and every `Workspace` handler is reachable from the root, since `Workspace` *is* the window's root view. So a `None`-context binding keeps working, measured: a test asserting `ctrl-shift-h` still added a header **passed against the bug** and read exactly like coverage. What actually breaks is anything needing a live element — no `TextInput` holds focus, so typing vanishes, and no `key_context` node exists, so every scoped binding stops matching. `hiding_the_panel_leaves_typing_somewhere_to_land` asserts the typing, which is the half a user would notice. |
 `on_mouse_down` is a **Bubble**-phase listener, so an **ancestor's** handler runs too | Overlapping *siblings* are resolved by hit-testing — the one painted later occludes the rest, which is why `chrome.rs` emits the resize corners last. **Ancestor/descendant is not**: a click inside a child is inside the parent's hitbox as well, so both fire, child first. A clickable nested in a clickable therefore needs `cx.stop_propagation()`. The window controls sit inside the drag-to-move titlebar and went without it for a while — so closing the window also asked the compositor to start dragging it. `platform/test/window.rs`'s `start_window_move` is `unimplemented!()`, which is what makes this testable at all. |
 `flex_none` on a label in a `justify_between` row takes its **siblings** off the edge | `flex: none` pins `flex-shrink: 0`, so a long string does not merely overflow itself — it pushes whatever shares the row out of the container. Shipped twice: the picker's label carried its URL column out of the row, and the collection header's workspace name carried New request, New folder, Collapse and Expand off the panel, leaving four controls with no mouse path. **A name is content and has to shrink; its neighbours are controls and must not** — `flex_shrink().min_w(px(0.))` on the name, `flex_none` on the chevron. Invisible until a string gets long, and an off-screen control still has bounds that agree with the bug, so assert each sibling's bounds against **the container's** width, never its own. |
+`on_mouse_move` cannot drive a drag — it is gated on `hitbox.is_hovered` | So the obvious resize pair, `on_mouse_down` setting a flag and `on_mouse_move` updating a width, **dies the moment the pointer outruns the handle** — for a 5px strip that is inside one frame of a fast drag. It works when you drag slowly, so it presents as jitter rather than as a missed event. `on_drag(T, …)` + `on_drag_move::<T>` is the pair gpui's own doc comment recommends for "draggable UIs that don't conform to a drag and drop style interaction, like resizing": that listener runs in the **Capture** phase and gates on `cx.active_drag`'s `TypeId`, not on the hitbox, so it fires for every move anywhere in the window. Three details that live only in the source — `on_drag` is on `StatefulInteractiveElement`, so the handle needs `.id()`; there is a 2px `DRAG_THRESHOLD`, and the move that crosses it is consumed *starting* the drag (capture runs before the bubble-phase handler that sets `active_drag`), so a test needs **two** moves and one reads like a flake; and `on_drag` demands a real `Entity<impl Render>` for the preview that follows the cursor, so pass `Empty` or a ghost trails the pointer. gpui clears `active_drag` on mouse-up itself, which makes `cx.has_active_drag()` a read-only "am I dragging" with no flag to reset — worth preferring over a `bool` for exactly that reason. |
+`DragMoveEvent::bounds` is **last frame's** hitbox, so never pair it with live state | It is `hitbox.bounds`, written during the previous frame's `interactivity.prepaint` — the same "a frame behind" rule as `max_offset`, from a direction that looks safe because an event feels current. A mouse reporting at 500Hz against a 60Hz window delivers six or seven moves *per frame*, and every one of them sees the same stale bounds while state written by its predecessors is already fresh. So `current_width + (position.x - bounds.center().x)` re-adds the whole travel on each event, the frame paints the overshoot, the next batch measures back from there and yanks it in. **It presents as flicker — "you can see the current and past frames at once" — not as a wrong number**, which is why it reads as a rendering or vsync problem rather than as arithmetic. Fix by pairing the stale bounds with the width *those bounds were painted at* (capture it in the closure at render; do not re-read it) to recover a reference that does not move, then map the pointer to a width **absolutely**. **Unreproducible headlessly**, and expensively so: `VisualTestContext::simulate_event` calls `run_until_parked` after *every* event, so the harness repaints between moves and bounds are never stale — `test_window`, the only way to deliver two events without a park, is `pub(crate)` to gpui. A burst test was written and **passed against the bug**. |
 
 ## Packaging
 
@@ -263,6 +265,19 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   can prove each icon rasterizes to visible pixels, which catches the malformed-file variant of the
   same silent failure. **When a comment states a rule, check the rule is applied to the thing the
   comment is about**, not merely present nearby.
+
+- **The harness parks after every event, so no test can see a burst.** A drag flickered because
+  each of a frame's several move events re-applied the same travel; the test written to catch it
+  passed, and would have passed against any version of the bug. `VisualTestContext::simulate_event`
+  calls `run_until_parked` itself, so the harness repaints between simulated moves and the stale
+  bounds the bug needs never occur — and `test_window`, the only way to deliver two events
+  without a park, is `pub(crate)` to gpui. The test was **deleted rather than kept**: it read
+  exactly like coverage. What replaced it is a pure function over the mapping plus a *second*
+  drag end-to-end, and the second drag is the load-bearing half — on a first drag the painted
+  width and `DEFAULT_WIDTH` are the same number, so the wrong one of the two passed every
+  assertion in the file. **Sixth time a weak assertion has read like a strong one**, and the
+  first where the honest fix was to admit the mechanism is untestable and go looking for what
+  *is*.
 
 - **A "bug" reported from the harness that the real app did not have.** A probe showed `Ctrl+B`
   failing to reach the body editor while the response find bar was open, and it was written up as

@@ -167,8 +167,16 @@ actions!(
         ShowHeadersTab,
         ShowParamsTab,
         ShowBodyTab,
-        // Response viewer
-        ToggleResponseView,
+        // Response sections. Three tabs now, so the same rule the request pane's comment
+        // above states applies here — `ToggleResponseView` was renamed rather than kept,
+        // because an action named "toggle" that cycles three ways is the stale-confident-name
+        // failure, and because clicking Timing from Body is two steps and a cycling handler
+        // would send the click to Headers.
+        NextResponseTab,
+        PrevResponseTab,
+        ShowResponseBody,
+        ShowResponseHeaders,
+        ShowResponseTiming,
         FindInResponse,
         FindNext,
         FindPrev,

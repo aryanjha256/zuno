@@ -43,5 +43,8 @@ pub use request::{
     Body, FormField, Header, Method, MultipartField, MultipartValue, QueryParam, RawKind,
     RequestId, RequestSettings, RequestSpec, label_for,
 };
-pub use response::{HttpVersion, ResponseData, SizeInfo, StatusClass, Timing};
+pub use response::{
+    Connection, HttpVersion, Phase, PhaseKind, ResponseData, SizeInfo, StatusClass, Timing,
+    axis_ticks,
+};
 pub use search::Hits;

@@ -11,8 +11,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use zuno_core::{
-    Body, Engine, EngineError, Event, Header, Method, MultipartField, MultipartValue, RawKind,
-    RequestSpec,
+    Body, Connection, Engine, EngineError, Event, Header, Method, MultipartField, MultipartValue,
+    PhaseKind, RawKind, RequestSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -764,4 +764,196 @@ fn a_multipart_body_goes_out_with_a_boundary_and_both_part_kinds() {
     assert!(request.contains("PNGDATA"), "the file's bytes are missing:\n{request}");
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Connection timing — what the waterfall is drawn from
+// ---------------------------------------------------------------------------
+
+/// Accept **one** connection and answer two requests on it, keep-alive.
+///
+/// The opposite of `serve_twice_setting_a_cookie`, which sends `Connection: close` and so hands
+/// each request a socket of its own. Here the whole point is that the *second* request finds the
+/// first one's socket in the pool, which is the state `Connection::Pooled` describes.
+///
+/// It yields **how many requests it served**, and that number is the load-bearing half of the
+/// pooled assertion: only one `accept` happens, so "served 2" is independent proof that both
+/// requests travelled over one socket. Reading our own probe back would prove only that the
+/// probe agrees with itself.
+fn serve_twice_on_one_connection() -> (String, JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let handle = std::thread::spawn(move || {
+        let Some(mut stream) = accept_before(&listener, SERVER_DEADLINE) else {
+            return 0;
+        };
+
+        let mut served = 0;
+        for _ in 0..2 {
+            let request = read_request(&mut stream);
+            if request.is_empty() {
+                break;
+            }
+            // Deliberately **no** `Connection: close`: closing after the first response is
+            // exactly what would push the client onto a second socket and make this test
+            // pass against a probe that never reports `Pooled` at all.
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: application/json\r\n\
+                      Content-Length: 2\r\n\
+                      \r\n\
+                      {}",
+                )
+                .is_err()
+            {
+                break;
+            }
+            let _ = stream.flush();
+            served += 1;
+        }
+        served
+    });
+
+    (format!("http://{addr}"), handle)
+}
+
+/// Serve one request on a listener bound to `localhost`, so the client has a **name** to
+/// resolve rather than an IP literal.
+///
+/// Bound by name rather than to `127.0.0.1` on purpose: whatever `localhost` resolves to on
+/// this machine is what we are listening on, so the test does not depend on whether `::1` or
+/// `127.0.0.1` comes back first. No network either — this is `getaddrinfo` against
+/// `/etc/hosts`, so it is as hermetic as the rest of the file.
+fn serve_once_by_name() -> Option<(String, JoinHandle<String>)> {
+    let listener = TcpListener::bind("localhost:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+
+    let handle = std::thread::spawn(move || {
+        let Some(mut stream) = accept_before(&listener, SERVER_DEADLINE) else {
+            return String::new();
+        };
+        let request = read_request(&mut stream);
+        let _ = stream.write_all(OK_JSON.as_bytes());
+        let _ = stream.flush();
+        request
+    });
+
+    Some((format!("http://localhost:{port}"), handle))
+}
+
+fn done_response(events: &[Event]) -> &zuno_core::ResponseData {
+    match events.iter().find(|event| event.is_terminal()) {
+        Some(Event::Done { response, .. }) => response,
+        other => panic!("expected a Done event, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_fresh_connection_reports_the_socket_it_opened() {
+    // The first half of the waterfall's data, and it was hardcoded `None` from M1.2 until the
+    // Timing tab wanted it. `dns` is `None` because the URL is an IP literal and hyper skips
+    // resolution entirely for those — a different fact from "resolved instantly", which is
+    // why `Connection` distinguishes them.
+    let (base, server) = serve_once(OK_JSON);
+    let engine = Engine::new().expect("engine");
+
+    let events = drain(&engine.send(spec_for(format!("{base}/health"))).1);
+    let _ = server.join();
+
+    let timing = done_response(&events).timing;
+    let Connection::Opened { dns, sockets, .. } = timing.connection else {
+        panic!("a first request cannot have come from the pool: {timing:?}");
+    };
+
+    assert_eq!(dns, None, "an IP literal is not resolved");
+    assert_eq!(sockets, 1);
+
+    // And the phases the pane draws describe one timeline over this real response.
+    let phases = timing.phases();
+    assert_eq!(
+        phases.iter().map(|p| p.kind).collect::<Vec<_>>(),
+        vec![PhaseKind::Connect, PhaseKind::Wait, PhaseKind::Download],
+        "no DNS bar for an IP literal"
+    );
+    assert_eq!(phases.last().unwrap().end(), timing.total);
+}
+
+#[test]
+fn a_second_request_reuses_its_socket_and_says_so() {
+    // **The distinction the whole `Connection` type exists for.** A resend travels on the
+    // pooled socket, so there was no lookup and no handshake — and drawing those as zero-width
+    // bars would assert they happened and took no time.
+    //
+    // Both requests go through one `Engine`, so they share the `ClientKey`'s client and
+    // therefore its pool. That sharing is what makes resend feel instant (§10 M1.2) and it is
+    // also what makes this state the common one rather than an edge case.
+    let (base, server) = serve_twice_on_one_connection();
+    let engine = Engine::new().expect("engine");
+
+    let first = drain(&engine.send(spec_for(format!("{base}/one"))).1);
+    // Drained to completion above, so the connection is back in the pool before this starts.
+    let second = drain(&engine.send(spec_for(format!("{base}/two"))).1);
+
+    assert_eq!(
+        server.join().expect("server thread"),
+        2,
+        "the server accepted once and served twice, or this test is not about pooling"
+    );
+
+    assert!(
+        matches!(
+            done_response(&first).timing.connection,
+            Connection::Opened { sockets: 1, .. }
+        ),
+        "{:?}",
+        done_response(&first).timing
+    );
+
+    let timing = done_response(&second).timing;
+    assert_eq!(
+        timing.connection,
+        Connection::Pooled,
+        "the second request opened nothing, so it must not report a handshake: {timing:?}"
+    );
+    assert_eq!(
+        timing.phases().iter().map(|p| p.kind).collect::<Vec<_>>(),
+        vec![PhaseKind::Wait, PhaseKind::Download],
+        "a pooled connection has two phases, not four with two empty"
+    );
+}
+
+#[test]
+fn resolving_a_hostname_is_reported_as_a_dns_phase() {
+    // The resolver half of the probe. Asserted as `is_some` and never as `> 0`: a warm
+    // `/etc/hosts` lookup can genuinely land inside a nanosecond, and a test that demands a
+    // positive duration would fail for being fast.
+    let Some((base, server)) = serve_once_by_name() else {
+        // A machine with no usable `localhost` is not a failure of this code.
+        eprintln!("skipping: cannot bind localhost");
+        return;
+    };
+    let engine = Engine::new().expect("engine");
+
+    let events = drain(&engine.send(spec_for(format!("{base}/health"))).1);
+    let request = server.join().expect("server thread");
+    assert!(
+        request.starts_with("GET /health"),
+        "the request never arrived, so there is no timing to check:\n{request}"
+    );
+
+    let timing = done_response(&events).timing;
+    let Connection::Opened { dns, .. } = timing.connection else {
+        panic!("a first request cannot have come from the pool: {timing:?}");
+    };
+
+    assert!(
+        dns.is_some(),
+        "a hostname must record a lookup, even an instant one: {timing:?}"
+    );
+    assert!(
+        timing.phases().iter().any(|p| p.kind == PhaseKind::Dns),
+        "and it must reach the phases the pane draws: {timing:?}"
+    );
 }

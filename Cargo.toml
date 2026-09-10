@@ -66,3 +66,11 @@ trash = { version = "5", default-features = false }
 # Grapheme-aware cursor movement. Already in the tree via gpui, so this pins the
 # same version rather than adding a second copy.
 unicode-segmentation = "1.13"
+
+# The two tower traits, and only those two, for the connector layer that times a
+# connection (`core/src/engine/probe.rs`). `tower` itself would work and is also already in
+# the tree, but these are what it re-exports and they carry no features to choose. Both are
+# already in `Cargo.lock` at 0.3.3 via reqwest, so declaring them adds **no** crate to the
+# graph — verified with `cargo info`, per invariant 5, rather than written from memory.
+tower-layer = "0.3.3"
+tower-service = "0.3.3"

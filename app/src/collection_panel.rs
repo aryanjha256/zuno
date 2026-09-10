@@ -17,9 +17,10 @@
 //! layout (architecture.md §6).
 
 use gpui::{
-    Context, Div, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
-    uniform_list,
+    AppContext as _, ClickEvent, Context, Div, DragMoveEvent, Empty, Entity, InteractiveElement,
+    IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
+    Window, div, px, uniform_list,
 };
 use zuno_core::Method;
 use zuno_core::collection::{Node, NodeKind};
@@ -51,12 +52,49 @@ const METHOD_WIDTH: f32 = 38.0;
 /// The title strip's height. Named because the workspace menu anchors just below it.
 pub const HEADER_HEIGHT: f32 = 28.0;
 
-/// The panel's width.
+/// The panel's width when nothing has resized it, and where a double-click on the handle
+/// returns it to. Also what a pre-v5 session adopts — `session.rs` imports this one rather
+/// than restating the number.
+pub const DEFAULT_WIDTH: f32 = 232.0;
+
+/// The narrowest useful panel.
 ///
-/// Fixed rather than resizable, and that is a deliberate limitation rather than an oversight:
-/// a drag handle means a stored width, a minimum, and a pointer mode, to serve a preference
-/// nobody has expressed yet. Revisit when someone asks.
-pub const WIDTH: f32 = 232.0;
+/// Not arbitrary: `CHEVRON + GLYPH_WIDTH + METHOD_WIDTH` is 68px of fixed columns before a
+/// name starts, plus the list's own padding, so much below this and every row is chrome with
+/// an ellipsis after it. A resize that can reach a useless width is a resize you can get
+/// stuck in.
+const MIN_WIDTH: f32 = 180.0;
+
+/// The widest the panel may get, whatever the window.
+///
+/// Two ceilings, and the *lower* wins. The absolute one is because past this the panel stops
+/// being a sidebar; the proportional one is because a fixed maximum on a narrow window still
+/// leaves the request pane unusable.
+const MAX_WIDTH: f32 = 600.0;
+const MAX_FRACTION: f32 = 0.5;
+
+/// The grab strip, wider than the seam it sits on so it can actually be hit with a pointer.
+///
+/// Straddles the border rather than sitting beside it, which is why it costs no layout: it is
+/// absolutely positioned over the boundary, ~2px into the panel and ~2px into the pane. A
+/// gutter that consumed its own width would take those pixels from one side or the other.
+const HANDLE_WIDTH: f32 = 5.0;
+
+/// Clamp a desired panel width into what the window can actually accommodate.
+///
+/// **Applied at render, not only while dragging**, and that is the whole reason it is a
+/// function rather than two `min` calls inside the drag handler. A width is stored unclamped
+/// and the ceiling moves with the window, so a 600px panel restored onto a 500px screen — or
+/// a window dragged narrow after the fact — has to be reined in on the frame that draws it.
+/// Clamping only on input leaves the panel eating the request pane with no way to notice.
+///
+/// A viewport narrow enough that `MIN_WIDTH` alone exceeds the fraction resolves to
+/// `MIN_WIDTH`: at that size something has to overflow, and the panel being unreadable is
+/// worse than the panes being cramped.
+pub fn clamp_width(desired: f32, viewport_width: f32) -> f32 {
+    let ceiling = MAX_WIDTH.min(viewport_width * MAX_FRACTION);
+    desired.clamp(MIN_WIDTH, ceiling.max(MIN_WIDTH))
+}
 
 pub fn render(
     workspace: &Workspace,
@@ -83,6 +121,9 @@ pub fn render(
     // so `cx.listener` is unavailable inside it and the entity has to be captured instead —
     // the same shape the response body's rows use.
     let entity = cx.entity();
+    // Captured for the rows rather than read inside the closure: a `uniform_list` render closure
+    // gets a bare `&mut App` and cannot reach the entity's own state.
+    let width = workspace.clamped_panel_width(window);
 
     let list = uniform_list("collection-tree", count, move |range, _window, _cx| {
         range
@@ -110,6 +151,7 @@ pub fn render(
                     expanded,
                     selection == Some(row_ix),
                     renaming.as_ref().filter(|(ix, _)| *ix == row_ix).map(|(_, i)| i.clone()),
+                    width,
                     &row_theme,
                     entity.clone(),
                 )
@@ -137,7 +179,7 @@ pub fn render(
         .flex()
         .flex_col()
         .flex_none()
-        .w(px(WIDTH))
+        .w(px(width))
         .h_full()
         .overflow_hidden()
         .bg(theme.bg_panel)
@@ -146,6 +188,113 @@ pub fn render(
         .child(header(workspace, theme, cx))
         .child(list)
         .children(empty_notice(workspace, theme))
+}
+
+/// The panel width a pointer at `pointer_x` is asking for.
+///
+/// **Absolute, not a delta, and that distinction is a bug fix rather than a preference.** The
+/// first version added `pointer_x - handle_center_x` to the panel's *current* width, which
+/// reads as self-correcting and is not: `handle_center_x` comes from `hitbox.bounds`, written
+/// during the last frame's prepaint, while the current width has already been updated by every
+/// earlier event in the same batch. A mouse reporting at 500Hz against a 60Hz window delivers
+/// six or seven moves per frame, and each one added the *whole* travel again, measured from a
+/// reference that had not moved. The frame then painted the overshoot, the next batch measured
+/// back from there and yanked it in — an oscillation, which is why it presented as the panel
+/// showing two widths at once rather than as a wrong number.
+///
+/// Pairing `handle_center_x` with `painted_width` — the width those same bounds were laid out
+/// at — recovers the row's left edge, which does not move during a drag. Every event in a
+/// batch then computes the same answer from the same pointer, so the function is **idempotent**,
+/// and that is what `applying_the_same_drag_event_twice_does_not_move_the_panel_twice` pins.
+///
+/// **Not testable end-to-end**: `VisualTestContext::simulate_event` calls `run_until_parked`
+/// after every event, so the harness repaints between moves and the stale-bounds condition
+/// cannot occur; `test_window`, the only way in below that, is `pub(crate)` to gpui. A burst
+/// test was written and passed against the bug, exactly as CLAUDE.md's Lessons section warns.
+fn width_from_drag(pointer_x: f32, handle_center_x: f32, painted_width: f32) -> f32 {
+    // The handle is centred on the panel's right edge, so this is the panel's left edge.
+    let panel_left = handle_center_x - painted_width;
+    pointer_x - panel_left
+}
+
+/// The payload that marks a resize in flight.
+///
+/// A type rather than a `bool` on `Workspace` because `on_drag_move` dispatches on the
+/// dragged value's `TypeId`, so this *is* the drag's identity — and gpui clears
+/// `active_drag` itself on mouse-up, which means there is no end-of-drag flag to forget to
+/// reset.
+struct ResizePanel;
+
+/// The seam between the panel and the panes, as a grab handle.
+///
+/// **Absolutely positioned rather than a sibling in the flex row**, so it costs no layout:
+/// it straddles the boundary, half over the panel's own border and half over the pane, and
+/// neither side gives up width for it. A gutter wide enough to hit would otherwise have to
+/// take its pixels from one of them.
+///
+/// **Emitted last in the row**, because paint order is what decides hit-testing between
+/// overlapping siblings — the same reason `chrome.rs` paints its resize corners last.
+///
+/// The drag itself goes through `on_drag`/`on_drag_move` rather than the obvious
+/// `on_mouse_down` + `on_mouse_move` pair, and that is not a style preference: a `div`'s
+/// move listener is gated on `hitbox.is_hovered`, so the drag would die the moment the
+/// pointer outran this 5px strip — which a fast drag does within one frame. `on_drag_move`
+/// fires in the capture phase for every move anywhere in the window while a `ResizePanel`
+/// drag is live, which is what gpui's own doc comment recommends it for.
+pub fn resize_handle(
+    workspace: &Workspace,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let width = workspace.clamped_panel_width(window);
+    // Nothing else in the app calls `on_drag`, so an active drag is *this* drag. Read rather
+    // than stored, which is what keeps it honest: the flag cannot outlive the gesture.
+    let dragging = cx.has_active_drag();
+
+    // Invisible at rest — the panel's own border is what shows through, focus colour and all.
+    // Hover and drag override it, because hover is transient and only appears while the
+    // pointer is on the seam, while focus stays legible on the panel's other three edges.
+    let line = if dragging { theme.accent } else { gpui::transparent_black() };
+
+    div()
+        .id("collection-resize-handle")
+        .debug_selector(|| "collection-resize-handle".to_string())
+        .group("panel-resize")
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(width - HANDLE_WIDTH / 2.0))
+        .w(px(HANDLE_WIDTH))
+        .flex()
+        .justify_center()
+        .cursor_col_resize()
+        .on_drag(ResizePanel, |_, _, _, cx| cx.new(|_| Empty))
+        .on_drag_move(cx.listener(
+            move |workspace, event: &DragMoveEvent<ResizePanel>, _window, cx| {
+                // `width` is captured, not re-read, and that pairing is the entire fix — see
+                // `width_from_drag`. These bounds were painted at that width, and reading a
+                // fresher one here is what made the panel flicker.
+                let desired = width_from_drag(
+                    f32::from(event.event.position.x),
+                    f32::from(event.bounds.center().x),
+                    width,
+                );
+                workspace.set_panel_width(desired, cx);
+            },
+        ))
+        .on_click(cx.listener(|workspace, event: &ClickEvent, _window, cx| {
+            if event.click_count() == 2 {
+                workspace.set_panel_width(DEFAULT_WIDTH, cx);
+            }
+        }))
+        .child(
+            div()
+                .w(px(2.0))
+                .h_full()
+                .bg(line)
+                .group_hover("panel-resize", |style| style.bg(theme.accent)),
+        )
 }
 
 /// The title strip. Names the collection's own directory rather than saying "Collection",
@@ -313,13 +462,17 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
 ///
 /// `5.95` is `TAB_LABEL_WIDTH / TAB_LABEL_CHARS` — the same measured advance the tab strip is
 /// tuned to, since both draw `text_xs` in the UI font.
-pub(crate) fn name_budget(depth: u16, is_directory: bool) -> usize {
+///
+/// Takes the panel's width rather than reading `DEFAULT_WIDTH`, because the panel is resizable:
+/// a budget pinned to the default would keep putting a tooltip on names that plainly fit once
+/// someone widened the panel, which is the exact noise the tooltip guard exists to avoid.
+pub(crate) fn name_budget(panel_width: f32, depth: u16, is_directory: bool) -> usize {
     // 6 left pad, the chevron column, two 4px gaps, the kind column, 8 right pad. A folder's
     // kind column is the glyph's own width, so a folder name has more room than a request's —
     // which is the trade for the glyph sitting beside its name instead of a column away.
     let kind = if is_directory { GLYPH_WIDTH } else { METHOD_WIDTH };
     let chrome = 6. + CHEVRON + 4. + kind + 4. + 8. + f32::from(depth) * INDENT;
-    (((WIDTH - chrome) / 5.95).max(0.)) as usize
+    (((panel_width - chrome) / 5.95).max(0.)) as usize
 }
 
 /// The method's name. Replaced a pictograph per method, whose worst arm was a trash can for
@@ -368,13 +521,14 @@ fn glyph_cell() -> Div {
 /// already read in full is noise, and the panel would have one on every row.
 fn name_cell(
     name: &str,
+    panel_width: f32,
     depth: u16,
     is_directory: bool,
     color: gpui::Hsla,
     row_ix: usize,
 ) -> gpui::Stateful<Div> {
     let full = SharedString::from(name.to_string());
-    let overflows = name.chars().count() > name_budget(depth, is_directory);
+    let overflows = name.chars().count() > name_budget(panel_width, depth, is_directory);
 
     let mut cell = div()
         // `tooltip` lives on `StatefulInteractiveElement`, so the cell needs an id — which is
@@ -400,6 +554,7 @@ fn row(
     expanded: bool,
     selected: bool,
     renaming: Option<Entity<crate::input::TextInput>>,
+    panel_width: f32,
     theme: &Theme,
     workspace: Entity<Workspace>,
 ) -> Div {
@@ -493,7 +648,7 @@ fn row(
                     .overflow_hidden()
                     .child(input)
                     .into_any_element(),
-                None => name_cell(&node.name, node.depth, true, theme.text, row_ix)
+                None => name_cell(&node.name, panel_width, node.depth, true, theme.text, row_ix)
                     .into_any_element(),
             }),
         NodeKind::Request { method, .. } => row
@@ -513,6 +668,7 @@ fn row(
                     .into_any_element(),
                 None => name_cell(
                     &node.name,
+                    panel_width,
                     node.depth,
                     false,
                     theme.text_muted,
@@ -527,13 +683,87 @@ fn row(
 mod tests {
     use super::*;
 
+    /// A wide window, so `MAX_FRACTION` is not the binding constraint.
+    const WIDE: f32 = 1600.0;
+
+    /// Pins the mapping, **not** the flicker.
+    ///
+    /// Worth being exact, because the honest version of this comment is less flattering than
+    /// the one first written here: the shipped bug lived in *which width the handler read*, not
+    /// in this arithmetic, so extracting the function removed it by construction and no
+    /// assertion below can fail against it. What these two do catch is a wrong formula — losing
+    /// `painted_width`, or measuring from the seam instead of the panel's left edge. The
+    /// `DEFAULT_WIDTH`-instead-of-`painted_width` variant escapes them both, and is caught
+    /// end-to-end by the *second* drag in `dragging_the_seam_widens_the_collection_panel`.
+    #[test]
+    fn applying_the_same_drag_event_twice_does_not_move_the_panel_twice() {
+        // A panel painted 232 wide whose seam is therefore at x=340: the row starts at 108.
+        let (center, painted) = (340.0, DEFAULT_WIDTH);
+        let first = width_from_drag(440.0, center, painted);
+        let again = width_from_drag(440.0, center, painted);
+
+        assert_eq!(first, 332.0, "a pointer 100px right of the seam asks for 100px more panel");
+        assert_eq!(first, again, "and asking twice from the same frame must not ask for 200");
+    }
+
+    #[test]
+    fn a_drag_width_follows_the_pointer_rather_than_the_path_taken_to_it() {
+        // Same destination, reached in one hop or three. A batch of moves within one frame all
+        // carry the same stale `center`, so the last one has to win outright.
+        let (center, painted) = (340.0, DEFAULT_WIDTH);
+        let direct = width_from_drag(500.0, center, painted);
+        let stepped = [380.0, 460.0, 500.0]
+            .into_iter()
+            .map(|x| width_from_drag(x, center, painted))
+            .last()
+            .expect("three steps");
+
+        assert_eq!(direct, stepped);
+    }
+
+    #[test]
+    fn the_clamp_holds_the_panel_between_its_floor_and_its_ceiling() {
+        assert_eq!(clamp_width(DEFAULT_WIDTH, WIDE), DEFAULT_WIDTH, "untouched");
+        assert_eq!(clamp_width(40.0, WIDE), MIN_WIDTH, "a drag past the floor stops");
+        assert_eq!(
+            clamp_width(5_000.0, WIDE),
+            MAX_WIDTH,
+            "and one past the absolute ceiling stops there"
+        );
+    }
+
+    #[test]
+    fn a_narrow_window_lowers_the_ceiling_below_the_absolute_one() {
+        // The half that only a *stored* width exercises: 600 was legal on the monitor it was
+        // set on, and this session is now open on a 900px window. Without the proportional
+        // ceiling the panel would take two thirds of it and leave the request pane unusable —
+        // and because the clamp runs at render, merely dragging the window narrower is enough
+        // to trigger this with no resize of the panel at all.
+        assert_eq!(clamp_width(MAX_WIDTH, 900.0), 450.0);
+        assert!(
+            clamp_width(MAX_WIDTH, 900.0) < MAX_WIDTH,
+            "the window, not the constant, is what binds here"
+        );
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_both_limits_keeps_the_panel_readable() {
+        // Below ~360px the fraction wants a panel narrower than `MIN_WIDTH`, and the two
+        // limits contradict each other. The floor wins: at that size something must overflow,
+        // and a panel of pure chrome is worse than cramped panes. Asserted because the naive
+        // `min(MAX, fraction)` reading of it produces a *negative* clamp range and panics in
+        // `f32::clamp`.
+        assert_eq!(clamp_width(DEFAULT_WIDTH, 200.0), MIN_WIDTH);
+        assert_eq!(clamp_width(10.0, 0.0), MIN_WIDTH, "and a zero viewport is survivable");
+    }
+
     #[test]
     fn the_name_budget_shrinks_with_depth_and_stays_sane() {
         // Decides whether a row gets a hover tooltip, so both failure modes are silent: a budget
         // of zero puts one on every row, and an enormous one puts it on none. A bounded range is
         // the only assertion that catches either — the same shape as the response viewer's
         // `the_widest_row_can_actually_be_reached`.
-        let root = name_budget(0, false);
+        let root = name_budget(DEFAULT_WIDTH, 0, false);
         assert!(
             (20..=32).contains(&root),
             "a root-level name should fit roughly 30 characters, got {root}"
@@ -541,9 +771,9 @@ mod tests {
 
         // Each level of nesting costs `INDENT`, which is about two characters.
         for depth in 1..6u16 {
-            let deeper = name_budget(depth, false);
+            let deeper = name_budget(DEFAULT_WIDTH, depth, false);
             assert!(
-                deeper < name_budget(depth - 1, false),
+                deeper < name_budget(DEFAULT_WIDTH, depth - 1, false),
                 "depth {depth} must have less room than depth {}",
                 depth - 1
             );
@@ -553,7 +783,7 @@ mod tests {
         // A folder's glyph column is narrower than a request's method column, so its name has
         // more room. Asserted rather than assumed: the two used to be equal, and a reader
         // comparing them is the only way to notice the columns diverged.
-        assert!(name_budget(2, true) > name_budget(2, false));
+        assert!(name_budget(DEFAULT_WIDTH, 2, true) > name_budget(DEFAULT_WIDTH, 2, false));
     }
 
     #[test]

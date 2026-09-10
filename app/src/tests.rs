@@ -102,6 +102,140 @@ async fn the_registry_resolves_the_active_workspace_into_root_and_session(cx: &m
     let _ = std::fs::remove_dir_all(&config);
 }
 
+/// Asserted against the **panel's own bounds**, not against a stored number.
+///
+/// The width goes through `clamp_width` and then through layout, so `panel_width` growing by
+/// 100 proves only that a field was written — it would hold with the panel still rendering at
+/// `DEFAULT_WIDTH`, which is the whole class of weak assertion CLAUDE.md's Lessons section is
+/// about. What a person notices is the panel getting wider, so that is what this reads.
+///
+/// **Two moves, not one, and that is gpui's contract rather than a flake.** The first move past
+/// `DRAG_THRESHOLD` is what *starts* the drag: it runs in the bubble phase and sets
+/// `active_drag`, while `on_drag_move` is a capture-phase listener that has already run and
+/// found nothing. Only the second move is delivered as a drag.
+#[gpui::test]
+async fn dragging_the_seam_widens_the_collection_panel(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("panel-resize");
+    let (_window, _v, mut cx) = boot(cx, Some(session.clone()), Some(root));
+
+    let before = cx
+        .debug_bounds("collection-panel")
+        .expect("the panel is showing by default");
+    let handle = cx
+        .debug_bounds("collection-resize-handle")
+        .expect("a visible panel has a seam to grab");
+
+    let grab = handle.center();
+    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+    for step in [20.0, 100.0] {
+        cx.simulate_mouse_move(
+            gpui::point(grab.x + gpui::px(step), grab.y),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+    }
+    cx.simulate_mouse_up(
+        gpui::point(grab.x + gpui::px(100.), grab.y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let after = cx
+        .debug_bounds("collection-panel")
+        .expect("the panel is still showing");
+    let grew = f32::from(after.size.width) - f32::from(before.size.width);
+    assert!(
+        (grew - 100.0).abs() < 2.0,
+        "the panel should follow the pointer: grew by {grew}px, wanted ~100"
+    );
+
+    // **A second drag, from a width that is no longer the default.** The handler recovers the
+    // row's left edge by subtracting the *painted* width from the seam's position, and on the
+    // first drag those two are the same number — so a version that subtracted `DEFAULT_WIDTH`
+    // instead passed every assertion above and every other test in this file. Only a drag that
+    // starts somewhere else can tell them apart, which is also the gesture anyone resizing
+    // twice in a row performs.
+    let seam = cx.debug_bounds("collection-resize-handle").expect("the seam moved with it");
+    let grab = seam.center();
+    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+    for step in [-20.0, -60.0] {
+        cx.simulate_mouse_move(
+            gpui::point(grab.x + gpui::px(step), grab.y),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+    }
+    cx.simulate_mouse_up(
+        gpui::point(grab.x + gpui::px(-60.), grab.y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let narrowed = cx.debug_bounds("collection-panel").expect("still showing").size.width;
+    let shrank = f32::from(after.size.width) - f32::from(narrowed);
+    assert!(
+        (shrank - 60.0).abs() < 2.0,
+        "dragging 60px back from a non-default width must narrow it by 60, not {shrank}"
+    );
+}
+
+/// The escape hatch from a width you regret, and the reason the reset target is a named
+/// constant rather than a literal at the call site.
+#[gpui::test]
+async fn double_clicking_the_seam_restores_the_default_width(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("panel-reset");
+    let (_window, _v, mut cx) = boot(cx, Some(session.clone()), Some(root));
+
+    let handle = cx.debug_bounds("collection-resize-handle").expect("a seam to grab");
+    let grab = handle.center();
+    cx.simulate_mouse_down(grab, gpui::MouseButton::Left, gpui::Modifiers::default());
+    for step in [20.0, 140.0] {
+        cx.simulate_mouse_move(
+            gpui::point(grab.x + gpui::px(step), grab.y),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+    }
+    cx.simulate_mouse_up(
+        gpui::point(grab.x + gpui::px(140.), grab.y),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    let widened = cx.debug_bounds("collection-panel").expect("still showing").size.width;
+    assert!(
+        f32::from(widened) > crate::collection_panel::DEFAULT_WIDTH + 50.0,
+        "the drag has to actually move it, or the reset below proves nothing"
+    );
+
+    // The handle has moved with the panel, so re-read it rather than reusing `grab`.
+    let moved = cx.debug_bounds("collection-resize-handle").expect("a seam to grab");
+    cx.simulate_event(gpui::MouseDownEvent {
+        position: moved.center(),
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Left,
+        click_count: 2,
+        first_mouse: false,
+    });
+    cx.simulate_event(gpui::MouseUpEvent {
+        position: moved.center(),
+        modifiers: gpui::Modifiers::default(),
+        button: gpui::MouseButton::Left,
+        click_count: 2,
+    });
+    cx.run_until_parked();
+
+    let reset = cx.debug_bounds("collection-panel").expect("still showing").size.width;
+    assert!(
+        (f32::from(reset) - crate::collection_panel::DEFAULT_WIDTH).abs() < 2.0,
+        "a double-click returns the panel to {}px, got {reset:?}",
+        crate::collection_panel::DEFAULT_WIDTH
+    );
+}
+
 #[gpui::test]
 async fn clicking_the_workspace_header_offers_all_four_verbs(cx: &mut TestAppContext) {
     // The four workspace verbs shipped with a palette row each and *one* mouse path between
@@ -2492,6 +2626,7 @@ async fn every_saved_buffer_is_restored_not_just_the_active_one(cx: &mut TestApp
         1, // not 0, so ignoring `active` fails the test rather than passing by luck
         None,
         true,
+        crate::collection_panel::DEFAULT_WIDTH,
     );
     std::fs::write(&path, serde_json::to_vec(&session).expect("serialize")).expect("write");
 
@@ -4133,22 +4268,33 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     cx.simulate_keystrokes("alt-r");
     assert_eq!(
         response_view(&view, &mut cx),
-        ResponseView::Body,
-        "one action for two tabs means it has to cycle back"
+        ResponseView::Timing,
+        "the Timing tab is the third stop, not a replacement for one of the first two"
     );
+
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(
+        response_view(&view, &mut cx),
+        ResponseView::Body,
+        "and the cycle wraps"
+    );
+
+    // Backwards, which is the half `alt-shift-r` exists for: from Body, one step back is the
+    // last tab rather than an error or a no-op.
+    cx.simulate_keystrokes("alt-shift-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
 }
 
 #[gpui::test]
 async fn clicking_the_headers_tab_switches_the_response_view(cx: &mut TestAppContext) {
-    // What this proves: the tab is painted once a response lands, and clicking it is wired to
-    // something. That catches a dead control, which is worth having.
+    // **This test could not discriminate until the third tab arrived, and now it can.** With
+    // two tabs and one cycling action, a click that dispatched and a click that called the view
+    // directly ended in the same state — so the previous version of this comment recorded that
+    // the convention was held by review rather than by the assertion.
     //
-    // What it does **not** prove, though a first draft of this comment claimed it did: that the
-    // tab dispatches `ToggleResponseView` rather than calling the view directly. Checked by
-    // replacing the dispatch with a direct call — the test still passed, because with two tabs
-    // and a cycling action both routes end in the same state. The body-kind chip's click test
-    // *can* discriminate only because there, cycling and opening a picker have visibly
-    // different outcomes. Here the convention is held by review, not by this assertion.
+    // Timing is two steps from Body, so a cycling handler lands on Headers and the last block
+    // below fails with exactly that. Verified by reverting `view_tab` to dispatch
+    // `NextResponseTab` for every tab.
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
@@ -4181,6 +4327,86 @@ async fn clicking_the_headers_tab_switches_the_response_view(cx: &mut TestAppCon
         .expect("the Body tab should still be painted");
     cx.simulate_click(body_tab.center(), gpui::Modifiers::default());
     assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
+
+    // The discriminating half: two steps away, so cycling cannot fake it.
+    let timing_tab = cx
+        .debug_bounds("response-tab-timing")
+        .expect("the Timing tab should be painted once a response has landed");
+    cx.simulate_click(timing_tab.center(), gpui::Modifiers::default());
+    assert_eq!(
+        response_view(&view, &mut cx),
+        ResponseView::Timing,
+        "clicking a tab two steps away must land on it, not one step along the cycle"
+    );
+}
+
+#[gpui::test]
+async fn a_send_through_the_app_reports_a_measured_connection(cx: &mut TestAppContext) {
+    // **What this adds over the core socket tests**, which drive `Engine::send` directly: that
+    // the probe survives the whole app path — the engine global, `SendRequest`, and the event
+    // loop that folds `Done` into the view. The Timing tab has nothing to draw if the
+    // measurement is lost anywhere along it, and the failure would be a chart of two bars that
+    // looks exactly like a legitimately pooled connection.
+    //
+    // Break-tested by removing `.dns_resolver(..)` and `.connector_layer(..)` from
+    // `build_client`, which turns this into `Connection::Pooled` and fails here.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+
+    let timing = cx
+        .update(|_, cx| view.read(cx).response.as_ref().map(|r| r.timing))
+        .expect("a response");
+
+    assert!(
+        matches!(
+            timing.connection,
+            zuno_core::Connection::Opened { sockets: 1, .. }
+        ),
+        "a first send opens one socket and must say so: {timing:?}"
+    );
+    // And the phases reach the shape the pane draws, over a real response rather than a
+    // hand-built `Timing`.
+    assert_eq!(
+        timing.phases().last().map(|phase| phase.end()),
+        Some(timing.total),
+        "the bars have to fill the track they are measured against: {timing:?}"
+    );
+}
+
+#[gpui::test]
+async fn the_timing_tab_draws_a_row_for_each_phase(cx: &mut TestAppContext) {
+    // Paired with `phases_are_contiguous_and_sum_to_the_total` in core, which pins *how many*
+    // phases there are and what they contain. This is the other half: that the tab turns them
+    // into rows at all rather than rendering an empty container.
+    //
+    // Asserted with `is_some`, never `is_none` — `debug_bounds` reads the last rendered frame
+    // and a removed element keeps its entry until another is drawn, so absence proves nothing
+    // (CLAUDE.md). That is also why this does not try to assert the rows are *gone* on the
+    // Body tab.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, "{}")]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("alt-r alt-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("response-timing").is_some(),
+        "the timing region should be painted on its own tab"
+    );
+    assert!(
+        cx.debug_bounds("phase-row").is_some(),
+        "and it should hold phase rows rather than an empty container"
+    );
 }
 
 #[gpui::test]

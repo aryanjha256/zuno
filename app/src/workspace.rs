@@ -39,7 +39,8 @@ use crate::actions::{
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
-    ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleResponseView, ToggleRow, ToggleTheme, UnfoldAll,
+    ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
@@ -56,7 +57,7 @@ use crate::engine::ActiveEngine;
 use crate::context_menu;
 use crate::picker;
 use crate::settings_panel::{Scope, SettingsEvent, SettingsPanel};
-use crate::request_view::{BodyType, RequestTab, RequestView, RowKind};
+use crate::request_view::{BodyType, RequestTab, RequestView, ResponseView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
 pub struct Workspace {
@@ -119,6 +120,13 @@ pub struct Workspace {
     /// the old message claimed the second while the truth was the first.
     pub(crate) tree_skipped: usize,
     pub(crate) panel_visible: bool,
+    /// The panel's width as the user left it, **unclamped**.
+    ///
+    /// Stored raw and clamped at read through `clamped_panel_width`, because the ceiling
+    /// depends on the window: clamping on the way in would permanently shrink a width just
+    /// because the window happened to be narrow when it was set, and the user would find it
+    /// changed after maximizing.
+    panel_width: f32,
     /// **An index into `tree`, not into `tree_visible`.** Folding rewrites `tree_visible`
     /// underneath the selection, so a visible index would silently retarget it at whatever
     /// row slid into that slot — the lesson the response viewer's row cursor already records
@@ -283,6 +291,7 @@ impl Workspace {
         let active_ix = session.active;
         let environment = session.environment.clone();
         let session_panel = session.collection_panel;
+        let session_width = session.panel_width;
         let views: Vec<_> = session
             .tabs
             .into_iter()
@@ -339,6 +348,7 @@ impl Workspace {
             tree_scanned: false,
             tree_skipped: 0,
             panel_visible: session_panel,
+            panel_width: session_width,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
             panel_focus: cx.focus_handle(),
@@ -466,6 +476,7 @@ impl Workspace {
         self.environment = session.environment;
         self.globals_active = globals_has_values(cx);
         self.panel_visible = session.collection_panel;
+        self.panel_width = session.panel_width;
 
         // Every handle into the old buffers is dead, so focus has to move or the keymap goes
         // with them. `activate` is the one funnel that does both.
@@ -906,6 +917,32 @@ impl Workspace {
 
     // --- The collection panel -------------------------------------------------------------
 
+    /// The panel's width as it should actually be drawn this frame.
+    ///
+    /// The clamp lives here rather than at the drag, so a stored width that no longer fits —
+    /// restored onto a smaller screen, or a window since dragged narrow — is reined in on the
+    /// frame that draws it instead of eating the request pane until someone resizes the panel
+    /// again. Every reader goes through this: the panel, the handle, and the menu anchor.
+    pub(crate) fn clamped_panel_width(&self, window: &Window) -> f32 {
+        crate::collection_panel::clamp_width(
+            self.panel_width,
+            f32::from(window.viewport_size().width),
+        )
+    }
+
+    /// Set the panel's width from a drag, or reset it from a double-click.
+    ///
+    /// Stores the value **unclamped** — see the field's comment. The clamp is a function of the
+    /// window, and baking one window's ceiling into the stored number is how a width silently
+    /// shrinks for good.
+    pub(crate) fn set_panel_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        if self.panel_width == width {
+            return;
+        }
+        self.panel_width = width;
+        cx.notify();
+    }
+
     /// The collection root's own directory name, for the panel's title strip.
     pub(crate) fn collection_name(&self, cx: &App) -> Option<SharedString> {
         let root = crate::collections::root(cx)?;
@@ -1256,9 +1293,10 @@ impl Workspace {
     /// A right-click supplies the point. The `delete` key does not, so it falls back to a spot
     /// inside the panel — near enough to the tree to read as belonging to it, and `anchored()`
     /// flips the corner near a window edge on its own.
-    fn collection_menu_anchor(&self) -> gpui::Point<gpui::Pixels> {
-        self.collection_menu_at
-            .unwrap_or_else(|| gpui::point(px(crate::collection_panel::WIDTH * 0.5), px(160.)))
+    fn collection_menu_anchor(&self, window: &Window) -> gpui::Point<gpui::Pixels> {
+        self.collection_menu_at.unwrap_or_else(|| {
+            gpui::point(px(self.clamped_panel_width(window) * 0.5), px(160.))
+        })
     }
 
     /// The selected row, when it is a request. Directories are excluded deliberately:
@@ -1318,7 +1356,7 @@ impl Workspace {
         // `selected_request`, so the gesture a tree most invites was inert — and "New folder"
         // sat in a menu you could not reach with a folder selected.
         let directory = self.selection_is_directory();
-        let at = self.collection_menu_anchor();
+        let at = self.collection_menu_anchor(window);
         let focus = self.panel_focus.clone();
         let restore = Some(focus.clone());
 
@@ -1406,7 +1444,7 @@ impl Workspace {
         let name = node.name.clone();
         let directory = matches!(node.kind, NodeKind::Directory);
         let path = node.path.clone();
-        let at = self.collection_menu_anchor();
+        let at = self.collection_menu_anchor(window);
         let restore = Some(self.panel_focus.clone());
 
         // **A folder's prompt names the count.** "Delete billing?" with no number is how a
@@ -3408,6 +3446,7 @@ impl Workspace {
             self.active_ix,
             self.environment.clone(),
             self.panel_visible,
+            self.panel_width,
         )
     }
 
@@ -4202,15 +4241,44 @@ impl Workspace {
     ///
     /// On `Workspace` like every other handler, but the *state* is on the buffer — two
     /// requests open for different reasons shouldn't share a pane preference.
-    fn toggle_response_view(
+    fn next_response_tab(&mut self, _: &NextResponseTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_response_view(1, cx));
+        }
+    }
+
+    fn prev_response_tab(&mut self, _: &PrevResponseTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.cycle_response_view(-1, cx));
+        }
+    }
+
+    fn show_response_view(&mut self, view: ResponseView, cx: &mut Context<Self>) {
+        if let Some(active) = self.active() {
+            active.update(cx, |active, cx| active.show_response_view(view, cx));
+        }
+    }
+
+    fn show_response_body(&mut self, _: &ShowResponseBody, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_response_view(ResponseView::Body, cx);
+    }
+
+    fn show_response_headers(
         &mut self,
-        _: &ToggleResponseView,
+        _: &ShowResponseHeaders,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(view) = self.active() {
-            view.update(cx, |view, cx| view.toggle_response_view(cx));
-        }
+        self.show_response_view(ResponseView::Headers, cx);
+    }
+
+    fn show_response_timing(
+        &mut self,
+        _: &ShowResponseTiming,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_response_view(ResponseView::Timing, cx);
     }
 
     /// Open the find bar over the response body.
@@ -5042,7 +5110,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::add_multipart_field))
             .on_action(cx.listener(Self::import_curl))
             .on_action(cx.listener(Self::quit))
-            .on_action(cx.listener(Self::toggle_response_view))
+            .on_action(cx.listener(Self::next_response_tab))
+            .on_action(cx.listener(Self::prev_response_tab))
+            .on_action(cx.listener(Self::show_response_body))
+            .on_action(cx.listener(Self::show_response_headers))
+            .on_action(cx.listener(Self::show_response_timing))
             .on_action(cx.listener(Self::find_in_body))
             .on_action(cx.listener(Self::body_find_next))
             .on_action(cx.listener(Self::body_find_prev))
@@ -5109,6 +5181,10 @@ impl Render for Workspace {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
+                    // The frame the resize handle is positioned against. It is absolute rather
+                    // than a sibling in this row so that a strip wide enough to grab costs
+                    // neither the panel nor the panes any width.
+                    .relative()
                     // Panel first: it is leftmost, and paint order decides hit-testing between
                     // siblings.
                     .children(
@@ -5120,14 +5196,19 @@ impl Render for Workspace {
                             .flex_1()
                             .flex()
                             .flex_col()
-                            // The panel is a fixed width, so the panes are what must give when
+                            // The panel is `flex_none`, so the panes are what must give when
                             // the window narrows. Without this the column's content sets a floor
                             // and the two together overflow instead.
                             .min_w(px(0.))
                             .overflow_hidden()
                             .children(tab_strip(tabs, &theme, cx))
                             .children(self.active()),
-                    ),
+                    )
+                    // Last, so hit-testing gives the seam to the handle rather than to
+                    // whichever pane it overlaps.
+                    .children(self.panel_visible.then(|| {
+                        crate::collection_panel::resize_handle(self, &theme, window, cx)
+                    })),
             )
             .child(status_bar(
                 focused_region,

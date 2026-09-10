@@ -7747,6 +7747,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tower-layer",
+ "tower-service",
  "trash",
  "url",
 ]
