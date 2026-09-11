@@ -2417,6 +2417,84 @@ async fn a_freshly_loaded_request_is_clean_for_every_body_type(cx: &mut TestAppC
 }
 
 #[gpui::test]
+async fn the_certificates_panel_is_reachable_with_nothing_configured(cx: &mut TestAppContext) {
+    // The cold-start gap this was rebuilt to close: the first version showed a status chip only
+    // when a certificate was already configured, so with none there was no trace the feature
+    // existed at all. The lock is always in the titlebar, and it opens the panel.
+    let (window, _v, mut cx) = boot(cx, None, None);
+    cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
+    cx.run_until_parked();
+
+    let lock = cx
+        .debug_bounds("certificates")
+        .expect("the lock must be in the titlebar even with nothing configured");
+    cx.simulate_click(lock.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // Both choosers are offered, which is what makes an empty panel useful rather than a dead
+    // end. Row 0 is "None" for the identity.
+    assert!(cx.debug_bounds("cert-row-0").is_some(), "the identity radio");
+    assert!(cx.debug_bounds("cert-row-2").is_some(), "and both file choosers");
+
+    // Escape closes it and leaves the keymap alive — the modal moved focus to an element that
+    // is no longer painted, which is the half that dies silently.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(&mut cx, |workspace, _, _| !workspace.certs_open())
+            .expect("window")
+    );
+    cx.simulate_keystrokes("ctrl-t");
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.tab_count())
+            .expect("window"),
+        2,
+        "a binding still resolves after the panel closes"
+    );
+}
+
+#[gpui::test]
+async fn removing_the_active_identity_stops_presenting_it(cx: &mut TestAppContext) {
+    // The state with no way back: leaving `identity` naming a file that is no longer in the
+    // list would present a certificate the panel cannot show you.
+    let (_window, _v, mut cx) = boot(cx, None, None);
+    cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
+
+    let path = std::path::PathBuf::from("/keys/client.pem");
+    cx.update(|_, cx| {
+        crate::app_state::set_tls(
+            cx,
+            zuno_core::TlsFiles {
+                identity: Some(path.clone()),
+                identities: vec![path.clone()],
+                root_cas: vec![std::path::PathBuf::from("/keys/corp.pem")],
+            },
+        )
+    });
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Manage certificates");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // Row 1 is the saved identity: row 0 is "None".
+    let row = cx.debug_bounds("cert-remove-1").expect("its remove button");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let files = cx.update(|_, cx| crate::app_state::tls(cx));
+    assert!(files.identities.is_empty(), "removed from the list");
+    assert_eq!(files.identity, None, "and no longer presented");
+    assert_eq!(
+        files.root_cas.len(),
+        1,
+        "the issuers are a separate set and must not be touched"
+    );
+}
+
+#[gpui::test]
 async fn closing_a_batch_asks_once_for_all_the_dirty_ones(cx: &mut TestAppContext) {
     // **One prompt, not one per buffer.** Closing several tabs with three unsaved would
     // otherwise stack three modals with no way to see how many were coming — and the previous

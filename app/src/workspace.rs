@@ -42,6 +42,8 @@ use crate::actions::{
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
+    CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
+    ChooseRootCa, OpenCertificates,
     CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
@@ -148,6 +150,9 @@ pub struct Workspace {
     /// and the status bar asks this every frame. Same shape as `globals_active`.
     /// Where a tab was right-clicked. Taken by `OpenTabMenu`, so a stale anchor cannot place
     /// a later menu.
+    /// Held for the same reason `workspace_prompt` is: dropping the task cancels the dialog.
+    cert_prompt: Option<Task<()>>,
+    certs: Option<crate::cert_panel::CertPanel>,
     tab_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     system_proxy: Option<String>,
     pub(crate) tab_scroll: ScrollHandle,
@@ -376,6 +381,8 @@ impl Workspace {
             panel_width: session_width,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
+            cert_prompt: None,
+            certs: None,
             tab_menu_anchor: None,
             system_proxy: [
                 "HTTP_PROXY",
@@ -550,6 +557,7 @@ impl Workspace {
             || self.menu.is_some()
             || self.import.is_some()
             || self.close_confirm.is_some()
+            || self.certs.is_some()
             || self.new_workspace_panel.is_some()
             || self.environment_panel.is_some()
             || self.run.is_some()
@@ -711,6 +719,11 @@ impl Workspace {
     /// Reads the real state rather than the last painted frame: `cx.debug_bounds` reports what
     /// was drawn *previously*, so `is_none()` proves nothing about a row that has just been
     /// folded away — four context-menu tests already made that mistake.
+    #[cfg(test)]
+    pub(crate) fn certs_open(&self) -> bool {
+        self.certs.is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn tree_rows(&self) -> Vec<(u16, String, bool)> {
         self.tree_visible
@@ -3966,6 +3979,176 @@ impl Workspace {
         picker.update(cx, |picker, cx| picker.set_fallback(typed_proxy_row, cx));
     }
 
+    /// Pick a certificate file.
+    ///
+    /// A native dialog rather than the picker's typed-text row the proxy uses: a path is
+    /// something you browse to, and `prompt_for_paths` already backs binary bodies and
+    /// multipart parts. The cost is that the *selection* cannot be driven headlessly —
+    /// `prompt_for_paths` is `unimplemented!()` in the test platform — so what is asserted is
+    /// the layer below, that a chosen path reaches the client and a bad one is reported.
+    fn choose_cert(&mut self, identity: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(if identity {
+                "Choose a client certificate".into()
+            } else {
+                "Choose a root CA certificate".into()
+            }),
+        });
+
+        self.cert_prompt = Some(cx.spawn_in(window, async move |workspace, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            workspace
+                .update_in(cx, |workspace, _, cx| {
+                    let mut files = crate::app_state::tls(cx);
+                    if identity {
+                        // Chosen means active, and remembered so switching back needs no
+                        // second trip through the dialog.
+                        if !files.identities.contains(&path) {
+                            files.identities.push(path.clone());
+                        }
+                        files.identity = Some(path.clone());
+                    } else if !files.root_cas.contains(&path) {
+                        files.root_cas.push(path.clone());
+                    }
+                    crate::app_state::set_tls(cx, files);
+                    let name = cert_name(&path);
+                    workspace.set_status(&format!("Using {name}"), cx);
+                })
+                .ok();
+        }));
+    }
+
+    fn choose_client_cert(&mut self, _: &ChooseClientCert, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_cert(true, window, cx);
+    }
+
+    fn choose_root_ca(&mut self, _: &ChooseRootCa, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_cert(false, window, cx);
+    }
+
+    fn open_certificates(&mut self, _: &OpenCertificates, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let restore = Some(window.focused(cx).unwrap_or_else(|| self.focus_handle.clone()));
+        let panel = crate::cert_panel::CertPanel::new(restore, cx);
+        let focus = panel.focus_handle.clone();
+        self.certs = Some(panel);
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn certs_dismiss(&mut self, _: &CertsDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.certs.take() else { return };
+        if let Some(focus) = panel.restore_focus {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    fn certs_next(&mut self, _: &CertsNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_certs(1, cx);
+    }
+
+    fn certs_prev(&mut self, _: &CertsPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_certs(-1, cx);
+    }
+
+    fn step_certs(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let files = crate::app_state::tls(cx);
+        if let Some(panel) = self.certs.as_mut() {
+            panel.step(delta, &files);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_cert_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(panel) = self.certs.as_mut() {
+            panel.selected = ix;
+            cx.notify();
+        }
+    }
+
+    fn certs_confirm(&mut self, _: &CertsConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::cert_panel::Row;
+        let files = crate::app_state::tls(cx);
+        let Some(row) = self.certs.as_ref().and_then(|panel| panel.row(&files)) else {
+            return;
+        };
+
+        match row {
+            // Switching identity keeps the panel open: choosing is the thing you came to do and
+            // you may well want to look at the issuer list next.
+            Row::UseNoIdentity => {
+                let mut files = files;
+                files.identity = None;
+                crate::app_state::set_tls(cx, files);
+                cx.notify();
+            }
+            Row::UseIdentity(path) => {
+                let mut files = files;
+                files.identity = Some(path);
+                crate::app_state::set_tls(cx, files);
+                cx.notify();
+            }
+            // The dialog is modal to the OS, so the panel closes first rather than sitting
+            // behind it catching keys it can no longer see.
+            Row::ChooseIdentity => {
+                self.certs = None;
+                self.choose_cert(true, window, cx);
+            }
+            Row::ChooseRootCa => {
+                self.certs = None;
+                self.choose_cert(false, window, cx);
+            }
+            // Every issuer in the list is already in force, so there is nothing to confirm.
+            Row::RootCa(_) => {}
+        }
+    }
+
+    fn certs_remove(&mut self, _: &CertsRemove, _: &mut Window, cx: &mut Context<Self>) {
+        use crate::cert_panel::Row;
+        let files = crate::app_state::tls(cx);
+        let Some(row) = self.certs.as_ref().and_then(|panel| panel.row(&files)) else {
+            return;
+        };
+
+        let mut next = files;
+        match row {
+            Row::UseIdentity(path) => {
+                next.identities.retain(|saved| *saved != path);
+                // Removing the one being presented stops presenting it — leaving `identity`
+                // naming a file no longer in the list is a state with no way back to it.
+                if next.identity.as_deref() == Some(path.as_path()) {
+                    next.identity = None;
+                }
+            }
+            Row::RootCa(path) => next.root_cas.retain(|saved| *saved != path),
+            // Nothing to remove on a chooser or on "None".
+            Row::UseNoIdentity | Row::ChooseIdentity | Row::ChooseRootCa => return,
+        }
+
+        crate::app_state::set_tls(cx, next);
+        // Clamp: the list just got shorter.
+        let shorter = crate::app_state::tls(cx);
+        if let Some(panel) = self.certs.as_mut() {
+            let len = crate::cert_panel::CertPanel::rows(&shorter).len();
+            panel.selected = panel.selected.min(len.saturating_sub(1));
+        }
+        cx.notify();
+    }
+
     /// Forget a saved proxy. Mirrors `Forget workspace`: a verb of its own over a list of what
     /// can be removed, rather than a delete gesture the picker would have to learn.
     fn remove_proxy(&mut self, _: &RemoveProxy, window: &mut Window, cx: &mut Context<Self>) {
@@ -5406,6 +5589,8 @@ impl Render for Workspace {
         let focused_region = self.focused_region(window, cx);
         let status_message = self.status_message(cx);
         let cookies = self.cookies_enabled(cx);
+        let cert_files = crate::app_state::tls(cx);
+        let certs_active = !cert_files.is_empty();
         let proxy_badge = proxy_badge_label(
             &crate::app_state::proxy(cx),
             self.system_proxy.as_deref(),
@@ -5550,6 +5735,14 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::quit))
             .on_action(cx.listener(Self::set_proxy))
             .on_action(cx.listener(Self::remove_proxy))
+            .on_action(cx.listener(Self::choose_client_cert))
+            .on_action(cx.listener(Self::choose_root_ca))
+            .on_action(cx.listener(Self::open_certificates))
+            .on_action(cx.listener(Self::certs_dismiss))
+            .on_action(cx.listener(Self::certs_next))
+            .on_action(cx.listener(Self::certs_prev))
+            .on_action(cx.listener(Self::certs_confirm))
+            .on_action(cx.listener(Self::certs_remove))
             .on_action(cx.listener(Self::open_tab_menu))
             .on_action(cx.listener(Self::close_other_tabs))
             .on_action(cx.listener(Self::close_tabs_to_the_right))
@@ -5607,6 +5800,7 @@ impl Render for Workspace {
             .child(crate::chrome::titlebar(
                 title,
                 self.panel_visible,
+                certs_active,
                 &theme,
                 window,
             ))
@@ -5697,6 +5891,9 @@ impl Render for Workspace {
                     .as_ref()
                     .map(|state| crate::close_panel::render(state, &theme, cx)),
             )
+            .children(self.certs.as_ref().map(|panel| {
+                crate::cert_panel::render(panel, &cert_files, &theme, cx)
+            }))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
     }
@@ -6214,6 +6411,13 @@ fn format_bytes(bytes: u64) -> String {
 /// Returns `None` rather than offering a row that would fail: the engine rejects anything
 /// outside RFC 9110's `tchar` set with `InvalidMethod`, and offering `Use "foo bar"` only to
 /// fail at send is worse than not offering it.
+/// A certificate's filename, which is the only part of a long path worth a status chip.
+fn cert_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// What the status bar says about the proxy. **Always something.**
 ///
 /// It was `Option`, shown only when a proxy was in effect — so in the default state there was

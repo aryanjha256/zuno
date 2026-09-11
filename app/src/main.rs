@@ -9,6 +9,7 @@ mod timing;
 
 mod actions;
 mod body_view;
+mod cert_panel;
 mod chrome;
 mod app_state;
 mod close_panel;
@@ -50,6 +51,7 @@ use crate::actions::{
     OpenAppMenu, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
+    CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue,
     FindInBody, FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
@@ -118,6 +120,7 @@ fn main() {
         // setting the engine never heard about is a status bar naming a proxy nothing uses.
         if let Some(engine) = crate::engine::ActiveEngine::engine(cx as &gpui::App) {
             engine.set_proxy(app_state::proxy(cx));
+            engine.set_tls(app_state::tls(cx));
         }
         // Without this, closing the last window leaves the process running with nothing
         // on screen — GPUI does not quit on last-window-close by default. Quitting here
@@ -431,6 +434,11 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-up", FlowStepUp, Some("FlowPanel")),
         KeyBinding::new("alt-down", FlowStepDown, Some("FlowPanel")),
         KeyBinding::new("delete", FlowStepRemove, Some("FlowPanel")),
+        KeyBinding::new("enter", CertsConfirm, Some("CertPanel")),
+        KeyBinding::new("escape", CertsDismiss, Some("CertPanel")),
+        KeyBinding::new("down", CertsNext, Some("CertPanel")),
+        KeyBinding::new("up", CertsPrev, Some("CertPanel")),
+        KeyBinding::new("delete", CertsRemove, Some("CertPanel")),
         KeyBinding::new("enter", ConfirmClose, Some("CloseConfirm")),
         KeyBinding::new("escape", CancelClose, Some("CloseConfirm")),
         KeyBinding::new("right", CloseChoiceNext, Some("CloseConfirm")),

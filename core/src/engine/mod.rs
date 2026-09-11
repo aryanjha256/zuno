@@ -22,6 +22,7 @@ mod probe;
 mod run;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -67,6 +68,50 @@ pub enum ProxyMode {
     /// An explicit proxy. `ClientBuilder::proxy` clears `auto_sys_proxy` itself, so this needs
     /// no second call.
     Url(String),
+}
+
+/// Certificate files handed to every client.
+///
+/// **Paths, not bytes**, and app-level rather than per request for the reason `ProxyMode` is:
+/// these name files on this machine, so a `RequestSettings` field would write a path into every
+/// committed collection file and break on anyone else's clone.
+///
+/// A single PEM carrying both certificate and key, because that is the only shape our TLS
+/// backend accepts: `Identity::from_pem` is the sole constructor under `rustls`, while
+/// PKCS#12 and separate cert/key files are `native-tls` only. That constraint is convenient —
+/// PKCS#12 would mean storing its password.
+///
+/// **Known limitation:** the files are read when a client is built and the paths are what key
+/// the cache, so editing a certificate in place without changing its path keeps the old one
+/// until the setting is re-applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TlsFiles {
+    /// The identity being presented, if any. **One**, and that is TLS deciding rather than a
+    /// simplification: a handshake presents a single certificate, and reqwest takes one per
+    /// client. Choosing between several needs a rule for which to use per host, which is a
+    /// different feature.
+    #[serde(default)]
+    pub identity: Option<PathBuf>,
+    /// Identities the user has chosen before, so switching does not mean browsing again. Holds
+    /// `identity` too — the same shape the saved proxy list has.
+    #[serde(default)]
+    pub identities: Vec<PathBuf>,
+    /// Extra trusted issuers, **all active at once**.
+    ///
+    /// A set rather than one, because `add_root_certificate` is callable repeatedly and trust is
+    /// additive: a corporate CA *and* a staging CA is an ordinary thing to need. That asymmetry
+    /// with `identity` is why the panel draws two differently-shaped sections.
+    ///
+    /// Added to the defaults rather than replacing them, and the scalpel where
+    /// `verify_tls: false` is the sledgehammer: trusting one issuer is not trusting anything.
+    #[serde(default)]
+    pub root_cas: Vec<PathBuf>,
+}
+
+impl TlsFiles {
+    pub fn is_empty(&self) -> bool {
+        self.identity.is_none() && self.root_cas.is_empty()
+    }
 }
 
 impl ProxyMode {
@@ -178,6 +223,8 @@ enum Command {
     ClearCookies,
     /// Change where requests are routed. Future clients are built with it.
     SetProxy(ProxyMode),
+    /// Change which certificates future clients are built with.
+    SetTls(TlsFiles),
 }
 
 pub struct Engine {
@@ -264,6 +311,11 @@ impl Engine {
     pub fn set_proxy(&self, mode: ProxyMode) {
         let _ = self.commands.send(Command::SetProxy(mode));
     }
+
+    /// Build future clients with `files`. Same ordering guarantee as `set_proxy`.
+    pub fn set_tls(&self, files: TlsFiles) {
+        let _ = self.commands.send(Command::SetTls(files));
+    }
 }
 
 /// The engine thread's main loop.
@@ -287,6 +339,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut clients = ClientCache::default();
         let mut jobs: HashMap<JobId, tokio::task::JoinHandle<()>> = HashMap::new();
         let mut proxy = ProxyMode::default();
+        let mut tls = TlsFiles::default();
 
         while let Some(command) = commands.recv().await {
             // Opportunistic reaping: without this the map grows for the life of the
@@ -294,7 +347,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
             jobs.retain(|_, handle| !handle.is_finished());
 
             match command {
-                Command::Send { job, spec, events } => match clients.get(&spec.settings, &proxy) {
+                Command::Send { job, spec, events } => match clients.get(&spec.settings, &proxy, &tls) {
                     Ok(client) => {
                         jobs.insert(
                             job,
@@ -324,6 +377,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                 // No `clear()` needed: the mode is part of `ClientKey`, so a changed proxy
                 // simply misses the cache rather than relying on anyone remembering to evict.
                 Command::SetProxy(mode) => proxy = mode,
+                Command::SetTls(files) => tls = files,
             }
         }
     });
@@ -346,10 +400,13 @@ struct ClientKey {
     /// of a request. Keeping it out of `RequestSpec` is also what keeps a URL carrying
     /// `user:pass@` from being serialized into a committed collection file (invariant 10).
     proxy: ProxyMode,
+    /// In the key for the same reason the proxy is: a changed certificate must miss the cache
+    /// rather than leave every pooled client presenting the old one.
+    tls: TlsFiles,
 }
 
 impl ClientKey {
-    fn new(settings: &RequestSettings, proxy: &ProxyMode) -> Self {
+    fn new(settings: &RequestSettings, proxy: &ProxyMode, tls: &TlsFiles) -> Self {
         Self {
             verify_tls: settings.verify_tls,
             follow_redirects: settings.follow_redirects,
@@ -357,6 +414,7 @@ impl ClientKey {
             accept_encodings: settings.accept_encodings,
             cookie_store: settings.cookie_store,
             proxy: proxy.clone(),
+            tls: tls.clone(),
         }
     }
 }
@@ -381,8 +439,9 @@ impl ClientCache {
         &mut self,
         settings: &RequestSettings,
         proxy: &ProxyMode,
+        tls: &TlsFiles,
     ) -> Result<Client, EngineError> {
-        let key = ClientKey::new(settings, proxy);
+        let key = ClientKey::new(settings, proxy, tls);
 
         if let Some(client) = self.clients.get(&key) {
             return Ok(client.clone());
@@ -433,8 +492,38 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         ),
     };
 
+    // Read here rather than at send: a client is built once per distinct settings and reused.
+    // **Reported, not swallowed** — a certificate silently ignored means a request that fails
+    // its handshake for a reason nothing on screen explains.
+    let builder = match &key.tls.identity {
+        None => builder,
+        Some(path) => builder.identity(read_identity(path)?),
+    };
+    let mut builder = builder;
+    for path in &key.tls.root_cas {
+        builder = builder.add_root_certificate(read_root_ca(path)?);
+    }
+
     builder.build().map_err(|error| EngineError::Build {
         reason: error.to_string(),
+    })
+}
+
+fn read_identity(path: &std::path::Path) -> Result<reqwest::Identity, EngineError> {
+    let pem = std::fs::read(path).map_err(|error| EngineError::Build {
+        reason: format!("client certificate {}: {error}", path.display()),
+    })?;
+    reqwest::Identity::from_pem(&pem).map_err(|error| EngineError::Build {
+        reason: format!("client certificate {}: {error}", path.display()),
+    })
+}
+
+fn read_root_ca(path: &std::path::Path) -> Result<reqwest::Certificate, EngineError> {
+    let pem = std::fs::read(path).map_err(|error| EngineError::Build {
+        reason: format!("root certificate {}: {error}", path.display()),
+    })?;
+    reqwest::Certificate::from_pem(&pem).map_err(|error| EngineError::Build {
+        reason: format!("root certificate {}: {error}", path.display()),
     })
 }
 
@@ -467,14 +556,14 @@ mod tests {
         // (and with it, the connection pool).
         let system = ProxyMode::System;
         assert_eq!(
-            ClientKey::new(&a, &system),
-            ClientKey::new(&b, &system)
+            ClientKey::new(&a, &system, &TlsFiles::default()),
+            ClientKey::new(&b, &system, &TlsFiles::default())
         );
 
         b.verify_tls = false;
         assert_ne!(
-            ClientKey::new(&a, &system),
-            ClientKey::new(&b, &system)
+            ClientKey::new(&a, &system, &TlsFiles::default()),
+            ClientKey::new(&b, &system, &TlsFiles::default())
         );
     }
 
@@ -485,13 +574,90 @@ mod tests {
         // on screen would say so.
         let settings = RequestSettings::default();
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::System),
-            ClientKey::new(&settings, &ProxyMode::Off)
+            ClientKey::new(&settings, &ProxyMode::System, &TlsFiles::default()),
+            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default())
         );
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::Off),
-            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()))
+            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default()),
+            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()), &TlsFiles::default())
         );
+    }
+
+    #[test]
+    fn tls_files_report_whether_anything_is_configured() {
+        // What the titlebar icon reads to decide whether it is muted or lit. Either half alone
+        // counts: a root CA with no identity is still a certificate in force.
+        assert!(TlsFiles::default().is_empty());
+        assert!(
+            !TlsFiles {
+                identity: Some(PathBuf::from("/k/a.pem")),
+                ..TlsFiles::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TlsFiles {
+                root_cas: vec![PathBuf::from("/k/corp.pem")],
+                ..TlsFiles::default()
+            }
+            .is_empty()
+        );
+        // A remembered identity that is not the active one is not "in force".
+        assert!(
+            TlsFiles {
+                identities: vec![PathBuf::from("/k/a.pem")],
+                ..TlsFiles::default()
+            }
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn changing_a_certificate_misses_the_client_cache() {
+        let settings = RequestSettings::default();
+        let none = TlsFiles::default();
+        let with_identity = TlsFiles {
+            identity: Some(PathBuf::from("/tmp/a.pem")),
+            ..TlsFiles::default()
+        };
+        assert_ne!(
+            ClientKey::new(&settings, &ProxyMode::System, &none),
+            ClientKey::new(&settings, &ProxyMode::System, &with_identity)
+        );
+    }
+
+    #[test]
+    fn a_certificate_that_cannot_be_read_is_reported_rather_than_ignored() {
+        // The failure that matters. A cert silently dropped means a handshake that fails for a
+        // reason nothing on screen explains — so both a missing file and a malformed one have
+        // to name the path.
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/identity.pem");
+
+        let missing = ClientKey::new(
+            &RequestSettings::default(),
+            &ProxyMode::System,
+            &TlsFiles {
+                identity: Some(PathBuf::from("/definitely/not/here.pem")),
+                ..TlsFiles::default()
+            },
+        );
+        let error = build_client(&missing).expect_err("a missing certificate must fail");
+        assert!(
+            matches!(&error, EngineError::Build { reason } if reason.contains("not/here.pem")),
+            "{error:?}"
+        );
+
+        // And a real one builds, so the failure above is about the file and not about the path
+        // ever being honoured at all.
+        let ok = ClientKey::new(
+            &RequestSettings::default(),
+            &ProxyMode::System,
+            &TlsFiles {
+                identity: Some(PathBuf::from(fixture)),
+                ..TlsFiles::default()
+            },
+        );
+        assert!(build_client(&ok).is_ok(), "a valid PEM identity should build");
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub use environment::{Environment, EnvironmentError, Resolver};
 pub use import::{Import, ImportError, Imported};
 pub use curl::{CurlError, CurlImport};
 pub use diff::ResponseDiff;
-pub use engine::{Engine, EngineError, Event, JobId, ProxyMode};
+pub use engine::{Engine, EngineError, Event, JobId, ProxyMode, TlsFiles};
 pub use highlight::{Token, TokenKind};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;

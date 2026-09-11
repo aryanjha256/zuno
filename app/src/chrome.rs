@@ -35,6 +35,8 @@ pub const TITLEBAR_HEIGHT: f32 = 34.;
 pub fn titlebar(
     title: SharedString,
     panel_visible: bool,
+    // Whether any certificate is in force, which picks the lock's state below.
+    certs_active: bool,
     theme: &Theme,
     window: &Window,
 ) -> impl IntoElement {
@@ -181,6 +183,30 @@ pub fn titlebar(
                 // pane — that pane's gear edits the request in front of you, and a second gear
                 // there that rewrote app state was the version of this that needed a header and
                 // a row to explain itself.
+                // **Always here, lit or not.** A conditional badge was the first attempt and it
+                // meant that with nothing configured there was no trace the feature existed —
+                // the same cold-start gap the proxy badge had to be rebuilt to close. Two icons
+                // rather than two colours, which is the theme toggle's own trick: `icon_button`
+                // owns its colours, and an open padlock says "nothing in force" more plainly
+                // than a dimmer one.
+                .child(
+                    div().px_2().child(crate::ui::icon_button_tinted(
+                        "certificates",
+                        Icon::FileBadge,
+                        "Certificates",
+                        crate::actions::OpenCertificates,
+                        // One stable glyph, tinted when something is in force — the way
+                        // `cookies on` and the proxy chip already signal. A padlock said
+                        // "secure" rather than "certificate", and `LockOpen` at this size read
+                        // as a warning rather than as "nothing configured".
+                        if certs_active {
+                            theme.accent
+                        } else {
+                            theme.text_muted
+                        },
+                        theme,
+                    )),
+                )
                 .child(
                     div().px_2().child(crate::ui::icon_button(
                         "defaults-settings",

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
-use zuno_core::{ProxyMode, RequestSettings};
+use zuno_core::{ProxyMode, RequestSettings, TlsFiles};
 
 use crate::engine::ActiveEngine as _;
 use crate::theme::Appearance;
@@ -70,6 +70,9 @@ struct AppFile {
     /// away. A list, not a last-value: people have more than one and should not retype either.
     #[serde(default)]
     proxies: Vec<String>,
+    /// Certificate files. App-level for `proxy`'s reason: these name files on this machine.
+    #[serde(default)]
+    tls: TlsFiles,
 }
 
 pub struct AppState {
@@ -87,6 +90,7 @@ impl AppState {
             defaults: RequestSettings::default(),
             proxy: ProxyMode::default(),
             proxies: Vec::new(),
+            tls: TlsFiles::default(),
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.to_string()),
             workspaces: default_workspace
@@ -344,6 +348,7 @@ pub fn install_at(cx: &mut App, dir: Option<PathBuf>, workspaces: Vec<WorkspaceE
         defaults: RequestSettings::default(),
         proxy: ProxyMode::default(),
         proxies: Vec::new(),
+        tls: TlsFiles::default(),
         theme: Appearance::Dark,
         last: workspaces.first().map(|entry| entry.id.clone()),
         workspaces,
@@ -479,6 +484,32 @@ pub fn set_proxy(cx: &mut App, mode: ProxyMode) {
     save(cx);
 }
 
+/// The certificate files in use.
+pub fn tls(cx: &App) -> TlsFiles {
+    cx.try_global::<AppState>()
+        .map(|state| state.file.tls.clone())
+        .unwrap_or_default()
+}
+
+/// Change the certificate files, and tell the engine.
+///
+/// Both halves through one function, for `set_proxy`'s reason: a saved path the engine never
+/// heard about is a status chip naming a certificate nothing presents.
+pub fn set_tls(cx: &mut App, files: TlsFiles) {
+    if let Some(engine) = cx.engine() {
+        engine.set_tls(files.clone());
+    }
+    if cx.try_global::<AppState>().is_none() {
+        return;
+    }
+    let state = cx.global_mut::<AppState>();
+    if state.file.tls == files {
+        return;
+    }
+    state.file.tls = files;
+    save(cx);
+}
+
 /// Remember the theme across restarts. It was hardcoded to `Dark` at every startup, so
 /// `Ctrl+Shift+T` never survived one.
 pub fn set_theme(cx: &mut App, theme: Appearance) {
@@ -562,6 +593,7 @@ mod tests {
                 defaults: RequestSettings::default(),
                 proxy: ProxyMode::default(),
                 proxies: Vec::new(),
+                tls: TlsFiles::default(),
                 theme: Appearance::Dark,
                 last: Some("gone".into()),
                 workspaces: vec![WorkspaceEntry {
@@ -582,6 +614,7 @@ mod tests {
                 defaults: RequestSettings::default(),
                 proxy: ProxyMode::default(),
                 proxies: Vec::new(),
+                tls: TlsFiles::default(),
                 theme: Appearance::Dark,
                 last: None,
                 workspaces: Vec::new(),
@@ -599,6 +632,7 @@ mod tests {
             defaults: RequestSettings::default(),
             proxy: ProxyMode::default(),
             proxies: Vec::new(),
+            tls: TlsFiles::default(),
             theme: Appearance::Light,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![WorkspaceEntry {
@@ -640,6 +674,7 @@ mod tests {
             defaults: RequestSettings::default(),
             proxy: ProxyMode::default(),
             proxies: Vec::new(),
+            tls: TlsFiles::default(),
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![

@@ -83,6 +83,7 @@ pub enum Icon {
     LockOpen,
     Cookie,
     Waypoints,
+    FileBadge,
 }
 
 impl Icon {
@@ -100,6 +101,7 @@ impl Icon {
             Icon::Globe => "icons/globe.svg",
             Icon::Cookie => "icons/cookie.svg",
             Icon::Waypoints => "icons/waypoints.svg",
+            Icon::FileBadge => "icons/file-badge.svg",
             Icon::Eye => "icons/eye.svg",
             Icon::PlusCircle => "icons/plus-circle.svg",
             Icon::RotateCw => "icons/rotate-cw.svg",
@@ -147,6 +149,7 @@ impl Icon {
         Icon::Globe,
         Icon::Cookie,
         Icon::Waypoints,
+        Icon::FileBadge,
         Icon::Eye,
         Icon::PlusCircle,
         Icon::RotateCw,
@@ -195,6 +198,7 @@ impl AssetSource for Assets {
             "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
             "icons/cookie.svg" => include_bytes!("../assets/icons/cookie.svg"),
             "icons/waypoints.svg" => include_bytes!("../assets/icons/waypoints.svg"),
+            "icons/file-badge.svg" => include_bytes!("../assets/icons/file-badge.svg"),
             "icons/eye.svg" => include_bytes!("../assets/icons/eye.svg"),
             "icons/plus-circle.svg" => include_bytes!("../assets/icons/plus-circle.svg"),
             "icons/rotate-cw.svg" => include_bytes!("../assets/icons/rotate-cw.svg"),
@@ -359,6 +363,23 @@ pub(crate) fn glyph(icon: Icon, color: Hsla, hovered: Hsla, size: f32) -> Svg {
         .group_hover(ICON_GROUP, move |style| style.text_color(hovered))
 }
 
+/// `icon_button` in a caller-chosen colour.
+///
+/// Exists because `icon_button` fixes its own (`text_muted`, brightening to `text`), and the
+/// certificates button has to signal *state* rather than just be a button — accent when a
+/// certificate is in force. A sibling rather than a colour parameter on `icon_button` itself,
+/// which would churn every one of its call sites for one caller that needs it.
+pub fn icon_button_tinted<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    action: A,
+    tint: Hsla,
+    theme: &Theme,
+) -> impl IntoElement + use<A> {
+    button_in(id, icon, label, action, tint, theme)
+}
+
 /// An icon button that dispatches an action, with a tooltip naming its keystroke.
 ///
 /// Dispatches rather than calling anything directly, so the button and the keybinding are one verb
@@ -375,6 +396,19 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
     icon: Icon,
     label: &'static str,
     action: A,
+    theme: &Theme,
+) -> impl IntoElement + use<A> {
+    button_in(id, icon, label, action, theme.text_muted, theme)
+}
+
+/// The shared body. One place, so the stop-propagation rule and the tooltip cannot be present on
+/// one of the two and missing from the other.
+fn button_in<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    action: A,
+    tint: Hsla,
     theme: &Theme,
 ) -> impl IntoElement + use<A> {
     let tooltip_action = action.clone();
@@ -405,7 +439,7 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
                 window.dispatch_action(action.boxed_clone(), cx);
             },
         )
-        .child(glyph(icon, theme.text_muted, theme.text, GLYPH))
+        .child(glyph(icon, tint, theme.text, GLYPH))
 }
 
 /// A thin bar showing how far a horizontally scrollable list is scrolled, and how much it hides.
