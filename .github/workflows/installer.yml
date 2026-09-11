@@ -1,0 +1,96 @@
+name: Installer
+
+# `scripts/install.sh` is the advertised way in, and the only shipped artifact with no compiler
+# behind it — so it gets its own workflow rather than a job inside `rust.yml`.
+#
+# **Its own file because `paths:` is a workflow-level filter, not a job-level one.** Gating a
+# single job would need a third-party changed-files action; a separate workflow is native.
+#
+# **Gated, because this job is expensive and the script is not.** It ran on every push to main
+# for a while and re-verified an unchanged script against an unchanged release each time — one
+# of those runs exhausted a 15-minute budget and was cancelled. Shellcheck is gated too: linting
+# a file nobody touched tells you nothing.
+#
+# What it does *not* replace: `release.yml`'s `smoke`, which installs the genuinely published
+# artifact at tag time. This one is the pre-release half — a change to the script is exercised
+# before it can be tagged, which is the gap that let a broken checksum lookup reach users.
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "scripts/install.sh"
+      - ".github/workflows/installer.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "scripts/install.sh"
+      - ".github/workflows/installer.yml"
+
+jobs:
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=sh scripts/install.sh
+
+      # Ubuntu 22.04 is the floor the .deb claims (`libc6 (>= 2.35)`), so installing there
+      # proves the claim rather than trusting it. The container runs as root, which is also
+      # the sudo-less branch of `ensure_root`.
+      #
+      # Its own `timeout-minutes`, because a job-level one cannot say *which* phase stalled —
+      # the job that died here reported only "The operation was canceled".
+      - name: Install the latest release in a clean Ubuntu 22.04
+        timeout-minutes: 10
+        run: |
+          docker run --rm \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -v "$PWD/scripts/install.sh:/install.sh:ro" \
+            ubuntu:22.04 sh -c '
+              set -eux
+
+              # A container does not inherit the apt mirror of the runner that started it.
+              # GitHub hosted images rewrite sources.list to azure.archive.ubuntu.com, in the
+              # same datacentre; a stock ubuntu:22.04 ships plain archive.ubuntu.com, which is
+              # geo-routed and throttled from Azure. That difference is what made this step
+              # take five minutes on one run and time out on the next. It assumes a hosted
+              # runner, which is what we use; elsewhere this mirror would be the wrong choice.
+              #
+              # One line, no backslash continuation: this whole script is nested inside single
+              # quotes, and a continuation inside a nested double-quoted string is exactly the
+              # kind of quoting that already cost a red build here.
+              sed -i -e "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g" -e "s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g" /etc/apt/sources.list
+
+              # Deliberately not silenced. These two lines were `-qq >/dev/null`, so when they
+              # stalled the log showed nothing at all after the image pull and the failure was
+              # indistinguishable from a hang in the installer itself.
+              apt-get update
+              apt-get install -y curl ca-certificates
+
+              sh /install.sh
+
+              # Installed, and where the launcher looks. The .desktop filename must equal the
+              # app_id or Wayland shows a generic icon with no error anywhere.
+              # No `-f` format: `${Package}` inside double quotes is expanded by *this* shell,
+              # and under `set -eu` an unset parameter aborts the job.
+              dpkg-query -W zuno
+              test -x /usr/bin/zuno
+              test -f /usr/share/applications/dev.zuno.Zuno.desktop
+              test -f /usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg
+
+              # The update path. Re-running is what an existing user does, and it has to be a
+              # clean no-op rather than a reinstall or an error.
+              out=$(sh /install.sh 2>&1)
+              printf "%s\n" "$out"
+              case "$out" in
+                *"already the latest"*) echo "ok: re-run is a no-op" ;;
+                *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
+              esac
+            '

@@ -204,7 +204,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Its own `timeout-minutes`: a job-level one cannot say which phase stalled, and the
+      # twin of this step in `installer.yml` died reporting only "The operation was canceled".
       - name: Install the published release in a clean Ubuntu 22.04
+        timeout-minutes: 10
         env:
           # 22.04 is the floor the .deb claims (`libc6 (>= 2.35)`), so this also proves the
           # claim rather than trusting it.
@@ -213,11 +216,22 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           docker run --rm \
             -e "ZUNO_VERSION=$version" \
+            -e DEBIAN_FRONTEND=noninteractive \
             -v "$PWD/scripts/install.sh:/install.sh:ro" \
             "$IMAGE" sh -c '
-              set -eu
-              apt-get update -qq >/dev/null
-              apt-get install -y -qq curl ca-certificates >/dev/null
+              set -eux
+
+              # A container does not inherit the apt mirror of the runner that started it: a
+              # stock ubuntu:22.04 ships archive.ubuntu.com, which is geo-routed and throttled
+              # from Azure, while the hosted image uses azure.archive.ubuntu.com in the same
+              # datacentre. This step passed in five minutes on the run that gave the twin job
+              # a fifteen-minute timeout, which is the spread this removes.
+              sed -i -e "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g" -e "s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g" /etc/apt/sources.list
+
+              # Not silenced. As `-qq >/dev/null` these printed nothing at all while they
+              # stalled, so the log ended at the image pull and said nothing about the phase.
+              apt-get update
+              apt-get install -y curl ca-certificates
 
               sh /install.sh
 
@@ -225,9 +239,8 @@ jobs:
               # filename must equal the app_id or Wayland shows a generic icon with no
               # error anywhere, so it is asserted rather than assumed.
               # No `-f` format: `${Package}` inside double quotes is expanded by *this* shell,
-            # and under `set -eu` an unset parameter aborts the job. The default output is
-            # "zuno<TAB>version", which is all this needs.
-            dpkg-query -W zuno
+              # and under `set -eu` an unset parameter aborts the job.
+              dpkg-query -W zuno
               test -x /usr/bin/zuno
               test -f /usr/share/applications/dev.zuno.Zuno.desktop
               test -f /usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg
