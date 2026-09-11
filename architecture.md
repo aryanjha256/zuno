@@ -973,7 +973,8 @@ button, and one that opens wherever you clicked reads as a context menu.
 
 `app/src/context_menu.rs` is a **primitive**, not a response-pane feature, for principle 2's
 reason — saved requests want delete/rename, the tab strip wants close/rename, header rows want
-toggle/remove. It is also the first genuine consumer of `anchored()`, a question §12 left open
+toggle/remove. Two of those three have since arrived (§6a's row menu, §12's tab menu), which is
+the leverage that argument predicted; header rows still have none. It is also the first genuine consumer of `anchored()`, a question §12 left open
 twice: the picker chose modal, then the method dropdown turned out not to want anchoring either. A
 menu settles it, because appearing where you clicked *is* the feature.
 
@@ -2374,22 +2375,35 @@ Three consequences, each of which shortened the slice:
 toggles, a stepper and an action row — it holds **no `TextInput` at all** — and its arrow keys
 move between rows, so a URL field would have to fight that model. A proxy needs a URL.
 
-So it is the ninth `Target` on the picker, which already answers "pick one of these, or type your
-own": `System` and `Off` are rows, and `set_fallback` offers the typed text, exactly the trick
-that lets an unknown verb become `Method::Other`. `ProxyMode::from_input` decides whether the
-query could work — in core, where it is unit-tested — so the picker cannot offer a row that fails
-at the next send. It fills in a missing scheme, because `localhost:3128` is what people type, and
-it **refuses `socks5`**: a legal proxy scheme that reqwest rejects without its `socks` feature,
-so offering it would produce a mode that cannot send.
+So it is a `Target` on the picker, which already answers "pick one of these, or type your own":
+`System`, `Off` and **every proxy you have entered** are rows, and `set_fallback` offers the typed
+text — the trick that lets an unknown verb become `Method::Other`. `ProxyMode::from_input` decides
+whether the query could work, in core where it is unit-tested, so the picker cannot offer a row
+that fails at the next send. It fills in a missing scheme (`localhost:3128` is what people type)
+and **refuses `socks5`**, which reqwest rejects without its `socks` feature.
 
-Still no `PickerDelegate` trait. Nine consumers, all drawing as label plus dimmed detail.
+**The saved list was the correction that mattered.** The first build offered a URL row only while
+that proxy was *current*, so switching to System or Off deleted it and the only way back was
+retyping — losing a setting rather than changing one. `app.json` keeps the list; removal is its
+own verb (*Remove a saved proxy*), mirroring `Forget workspace`, because a picker is a chooser
+that closes and cannot express per-row deletion. Removing the one in use falls back to `System`,
+since a mode that is set but no longer offered has no way back to it.
+
+Still no `PickerDelegate` trait, at eleven consumers, all drawing as label plus dimmed detail.
 
 ### The badge is the half that earns it
 
 The switch says what *will* happen; the badge says what *is* happening, and the second is the
-whole reason this was worth fixing rather than documenting. `proxy_badge_label` is pure and shows
-a badge only when a proxy is actually in effect: nothing for `Off`, nothing for `System` with an
-empty environment — since those two behave identically — and always for an explicit URL. It takes
+whole reason this was worth fixing rather than documenting. `proxy_badge_label` is pure and
+**always returns something** — `proxy system`, `proxy off`, `proxy corp:3128`, or
+`proxy corp:3128 · env` when the environment is what supplied it, so "the mode is System" and "a
+proxy is actually being used" stay distinguishable.
+
+It was conditional at first, shown only when a proxy was in effect, which meant that from a cold
+start there was no badge and no hint the feature existed — reachable only by a palette row nobody
+would think to search for. That is the discoverability rule in §2 broken by the very thing meant
+to satisfy it, and it is the second time in this document that a conditional indicator had to be
+made permanent. It takes
 the environment's value as an argument rather than reading it, both so it is unit-testable and
 because `std::env::set_var` is `unsafe` under edition 2024 and racy across parallel tests. The
 env read itself happens **once at boot** and is cached on `Workspace`, the way `globals_active`
@@ -2415,6 +2429,64 @@ does for `trash`.
 `HTTPS` through a proxy is `CONNECT` plus a TLS tunnel, and is not driven at all — a socket test
 faking that would be asserting its own fixture. The configuration path is shared with HTTP, so
 what is untested is reqwest's tunnelling rather than Zuno's decision.
+
+---
+
+## 6j. Certificates — two halves that are not the same shape
+
+mTLS APIs were simply uncallable, and a private CA could only be reached by turning verification
+off entirely. Both are one `ClientBuilder` call, so they shipped together.
+
+**PEM only, and the backend decided that.** Under `rustls`, `Identity::from_pem` is the sole
+constructor — `from_pkcs12_der` and `from_pkcs8_pem` are `native-tls` only. One file carrying cert
+and key, no password, which conveniently means nothing secret lands in `app.json`.
+
+**The asymmetry is the whole design.** A client identity is *one*: a handshake presents a single
+certificate and reqwest takes one per client, so choosing among several would need a rule for
+which to use per host — a different feature. Trusted issuers are a *set*, all active, because
+`add_root_certificate` is repeatable and trust is additive; a corporate CA and a staging CA at
+once is ordinary. `cert_panel` draws two differently-shaped sections for exactly that reason — a
+radio and a list — since a flat list would hide the one thing a reader needs to understand.
+
+Identities are still kept as a list you switch between, the same correction the proxy needed:
+choosing remembers the path so switching back costs no second trip through the file dialog.
+
+App-level in `app.json`, for `ProxyMode`'s reason — these name files on this machine, so a
+`RequestSettings` field would write an absolute path into every committed collection file. In
+`ClientKey`, so a changed certificate misses the cache instead of leaving pooled clients
+presenting the old one. **Known limitation:** the paths key the cache and the files are read when
+a client is built, so editing a certificate in place without changing its path keeps the old one
+until the setting is re-applied.
+
+**A failure is reported, never swallowed** — a certificate silently dropped means a handshake
+failing for a reason nothing on screen explains. Both a missing file and a malformed one name the
+path.
+
+### The panel, and what it replaced
+
+`cert_panel` is a plain state struct with a render function rather than an `Entity`, the shape
+`close_panel` uses: it owns no text input, so its whole state is which row is selected, and the
+certificates are read from `app_state` at render time rather than mirrored. Rows carry a *path*
+rather than an index, so a list that changed under the selection cannot activate the wrong file.
+Removing the active identity also stops presenting it.
+
+The entry point is a permanent `file-badge` in the titlebar, tinted `accent` when anything is in
+force. It replaced a status chip that appeared **only when a certificate was already configured**
+— which is the cold-start gap this document has now recorded three times (§2's audit, the proxy
+badge above, and here), and the third time it was my repeating a mistake the section directly
+above it describes. A padlock was the first glyph and said "secure" rather than "certificate".
+
+The cost of the colour-only signal, stated: a colour-blind reader gets no "in force" cue from the
+icon, and the panel is the fallback that spells it out.
+
+### What is asserted
+
+A real generated PEM builds a client; a missing one errors with the path named; a changed
+certificate misses the cache. The **selection** cannot be driven headlessly —
+`prompt_for_paths` is `unimplemented!()` in the test platform, the same hole `reveal_path` and
+`open_with_system` sit in — so what is tested is everything below it. An actual mTLS handshake is
+not exercised: that needs a server demanding a client certificate, which is reqwest's behaviour
+rather than Zuno's decision.
 
 ---
 
@@ -3192,6 +3264,19 @@ convention. Stacked rather than chosen in Rust, since hover is a paint-time styl
 painted and only their colours move, which is also what keeps the label from shifting. It reuses
 `ICON_GROUP` — `GroupBounds::get` takes the innermost open group of a name and sibling tabs push
 and pop separately, so one constant is still per-tab and hovering one does not light up the rest.
+
+**The strip has a context menu**, the primitive's second consumer: Close, Close others, Close to
+the right, Close all, and Copy as curl. Right-click activates the tab first, so every row acts on
+the active buffer and `Close` needed no action of its own — the two steps the `×` and middle-click
+already take. Rows hide rather than grey when they would do nothing.
+
+Two things it forced. Targets are **entity ids resolved fresh**, not indices: every close
+renumbers `views`, so a stored list would aim at whatever slid into each slot. And `CloseConfirm`
+grew from one index to a set, because closing ten tabs with four unsaved would otherwise stack
+four modals with no way to see how many were coming — it asks **once**, naming the request when
+one is unsaved and counting them otherwise. A failed save keeps that buffer open, which is the
+single-buffer rule and matters more in a batch. `Ctrl+W` routes through the same path, so the
+prompt cannot behave differently depending on how many tabs you asked to close.
 
 *Still absent:* tab reordering and renaming. And the strip hides itself at one buffer, so a lone
 dirty buffer shows no dot — the prompt is what covers that case.

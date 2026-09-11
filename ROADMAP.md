@@ -33,9 +33,11 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   outline; and find-and-replace in the request body, which is what made `Ctrl+F` mean something
   everywhere rather than everywhere except the surface you type into; the **collection panel** —
   a browsable tree of what you have saved, which until then nothing in the app could show you.
-  Most recently the **timing timeline**, a third response tab breaking a request into DNS,
-  connect + TLS, waiting and download along one time axis — the first item on that audit where
-  the engine, not the UI, was the half that was missing.
+  The **timing timeline**, a third response tab breaking a request into DNS, connect + TLS,
+  waiting and download along one time axis — the first item on that audit where the engine, not
+  the UI, was the half that was missing. Then the **proxy** and **certificates**, which between
+  them are what makes Zuno usable on a corporate network at all; and a **tab context menu**,
+  which took the batch-close prompt with it.
 
   Adding to this list rather than leaving it is deliberate: the paragraph below is about this
   exact list going stale, and a slice that updates architecture.md and skips the file owning
@@ -552,7 +554,7 @@ cursors stayed separate, because a match and where you are standing are differen
   found missing from these documents entirely.
 
   Moved here from *Named, not planned*, where its write-up had been pasted into the middle of
-  that section's bullet list — splitting Scripting from Client certificates and presenting a
+  that section's bullet list — splitting it in two and presenting a
   shipped feature as an unplanned one. A formatting slip rather than a stale claim, and the same
   cost: a reader scanning for what is left found it under the heading that means "not
   committed".
@@ -585,6 +587,16 @@ cursors stayed separate, because a match and where you are standing are differen
   out (it holds no text input, so the picker took it as its ninth consumer), and curl gets no
   `-x` in either direction — for the reason the cookie jar gets no flag either. See
   architecture.md §6i.
+
+- **Certificates — done.** mTLS APIs were uncallable and a private CA could only be reached by
+  turning verification off entirely; both are now real, through a panel reached from a permanent
+  lock-shaped button in the titlebar. The design note worth keeping is that the two halves are
+  *not* the same shape — one identity at a time because a handshake presents one certificate,
+  but any number of trusted issuers at once because trust is additive. See architecture.md §6j.
+
+- **Tab context menu — done.** Right-click a tab for Close / Close others / Close to the right /
+  Close all / Copy as curl. It also closed the last data-loss shape in `Ctrl+W`'s family: closing
+  a batch now asks **once** about every unsaved buffer rather than per tab. See §12.
 
 - **The timing timeline — done, and it is the first item here where the *engine* was the
   missing half.** `Alt+R` reaches a third response tab showing where a request's time went: DNS,
@@ -834,10 +846,6 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
-- **Client certificates.** reqwest supports them. "`RequestSettings` has room" is what this
-  line used to say, which reads as though a field were already there — none is, and the proxy
-  slice suggests none should be: a certificate is a path on this machine, so it belongs in
-  `app.json` beside the proxy rather than in a committed request file (architecture.md §6i).
 - **Inline body diff.** The summary diff answers "did my change do anything?". A structural diff
   over `Row` spans is probably better than a text diff, now that the JSON outline exists.
 - **gRPC / WebSocket / SSE.** Each is a different transport and a different response viewer. Not
