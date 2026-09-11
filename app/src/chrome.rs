@@ -37,6 +37,8 @@ pub fn titlebar(
     panel_visible: bool,
     // Whether any certificate is in force, which picks the lock's state below.
     certs_active: bool,
+    // The release to offer, when the check found one that has not been dismissed.
+    update: Option<SharedString>,
     theme: &Theme,
     window: &Window,
 ) -> impl IntoElement {
@@ -189,6 +191,29 @@ pub fn titlebar(
                 // rather than two colours, which is the theme toggle's own trick: `icon_button`
                 // owns its colours, and an open padlock says "nothing in force" more plainly
                 // than a dimmer one.
+                // **The one conditional control in this row, and deliberately so.** Every
+                // other button here is permanent — see the certificate note below, which is
+                // about a capability you could not otherwise discover. This is not a
+                // capability, it is a *notice*: with nothing to update to there is nothing to
+                // discover, and `cookies on` already establishes the other half of the rule —
+                // "a badge that's always there stops being read". The always-available path is
+                // the palette's `Copy the Zuno install command`.
+                //
+                // First in the cluster, which is what makes it free: the group is `flex_none`
+                // inside a `justify_between` row, so it is pinned by its right edge and grows
+                // leftward. Adding a child *here* moves nothing; adding one at the end would
+                // shift the window controls out from under the pointer.
+                .children(update.map(|version| {
+                    div().px_2().child(crate::ui::icon_text_action(
+                        "update-available",
+                        crate::ui::Icon::Download,
+                        crate::update::badge_label(&version),
+                        "A new version of Zuno is available",
+                        crate::actions::OpenUpdateMenu,
+                        theme.accent,
+                        theme,
+                    ))
+                }))
                 .child(
                     div().px_2().child(crate::ui::icon_button_tinted(
                         "certificates",

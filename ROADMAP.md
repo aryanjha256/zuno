@@ -37,7 +37,12 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   waiting and download along one time axis — the first item on that audit where the engine, not
   the UI, was the half that was missing. Then the **proxy** and **certificates**, which between
   them are what makes Zuno usable on a corporate network at all; and a **tab context menu**,
-  which took the batch-close prompt with it.
+  which took the batch-close prompt with it. Then **distribution**, which is the first item in
+  this list that is not about the app at all: a single `curl | sh` that installs *and* updates
+  (one command, because `apt-get install ./file.deb` is already both), the checksums and the two
+  container smoke tests that keep it honest, and an update **notice** in the titlebar that copies
+  that command. Deliberately not an updater — see architecture.md §6k, where the password prompt
+  turns out to be a consequence of a *window* asking for root rather than a requirement.
 
   Adding to this list rather than leaving it is deliberate: the paragraph below is about this
   exact list going stale, and a slice that updates architecture.md and skips the file owning

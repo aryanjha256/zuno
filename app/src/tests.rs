@@ -11611,3 +11611,145 @@ async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext
 
     assert!(seen.len() > 30, "the list should be substantial: {}", seen.len());
 }
+
+// ---------------------------------------------------------------------------
+// The update notice
+//
+// Zuno never installs anything itself (see `update.rs`), so what has to work here is small and
+// entirely in what a person can *reach*: a chip that appears only when there is something to
+// say, a menu behind it, and a clipboard write they are told about. The network half is not
+// driven — the check is started from `main`, deliberately, so no test opens a socket to GitHub.
+
+/// The chip is conditional, so `affordances()` cannot cover it: that table renders the default
+/// state, where there is no update and the chip is correctly absent. Same reason the find bars
+/// have a test of their own.
+#[gpui::test]
+async fn the_update_chip_appears_only_when_there_is_an_update(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    let _ = &view;
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("update-available").is_none(),
+        "nothing has been checked yet, so there is nothing to offer"
+    );
+
+    // `Current` is its own state, and it must be as silent as `Unknown`.
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.set_update_for_test(crate::update::Update::Current, cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("update-available").is_none(),
+        "an up-to-date install must not advertise anything"
+    );
+
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.set_update_for_test(crate::update::Update::Available("9.9.9".into()), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("update-available").is_some(),
+        "a newer release must put the chip in the titlebar"
+    );
+}
+
+/// The chip is a control, not a decoration. Asserted through the menu actually opening, because
+/// a chip that paints and dispatches nothing looks identical — the dead-control shape this
+/// codebase keeps finding.
+#[gpui::test]
+async fn clicking_the_update_chip_opens_its_menu(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    let _ = &view;
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.set_update_for_test(crate::update::Update::Available("9.9.9".into()), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+
+    let chip = cx.debug_bounds("update-available").expect("the chip is painted");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.menu_open())
+            .expect("window"),
+        "clicking the chip must open the update menu"
+    );
+}
+
+/// The copy is the whole feature — Zuno hands over the command and the terminal does the rest.
+/// Asserted at the clipboard rather than at the action, and paired with the status line,
+/// because a clipboard write is invisible and without the message this reads as a dead control.
+#[gpui::test]
+async fn copying_the_install_command_puts_it_on_the_clipboard(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    let _ = &view;
+    cx.run_until_parked();
+
+    cx.dispatch_action(crate::actions::CopyInstallCommand);
+    cx.run_until_parked();
+
+    assert_eq!(
+        clipboard_text(&mut cx).as_deref(),
+        Some(crate::update::INSTALL_COMMAND),
+        "the command people actually run has to be what lands on the clipboard"
+    );
+    assert!(
+        window
+            .update(&mut cx, |workspace, _, cx| workspace
+                .status_for_test(cx)
+                .map(|status| status.to_string()))
+            .expect("window")
+            .is_some_and(|status| status.contains("terminal")),
+        "the copy has to say so, and has to say where to run it"
+    );
+}
+
+/// Dismissal stores the *version*, so it lapses on its own when a later release lands. Asserted
+/// in both directions: the same version stays hidden, a newer one comes back. A test of the
+/// first alone passes against a plain boolean flag, which is the shape that would strand
+/// someone on one release forever.
+#[gpui::test]
+async fn dismissing_an_update_hides_it_until_a_newer_one(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    let _ = &view;
+    // `boot` does not install the workspace registry, and the dismissal is stored in it — so
+    // without this the verb silently does nothing and the test reads as a product bug.
+    // `None` keeps the write in memory, per invariant 6.
+    cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.set_update_for_test(crate::update::Update::Available("9.9.9".into()), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("update-available").is_some());
+
+    cx.dispatch_action(crate::actions::DismissUpdate);
+    cx.run_until_parked();
+    assert_eq!(
+        window
+            .update(&mut cx, |workspace, _, cx| workspace.offered_update_for_test(cx))
+            .expect("window"),
+        None,
+        "a dismissed release must stop being offered"
+    );
+
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.set_update_for_test(crate::update::Update::Available("9.9.10".into()), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("update-available").is_some(),
+        "a release newer than the dismissed one must be offered again"
+    );
+}

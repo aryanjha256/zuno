@@ -109,6 +109,11 @@ pub fn palette() -> Vec<Command> {
         command("Copy response body", CopyResponse),
         command("Save response body to a file", SaveResponse),
         command("Copy request as a curl command", CopyAsCurl),
+        // Offered whether or not an update is pending: it is also how someone shares the
+        // install command with a colleague, and it is the one always-available path to the
+        // feature — the chip itself is conditional, because a badge that is always there
+        // stops being read.
+        command("Copy the Zuno install command", CopyInstallCommand),
         command("Show response history", ShowHistory),
         command("Show response body", ShowResponseBody),
         command("Show response headers", ShowResponseHeaders),
@@ -168,6 +173,11 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::CaptureValue", "acts on the selected response row"),
     ("zuno::AssertValue", "acts on the selected response row"),
     ("zuno::RunDismiss", "only valid while a run report is open"),
+    // The chip in the titlebar is the entry point, and it only exists when there is something
+    // to say. Same reasoning as `OpenAppMenu`: reaching a menu from the palette is backwards.
+    ("zuno::OpenUpdateMenu", "a menu reached from the palette is backwards"),
+    // Dismisses a notice the palette cannot show you, and means nothing when there isn't one.
+    ("zuno::DismissUpdate", "acts on a notice that may not be on screen"),
     // Only valid inside the flow editor, where each has a button.
     ("zuno::FlowNew", "only valid inside the flow editor"),
     ("zuno::FlowRename", "only valid inside the flow editor"),

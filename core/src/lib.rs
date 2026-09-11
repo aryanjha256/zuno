@@ -29,6 +29,7 @@ pub mod request;
 pub mod runner;
 pub mod response;
 pub mod search;
+pub mod version;
 
 pub use collection::CollectionError;
 pub use environment::{Environment, EnvironmentError, Resolver};

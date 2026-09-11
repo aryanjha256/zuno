@@ -13,7 +13,19 @@ collections stored as one file per request so they live in git like anything els
 
 ## Install
 
-Download the `.deb` from the [latest release](https://github.com/aryanjha256/zuno/releases/latest):
+```bash
+curl -fsSL https://raw.githubusercontent.com/aryanjha256/zuno/main/scripts/install.sh | sh
+```
+
+The same command installs Zuno and updates it — run it again whenever you want the latest.
+It downloads the `.deb` from the latest release, verifies its checksum, and hands it to
+`apt-get`, asking for `sudo` only at that last step. `ZUNO_VERSION=0.2.4` pins a specific
+release if you need to go back.
+
+<details>
+<summary>Or install the <code>.deb</code> by hand</summary>
+
+Download it from the [latest release](https://github.com/aryanjha256/zuno/releases/latest):
 
 ```bash
 sudo apt install ./zuno_*_amd64.deb
@@ -21,6 +33,8 @@ sudo apt install ./zuno_*_amd64.deb
 
 Use `apt install ./file.deb` rather than `dpkg -i` — apt resolves the runtime dependencies,
 `dpkg` does not.
+
+</details>
 
 **Requirements:** x86-64, and Ubuntu 22.04+ / Debian 12+ or a derivative (Mint, Pop!\_OS,
 elementary). Zuno renders through Vulkan, so on a machine with no GPU driver installed you

@@ -102,6 +102,18 @@ jobs:
           dpkg-deb --contents "$deb"
           echo "DEB_PATH=$deb" >> "$GITHUB_ENV"
 
+      # `scripts/install.sh` reads this file for two things, not one: the hash, and the
+      # asset's *real* filename. cargo-deb appends a Debian revision the git tag does not
+      # carry (`zuno_0.2.5-1_amd64.deb` for tag v0.2.5), so an installer that builds the
+      # name from the tag 404s on every download. Publishing the list means the name is
+      # read rather than guessed.
+      - name: Write the checksums
+        run: |
+          cd "$(dirname "$DEB_PATH")"
+          sha256sum ./*.deb > sha256sums.txt
+          cat sha256sums.txt
+          echo "SUMS_PATH=$PWD/sha256sums.txt" >> "$GITHUB_ENV"
+
       # The two dlopen'ed libraries cannot be detected by dpkg-shlibdeps, so they are
       # declared by hand in app/Cargo.toml. If someone removes them the package still
       # builds and installs, then dies at startup on a clean machine — so assert here
@@ -137,16 +149,27 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           {
-            echo '### Install'
+            echo '### Install or update'
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/aryanjha256/zuno/main/scripts/install.sh | sh'
+            echo '```'
+            echo
+            echo 'The same command does both — it installs Zuno if you do not have it and'
+            echo 'updates it if you do. It asks for sudo only to run `apt-get install`.'
+            echo
+            echo '<details><summary>Or install the .deb by hand</summary>'
             echo
             echo '```bash'
             echo 'sudo apt install ./zuno_*_amd64.deb'
             echo '```'
             echo
-            echo 'Requires Ubuntu 22.04+, Debian 12+, or a derivative, on x86-64.'
-            echo
             echo 'Use `apt install ./file.deb` rather than `dpkg -i`, so the runtime'
             echo 'dependencies are resolved for you.'
+            echo
+            echo '</details>'
+            echo
+            echo 'Requires Ubuntu 22.04+, Debian 12+, or a derivative, on x86-64.'
             echo
             echo 'Zuno renders through Vulkan. On a machine with no GPU driver present,'
             echo 'install `mesa-vulkan-drivers` as well.'
@@ -159,6 +182,56 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" \
+          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" "$SUMS_PATH" \
             --title "Zuno $GITHUB_REF_NAME" \
             --notes-file release-notes.md
+
+  # The installer is the only shipped artifact with no compiler behind it, and its failure
+  # mode is that it breaks *only for people who do not have Zuno yet* — precisely the
+  # population that cannot report it. So the published release is installed for real, in a
+  # clean container, before anyone else tries it.
+  #
+  # `needs: deb` and a tag guard, because it installs the release that job just published.
+  smoke:
+    needs: deb
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the published release in a clean Ubuntu 22.04
+        env:
+          # 22.04 is the floor the .deb claims (`libc6 (>= 2.35)`), so this also proves the
+          # claim rather than trusting it.
+          IMAGE: ubuntu:22.04
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker run --rm \
+            -e "ZUNO_VERSION=$version" \
+            -v "$PWD/scripts/install.sh:/install.sh:ro" \
+            "$IMAGE" sh -c '
+              set -eu
+              apt-get update -qq >/dev/null
+              apt-get install -y -qq curl ca-certificates >/dev/null
+
+              sh /install.sh
+
+              # Installed, and installed where the .desktop and the launcher expect. The
+              # filename must equal the app_id or Wayland shows a generic icon with no
+              # error anywhere, so it is asserted rather than assumed.
+              dpkg-query -W -f="${Package} ${Version}\n" zuno
+              test -x /usr/bin/zuno
+              test -f /usr/share/applications/dev.zuno.Zuno.desktop
+              test -f /usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg
+
+              # The update path: re-running is what an existing user does, and it has to be
+              # a clean no-op rather than a reinstall or an error.
+              out=$(sh /install.sh 2>&1)
+              printf "%s\n" "$out"
+              case "$out" in
+                *"already the latest"*) echo "ok: re-run is a no-op" ;;
+                *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
+              esac
+            '
+

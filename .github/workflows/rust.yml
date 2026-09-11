@@ -40,3 +40,52 @@ jobs:
         # step-level timeout says *which* phase stalled rather than just "the job did".
         timeout-minutes: 10
         run: cargo test --verbose
+
+  # The installer has no compiler behind it, so nothing else in this repo would notice it
+  # breaking — and it breaks only for people who do not have Zuno yet, who are exactly the
+  # people unable to report it. Run on every push rather than only at release time.
+  #
+  # Not redundant with release.yml's `smoke`, which points the other way: this checks the
+  # script against the *published* release, that one checks a *new* release against the
+  # script. A renamed asset fails there; a broken script fails here.
+  installer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --shell=sh scripts/install.sh
+
+      # Ubuntu 22.04 is the floor the .deb claims (`libc6 (>= 2.35)`), so installing there
+      # proves the claim rather than trusting it. The container runs as root, which is also
+      # the sudo-less branch of `ensure_root`.
+      - name: Install the latest release in a clean Ubuntu 22.04
+        run: |
+          docker run --rm -v "$PWD/scripts/install.sh:/install.sh:ro" ubuntu:22.04 sh -c '
+            set -eu
+            apt-get update -qq >/dev/null
+            apt-get install -y -qq curl ca-certificates >/dev/null
+
+            sh /install.sh
+
+            # Installed, and where the launcher looks. The .desktop filename must equal the
+            # app_id or Wayland shows a generic icon with no error anywhere.
+            dpkg-query -W -f="${Package} ${Version}\n" zuno
+            test -x /usr/bin/zuno
+            test -f /usr/share/applications/dev.zuno.Zuno.desktop
+            test -f /usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg
+
+            # The update path. Re-running is what an existing user does, and it has to be a
+            # clean no-op rather than a reinstall or an error.
+            out=$(sh /install.sh 2>&1)
+            printf "%s\n" "$out"
+            case "$out" in
+              *"already the latest"*) echo "ok: re-run is a no-op" ;;
+              *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
+            esac
+          '

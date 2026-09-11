@@ -26,6 +26,7 @@ use zuno_core::{
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
+    CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
     AddAssertion, AddCapture, AssertValue, CaptureValue, CycleAssertOp, EditEnvironments,
     EnvConfirm, EnvDismiss, EnvNewEnvironment, ShowAssertTab,
@@ -200,6 +201,10 @@ pub struct Workspace {
     flows: Option<FlowPanelState>,
     /// The folder dialog behind New and Open. Held because dropping the task cancels it.
     workspace_prompt: Option<Task<()>>,
+    /// What the release check found. See `update.rs` — it is a notice, never an installer.
+    update: crate::update::Update,
+    /// Held because dropping a `Task` cancels it.
+    update_task: Option<Task<()>>,
 }
 
 /// An in-progress inline rename.
@@ -411,6 +416,8 @@ impl Workspace {
             run: None,
             flows: None,
             workspace_prompt: None,
+            update: crate::update::Update::Unknown,
+            update_task: None,
         };
 
         // Off-thread and non-blocking, so a large collection cannot delay the first frame —
@@ -5189,6 +5196,149 @@ impl Workspace {
         self.show_menu(rows, at, restore, window, cx);
     }
 
+    /// Ask GitHub whether there is a newer release, once per launch.
+    ///
+    /// **Once per launch rather than on a stored timer.** A timestamp in `app.json` was the
+    /// first plan and buys very little: the endpoint is a redirect with no rate limit, so the
+    /// cost of asking is one small request per start. What it *would* buy is a wall clock in
+    /// the code path, and the test dispatcher runs a simulated one — so the throttle would be
+    /// the half no test could drive. The cost is stated: a window left open for a week does
+    /// not re-check.
+    ///
+    /// Silent in every failure. Offline, firewalled, answered with something unreadable — all
+    /// of them leave `Update::Unknown` and put nothing on screen.
+    pub fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        // An opt-out for anyone who would rather Zuno made no outbound request at start. An
+        // env var rather than a setting: the people who want this are the people already
+        // launching from a shell, and a toggle for it would need a home in a panel.
+        if std::env::var_os("ZUNO_NO_UPDATE_CHECK").is_some() {
+            return;
+        }
+        let Some(engine) = cx.engine() else { return };
+        let spec = crate::update::latest_request(crate::app_state::defaults(cx));
+        let (_job, events) = engine.send(spec);
+
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let mut found = None;
+            while let Ok(event) = events.recv().await {
+                match event {
+                    zuno_core::engine::Event::Done { response, .. } => {
+                        found = crate::update::tag_from_response(&response);
+                        break;
+                    }
+                    zuno_core::engine::Event::Failed { .. } => break,
+                    _ => {}
+                }
+            }
+            let _ = this.update(cx, |workspace, cx| {
+                let Some(latest) = found else { return };
+                workspace.update = if zuno_core::version::is_newer(&latest, crate::update::current())
+                {
+                    crate::update::Update::Available(latest)
+                } else {
+                    crate::update::Update::Current
+                };
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The version to put in the chip, or `None` for no chip at all.
+    fn offered_update(&self, cx: &App) -> Option<String> {
+        let dismissed = crate::app_state::dismissed_update(cx);
+        self.update
+            .offered(dismissed.as_deref())
+            .map(str::to_string)
+    }
+
+    /// The status line as rendered. A test asserting the clipboard alone cannot see whether the
+    /// copy announced itself, and an unannounced clipboard write is indistinguishable from a
+    /// dead control.
+    /// What the chip would show. Read by tests directly, because `debug_bounds` reads the
+    /// *last rendered frame* — a removed element keeps its entry until another frame is drawn,
+    /// so `is_none()` there is not evidence of anything (CLAUDE.md).
+    #[cfg(test)]
+    pub fn offered_update_for_test(&self, cx: &App) -> Option<String> {
+        self.offered_update(cx)
+    }
+
+    #[cfg(test)]
+    pub fn status_for_test(&self, cx: &App) -> Option<SharedString> {
+        self.status_message(cx)
+    }
+
+    #[cfg(test)]
+    pub fn set_update_for_test(&mut self, update: crate::update::Update, cx: &mut Context<Self>) {
+        self.update = update;
+        cx.notify();
+    }
+
+    fn open_update_menu(&mut self, _: &OpenUpdateMenu, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(version) = self.offered_update(cx) else {
+            return;
+        };
+        // The pointer's own position rather than one stashed at click time: `mouse_position`
+        // is already in window coordinates, which is what `anchored` wants, so the chip needs
+        // to carry nothing and there is no stale anchor to `take`. Pinned to just below the
+        // titlebar on y, so the menu drops out of the chrome the way the app menu does rather
+        // than overlapping the chip it came from.
+        let at = gpui::point(
+            window.mouse_position().x,
+            gpui::px(crate::chrome::TITLEBAR_HEIGHT),
+        );
+        use context_menu::{MenuItem, MenuRow};
+        // Both verbs are bound globally, so the context does not decide the lookup — but it
+        // still has to be *a* handle, and the chip belongs to the window rather than a pane.
+        let focus = self.focus_handle.clone();
+        // Two rows because there are two questions, and one click can only answer one: how do
+        // I update, and should I. The second is why this is a menu and not a single action.
+        let rows = vec![
+            MenuItem::new("Copy install command", CopyInstallCommand, &focus, window).into(),
+            MenuItem::url(
+                format!("What's new in {version}"),
+                "",
+                crate::update::RELEASES_URL,
+            )
+            .into(),
+            MenuRow::Separator,
+            MenuItem::new(
+                "Dismiss until the next release",
+                DismissUpdate,
+                &focus,
+                window,
+            )
+            .into(),
+        ];
+        let restore = self.active().map(|view| view.read(cx).url_focus(cx));
+        self.show_menu(rows, at, restore, window, cx);
+    }
+
+    /// Copy, and *say* so. A clipboard write is invisible, so without the status line this
+    /// reads as a dead control — and the second half of the message matters as much as the
+    /// first: nobody should be left waiting for Zuno to install something itself.
+    fn copy_install_command(
+        &mut self,
+        _: &CopyInstallCommand,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+            crate::update::INSTALL_COMMAND.to_string(),
+        ));
+        self.set_status("Install command copied — run it in a terminal", cx);
+    }
+
+    fn dismiss_update(&mut self, _: &DismissUpdate, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(version) = self.offered_update(cx) else {
+            return;
+        };
+        crate::app_state::set_dismissed_update(cx, Some(version));
+        cx.notify();
+    }
+
     /// Put a menu on screen and wire it up. Shared by the row menu and the application menu,
     /// which differ only in their rows and where they are anchored.
     fn show_menu(
@@ -5591,6 +5741,7 @@ impl Render for Workspace {
         let cookies = self.cookies_enabled(cx);
         let cert_files = crate::app_state::tls(cx);
         let certs_active = !cert_files.is_empty();
+        let update_offer = self.offered_update(cx).map(SharedString::from);
         let proxy_badge = proxy_badge_label(
             &crate::app_state::proxy(cx),
             self.system_proxy.as_deref(),
@@ -5772,6 +5923,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::scroll_start))
             .on_action(cx.listener(Self::open_row_menu))
             .on_action(cx.listener(Self::open_app_menu))
+            .on_action(cx.listener(Self::open_update_menu))
+            .on_action(cx.listener(Self::copy_install_command))
+            .on_action(cx.listener(Self::dismiss_update))
             .on_action(cx.listener(Self::menu_next))
             .on_action(cx.listener(Self::menu_prev))
             .on_action(cx.listener(Self::menu_confirm))
@@ -5801,6 +5955,7 @@ impl Render for Workspace {
                 title,
                 self.panel_visible,
                 certs_active,
+                update_offer,
                 &theme,
                 window,
             ))

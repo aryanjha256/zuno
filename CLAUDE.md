@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 824 tests, ~20s
+cargo test --workspace                   # 844 tests, ~20s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -158,6 +158,18 @@ The test dispatcher runs a **simulated clock**, so anything driven by `timer()` 
 `DragMoveEvent::bounds` is **last frame's** hitbox, so never pair it with live state | It is `hitbox.bounds`, written during the previous frame's `interactivity.prepaint` — the same "a frame behind" rule as `max_offset`, from a direction that looks safe because an event feels current. A mouse reporting at 500Hz against a 60Hz window delivers six or seven moves *per frame*, and every one of them sees the same stale bounds while state written by its predecessors is already fresh. So `current_width + (position.x - bounds.center().x)` re-adds the whole travel on each event, the frame paints the overshoot, the next batch measures back from there and yanks it in. **It presents as flicker — "you can see the current and past frames at once" — not as a wrong number**, which is why it reads as a rendering or vsync problem rather than as arithmetic. Fix by pairing the stale bounds with the width *those bounds were painted at* (capture it in the closure at render; do not re-read it) to recover a reference that does not move, then map the pointer to a width **absolutely**. **Unreproducible headlessly**, and expensively so: `VisualTestContext::simulate_event` calls `run_until_parked` after *every* event, so the harness repaints between moves and bounds are never stale — `test_window`, the only way to deliver two events without a park, is `pub(crate)` to gpui. A burst test was written and **passed against the bug**. |
 
 ## Packaging
+
+`scripts/install.sh` is the advertised way in — one command that installs *and* updates,
+because `apt-get install ./file.deb` is already both. It is the only shipped artifact with no
+compiler behind it, so CI shellchecks it and installs the result in a clean `ubuntu:22.04`
+container on every push; `release.yml` does the same against each newly published release.
+Four traps in it, each verified rather than assumed: the asset carries a Debian revision the
+git tag does not (`zuno_0.2.5-1_amd64.deb`), so the filename is read out of `sha256sums.txt`
+rather than built from the tag; `dpkg --compare-versions 0.2.5-1 gt 0.2.5` is **true**, so the
+revision is stripped before comparing; an `EXIT` trap's last command sets the script's exit
+status, so a successful install reported failure until `cleanup` ended in `return 0`; and
+`[ -r /dev/tty ]` passes with no controlling terminal, so a confirmation prompt read its own
+failed `read` as the `[Y/n]` default and **auto-accepted**.
 
 `.github/workflows/release.yml` on a `v*` tag → `.deb` on a GitHub Release.
 `workflow_dispatch` runs the same build without publishing. Four things here are

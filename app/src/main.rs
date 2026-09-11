@@ -33,6 +33,7 @@ mod settings_panel;
 mod tests;
 mod theme;
 mod ui;
+mod update;
 mod workspace;
 mod workspace_panel;
 
@@ -135,7 +136,7 @@ fn main() {
         boot.mark("engine + session");
 
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
-        cx.open_window(
+        let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -159,6 +160,12 @@ fn main() {
 
         boot.mark("window open");
         cx.activate(true);
+
+        // Started here rather than inside `Workspace::new`, and that placement is the whole
+        // isolation: the test harness builds a `Workspace` directly, so a check wired into the
+        // constructor would put a real HTTPS request to GitHub in front of every test in the
+        // suite. `main` is the one path a person takes and no test does.
+        let _ = window.update(cx, |workspace, _window, cx| workspace.check_for_update(cx));
     });
 }
 

@@ -73,6 +73,16 @@ struct AppFile {
     /// Certificate files. App-level for `proxy`'s reason: these name files on this machine.
     #[serde(default)]
     tls: TlsFiles,
+    /// The release the update chip was last dismissed for.
+    ///
+    /// The *version* rather than a flag, so the dismissal lapses by itself when a later release
+    /// lands — a bool would need something to clear it, and the thing that forgets to clear it
+    /// is a user who never sees another update.
+    ///
+    /// Defaulted per field for the reason above it: `read` discards an `app.json` it cannot
+    /// deserialize, so a required field would throw away every existing install's registry.
+    #[serde(default)]
+    dismissed_update: Option<String>,
 }
 
 pub struct AppState {
@@ -91,6 +101,7 @@ impl AppState {
             proxy: ProxyMode::default(),
             proxies: Vec::new(),
             tls: TlsFiles::default(),
+            dismissed_update: None,
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.to_string()),
             workspaces: default_workspace
@@ -349,6 +360,7 @@ pub fn install_at(cx: &mut App, dir: Option<PathBuf>, workspaces: Vec<WorkspaceE
         proxy: ProxyMode::default(),
         proxies: Vec::new(),
         tls: TlsFiles::default(),
+        dismissed_update: None,
         theme: Appearance::Dark,
         last: workspaces.first().map(|entry| entry.id.clone()),
         workspaces,
@@ -512,6 +524,21 @@ pub fn set_tls(cx: &mut App, files: TlsFiles) {
 
 /// Remember the theme across restarts. It was hardcoded to `Dark` at every startup, so
 /// `Ctrl+Shift+T` never survived one.
+/// The release the update chip has been dismissed for, if any.
+pub fn dismissed_update(cx: &App) -> Option<String> {
+    cx.try_global::<AppState>()
+        .and_then(|state| state.file.dismissed_update.clone())
+}
+
+pub fn set_dismissed_update(cx: &mut App, version: Option<String>) {
+    // No `try_global_mut` in 0.2.2 — check for presence, then take the mutable borrow.
+    if cx.try_global::<AppState>().is_none() {
+        return;
+    }
+    cx.global_mut::<AppState>().file.dismissed_update = version;
+    save(cx);
+}
+
 pub fn set_theme(cx: &mut App, theme: Appearance) {
     // No `try_global_mut` in 0.2.2 — check for presence, then take the mutable borrow.
     if cx.try_global::<AppState>().is_none() {
@@ -594,6 +621,7 @@ mod tests {
                 proxy: ProxyMode::default(),
                 proxies: Vec::new(),
                 tls: TlsFiles::default(),
+                dismissed_update: None,
                 theme: Appearance::Dark,
                 last: Some("gone".into()),
                 workspaces: vec![WorkspaceEntry {
@@ -615,6 +643,7 @@ mod tests {
                 proxy: ProxyMode::default(),
                 proxies: Vec::new(),
                 tls: TlsFiles::default(),
+                dismissed_update: None,
                 theme: Appearance::Dark,
                 last: None,
                 workspaces: Vec::new(),
@@ -633,6 +662,9 @@ mod tests {
             proxy: ProxyMode::default(),
             proxies: Vec::new(),
             tls: TlsFiles::default(),
+            // Deliberately not `None`: a defaulted field round-trips even when serialization
+            // drops it entirely, so the assertion would hold against the bug it is for.
+            dismissed_update: Some("0.9.9".into()),
             theme: Appearance::Light,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![WorkspaceEntry {
@@ -675,6 +707,7 @@ mod tests {
             proxy: ProxyMode::default(),
             proxies: Vec::new(),
             tls: TlsFiles::default(),
+            dismissed_update: None,
             theme: Appearance::Dark,
             last: Some(DEFAULT_ID.into()),
             workspaces: vec![

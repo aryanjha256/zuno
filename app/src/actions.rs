@@ -221,6 +221,10 @@ actions!(
         CopyResponse,
         SaveResponse,
         CopyAsCurl,
+        // Updates
+        OpenUpdateMenu,
+        CopyInstallCommand,
+        DismissUpdate,
         // Settings
         OpenSettings,
         SettingNext,

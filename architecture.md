@@ -74,7 +74,8 @@ zuno/
 │       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
 │       ├── fuzzy.rs        ✅ subsequence scoring for the picker
 │       ├── highlight.rs    ✅ JSON lexer for syntax colouring — tolerant, no cache
-│       └── search.rs       ✅ substring search over a response body
+│       ├── search.rs       ✅ substring search over a response body
+│       └── version.rs      ✅ comparing a released version against the running one
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
     └── src/
@@ -94,6 +95,7 @@ zuno/
         ├── timing.rs       ✅ the ZUNO_TIMING switch, shared by boot and requests
         ├── theme.rs        ✅ Theme global; light + dark tokens; font resolution
         ├── ui.rs           ✅ icon set + asset source, icon/text buttons, tooltips
+        ├── update.rs       ✅ the release check — a notice, never an installer
         ├── workspace.rs    ✅ root Render; owns buffers + all action handlers
         ├── request_view.rs ✅ one buffer: inputs + response + derived spec()
         ├── request_pane.rs ✅ method, URL bar, send, Headers/Params/Body tabs
@@ -2487,6 +2489,88 @@ certificate misses the cache. The **selection** cannot be driven headlessly —
 `open_with_system` sit in — so what is tested is everything below it. An actual mTLS handshake is
 not exercised: that needs a server demanding a client certificate, which is reqwest's behaviour
 rather than Zuno's decision.
+
+---
+
+## 6k. The update notice — and why there is no updater
+
+Zuno installs system-wide through `apt`, so installing an update means root. The shape that was
+sketched first — the app downloads the package, prompts for a password, installs, restarts — was
+dropped, and the reason is worth keeping because it inverts on one fact: **the password problem
+exists only because a *window* is asking.** A terminal asking for `sudo` is unremarkable, and
+`scripts/install.sh` is already one command for both installing and updating. So the app's whole
+job is to say a release exists and hand over that command.
+
+Four things that decided it, beyond the ceremony of a polkit policy and a helper binary:
+
+- **Chicken-and-egg.** The policy would ship *in the .deb*, so nobody on the current release
+  could use the first auto-update anyway. The one manual step is unavoidable either way, and
+  spending it on the script buys updates forever after.
+- **An app that `dpkg -i`s behind apt's back desynchronises dpkg's state**, and it gets worse
+  the day there is an apt repository.
+- **Root plus an auto-downloaded binary is a supply chain**, defensible only with signature
+  verification — real work, for a convenience.
+- It is the one path where a failed install leaves someone with no working Zuno.
+
+### The check reads a redirect, not the API
+
+`releases/latest` answers `302` with the tag in `location`. That needs no JSON parser, and —
+unlike `api.github.com` — has no 60-per-hour limit shared by everyone behind one NAT. An office
+all starting at nine would exhaust that limit, and the failure here is silent by design, so the
+feature would stop working for precisely the people most likely to have it. `follow_redirects` is
+therefore **off** for this one request: following it lands on an HTML page that would have to be
+scraped, while the redirect itself is the answer.
+
+It goes through `Engine::send` rather than a second HTTP client, which is §6b's rule and earns
+more here than it does there: the check inherits the proxy (§6i) and the trusted CAs (§6j), and a
+corporate network is exactly where a second client fails silently.
+
+**Every failure is nothing.** Offline, firewalled, rate-limited, answered with something
+unreadable — all of them leave `Update::Unknown` and put nothing on screen. `version::is_newer`
+returns false when *either* side is unparseable, so a malformed answer cannot produce a notice and
+a malformed `CARGO_PKG_VERSION` cannot make every check announce one.
+
+**Once per launch, not on a stored timer.** A timestamp in `app.json` was the plan and buys very
+little against a redirect with no rate limit — while costing a wall clock in the code path, which
+the test dispatcher's simulated clock makes the one half no test could drive. The cost is stated:
+a window left open for a week does not re-check. The check is started from `main` rather than from
+`Workspace::new`, and that placement *is* the test isolation — the harness builds a `Workspace`
+directly, so a check in the constructor would put a real request to GitHub in front of every test
+in the suite.
+
+### The chip is the one conditional control in the titlebar
+
+Two rules in this codebase point opposite ways here, and both are right. A **control** must be
+permanent or the capability behind it cannot be discovered from a cold start — §2's audit, the
+proxy badge, the certificate button, three times. A **state badge** must be conditional, because
+"a badge that's always there stops being read", which is why `cookies on` only appears when they
+are on.
+
+This is a notice, not a control: with nothing to update to there is nothing to discover. So the
+chip is conditional, and the always-available path is the palette's *Copy the Zuno install
+command* — which is also how someone sends the command to a colleague.
+
+It sits **first in the titlebar's right-hand cluster**, and that position is what makes it free.
+The cluster is `flex_none` inside a `justify_between` row, so it is pinned by its right edge and
+grows leftward: a child added at the *start* moves nothing, while one added at the end would shift
+the window controls out from under the pointer. That is the layout-jump failure §6a records about
+the collection panel, which manufactured a flaky test rather than merely looking bad.
+
+Three smaller decisions:
+
+- **Clicking opens a menu, not an action.** There are two questions — how do I update, and should
+  I — and one click can only answer one. `Copy install command` and `What's new in <version>`,
+  with `Dismiss until the next release` below a separator. Fourth consumer of `context_menu.rs`.
+- **The copy announces itself.** A clipboard write is invisible, so without the status line this
+  is indistinguishable from a dead control, and the second half of the message carries as much as
+  the first: *run it in a terminal* is what stops someone waiting for Zuno to install it.
+- **The dismissal stores the version, not a flag.** It lapses by itself when a later release
+  lands, so there is no reset to forget — and the thing that forgets to reset a flag is a user who
+  never sees another update. The test asserts both directions, because one asserting only that the
+  dismissed version stays hidden passes against a plain boolean.
+
+`ZUNO_NO_UPDATE_CHECK=1` turns the request off entirely. An env var rather than a setting: the
+people who want it are already launching from a shell, and a toggle would need a home in a panel.
 
 ---
 
