@@ -110,7 +110,11 @@ jobs:
       - name: Write the checksums
         run: |
           cd "$(dirname "$DEB_PATH")"
-          sha256sum ./*.deb > sha256sums.txt
+          # A bare glob, not `./*.deb`: the latter records the name as `./zuno_…deb`, which is
+          # a worse artifact to read and was the spelling that broke the installer's lookup on
+          # the first release to carry this file. The installer tolerates both now; this keeps
+          # the published list plain.
+          sha256sum -- *.deb > sha256sums.txt
           cat sha256sums.txt
           echo "SUMS_PATH=$PWD/sha256sums.txt" >> "$GITHUB_ENV"
 
@@ -220,7 +224,10 @@ jobs:
               # Installed, and installed where the .desktop and the launcher expect. The
               # filename must equal the app_id or Wayland shows a generic icon with no
               # error anywhere, so it is asserted rather than assumed.
-              dpkg-query -W -f="${Package} ${Version}\n" zuno
+              # No `-f` format: `${Package}` inside double quotes is expanded by *this* shell,
+            # and under `set -eu` an unset parameter aborts the job. The default output is
+            # "zuno<TAB>version", which is all this needs.
+            dpkg-query -W zuno
               test -x /usr/bin/zuno
               test -f /usr/share/applications/dev.zuno.Zuno.desktop
               test -f /usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg

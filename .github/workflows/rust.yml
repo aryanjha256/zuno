@@ -75,7 +75,10 @@ jobs:
 
             # Installed, and where the launcher looks. The .desktop filename must equal the
             # app_id or Wayland shows a generic icon with no error anywhere.
-            dpkg-query -W -f="${Package} ${Version}\n" zuno
+            # No `-f` format: `${Package}` inside double quotes is expanded by *this* shell,
+            # and under `set -eu` an unset parameter aborts the job. The default output is
+            # "zuno<TAB>version", which is all this needs.
+            dpkg-query -W zuno
             test -x /usr/bin/zuno
             test -f /usr/share/applications/dev.zuno.Zuno.desktop
             test -f /usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg

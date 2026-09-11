@@ -156,6 +156,27 @@ asset_name() {
     printf 'zuno_%s-1_%s.deb' "$version" "$arch"
 }
 
+# The recorded hash for one file.
+#
+# Compares the *name* field rather than matching the whole line, because how that name is spelled
+# depends on how the checksums were generated: `sha256sum ./*.deb` writes `./zuno_…deb`, a bare
+# glob writes `zuno_…deb`, and binary mode prefixes a `*`. A line match worked against every
+# release that had no checksum file and failed on the first one that did — which is the worst
+# possible moment for it, and is exactly when it failed.
+sum_for() {
+    want=$1
+    sums_path=$2
+    while read -r sum_hash sum_name; do
+        sum_name=${sum_name#./}
+        sum_name=${sum_name#\*}
+        if [ "$sum_name" = "$want" ]; then
+            printf '%s' "$sum_hash"
+            return 0
+        fi
+    done < "$sums_path"
+    return 1
+}
+
 download() {
     version=$1
     arch=$2
@@ -173,7 +194,7 @@ Check that version $version exists: $RELEASES"
     # A mismatch is always fatal. A *missing* checksum file is not, or pinning a release
     # published before this installer existed would be impossible.
     if [ -s "$dir/sha256sums.txt" ] && have sha256sum; then
-        expected=$(grep -F -- "  $file" "$dir/sha256sums.txt" | head -n 1 | cut -d' ' -f1)
+        expected=$(sum_for "$file" "$dir/sha256sums.txt" || true)
         actual=$(sha256sum "$dir/$file" | cut -d' ' -f1)
         [ -n "$expected" ] || die "$file is not listed in sha256sums.txt — refusing to install"
         [ "$expected" = "$actual" ] || die "checksum mismatch on $file — refusing to install"
