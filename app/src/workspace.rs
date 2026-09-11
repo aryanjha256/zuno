@@ -5339,6 +5339,61 @@ impl Workspace {
         cx.notify();
     }
 
+    /// SPIKE — a placeholder list under the focused header-name cell.
+    ///
+    /// Proving three things before the real feature is built: that the popup can be anchored
+    /// under a cell, that being owned *here* rather than inside the row escapes the request
+    /// pane's ten `overflow_hidden` ancestors, and that focus stays in the input so typing
+    /// still lands. The list is hardcoded; filtering and the data table come after.
+    fn header_suggestions(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let theme = cx.theme().clone();
+        let (_, bounds) = self.active()?.read(cx).focused_header_name(window, cx)?;
+
+        // Bottom-left of the cell, in window coordinates — the same `AnchoredPositionMode`
+        // the context menu uses, and for the same reason: these bounds are already absolute,
+        // so reading them as local would add the parent origin a second time.
+        let at = gpui::point(bounds.left(), bounds.bottom());
+
+        // **No scrim and no focus transfer**, which is what separates this from the context
+        // menu. A scrim would swallow the next click and focusing the list would stop the
+        // typing this exists to accompany.
+        Some(
+            gpui::anchored()
+                .position(at)
+                .anchor(gpui::Corner::TopLeft)
+                .position_mode(gpui::AnchoredPositionMode::Window)
+                .child(
+                    div()
+                        .id("header-suggestions")
+                        .debug_selector(|| "header-suggestions".to_string())
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .min_w(px(180.))
+                        .rounded_md()
+                        .p_1()
+                        .bg(theme.bg_elevated)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_md()
+                        .children(["Authorization", "Content-Type", "Accept"].into_iter().map(
+                            |name| {
+                                div()
+                                    .px_2()
+                                    .py_0p5()
+                                    .text_xs()
+                                    .text_color(theme.text)
+                                    .child(name)
+                            },
+                        )),
+                ),
+        )
+    }
+
     /// Put a menu on screen and wire it up. Shared by the row menu and the application menu,
     /// which differ only in their rows and where they are anchored.
     fn show_menu(
@@ -6039,6 +6094,7 @@ impl Render for Workspace {
             .children(self.run.as_ref().map(|state| state.panel.clone()))
             .children(self.flows.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
+            .children(self.header_suggestions(window, cx))
             // Built here rather than held as an `Entity`: it owns no input and no state beyond
             // which button is selected, so it is plain workspace state like `RenameState`.
             .children(

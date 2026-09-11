@@ -11753,3 +11753,55 @@ async fn dismissing_an_update_hides_it_until_a_newer_one(cx: &mut TestAppContext
         "a release newer than the dismissed one must be offered again"
     );
 }
+
+/// SPIKE — the three things that decide whether an inline header-name dropdown is buildable:
+/// it anchors under the cell, it escapes the request pane's `overflow_hidden` ancestors by
+/// being owned at the root, and focus stays in the input so typing still lands.
+///
+/// Clipping is the one part no assertion can reach — a clipped element still reports bounds,
+/// and nothing headless observes a paint. What is checked instead is the *ownership* that makes
+/// clipping impossible: the popup is positioned in window coordinates under a cell that sits
+/// inside those ancestors, which is only expressible from the root.
+///
+/// It types before looking, and that is not incidental: `last_bounds` is written during paint,
+/// so on the frame a brand-new row first appears the position is not known yet and the list is
+/// absent. Measured — `false` on frame one, `true` on frame two.
+#[gpui::test]
+async fn spike_header_suggestions_anchor_under_the_cell_and_typing_still_lands(
+    cx: &mut TestAppContext,
+) {
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.run_until_parked();
+    cx.simulate_input("X-Trace-Id");
+    cx.run_until_parked();
+
+    let cell = cx
+        .debug_bounds("hdr-name-0")
+        .expect("a header name cell is painted");
+    let popup = cx
+        .debug_bounds("header-suggestions")
+        .expect("the suggestion list is painted while a header name cell has focus");
+
+    assert!(
+        popup.origin.y >= cell.bottom() - gpui::px(1.),
+        "the list must sit below the cell, not over it: cell bottom {:?}, popup top {:?}",
+        cell.bottom(),
+        popup.origin.y
+    );
+    assert!(
+        (popup.origin.x - cell.left()).abs() < gpui::px(2.),
+        "the list must be left-aligned with the cell: cell left {:?}, popup left {:?}",
+        cell.left(),
+        popup.origin.x
+    );
+
+    // The half that would make the whole approach unusable: an overlay that takes focus stops
+    // the typing it exists to accompany.
+    assert_eq!(
+        spec_of(&view, &mut cx).headers.last().map(|h| h.name.clone()),
+        Some("X-Trace-Id".to_string()),
+        "typing must still reach the cell while the list is open"
+    );
+}

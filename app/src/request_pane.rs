@@ -1019,6 +1019,8 @@ fn render_row(
         )
         .child(
             div()
+                .id(SharedString::from(format!("{prefix}-name-{ix}")))
+                .debug_selector(move || format!("{prefix}-name-{ix}"))
                 .flex_none()
                 .w(px(160.))
                 .overflow_hidden()

@@ -979,6 +979,24 @@ impl RequestView {
             .position(|part| part.row.is_focused(window, cx))
     }
 
+    /// The header-*name* cell that currently has focus, and where it painted.
+    ///
+    /// By entity, not by key context: a row's name and value inputs share `"HeaderCell"`, so a
+    /// context predicate cannot tell them apart — only the row knows which of its two is which.
+    pub fn focused_header_name(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<(usize, gpui::Bounds<gpui::Pixels>)> {
+        self.headers.iter().enumerate().find_map(|(ix, row)| {
+            let input = row.name.read(cx);
+            if !input.focus_handle(cx).is_focused(window) {
+                return None;
+            }
+            input.last_bounds().map(|bounds| (ix, bounds))
+        })
+    }
+
     pub fn url_focus(&self, cx: &App) -> FocusHandle {
         self.url.read(cx).focus_handle(cx)
     }

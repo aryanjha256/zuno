@@ -142,6 +142,16 @@ impl TextInput {
         }
     }
 
+    /// Where this input last painted, in **window** coordinates.
+    ///
+    /// Already recorded for hit-testing and the IME rectangle; exposed so an overlay can be
+    /// anchored under the box. It is one frame behind, which is the rule for anything read off
+    /// a painted element — harmless here, because a cell does not move while you type into it,
+    /// unlike the drag case where the same staleness produced visible flicker.
+    pub fn last_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.last_bounds
+    }
+
     pub fn text(&self) -> &str {
         &self.content
     }
