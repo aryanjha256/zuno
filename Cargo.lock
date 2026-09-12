@@ -7853,7 +7853,7 @@ dependencies = [
 
 [[package]]
 name = "zuno"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-channel 2.5.0",
  "bytes",
@@ -7868,7 +7868,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-core"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "async-channel 2.5.0",
  "bytes",
