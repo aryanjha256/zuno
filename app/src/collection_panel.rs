@@ -427,6 +427,22 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
         return None;
     }
 
+    // A row being named is not an empty panel. The notice is absolutely positioned *over* the
+    // list, so with a draft open its text renders straight through the name box.
+    //
+    // **Cosmetic only — it does not steal the click**, which is worth stating because the
+    // overlap looks exactly like the dead-hitbox bugs elsewhere in this codebase and would
+    // otherwise send the next reader hunting for one. `Interactivity::should_insert_hitbox`
+    // (`div.rs`) is a disjunction over cursor, group, scroll offset, focus handle, hover style,
+    // listeners and tooltip, and a plain styled `div` has none of them, so this element inserts
+    // no hitbox at all and nothing below it is occluded.
+    //
+    // Its advice is wrong here besides: it explains `Ctrl+S`, which is the other way to create
+    // the thing already being created.
+    if workspace.new_node_row().is_some() {
+        return None;
+    }
+
     Some(
         div()
             .absolute()
