@@ -15,6 +15,7 @@ pub mod body_diff;
 pub mod capture;
 pub mod collection;
 pub mod curl;
+pub mod disposition;
 pub mod diff;
 pub mod engine;
 pub mod environment;

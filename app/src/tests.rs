@@ -7489,53 +7489,119 @@ async fn copying_while_browsing_history_copies_the_run_on_screen(cx: &mut TestAp
 fn a_suggested_filename_is_safe_and_matches_the_content_type() {
     use crate::workspace::suggested_filename;
 
-    assert_eq!(suggested_filename("invoices", Some("application/json")), "invoices.json");
+    assert_eq!(suggested_filename("invoices", Some("application/json"), None), "invoices.json");
     // Parameters don't change the essence.
     assert_eq!(
-        suggested_filename("invoices", Some("application/json; charset=utf-8")),
+        suggested_filename("invoices", Some("application/json; charset=utf-8"), None),
         "invoices.json"
     );
-    assert_eq!(suggested_filename("report", Some("text/csv")), "report.csv");
-    assert_eq!(suggested_filename("page", Some("text/html")), "page.html");
+    assert_eq!(suggested_filename("report", Some("text/csv"), None), "report.csv");
+    assert_eq!(suggested_filename("page", Some("text/html"), None), "page.html");
     // An unknown or absent type claims nothing.
-    assert_eq!(suggested_filename("blob", Some("application/octet-stream")), "blob.bin");
-    assert_eq!(suggested_filename("blob", None), "blob.bin");
+    assert_eq!(suggested_filename("blob", Some("application/octet-stream"), None), "blob.bin");
+    assert_eq!(suggested_filename("blob", None, None), "blob.bin");
     // Any `text/*` is readable.
-    assert_eq!(suggested_filename("notes", Some("text/plain")), "notes.txt");
+    assert_eq!(suggested_filename("notes", Some("text/plain"), None), "notes.txt");
 
     // **The bug this table was widened for.** A JPEG saved as `shot.bin` does not open by
     // double-clicking it, and `.bin` "claiming nothing" is no comfort to someone who now has to
     // know to rename the file. `image/jpeg` is not ambiguous.
-    assert_eq!(suggested_filename("shot", Some("image/jpeg")), "shot.jpg");
-    assert_eq!(suggested_filename("shot", Some("image/jpeg; charset=binary")), "shot.jpg");
-    assert_eq!(suggested_filename("logo", Some("image/svg+xml")), "logo.svg");
-    assert_eq!(suggested_filename("icon", Some("image/x-icon")), "icon.ico");
-    assert_eq!(suggested_filename("invoice", Some("application/pdf")), "invoice.pdf");
-    assert_eq!(suggested_filename("export", Some("application/zip")), "export.zip");
-    assert_eq!(suggested_filename("clip", Some("audio/mpeg")), "clip.mp3");
+    assert_eq!(suggested_filename("shot", Some("image/jpeg"), None), "shot.jpg");
+    assert_eq!(suggested_filename("shot", Some("image/jpeg; charset=binary"), None), "shot.jpg");
+    assert_eq!(suggested_filename("logo", Some("image/svg+xml"), None), "logo.svg");
+    assert_eq!(suggested_filename("icon", Some("image/x-icon"), None), "icon.ico");
+    assert_eq!(suggested_filename("invoice", Some("application/pdf"), None), "invoice.pdf");
+    assert_eq!(suggested_filename("export", Some("application/zip"), None), "export.zip");
+    assert_eq!(suggested_filename("clip", Some("audio/mpeg"), None), "clip.mp3");
     assert_eq!(
         suggested_filename(
             "sheet",
-            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"), None
         ),
         "sheet.xlsx"
     );
     // Case in a header is not meaningful.
-    assert_eq!(suggested_filename("shot", Some("IMAGE/JPEG")), "shot.jpg");
+    assert_eq!(suggested_filename("shot", Some("IMAGE/JPEG"), None), "shot.jpg");
 
     // Derived rather than tabled, so a format that shipped after this table did still lands.
-    assert_eq!(suggested_filename("shot", Some("image/png")), "shot.png");
-    assert_eq!(suggested_filename("shot", Some("image/avif")), "shot.avif");
-    assert_eq!(suggested_filename("clip", Some("video/mp4")), "clip.mp4");
-    assert_eq!(suggested_filename("face", Some("font/woff2")), "face.woff2");
+    assert_eq!(suggested_filename("shot", Some("image/png"), None), "shot.png");
+    assert_eq!(suggested_filename("shot", Some("image/avif"), None), "shot.avif");
+    assert_eq!(suggested_filename("clip", Some("video/mp4"), None), "clip.mp4");
+    assert_eq!(suggested_filename("face", Some("font/woff2"), None), "face.woff2");
 
     // But `application/*` subtypes are mostly not extensions, so nothing is derived there.
-    assert_eq!(suggested_filename("thing", Some("application/x-custom")), "thing.bin");
+    assert_eq!(suggested_filename("thing", Some("application/x-custom"), None), "thing.bin");
 
     // The label comes from a URL, so the same traversal guard as saving a request applies.
-    let escaped = suggested_filename("../../.ssh/config", Some("application/json"));
+    let escaped = suggested_filename("../../.ssh/config", Some("application/json"), None);
     assert!(!escaped.contains('/'), "{escaped:?}");
     assert!(!escaped.starts_with('.'), "{escaped:?}");
+}
+
+/// `Content-Disposition` is the server naming the file, and it beats anything inferable from the
+/// URL. A download endpoint at `/api/v1/export` returning `invoices-2026-Q1.xlsx` is exactly the
+/// case: the useful name is in the header and nowhere else.
+#[test]
+fn the_servers_own_filename_wins_over_the_url() {
+    use crate::workspace::suggested_filename;
+
+    assert_eq!(
+        suggested_filename(
+            "api-v1-export",
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            Some(r#"attachment; filename="invoices-2026-Q1.xlsx""#)
+        ),
+        "invoices-2026-Q1.xlsx"
+    );
+
+    // The encoded form carries names the plain one cannot.
+    assert_eq!(
+        suggested_filename(
+            "export",
+            Some("text/csv"),
+            Some("attachment; filename*=UTF-8''rapport%20d%C3%A9taill%C3%A9.csv")
+        ),
+        "rapport détaillé.csv"
+    );
+
+    // A server that names the file but gives it no extension still gets the one its content
+    // type implies — appending unconditionally would have produced `report.csv.csv`.
+    assert_eq!(
+        suggested_filename("x", Some("text/csv"), Some(r#"attachment; filename="report""#)),
+        "report.csv"
+    );
+
+    // No header, or one that names nothing, falls back to the label exactly as before.
+    assert_eq!(
+        suggested_filename("invoices", Some("application/json"), Some("attachment")),
+        "invoices.json"
+    );
+    assert_eq!(suggested_filename("invoices", Some("application/json"), None), "invoices.json");
+}
+
+/// The header is remote input whose entire purpose is to become a path, so it gets the same
+/// scrutiny the label and the content type already get — and it is the most direct of the three,
+/// because the server is literally choosing the filename.
+#[test]
+fn a_hostile_content_disposition_cannot_reach_out_of_the_save_directory() {
+    use crate::workspace::suggested_filename;
+
+    for hostile in [
+        r#"attachment; filename="../../.ssh/authorized_keys""#,
+        r#"attachment; filename="/etc/cron.d/evil""#,
+        r#"attachment; filename="..\..\Startup\evil.bat""#,
+        "attachment; filename*=UTF-8''..%2F..%2F.ssh%2Fconfig",
+        "attachment; filename=\"a\nb/../c\"",
+    ] {
+        let name = suggested_filename("fallback", Some("text/csv"), Some(hostile));
+        assert!(!name.contains('/'), "{hostile:?} -> {name:?}");
+        assert!(!name.contains('\\'), "{hostile:?} -> {name:?}");
+        assert!(!name.starts_with('.'), "{hostile:?} -> {name:?}");
+        assert!(
+            !name.chars().any(char::is_control),
+            "{hostile:?} -> {name:?}"
+        );
+    }
 }
 
 /// The *other* half of the same guard, and the one that did not exist before: `collection::slug`
@@ -7556,7 +7622,7 @@ fn a_hostile_content_type_cannot_reach_into_the_suggested_path() {
         "image/a b",
         "image/.",
     ] {
-        let name = suggested_filename("shot", Some(hostile));
+        let name = suggested_filename("shot", Some(hostile), None);
         assert!(!name.contains('/'), "{hostile:?} -> {name:?}");
         assert!(!name.contains('\\'), "{hostile:?} -> {name:?}");
         assert!(!name.contains(' '), "{hostile:?} -> {name:?}");

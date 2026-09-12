@@ -388,6 +388,19 @@ Three decisions worth keeping:
   guards the label half; a `Content-Type` of `image/../../.ssh/config` would have walked into the
   other, so a derived subtype has to be short and alphanumeric or it is refused.
 
+- **`Content-Disposition` outranks all of it.** A download endpoint that answers
+  `attachment; filename="invoices-2026-Q1.xlsx"` has named the file, and inferring
+  `api-v1-export.xlsx` from the URL throws that away. The header is used when it names something,
+  and the content type only supplies an extension the server omitted — appending unconditionally
+  would give `report.csv.csv`.
+
+  **That makes three attacker-controlled strings in one filename**, and this is the most direct of
+  them: the server is literally choosing the name. RFC 6266 allows a quoted string, so `filename`
+  can legally contain `/`, `..`, NUL or a leading dot. `disposition::filename` reduces it to a
+  single path segment — and *degrades* rather than rejects, since a refused header silently falls
+  back to the URL label and hides that the server said anything. `../../.ssh/config` becomes
+  `config`; a name that is only dots becomes nothing.
+
 *The rest of egress — done, in the slice after search.* Copying a single row's value or its path
 needed a selected row, which is why it waited: the pane had focus but no cursor. `up`/`down` and a
 click now place one, `Ctrl+C` copies the row's value and `Alt+C` its JSONPath. See

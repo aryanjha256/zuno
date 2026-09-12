@@ -5761,7 +5761,11 @@ impl Workspace {
             return;
         };
 
-        let suggested = suggested_filename(&view.read(cx).label(cx), response.content_type());
+        let suggested = suggested_filename(
+            &view.read(cx).label(cx),
+            response.content_type(),
+            response.header("content-disposition"),
+        );
         // `$HOME` rather than the collection root: a saved response is an artefact you're
         // taking elsewhere, not part of the collection you'd commit.
         let directory = std::env::var_os("HOME")
@@ -6782,14 +6786,34 @@ pub(crate) fn issue_url(repo: &str) -> String {
 ///
 /// Runs the label through `collection::slug` for the same reason saving a request does — the
 /// label derives from a URL, so `https://x.test/../../.ssh/config` must not become a path.
-pub fn suggested_filename(label: &str, content_type: Option<&str>) -> String {
+pub fn suggested_filename(
+    label: &str,
+    content_type: Option<&str>,
+    disposition: Option<&str>,
+) -> String {
     // Match on the essence only: `application/json; charset=utf-8` is still JSON.
     let base = content_type
         .and_then(|value| value.split(';').next())
         .map(str::trim)
         .unwrap_or("");
+    let extension = extension_for(base);
 
-    format!("{}.{}", collection::slug(label), extension_for(base))
+    // **The server's own name wins.** A download endpoint that says
+    // `attachment; filename="invoices-2026-Q1.xlsx"` knows something the URL does not, and
+    // guessing `api-v1-export.xlsx` from the path throws it away. `disposition::filename` has
+    // already reduced it to a single safe path segment — see it for why that is not optional.
+    if let Some(name) = disposition.and_then(zuno_core::disposition::filename) {
+        // A name the server sent without any extension still gets the one its content type
+        // implies. Appending unconditionally would produce `report.csv.csv`; replacing what is
+        // there would override a server that knows its own format better than the sniff does.
+        return if std::path::Path::new(&name).extension().is_some() {
+            name
+        } else {
+            format!("{name}.{extension}")
+        };
+    }
+
+    format!("{}.{extension}", collection::slug(label))
 }
 
 /// Media types whose extension is not simply their subtype, plus the `application/*` types worth

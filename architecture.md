@@ -70,6 +70,7 @@ zuno/
 │       │   └── script.rs    ✅ test scripts -> captures, assertions, expect_status
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 │       ├── body_diff.rs    ✅ BodyDiff — the line-by-line body comparison
+│       ├── disposition.rs  ✅ the filename a Content-Disposition asks for, sanitized
 │       ├── hex.rs          ✅ hexdump -C of a body that isn't text
 │       ├── html.rs         ✅ pulling readable text out of an HTML response
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
