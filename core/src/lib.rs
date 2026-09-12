@@ -21,6 +21,7 @@ pub mod environment;
 pub mod flow;
 pub mod fuzzy;
 pub mod highlight;
+pub mod hex;
 pub mod html;
 pub mod import;
 pub mod json;

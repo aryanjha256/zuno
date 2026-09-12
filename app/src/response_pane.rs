@@ -1122,9 +1122,11 @@ fn body_header(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
         None => SharedString::from("indexing…"),
         Some(body) => match &body.kind {
             BodyKind::Empty => SharedString::from("empty"),
-            BodyKind::Binary { len } => {
-                SharedString::from(format!("{} binary", format_bytes(*len as u64)))
-            }
+            BodyKind::Hex(lines) => SharedString::from(format!(
+                "{} binary · hex · {} rows",
+                format_bytes(view.displayed().map(|r| r.body.len()).unwrap_or(0) as u64),
+                lines.len()
+            )),
             BodyKind::Json(outline) => SharedString::from(format!(
                 "{} rows · {} shown",
                 outline.len(),
@@ -1302,11 +1304,6 @@ fn body_region(
 
     let list = match &body.kind {
         BodyKind::Empty => centered_note("(empty body)", theme).into_any_element(),
-        BodyKind::Binary { len } => centered_note(
-            &format!("{} of binary data", format_bytes(*len as u64)),
-            theme,
-        )
-        .into_any_element(),
         BodyKind::Json(outline) => json_list(
             outline.clone(),
             body.visible(),
@@ -1315,6 +1312,23 @@ fn body_region(
             selected,
             widest,
             content,
+            scroll,
+            theme,
+            cx,
+        )
+        .into_any_element(),
+        // The hex dump is text, so it renders through the same list — which is how it inherits
+        // search, selection, copy and horizontal scrolling rather than reimplementing four
+        // mechanisms. `highlight` is false: JSON lexing over hex would colour byte pairs that
+        // happen to look like numbers.
+        BodyKind::Hex(lines) => text_list(
+            lines.clone(),
+            hit,
+            matched,
+            selected,
+            widest,
+            content,
+            false,
             scroll,
             theme,
             cx,
@@ -1822,6 +1836,14 @@ fn notice_bar(notice: &BodyNotice, theme: &Theme) -> Div {
         BodyNotice::ParseFailed { message } => (
             theme.status_server_error,
             format!("not valid JSON: {message} — showing raw text"),
+        ),
+        BodyNotice::HexTruncated { len } => (
+            theme.status_client_error,
+            format!(
+                "{} of binary data — showing the first {} as hex",
+                format_bytes(*len as u64),
+                format_bytes(zuno_core::hex::MAX_DUMP_BYTES as u64)
+            ),
         ),
         BodyNotice::HtmlTooLarge { len } => (
             theme.status_client_error,

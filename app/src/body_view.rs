@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use zuno_core::{JsonOutline, LineIndex, html, json};
+use zuno_core::{JsonOutline, LineIndex, hex, html, json};
 
 /// Above this, JSON is not parsed automatically.
 ///
@@ -24,7 +24,15 @@ pub enum BodyKind {
     Empty,
     Json(Arc<JsonOutline>),
     Text(Arc<LineIndex>),
-    Binary { len: usize },
+    /// A hex dump of a body that isn't text, indexed as lines.
+    ///
+    /// **A variant of its own rather than reusing `Text`**, even though it holds the same type
+    /// and behaves identically in almost every accessor. `raw_is_json` is `Text(_)` plus a
+    /// notice, meaning "this was meant to be JSON and fell back to raw" — and a truncated dump
+    /// carries a notice, so reusing `Text` would have had the viewer syntax-highlight a hex dump
+    /// as JSON. The distinction costs one extra pattern in the arms that treat them alike.
+    Hex(Arc<LineIndex>),
+
 }
 
 /// Why the body isn't shown as JSON, when it might have been.
@@ -34,6 +42,8 @@ pub enum BodyNotice {
     ParseFailed { message: String },
     /// An HTML body past `html::MAX_EXTRACT_BYTES`, so there is no text view to offer.
     HtmlTooLarge { len: usize },
+    /// A binary body past `hex::MAX_DUMP_BYTES`; the dump shows its first megabyte.
+    HexTruncated { len: usize },
 }
 
 /// Which half of an HTML body is on screen.
@@ -162,7 +172,13 @@ impl BodyView {
             return Self::html(body, html_view);
         }
 
-        Self::plain(text_or_binary(body), None)
+        let len = body.len();
+        let kind = text_or_binary(body);
+        // Only a hex dump can be cut; text is indexed whole.
+        let notice = matches!(kind, BodyKind::Hex(_))
+            .then(|| hex::is_truncated(len).then_some(BodyNotice::HexTruncated { len }))
+            .flatten();
+        Self::plain(kind, notice)
     }
 
     /// An HTML body, indexed twice — once as markup, once as the text inside it.
@@ -173,9 +189,12 @@ impl BodyView {
     /// for a body that is, in the case this serves, a few kilobytes.
     fn html(body: Bytes, showing: HtmlView) -> Self {
         let len = body.len();
-        let BodyKind::Text(raw) = text_or_binary(body.clone()) else {
-            // Declared HTML but not valid UTF-8. Nothing to extract and nothing to toggle.
-            return Self::plain(BodyKind::Binary { len }, None);
+        let kind = text_or_binary(body.clone());
+        let BodyKind::Text(raw) = kind else {
+            // Declared HTML but not valid UTF-8, so there is no text to extract and no second
+            // half to toggle to. It still gets a hex dump like any other undecodable body.
+            let notice = hex::is_truncated(len).then_some(BodyNotice::HexTruncated { len });
+            return Self::plain(kind, notice);
         };
 
         let Some(text) = html::to_text(&body) else {
@@ -271,8 +290,8 @@ impl BodyView {
     pub fn row_count(&self) -> usize {
         match &self.kind {
             BodyKind::Json(_) => self.visible.len(),
-            BodyKind::Text(lines) => lines.len(),
-            BodyKind::Empty | BodyKind::Binary { .. } => 0,
+            BodyKind::Text(lines) | BodyKind::Hex(lines) => lines.len(),
+            BodyKind::Empty => 0,
         }
     }
 
@@ -328,8 +347,8 @@ impl BodyView {
     pub fn searchable_source(&self) -> Option<&Bytes> {
         match &self.kind {
             BodyKind::Json(outline) => Some(outline.source()),
-            BodyKind::Text(lines) => Some(lines.source()),
-            BodyKind::Empty | BodyKind::Binary { .. } => None,
+            BodyKind::Text(lines) | BodyKind::Hex(lines) => Some(lines.source()),
+            BodyKind::Empty => None,
         }
     }
 
@@ -340,8 +359,8 @@ impl BodyView {
     pub fn rows_for_offsets(&self, offsets: &[u32]) -> Vec<u32> {
         match &self.kind {
             BodyKind::Json(outline) => outline.rows_for_offsets(offsets),
-            BodyKind::Text(lines) => lines.lines_for_offsets(offsets),
-            BodyKind::Empty | BodyKind::Binary { .. } => Vec::new(),
+            BodyKind::Text(lines) | BodyKind::Hex(lines) => lines.lines_for_offsets(offsets),
+            BodyKind::Empty => Vec::new(),
         }
     }
 
@@ -355,7 +374,7 @@ impl BodyView {
     pub fn reveal(&mut self, row_ix: usize) -> Option<usize> {
         match &self.kind {
             // No folding in the raw view, so a line's row index *is* its visible index.
-            BodyKind::Text(lines) => (row_ix < lines.len()).then_some(row_ix),
+            BodyKind::Text(lines) | BodyKind::Hex(lines) => (row_ix < lines.len()).then_some(row_ix),
             BodyKind::Json(outline) => {
                 let outline = outline.clone();
                 if row_ix >= outline.len() {
@@ -379,7 +398,7 @@ impl BodyView {
                 // a scan. It cannot miss now that the ancestors are open.
                 self.visible.binary_search(&(row_ix as u32)).ok()
             }
-            BodyKind::Empty | BodyKind::Binary { .. } => None,
+            BodyKind::Empty => None,
         }
     }
 
@@ -418,18 +437,18 @@ impl BodyView {
     fn selected_visible_ix(&self) -> Option<usize> {
         let selected = self.selected?;
         match &self.kind {
-            BodyKind::Text(_) => Some(selected as usize),
+            BodyKind::Text(_) | BodyKind::Hex(_) => Some(selected as usize),
             BodyKind::Json(_) => self.visible.binary_search(&selected).ok(),
-            BodyKind::Empty | BodyKind::Binary { .. } => None,
+            BodyKind::Empty => None,
         }
     }
 
     /// Select the row currently drawn at `visible_ix`, returning it for scrolling.
     pub fn select_visible(&mut self, visible_ix: usize) -> Option<usize> {
         let row_ix = match &self.kind {
-            BodyKind::Text(lines) => (visible_ix < lines.len()).then_some(visible_ix as u32),
+            BodyKind::Text(lines) | BodyKind::Hex(lines) => (visible_ix < lines.len()).then_some(visible_ix as u32),
             BodyKind::Json(_) => self.visible.get(visible_ix).copied(),
-            BodyKind::Empty | BodyKind::Binary { .. } => None,
+            BodyKind::Empty => None,
         }?;
 
         self.selected = Some(row_ix);
@@ -503,8 +522,13 @@ impl BodyView {
                 let span = outline.value_span(selected)?;
                 Some(json::unquote(outline.text(span)))
             }
-            BodyKind::Text(lines) => lines.full_line(selected).map(str::to_string),
-            BodyKind::Empty | BodyKind::Binary { .. } => None,
+            // A hex row copies as the row you can see — offset, bytes and gutter. Copying the
+            // underlying 16 bytes instead would be the *other* plausible answer and is the wrong
+            // one here: the pane is showing text, and what you paste should be what you read.
+            BodyKind::Text(lines) | BodyKind::Hex(lines) => {
+                lines.full_line(selected).map(str::to_string)
+            }
+            BodyKind::Empty => None,
         }
     }
 
@@ -597,12 +621,19 @@ fn widest_of(lines: &LineIndex) -> (usize, (u16, u32)) {
     (ix, (0, lines.line(ix).0.chars().count() as u32))
 }
 
+/// Text if it decodes, otherwise a hex dump of the bytes.
+///
+/// **`BodyKind::Binary` used to be the end of the road** — one line saying how many bytes came
+/// back, and no way to tell a JPEG from an HTML error page served with the wrong content type.
+/// A hex dump answers that with no per-format decoder, and because it is *text* the viewer's
+/// existing search, selection and scrolling apply to it unchanged.
+///
+/// An empty body never reaches here, so `Binary` now means only "too large to dump".
 fn text_or_binary(body: Bytes) -> BodyKind {
     if std::str::from_utf8(&body).is_ok() {
-        BodyKind::Text(Arc::new(LineIndex::build(body)))
-    } else {
-        BodyKind::Binary { len: body.len() }
+        return BodyKind::Text(Arc::new(LineIndex::build(body)));
     }
+    BodyKind::Hex(Arc::new(LineIndex::build(Bytes::from(hex::dump(&body)))))
 }
 
 /// Content-Type first, then sniff the first byte.
@@ -716,11 +747,26 @@ mod tests {
         assert!(view.row_count() > 0, "the raw body must still be visible");
     }
 
+    /// Renamed from `a_non_utf8_body_is_binary`, which asserted `row_count() == 0` — the old
+    /// behaviour, where a binary response was a dead end showing a single sentence. It now has
+    /// rows like any other body, which is what makes search, selection and copy work on it.
     #[test]
-    fn a_non_utf8_body_is_binary() {
-        let view = BodyView::build(Bytes::from_static(&[0xff, 0xfe, 0x00]), None, false, HtmlView::default());
-        assert!(matches!(view.kind, BodyKind::Binary { len: 3 }));
-        assert_eq!(view.row_count(), 0);
+    fn a_non_utf8_body_becomes_a_hex_dump() {
+        let view = BodyView::build(
+            Bytes::from_static(&[0xff, 0xfe, 0x00]),
+            None,
+            false,
+            HtmlView::default(),
+        );
+
+        let BodyKind::Hex(lines) = &view.kind else {
+            panic!("expected a hex dump")
+        };
+        assert_eq!(lines.len(), 1);
+        assert!(lines.line(0).0.contains("ff fe 00"), "{:?}", lines.line(0).0);
+        assert_eq!(view.row_count(), 1, "the dump is rows, not a dead end");
+        assert!(view.notice.is_none(), "three bytes is not a truncation");
+        assert!(!view.is_json() && !view.raw_is_json(), "hex must never be JSON-lexed");
     }
 
     #[test]

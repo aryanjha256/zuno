@@ -70,6 +70,7 @@ zuno/
 │       │   └── script.rs    ✅ test scripts -> captures, assertions, expect_status
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 │       ├── body_diff.rs    ✅ BodyDiff — the line-by-line body comparison
+│       ├── hex.rs          ✅ hexdump -C of a body that isn't text
 │       ├── html.rs         ✅ pulling readable text out of an HTML response
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
@@ -2774,6 +2775,44 @@ concat, and is a genuine improvement on the thing being matched. Its limit has t
 than discovered: `<base>` resolves public static assets, but the page opens from a `file://`
 origin, so no cookies go, the auth header Zuno sent is not replayed, and any `fetch()` back to the
 API is cross-origin. A server-rendered template comes up right; an SPA shell stays blank.
+
+---
+
+## 6o. Binary bodies — a hex dump instead of a dead end
+
+`BodyKind::Binary` used to render one sentence: *"184 KB of binary data"*. No rows, no search, no
+selection, no way to tell a JPEG from an HTML error page served with the wrong content type. It is
+now a `hexdump -C`-shaped view, and the variant that stood for "nothing to show" is **gone** —
+nothing constructs it, so it was deleted rather than left as a branch nobody reaches.
+
+**The dump is text, and that decision is the whole slice.** The viewer already has a virtualized
+text path carrying search, selection, copy and horizontal scroll. Rendering hex rows by hand would
+have meant reimplementing four mechanisms to draw something that is, in the end, monospaced lines.
+So `hex::dump` produces a `String`, `LineIndex` indexes it, and `text_list` draws it — the same
+three steps any text body takes.
+
+**`BodyKind::Hex` is nonetheless its own variant, not `Text`.** It holds the same type and behaves
+identically in six accessors, which argues for reuse — but `raw_is_json` is `Text(_)` *plus a
+notice*, meaning "this was meant to be JSON and fell back to raw", and a truncated dump carries a
+notice. Reusing `Text` would therefore have syntax-highlighted a hex dump as JSON, colouring byte
+pairs that happen to look like numbers. The cost of keeping them apart is one extra pattern in the
+arms that treat them alike: `BodyKind::Text(lines) | BodyKind::Hex(lines) =>`.
+
+**Truncation keeps the front, and this is the one cap in the codebase that does.** `MAX_AUTO_PARSE`
+and `MAX_EXTRACT_BYTES` both *refuse* above their limit, because half a JSON tree or half a page of
+prose is worse than none. A hex dump is the opposite: it is read for magic numbers, headers and
+framing, all of which are in the first few rows, and nobody inspects the middle of a JPEG. So a
+large body shows its first megabyte and the notice says so.
+
+**The ASCII gutter is one cell per byte, and stays that way deliberately.** Anything outside
+printable ASCII is a `.`, including valid UTF-8 — widening it would let a two-byte character
+occupy one cell while consuming two bytes, so the gutter would stop corresponding to the hex
+columns beside it. A short final row pads its hex columns for the same reason: without the
+padding the last gutter slides left and no longer lines up with the rows above.
+
+*Deliberately absent:* a toggle to hex for bodies that **are** text. Occasionally useful — checking
+a BOM, a trailing `\r` — and it is the obvious generalisation of `HtmlView` into a three-way
+choice. Not built, because the gap being closed was binary responses having nothing at all.
 
 ---
 

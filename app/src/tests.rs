@@ -2103,6 +2103,99 @@ async fn the_diff_describes_the_two_most_recent_runs(cx: &mut TestAppContext) {
     });
 }
 
+// ---- binary bodies: a hex dump rather than a dead end ----------------------
+
+/// A one-pixel JPEG's opening bytes, served as `image/jpeg`. Real magic numbers, because the
+/// whole reason to look at hex is to check that what came back is what you asked for.
+fn serve_jpeg() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let body: &[u8] = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00H\x00H\x00\x00\xff\xd9";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+#[gpui::test]
+async fn a_binary_response_is_shown_as_a_hex_dump(cx: &mut TestAppContext) {
+    // Before this, a binary body was a single sentence saying how many bytes arrived — you could
+    // not tell a JPEG from an HTML error page served with the wrong content type. The assertion
+    // is on **rows**, because the old behaviour had none and a note instead.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_jpeg();
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+
+    let rows = body_lines(&view, &mut cx);
+    assert_eq!(rows.len(), 2, "21 bytes is two rows of sixteen: {rows:?}");
+    assert!(
+        rows[0].starts_with("00000000  ff d8 ff e0"),
+        "the JPEG magic number should be readable at offset zero: {:?}",
+        rows[0]
+    );
+    assert!(
+        rows[0].contains("|......JFIF"),
+        "and the ASCII gutter should show the marker: {:?}",
+        rows[0]
+    );
+    assert!(rows[1].starts_with("00000010  "), "{:?}", rows[1]);
+
+    cx.update(|_, cx| {
+        let body = view.read(cx).body_view.as_ref().expect("indexed");
+        assert!(
+            !body.is_json() && !body.raw_is_json(),
+            "a hex dump must never be syntax-highlighted as JSON"
+        );
+        assert!(body.notice.is_none(), "21 bytes is not a truncation");
+    });
+}
+
+/// The dump is text, and that is what buys search, selection and copy without writing any of
+/// them — so the thing worth asserting is that those actually reach it.
+#[gpui::test]
+async fn a_hex_row_can_be_selected_and_copied(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_jpeg();
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+
+    let row = cx.debug_bounds("response-row-1").expect("the second hex row is painted");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let copied = cx.update(|_, cx| {
+        view.read(cx)
+            .body_view
+            .as_ref()
+            .and_then(|body| body.selected_value())
+    });
+    let copied = copied.expect("a selected row");
+    assert!(
+        copied.starts_with("00000010  "),
+        "copying a hex row yields the row you can see: {copied:?}"
+    );
+}
+
 // ---- HTML bodies: reading the page, not the markup -------------------------
 
 /// A Django-shaped 500. `<pre>` is where the exception value lives, which is the element the
@@ -2122,9 +2215,14 @@ fn body_lines(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> V
         let view = view.read(cx);
         let body = view.body_view.as_ref().expect("a body index");
         (0..body.row_count())
-            .filter_map(|ix| match &body.kind {
-                crate::body_view::BodyKind::Text(lines) => Some(lines.line(ix).0.to_string()),
-                _ => None,
+            .map(|ix| match &body.kind {
+                // Both line-shaped kinds, and `map` rather than `filter_map`: filtering meant a
+                // kind this did not know about came back as an empty list, which reads as "the
+                // body had no rows" — a passing-looking failure. It did exactly that when the
+                // hex dump arrived.
+                crate::body_view::BodyKind::Text(lines)
+                | crate::body_view::BodyKind::Hex(lines) => lines.line(ix).0.to_string(),
+                other => panic!("body_lines has no arm for {:?}", std::mem::discriminant(other)),
             })
             .collect()
     })

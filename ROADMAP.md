@@ -842,6 +842,23 @@ Both are testable *at the consequence* even though the paint isn't: a click in t
 WCAG ratio. That's the transferable lesson — when a rendering bug can't be observed, find the
 functional half of it and assert that instead. See architecture.md §12.
 
+**Binary responses — a hex dump, and one dead variant removed.** `BodyKind::Binary` rendered a
+single sentence saying how many bytes arrived, which could not answer the only question anyone has
+about a binary response: *is this the thing I asked for?* It is now a `hexdump -C` view, so a JPEG
+shows `ff d8 ff e0` at offset zero and an HTML error page served as `image/png` is obvious at a
+glance. The variant is gone rather than kept — nothing constructs it any more.
+
+The reusable idea is the same one the HTML text view had: **a dump is text**, so indexing it as
+lines gives it the viewer's search, selection, copy and horizontal scrolling for nothing. It is
+also the one cap in the codebase that **truncates rather than refuses** — the JSON and HTML caps
+decline above their limit because half an answer is worse than none, while a hex dump is read for
+magic numbers and framing, which are at the front.
+
+Saving got the fix that prompted it: the extension table was five entries wide and everything else
+saved as `.bin`. See the egress section above.
+
+See architecture.md §6o.
+
 **HTML bodies — done, and the cheap dependency lost.** An API client gets HTML when a framework
 blew up, so the body view gained a text half and a toggle. See architecture.md §6n.
 
