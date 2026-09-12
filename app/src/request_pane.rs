@@ -583,7 +583,7 @@ fn rows_table(
     div().flex().flex_col().children(
         rows.iter()
             .enumerate()
-            .map(|(ix, row)| render_row(row, kind, prefix, ix, theme, cx)),
+            .map(|(ix, row)| render_row(row, kind, prefix, ix, None, theme, cx)),
     )
 }
 
@@ -964,15 +964,19 @@ fn multipart_table(
 
     div().flex().flex_col().children(parts.iter().enumerate().map(|(ix, part)| {
         let prefix = if part.is_file { "fil" } else { "txt" };
-        render_row(&part.row, RowKind::Multipart, prefix, ix, theme, cx)
+        render_row(&part.row, RowKind::Multipart, prefix, ix, Some(part.is_file), theme, cx)
     }))
 }
 
+/// `file_part` is `Some(is_file)` only for a multipart row — the other three tables hold text,
+/// and a type chip or a file picker there would be a control that cannot do anything.
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     row: &KeyValueRow,
     kind: RowKind,
     prefix: &'static str,
     ix: usize,
+    file_part: Option<bool>,
     theme: &Theme,
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
@@ -1026,6 +1030,73 @@ fn render_row(
                 .overflow_hidden()
                 .child(row.name.clone()),
         )
+        // **Says what the row sends, and is how you change it.** The state was previously
+        // visible nowhere — the `txt`/`fil` prefix reached element ids and nothing on screen —
+        // and a part could only *become* a file by having one chosen, with no way back. A
+        // form-data body routinely mixes text fields and uploads, so it has to be a per-row
+        // choice that can be made before there is any file to point at.
+        //
+        // A menu rather than a click-to-toggle: with two states a toggle is ambiguous about
+        // which one you are in versus which one you would get, and this label has to answer the
+        // first question. The menu shows both with the current one ticked.
+        //
+        // Shaped like `ui::menu_button` — word, trailing chevron, `GLYPH_INLINE` so the glyph
+        // matches the word's height — but not *using* it, for two reasons it cannot serve:
+        // its id is a `&'static str` where this needs one per row, and the row index has to be
+        // parked before the action is dispatched, since an `Action` carries no payload.
+        // `chrome.rs`'s app-name button is hand-rolled off the same primitive for its own
+        // reason, so this is the second of two rather than a new pattern.
+        .children(file_part.map(|is_file| {
+            let (label, colour) = if is_file {
+                ("file", theme.accent)
+            } else {
+                ("text", theme.text_muted)
+            };
+            div()
+                .id(SharedString::from(format!("part-kind-{ix}")))
+                .debug_selector(move || format!("part-kind-{ix}"))
+                .group(crate::ui::ICON_GROUP)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(colour)
+                .hover(|style| style.bg(theme.bg_hover))
+                .tooltip(move |_, cx| {
+                    crate::ui::Tooltip::text(
+                        if is_file {
+                            "This part sends a file — click to change"
+                        } else {
+                            "This part sends text — click to change"
+                        },
+                        cx,
+                    )
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                        // Same rule as the file picker beside it: `Workspace`'s root carries
+                        // `track_focus`, so letting this bubble hands focus to the root.
+                        cx.stop_propagation();
+                        view.set_part_kind_menu(ix, event.position);
+                        window.dispatch_action(
+                            Box::new(crate::actions::OpenPartKindMenu),
+                            cx,
+                        );
+                    }),
+                )
+                .child(label)
+                .child(crate::ui::glyph(
+                    crate::ui::Icon::ChevronDown,
+                    colour,
+                    theme.text,
+                    crate::ui::GLYPH_INLINE,
+                ))
+        }))
         .child(
             div()
                 .flex_1()
@@ -1034,6 +1105,56 @@ fn render_row(
                 .text_color(theme.text_muted)
                 .child(row.value.clone()),
         )
+        // Only on a part that sends a file: on a text part it would be a control with nothing
+        // to do. Placed before Remove so the destructive button stays last, as in every row.
+        .children(file_part.unwrap_or(false).then(|| {
+            div()
+                // `part-`, not `{prefix}-`, and deliberately: the row prefix flips between
+                // `txt` and `fil` the moment a part is given a file, so a selector built from it
+                // would rename the control the first time it is used. Every other cell in the
+                // row is prefixed because headers, query and form share `render_row`; this one
+                // exists only for multipart, so it has nothing to disambiguate against.
+                .id(SharedString::from(format!("part-file-{ix}")))
+                .debug_selector(move || format!("part-file-{ix}"))
+                .group(crate::ui::ICON_GROUP)
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover))
+                .tooltip(move |window, cx| {
+                    crate::ui::Tooltip::for_action(
+                        "Choose a file",
+                        &crate::actions::ChooseBodyFile,
+                        window,
+                        cx,
+                    )
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, window, cx| {
+                        // Focus first: the action resolves its target row from focus, and this
+                        // button is a sibling of the cell rather than inside it, so clicking it
+                        // moves nothing on its own.
+                        // **`stop_propagation` is load-bearing, not tidiness.** `Workspace`'s
+                        // root carries `track_focus`, whose focus-on-click is an ordinary
+                        // bubble listener — so without this the click sets the row's focus
+                        // here and the root takes it straight back, `focused_multipart_row`
+                        // reads `None`, and `ChooseBodyFile` falls through to its other
+                        // meaning and replaces the whole body with a binary one. Measured:
+                        // the click left focus at `None` until this line existed.
+                        cx.stop_propagation();
+                        view.focus_multipart_value(ix, window, cx);
+                        window.dispatch_action(Box::new(crate::actions::ChooseBodyFile), cx);
+                    }),
+                )
+                .child(crate::ui::glyph(
+                    crate::ui::Icon::File,
+                    theme.text_muted,
+                    theme.accent,
+                    crate::ui::GLYPH,
+                ))
+        }))
         .child(
             div()
                 .id(SharedString::from(format!("{prefix}-remove-{ix}")))

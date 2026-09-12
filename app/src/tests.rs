@@ -1228,6 +1228,205 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
     }
 }
 
+/// **The whole risk of the per-row browse icon.** `ChooseBodyFile` resolves *which* part it
+/// fills from focus, and the icon sits beside the cell rather than inside it — so `track_focus`
+/// does not move focus there on its own, and without the explicit focus the click would attach
+/// the file to whichever row the caret happened to be in. That is silent: a file lands, a status
+/// line says "Attached", and it is on the wrong part.
+///
+/// **The click itself cannot be driven here, and that is where the bug lived.** An earlier
+/// version of this test asserted exactly what follows and passed while the feature was broken
+/// in the app: clicking the icon set the row's focus and then `Workspace`'s root `track_focus`
+/// took it straight back on the same bubble, so the action read `None` and replaced the whole
+/// body with a binary one. `cx.stop_propagation()` in the listener is what stops that, and
+/// nothing below can see it — `prompt_for_paths` is a hard `unimplemented!()` in the test
+/// platform, so a simulated click panics inside gpui as soon as the action runs.
+///
+/// Kept anyway because it does pin `focus_multipart_value`, but read it knowing the leg it
+/// cannot reach. `prompt_for_paths` is a hard `unimplemented!()`
+/// in the test platform — `simulate_new_path_selection` exists but is `pub(crate)` and only
+/// primes the *save* dialog — so a simulated click panics inside gpui the moment the action
+/// runs. What is asserted is `focus_multipart_value` against `focused_multipart_row`, which is
+/// the seam the handler reads and the whole of what the click has to get right; the remaining
+/// glue is the one line that focuses and dispatches. Same limit every `prompt_for_paths` call
+/// site in this codebase already carries.
+#[gpui::test]
+async fn focusing_a_multipart_row_is_what_targets_a_chosen_file(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.run_until_parked();
+    let add_part = cx.debug_bounds("add-part").expect("the add control");
+    cx.simulate_click(add_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_click(add_part.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let parts = match &spec_of(&view, &mut cx).body {
+        zuno_core::Body::Multipart(parts) => parts.len(),
+        other => panic!("expected a multipart body: {other:?}"),
+    };
+    assert!(parts >= 3, "need several rows to tell them apart, got {parts}");
+
+    // Somewhere else entirely first, so focus cannot accidentally agree with the row being
+    // targeted — the bug and the fix look identical when it does.
+    cx.simulate_keystrokes("ctrl-l");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, cx| view.read(cx).focused_multipart_row(window, cx)),
+        None,
+        "no part should hold focus yet, or this tests nothing"
+    );
+
+    // Row 2 first and row 0 second, so the second call has to *move* the target rather than
+    // agreeing with where the previous one left it. Order is what makes this discriminate.
+    for row in [2usize, 0] {
+        cx.update(|window, cx| {
+            view.update(cx, |view, cx| view.focus_multipart_value(row, window, cx))
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|window, cx| view.read(cx).focused_multipart_row(window, cx)),
+            Some(row),
+            "row {row} should be what a chosen file lands on"
+        );
+    }
+
+    // Out of range must not move the target, or a stale row index silently retargets the file.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| view.focus_multipart_value(99, window, cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|window, cx| view.read(cx).focused_multipart_row(window, cx)),
+        Some(0),
+        "a row that does not exist should change nothing"
+    );
+}
+
+/// The import field takes a **path or a URL**, which is why browsing fills it rather than
+/// importing on selection: a dialog that imported straight away would make the mouse path a
+/// different verb from the keyboard one, and there would be no way to browse to a file and then
+/// edit the path. Same shape as the new-workspace location field.
+///
+/// `prompt_for_paths` cannot be driven headlessly, so this asserts `set_source` — the half the
+/// dialog calls — and that the field is still an ordinary editable input afterwards.
+#[gpui::test]
+async fn browsing_fills_the_import_field_and_leaves_it_editable(cx: &mut TestAppContext) {
+    let (window, _view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("import-panel").is_some(), "the modal must open");
+    assert!(
+        cx.debug_bounds("import-browse").is_some(),
+        "and it must offer a way to browse — typing a path by hand is the thing being fixed"
+    );
+
+    let panel = window
+        .update(&mut cx, |workspace, _, _| workspace.import_panel_for_test())
+        .expect("window")
+        .expect("the panel is open");
+
+    cx.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.set_source("/tmp/spec.json".to_string(), window, cx)
+        })
+    });
+    cx.run_until_parked();
+
+    let source = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| panel.read(cx).source_text(cx))
+    };
+    assert_eq!(source(&mut cx), "/tmp/spec.json", "the chosen path lands in the field");
+
+    // Still a field, not a display. Typing appends where the caret is, which is what makes a
+    // browsed path a starting value rather than a mode you cannot leave.
+    cx.simulate_input("x");
+    cx.run_until_parked();
+    assert_ne!(
+        source(&mut cx),
+        "/tmp/spec.json",
+        "the field must remain editable after being filled by the dialog"
+    );
+
+    // A second browse replaces rather than appends — `set_location`'s select-all-then-replace.
+    cx.update(|window, cx| {
+        panel.update(cx, |panel, cx| {
+            panel.set_source("/tmp/other.yaml".to_string(), window, cx)
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(source(&mut cx), "/tmp/other.yaml");
+}
+
+/// Two things at once, because they are the same rule: a control appears only where it can act.
+/// A header or query row holds text, so a file picker there could do nothing — and a multipart
+/// part that sends *text* is in the same position until it is switched.
+///
+/// Order matters here. `debug_bounds` reads the **last rendered frame** and keeps an entry for a
+/// removed element, so `is_none()` is only trustworthy for something that has never been drawn —
+/// which is why the header check runs before any part is switched to a file.
+#[gpui::test]
+async fn a_file_picker_appears_only_where_it_can_do_something(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    // A header row: painted, and must carry neither control.
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hdr-remove-0").is_some(),
+        "the header row is painted, so its selectors are current"
+    );
+    assert!(cx.debug_bounds("part-kind-0").is_none(), "no type chip on a header");
+    assert!(cx.debug_bounds("part-file-0").is_none(), "and no file picker");
+
+    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.run_until_parked();
+
+    // A fresh part sends text: it says so, and offers no picker.
+    assert!(
+        cx.debug_bounds("part-kind-0").is_some(),
+        "every multipart row must say which of the two it is"
+    );
+    assert!(
+        cx.debug_bounds("part-file-0").is_none(),
+        "a text part has nothing to pick a file for"
+    );
+
+    // Switching it is the choice that was previously impossible — a part could only *become* a
+    // file by having one chosen, with nothing on screen saying so and no way back. The chip
+    // opens a menu rather than toggling, so both states are visible and the current one ticked.
+    let chip = cx.debug_bounds("part-kind-0").expect("the type chip");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let file_row = cx
+        .debug_bounds("part-kind-select-1")
+        .expect("the type select should offer text and file");
+    cx.simulate_click(file_row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(
+        cx.debug_bounds("part-file-0").is_some(),
+        "switching the part to a file is what offers the picker"
+    );
+    assert_eq!(
+        window.update(&mut cx, |w, _, _| w.part_select_row()).expect("window"),
+        None,
+        "choosing must close the select"
+    );
+
+    // And the switch reaches the wire, not just the pixels.
+    match &spec_of(&view, &mut cx).body {
+        zuno_core::Body::Multipart(parts) => assert!(
+            matches!(parts[0].value, zuno_core::MultipartValue::File(_)),
+            "the part must actually send a file: {:?}",
+            parts[0].value
+        ),
+        other => panic!("expected a multipart body: {other:?}"),
+    }
+}
+
 #[gpui::test]
 async fn clicking_a_rows_remove_button_deletes_that_row(cx: &mut TestAppContext) {
     // The keyboard path above was covered; the button was not, and it is the destructive one.
@@ -12444,3 +12643,4 @@ async fn an_empty_header_cell_offers_the_whole_table(cx: &mut TestAppContext) {
         .expect("an empty header name cell should offer the full list");
     assert_eq!(items.len(), zuno_core::headers::COMMON.len());
 }
+

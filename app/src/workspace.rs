@@ -57,7 +57,7 @@ use crate::actions::{
     WorkspaceConfirm, WorkspaceDismiss,
     CollectionExpandAll, CommitRename, ConfirmClose, CopyRequestPath,
     CopyRequestRelativePath, DuplicateRequest,
-    FormatBody, ImportConfirm, ImportDismiss, ImportDocument, MinifyBody, MoveRequest,
+    FormatBody, ImportConfirm, ImportDismiss, ImportBrowse, OpenPartKindMenu, ImportDocument, MinifyBody, MoveRequest,
     NewFolder, NewRequest, OpenRequestExternally,
     RenameRequest, RevealRequest, TrashRequest,
 };
@@ -220,6 +220,8 @@ pub struct Workspace {
     suggest: Option<(usize, Option<usize>)>,
     /// The row whose list was dismissed with `escape`, so it stays shut until focus moves.
     suggest_dismissed: Option<usize>,
+    /// The open multipart type select: which row, and where its chip was.
+    part_select: Option<(usize, gpui::Point<gpui::Pixels>)>,
 }
 
 /// An in-progress inline rename.
@@ -435,6 +437,7 @@ impl Workspace {
             update_task: None,
             suggest: None,
             suggest_dismissed: None,
+            part_select: None,
         };
 
         // Off-thread and non-blocking, so a large collection cannot delay the first frame —
@@ -2537,6 +2540,42 @@ impl Workspace {
             panel
                 .update_in(cx, |panel, window, cx| {
                     panel.set_location(path.display().to_string(), window, cx)
+                })
+                .ok();
+        }));
+    }
+
+    /// Fill the import field from the file dialog.
+    ///
+    /// The **field stays editable** and the browsed path lands in it rather than starting the
+    /// import: the same field also takes a URL, so a dialog that imported on selection would
+    /// make browsing a different verb from typing. It is the `WorkspaceBrowse` shape exactly —
+    /// pick, see the path, then confirm.
+    #[cfg(test)]
+    pub fn import_panel_for_test(&self) -> Option<Entity<crate::import_panel::ImportPanel>> {
+        self.import.as_ref().map(|state| state.panel.clone())
+    }
+
+    fn import_browse(&mut self, _: &ImportBrowse, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.import.as_ref() else { return };
+        let panel = state.panel.clone();
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a document to import".into()),
+        });
+
+        self.workspace_prompt = Some(cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(paths))) = prompt.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            panel
+                .update_in(cx, |panel, window, cx| {
+                    panel.set_source(path.display().to_string(), window, cx)
                 })
                 .ok();
         }));
@@ -5067,6 +5106,70 @@ impl Workspace {
     /// keymap for each keystroke *and* owns the modal slot. They **adapt rather than disable**:
     /// no path on a raw body, no fold on a scalar. A greyed-out row that can never apply is
     /// noise in a menu this short, and the same rule the removed toolbar labels followed.
+    /// Open the select behind a multipart row's type chip.
+    ///
+    /// **A select, not a `context_menu`.** That primitive is a right-click menu: a full-window
+    /// scrim, and rows laid out for a label plus a right-aligned keybinding column. Borrowed
+    /// here it rendered a panel inches wide to hold the words "text" and "file", because the
+    /// keybinding column is still reserving its space. `ui::select_list` is the other shape —
+    /// pinned under the control, sized to its content, occluding rather than scrimming.
+    ///
+    /// Clicking the chip while it is already open closes it, so the chip is a toggle and never
+    /// a way to stack two of them.
+    fn open_part_kind_menu(
+        &mut self,
+        _: &OpenPartKindMenu,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        let Some((ix, at)) = view.update(cx, |view, _| view.take_part_kind_menu()) else {
+            return;
+        };
+        if self.modal_open() {
+            return;
+        }
+        self.part_select = match self.part_select {
+            Some((open, ..)) if open == ix => None,
+            _ => Some((ix, at)),
+        };
+        cx.notify();
+    }
+
+    /// The open type select, if any. Its own method so a test can read real state — a removed
+    /// element keeps its `debug_bounds` entry until another frame is drawn.
+    #[cfg(test)]
+    pub fn part_select_row(&self) -> Option<usize> {
+        self.part_select.map(|(ix, _)| ix)
+    }
+
+    fn choose_part_kind(&mut self, ix: usize, is_file: bool, cx: &mut Context<Self>) {
+        self.part_select = None;
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.set_multipart_kind(ix, is_file, cx));
+        }
+        cx.notify();
+    }
+
+    fn part_kind_select(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (row, at) = self.part_select?;
+        let theme = cx.theme().clone();
+        // The highlight *is* the tick: exactly one row is marked, and it is the one in force.
+        let current = usize::from(self.active()?.read(cx).multipart_is_file(row));
+
+        Some(crate::ui::select_list(
+            "part-kind-select",
+            at,
+            vec![SharedString::from("text"), SharedString::from("file")],
+            Some(current),
+            px(84.),
+            &theme,
+            cx,
+            |_, _, _| {},
+            move |workspace, ix, _window, cx| workspace.choose_part_kind(row, ix == 1, cx),
+        ))
+    }
+
     fn open_row_menu(&mut self, _: &OpenRowMenu, window: &mut Window, cx: &mut Context<Self>) {
         // The anchor is consumed either way: leaving it set after a refused open would place
         // the *next* menu where this click was.
@@ -5431,75 +5534,22 @@ impl Workspace {
         // so reading it as local would add the parent origin twice.
         let at = gpui::point(bounds.left(), bounds.bottom());
 
-        let rows: Vec<_> = items
-            .iter()
-            .enumerate()
-            .map(|(ix, name)| {
-                let selected = highlighted == Some(ix);
-                // Applied unconditionally rather than through a conditional builder: one
-                // highlight always says what Enter will do, so the unselected case needs a
-                // colour too, not the absence of one.
-                let (bg, fg) = if selected {
-                    (theme.bg_hover, theme.text)
-                } else {
-                    (theme.bg_elevated, theme.text_muted)
-                };
-                div()
-                    .id(SharedString::from(format!("suggest-{ix}")))
-                    .debug_selector(move || format!("suggest-{ix}"))
-                    .px_2()
-                    .py_0p5()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .bg(bg)
-                    .text_color(fg)
-                    // Hover moves the highlight rather than adding a second one, so there is
-                    // always exactly one row saying what Enter will do — `context_menu`'s rule.
-                    .on_mouse_move(cx.listener(move |workspace, _: &gpui::MouseMoveEvent, _, cx| {
-                        if let Some((row, _)) = workspace.suggest {
-                            workspace.suggest = Some((row, Some(ix)));
-                            cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |workspace, _: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            workspace.accept_suggestion(ix, window, cx);
-                        }),
-                    )
-                    .child(SharedString::from(*name))
-            })
-            .collect();
-
-        Some(
-            gpui::anchored()
-                .position(at)
-                .anchor(gpui::Corner::TopLeft)
-                .position_mode(gpui::AnchoredPositionMode::Window)
-                .child(
-                    div()
-                        .id("header-suggestions")
-                        .debug_selector(|| "header-suggestions".to_string())
-                        // Without this the wheel scrolls the pane behind the list, since scroll
-                        // handlers consult the hit test rather than propagation.
-                        .occlude()
-                        .flex()
-                        .flex_col()
-                        .max_h(px(220.))
-                        .overflow_y_scroll()
-                        .min_w(px(180.))
-                        .rounded_md()
-                        .p_1()
-                        .bg(theme.bg_elevated)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_md()
-                        .font_family(theme.mono.clone())
-                        .text_xs()
-                        .children(rows),
-                ),
-        )
+        Some(crate::ui::select_list(
+            "header-suggestions",
+            at,
+            items.iter().map(|name| SharedString::from(*name)).collect(),
+            highlighted,
+            px(180.),
+            &theme,
+            cx,
+            |workspace, ix, cx| {
+                if let Some((row, _)) = workspace.suggest {
+                    workspace.suggest = Some((row, Some(ix)));
+                    cx.notify();
+                }
+            },
+            |workspace, ix, window, cx| workspace.accept_suggestion(ix, window, cx),
+        ))
     }
 
     /// Write the chosen name into the cell.
@@ -6044,6 +6094,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::workspace_confirm))
             .on_action(cx.listener(Self::workspace_dismiss))
             .on_action(cx.listener(Self::workspace_browse))
+            .on_action(cx.listener(Self::import_browse))
+            .on_action(cx.listener(Self::open_part_kind_menu))
             .on_action(cx.listener(Self::show_capture_tab))
             .on_action(cx.listener(Self::run_folder))
             .on_action(cx.listener(Self::run_flow))
@@ -6301,6 +6353,7 @@ impl Render for Workspace {
             .children(self.flows.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
             .children(self.header_suggestions(window, cx))
+            .children(self.part_kind_select(cx))
             // Built here rather than held as an `Entity`: it owns no input and no state beyond
             // which button is selected, so it is plain workspace state like `RenameState`.
             .children(

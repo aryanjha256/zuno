@@ -480,6 +480,14 @@ pub struct RequestView {
     /// `Action`, so the position is parked here and `take`n by the handler. Consumed on read,
     /// so a stale anchor can never place a later menu.
     menu_anchor: Option<gpui::Point<gpui::Pixels>>,
+    /// Which multipart row's type menu is being opened, and where its chip is.
+    ///
+    /// Parked here for the reason `menu_anchor` is: an `Action` carries no payload without
+    /// pulling `schemars` in for a derived one, and the menu's two verbs need to know *which*
+    /// row they act on. Kept rather than consumed when the menu opens, because the row is still
+    /// needed when a item is finally chosen — a dismissed menu just leaves it to be overwritten
+    /// by the next chip click, and nothing else can dispatch those two actions.
+    part_kind_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
     /// Holding the diff task is what keeps it alive, and replacing it is what makes a
     /// superseded diff harmless — see `diff_against`.
     diff_task: Option<Task<()>>,
@@ -530,6 +538,7 @@ impl RequestView {
             diff_scroll: UniformListScrollHandle::new(),
             headers_scroll: gpui::ScrollHandle::new(),
             menu_anchor: None,
+            part_kind_menu: None,
             diff_task: None,
             inflight: None,
             error: None,
@@ -1019,6 +1028,25 @@ impl RequestView {
         cx.notify();
     }
 
+    /// Switch one multipart part between sending text and sending a file.
+    ///
+    /// **Lossless, and that is why it is a toggle rather than two row types.** `is_file` only
+    /// decides how the cell's text is *read* when the spec is derived — `MultipartValue::File`
+    /// of that string, or `Text` of it — so flipping it back and forth destroys nothing and a
+    /// path typed by hand survives being switched to text and back.
+    ///
+    /// It exists because the state was previously **invisible and one-way**: a part became a
+    /// file only by choosing one, nothing on the row said which it was, and there was no way
+    /// back. A form-data body routinely mixes the two.
+    pub fn set_multipart_kind(&mut self, ix: usize, is_file: bool, cx: &mut Context<Self>) {
+        let Some(part) = self.multipart.get_mut(ix) else { return };
+        if part.is_file == is_file {
+            return;
+        }
+        part.is_file = is_file;
+        cx.notify();
+    }
+
     /// Point a multipart part at a file, marking it a file part.
     pub fn set_multipart_file(&mut self, ix: usize, path: PathBuf, cx: &mut Context<Self>) {
         let Some(part) = self.multipart.get_mut(ix) else {
@@ -1031,6 +1059,19 @@ impl RequestView {
         let text = path.display().to_string();
         part.row.value = cx.new(|cx| TextInput::new(text, "path", "PartCell", cx));
         cx.notify();
+    }
+
+    /// Put focus on one multipart part's value cell.
+    ///
+    /// Exists so a **click** on that row's browse icon can target that row. `ChooseBodyFile`
+    /// resolves which part it fills from focus — one verb for "pick a file", per
+    /// `choose_body_file` — and an icon button is not inside the cell, so `track_focus` does not
+    /// move focus there on its own. `Window::focus` writes `window.focus` synchronously and
+    /// `Window::dispatch_action` reads it before deferring (`window.rs:1386` and `:1477`), so
+    /// focusing here and dispatching on the next line reaches the row that was clicked.
+    pub fn focus_multipart_value(&self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(part) = self.multipart.get(ix) else { return };
+        window.focus(&part.row.value.read(cx).focus_handle(cx));
     }
 
     /// The multipart part containing focus, if the body is multipart.
@@ -1913,6 +1954,20 @@ impl RequestView {
 
     pub fn set_menu_anchor(&mut self, at: gpui::Point<gpui::Pixels>) {
         self.menu_anchor = Some(at);
+    }
+
+    pub fn set_part_kind_menu(&mut self, ix: usize, at: gpui::Point<gpui::Pixels>) {
+        self.part_kind_menu = Some((ix, at));
+    }
+
+    pub fn multipart_is_file(&self, ix: usize) -> bool {
+        self.multipart.get(ix).is_some_and(|part| part.is_file)
+    }
+
+    /// The row whose type chip was clicked, and where it is. Consumed, so a stale click cannot
+    /// place a later select.
+    pub fn take_part_kind_menu(&mut self) -> Option<(usize, gpui::Point<gpui::Pixels>)> {
+        self.part_kind_menu.take()
     }
 
     pub fn take_menu_anchor(&mut self) -> Option<gpui::Point<gpui::Pixels>> {

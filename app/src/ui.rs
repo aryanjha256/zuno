@@ -69,6 +69,7 @@ pub enum Icon {
     Folder,
     FolderOpen,
     FolderPlus,
+    File,
     FilePlus,
     Replace,
     ReplaceAll,
@@ -120,6 +121,7 @@ impl Icon {
             Icon::Folder => "icons/folder.svg",
             Icon::FolderOpen => "icons/folder-open.svg",
             Icon::FolderPlus => "icons/folder-plus.svg",
+            Icon::File => "icons/file.svg",
             Icon::FilePlus => "icons/file-plus.svg",
             Icon::Replace => "icons/replace.svg",
             Icon::ReplaceAll => "icons/replace-all.svg",
@@ -149,6 +151,7 @@ impl Icon {
         Icon::Globe,
         Icon::Cookie,
         Icon::Waypoints,
+        Icon::File,
         Icon::FileBadge,
         Icon::Eye,
         Icon::PlusCircle,
@@ -198,6 +201,7 @@ impl AssetSource for Assets {
             "icons/globe.svg" => include_bytes!("../assets/icons/globe.svg"),
             "icons/cookie.svg" => include_bytes!("../assets/icons/cookie.svg"),
             "icons/waypoints.svg" => include_bytes!("../assets/icons/waypoints.svg"),
+            "icons/file.svg" => include_bytes!("../assets/icons/file.svg"),
             "icons/file-badge.svg" => include_bytes!("../assets/icons/file-badge.svg"),
             "icons/eye.svg" => include_bytes!("../assets/icons/eye.svg"),
             "icons/plus-circle.svg" => include_bytes!("../assets/icons/plus-circle.svg"),
@@ -630,6 +634,107 @@ pub fn field_box(input: Entity<crate::input::TextInput>, theme: &Theme) -> impl 
         .border_color(theme.border_focused)
         .text_xs()
         .child(input)
+}
+
+/// An anchored list pinned under a control — a **select**, not a menu.
+///
+/// **The distinction is the whole reason this exists separately from `context_menu`.** That one
+/// is a right-click menu: a full-window overlay with a scrim, dismissed by clicking anywhere,
+/// and its rows are laid out for a label *plus* a right-aligned keybinding column. Borrowing it
+/// for a two-option type picker produced a panel several inches wide to hold the words "Text"
+/// and "File", because the keybinding column is still there and still reserving space.
+///
+/// A select is the other shape: pinned to the bottom-left of the control it belongs to, sized to
+/// its own content, `.occlude()` rather than a scrim, and **no focus transfer** — the control
+/// keeps the keyboard, which is what lets a combobox filter as you type.
+///
+/// Emitted by whoever owns the *window*, never by the row it belongs to: an `overflow_hidden`
+/// ancestor masks an absolutely-positioned child, and every table this is used over has one.
+///
+/// `highlighted` is applied unconditionally rather than through a conditional builder — exactly
+/// one row always says what choosing would do, so the unselected case needs a colour of its own
+/// rather than the absence of one.
+pub fn select_list<V, H, C>(
+    id: &'static str,
+    at: gpui::Point<gpui::Pixels>,
+    items: Vec<SharedString>,
+    highlighted: Option<usize>,
+    min_width: gpui::Pixels,
+    theme: &Theme,
+    cx: &mut gpui::Context<V>,
+    on_highlight: H,
+    on_choose: C,
+) -> impl IntoElement + use<V, H, C>
+where
+    V: gpui::Render,
+    H: Fn(&mut V, usize, &mut gpui::Context<V>) + Clone + 'static,
+    C: Fn(&mut V, usize, &mut Window, &mut gpui::Context<V>) + Clone + 'static,
+{
+    let rows: Vec<_> = items
+        .into_iter()
+        .enumerate()
+        .map(|(ix, label)| {
+            let (bg, fg) = if highlighted == Some(ix) {
+                (theme.bg_hover, theme.text)
+            } else {
+                (theme.bg_elevated, theme.text_muted)
+            };
+            let highlight = on_highlight.clone();
+            let choose = on_choose.clone();
+            div()
+                .id(SharedString::from(format!("{id}-{ix}")))
+                .debug_selector(move || format!("{id}-{ix}"))
+                .px_2()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .whitespace_nowrap()
+                .bg(bg)
+                .text_color(fg)
+                // Hover *moves* the highlight rather than adding a second one, so there is
+                // always exactly one row saying what a click will do.
+                .on_mouse_move(cx.listener(move |view, _: &gpui::MouseMoveEvent, _, cx| {
+                    highlight(view, ix, cx)
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        choose(view, ix, window, cx)
+                    }),
+                )
+                .child(label)
+        })
+        .collect();
+
+    gpui::anchored()
+        .position(at)
+        .anchor(gpui::Corner::TopLeft)
+        // Window coordinates: the caller reads a painted element's bounds, which are already
+        // absolute, so treating them as local would add the parent's origin a second time.
+        .position_mode(gpui::AnchoredPositionMode::Window)
+        .child(
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                // Without this the wheel scrolls whatever is behind the list: scroll handlers
+                // consult the hit test, never propagation.
+                .occlude()
+                .flex()
+                .flex_col()
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .min_w(min_width)
+                .rounded_md()
+                .p_1()
+                .bg(theme.bg_elevated)
+                .border_1()
+                .border_color(theme.border)
+                .shadow_md()
+                .font_family(theme.mono.clone())
+                .text_xs()
+                .children(rows),
+        )
 }
 
 /// A word with a trailing chevron: a control that opens a menu.

@@ -220,6 +220,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::WorkspaceConfirm", "only valid inside the new-workspace dialog"),
     ("zuno::WorkspaceDismiss", "only valid inside the new-workspace dialog"),
     ("zuno::WorkspaceBrowse", "only valid inside the new-workspace dialog"),
+    ("zuno::ImportBrowse", "only valid inside the import dialog"),
+    // Acts on the one multipart row whose chip was clicked, so a palette row would have no row
+    // to act on. The two choices it offers are rows in the select, not actions.
+    ("zuno::OpenPartKindMenu", "opened by a multipart row's type chip"),
     ("zuno::ConfirmClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CancelClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CloseChoiceNext", "only valid inside the unsaved-changes prompt"),

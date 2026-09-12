@@ -20,7 +20,8 @@
 //! to remove.
 
 use gpui::{
-    AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
+    AppContext, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
     Styled, Window, div, px,
 };
@@ -110,6 +111,27 @@ impl ImportPanel {
     }
 }
 
+/// Fill the source from the file dialog.
+///
+/// Select-all then replace rather than a `set_text` API, the same route `WorkspacePanel`
+/// takes: `replace_text_in_range` with a `None` range acts on the selection, so the write
+/// keeps the sanitisation, the undo entry and the `Changed` emit every other edit path gets.
+/// Typing over it afterwards is the point — a browsed path is a starting value, not a mode.
+impl ImportPanel {
+    #[cfg(test)]
+    pub fn source_text(&self, cx: &gpui::App) -> String {
+        self.source.read(cx).text().to_string()
+    }
+
+    pub fn set_source(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.source.update(cx, |input, cx| {
+            input.select_all_text(cx);
+            input.replace_text_in_range(None, &path, window, cx);
+        });
+        cx.notify();
+    }
+}
+
 impl Focusable for ImportPanel {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -164,7 +186,29 @@ impl Render for ImportPanel {
                             .text_color(theme.text)
                             .child("Import from OpenAPI"),
                     )
-                    .child(crate::ui::field_box(self.source.clone(), &theme))
+                    // Field and browse button on one row, the shape `WorkspacePanel` already
+                    // uses for its location: the path is editable either way, and the dialog is
+                    // a faster way to fill it rather than a different way to answer.
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(crate::ui::field_box(self.source.clone(), &theme)),
+                            )
+                            .child(crate::ui::icon_button(
+                                "import-browse",
+                                crate::ui::Icon::File,
+                                "Choose a file",
+                                crate::actions::ImportBrowse,
+                                &theme,
+                            )),
+                    )
                     .child(
                         div()
                             .text_xs()

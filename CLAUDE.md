@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 913 tests, ~25s
+cargo test --workspace                   # 916 tests, ~25s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -465,6 +465,14 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   matches **exhaustively with no catch-all** — adding a variant is now a compile error until someone
   decides how to edit it. An interim `preserved_body` field held the unknown instead; it's gone,
   because a catch-all that quietly preserves is weaker than a match that refuses to build.
+- **A path the user must type is a path they have to already know.** Three fields take a file
+  path by hand — the new-workspace location, the import source, and a multipart part. Each pairs
+  the field with a folder icon that opens the native dialog and *fills the field*, rather than
+  importing or attaching on selection: the field stays editable, so browsing is a faster way to
+  answer rather than a different verb from typing. The import field also accepts a URL, which is
+  the reason a dialog must not act on its own. `prompt_for_paths` is `unimplemented!()` in the
+  test platform, so every one of these is asserted at the layer below the dialog.
+
 - **Every verb needs a mouse path, not just a keybinding.** Keyboard-first is not keyboard-only: an
   audit found only six of ~40 actions were reachable by mouse, and nine had none at all — find,
   copy-as-curl, copy response, settings, import, new tab. A shortcut nobody can discover is a

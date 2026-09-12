@@ -2817,6 +2817,47 @@ choice. Not built, because the gap being closed was binary responses having noth
 
 ---
 
+## 6p. Browsing for a file — three fields, one shape
+
+Three places take a filesystem path by hand: the new-workspace **location**, the **import
+source**, and a **multipart part**. Each now pairs its field with a folder icon that opens the
+native dialog, and the workspace one is the template the other two were made to match.
+
+**The dialog fills the field; it does not act.** Browsing and typing answer the same question, so
+a dialog that imported the moment you chose a file would make the mouse a different verb from the
+keyboard — and there would be no way to browse to a path and then edit it. The import field
+settles the argument on its own: it accepts a **URL as well as a path**, decided from the text
+(`workspace.rs`, `is_url`), so "chose a file" cannot mean "begin".
+
+**Writes go through the ordinary edit path.** `set_location` and `set_source` both select-all then
+`replace_text_in_range(None, …)`, rather than a `set_text` API that does not exist — which keeps
+the sanitisation, the undo entry and the `Changed` emit every other edit gets. A second browse
+then *replaces* rather than appends; without the select-all it concatenates, which is what the
+break test shows.
+
+**The multipart icon needed no new action, only a target.** `ChooseBodyFile` has always filled a
+focused part and otherwise set the whole binary body — one verb, two meanings, decided by focus
+(§6, `choose_body_file`). An icon button is a **sibling** of the cell rather than inside it, so
+`track_focus` does not move focus there, and a click would have attached the file to whichever row
+the caret was in: a file lands, the status bar says "Attached", and it is on the wrong part. So
+the listener focuses that row's value cell and *then* dispatches. That ordering is safe for a
+reason worth recording — `Window::focus` writes `window.focus` synchronously (`window.rs:1386`)
+and `Window::dispatch_action` reads it before deferring (`window.rs:1477`).
+
+**Its selector is `part-file-{ix}`, not `{prefix}-file-{ix}`.** Every other cell in `render_row`
+is prefixed because headers, query, form and multipart share that function — but the multipart
+prefix is *per row* and flips from `txt` to `fil` the moment a part is given a file, so a selector
+built from it renames the control the first time it is used. Found by a test looking for
+`fil-file-2` on a row that was still `txt`.
+
+**None of the three can be tested through the dialog.** `prompt_for_paths` is a hard
+`unimplemented!()` in the test platform — `simulate_new_path_selection` exists but is
+`pub(crate)` and primes only the *save* dialog — so a simulated click panics inside gpui as soon
+as the action runs. What is asserted is the seam each handler reads: `focused_multipart_row` for
+the part, and `set_source` for the import field.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains

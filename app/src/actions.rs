@@ -91,6 +91,8 @@ actions!(
         WorkspaceConfirm,
         WorkspaceDismiss,
         WorkspaceBrowse,
+        ImportBrowse,
+        OpenPartKindMenu,
         // Editing environments. Selecting one has existed since M3; until these, *authoring*
         // one meant leaving Zuno for a text editor — the last place where "the files are the
         // interface" still meant that.
