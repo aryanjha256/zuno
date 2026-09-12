@@ -11,6 +11,7 @@
 //! this line used to carry stopped meaning anything once modules kept arriving after M1.
 
 pub mod assertion;
+pub mod body_diff;
 pub mod capture;
 pub mod collection;
 pub mod curl;
@@ -36,6 +37,7 @@ pub use collection::CollectionError;
 pub use environment::{Environment, EnvironmentError, Resolver};
 pub use import::{Import, ImportError, Imported};
 pub use curl::{CurlError, CurlImport};
+pub use body_diff::{BodyDiff, DiffLine, LineKind};
 pub use diff::ResponseDiff;
 pub use engine::{Engine, EngineError, Event, JobId, ProxyMode, TlsFiles};
 pub use highlight::{Token, TokenKind};

@@ -2,9 +2,12 @@
 //!
 //! This exists to answer one question in the edit → resend → compare loop: *did my
 //! change do anything?* That's a summary question, so this is a summary diff — status,
-//! timing, size, which headers moved, whether the body is byte-identical. A full inline
-//! body diff is a different feature with a different UI, and building it here would
-//! bury the signal.
+//! timing, size, which headers moved, whether the body is byte-identical.
+//!
+//! *What* changed is a different question with a different UI, and it lives in `body_diff.rs`
+//! as its own type rather than as fields here — which is the same judgement this comment
+//! always made, now that there is something to point at. Folding a line list into a struct
+//! whose job is to fit on one bar would bury the signal the bar exists to carry.
 
 use std::collections::BTreeMap;
 

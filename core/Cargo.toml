@@ -27,3 +27,5 @@ trash.workspace = true
 # re-export the traits. See `engine/probe.rs`.
 tower-layer.workspace = true
 tower-service.workspace = true
+# The inline body diff. See the workspace manifest for why this crate and not another.
+similar.workspace = true

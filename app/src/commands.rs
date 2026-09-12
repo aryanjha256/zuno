@@ -118,6 +118,7 @@ pub fn palette() -> Vec<Command> {
         command("Show response body", ShowResponseBody),
         command("Show response headers", ShowResponseHeaders),
         command("Show response timing", ShowResponseTiming),
+        command("Show response diff", ShowResponseDiff),
         command("Next response tab", NextResponseTab),
         command("Previous response tab", PrevResponseTab),
         command("Find in response", FindInResponse),

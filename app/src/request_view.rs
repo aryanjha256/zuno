@@ -24,7 +24,7 @@ use zuno_core::{
     assertion::{Assertion, Op},
     capture::Capture,
     MultipartValue, QueryParam, RawKind, RequestId, RequestSettings, RequestSpec, Resolver,
-    ResponseData, ResponseDiff,
+    BodyDiff, ResponseData, ResponseDiff,
 };
 
 /// Flip `enabled` on a row, reporting whether the index existed.
@@ -247,16 +247,20 @@ pub enum ResponseView {
     /// Where the time went, on one time axis. Third, so the two answers you came for keep
     /// their positions — this is the tab you visit when one of them was slow.
     Timing,
+    /// What changed since the run before. Last for the same reason Timing is third: it is a
+    /// question you ask *about* an answer, not one of the answers.
+    Diff,
 }
 
 impl ResponseView {
     /// Visual order, which is also cycle order — not most-recently-used, for the reason
     /// `RequestTab::ALL` states: MRU on a fixed strip sends one keystroke somewhere
     /// different each time and throws away the muscle memory the strip gives for free.
-    pub const ALL: [ResponseView; 3] = [
+    pub const ALL: [ResponseView; 4] = [
         ResponseView::Body,
         ResponseView::Headers,
         ResponseView::Timing,
+        ResponseView::Diff,
     ];
 
     fn step(self, delta: isize) -> Self {
@@ -404,6 +408,15 @@ pub struct RequestView {
     pub response: Option<ResponseData>,
     /// How the current response differs from the one before it. `None` on the first run.
     pub diff: Option<ResponseDiff>,
+    /// The line-by-line body comparison behind the Diff tab. `None` on the first run, and
+    /// while the background comparison is still running.
+    ///
+    /// Computed eagerly beside `diff` rather than when the tab is opened, which is a real
+    /// cost traded for a real thing: the tab's label carries `+n −n`, and a count that only
+    /// appears once you visit the tab cannot tell you whether visiting is worth it. The cost
+    /// is bounded on both sides that matter — identical bodies settle on a byte compare, and
+    /// anything past `MAX_DIFF_BYTES` returns without diffing.
+    pub body_diff: Option<BodyDiff>,
     /// Previous responses, newest first, capped at `HISTORY_LIMIT`.
     pub history: Vec<ResponseData>,
     /// Which run is on screen: `0` is the live response, `1` the run before it, and so on
@@ -442,6 +455,13 @@ pub struct RequestView {
     /// to a match can scroll the one that is. `uniform_list` needs the handle at render time,
     /// which is why it lives here rather than in `BodyView`.
     pub body_scroll: UniformListScrollHandle,
+    /// The Diff tab's scroll state.
+    ///
+    /// Its own handle rather than sharing `body_scroll`: the two lists are never on screen
+    /// together, which is what lets the JSON and raw views share one, but they are views of
+    /// *different documents* — a diff is a few dozen rows where the body is thousands, so a
+    /// shared offset would land one of them somewhere its content does not reach.
+    pub diff_scroll: UniformListScrollHandle,
     /// The headers tab's scroll state. Tracked so the tab can scroll *sideways* — header values
     /// routinely exceed the pane, and until this existed the cell was told to shrink and clip.
     pub headers_scroll: gpui::ScrollHandle,
@@ -488,6 +508,7 @@ impl RequestView {
             settings: RequestSettings::default(),
             response: None,
             diff: None,
+            body_diff: None,
             history: Vec::new(),
             viewing: 0,
             response_view: ResponseView::default(),
@@ -498,6 +519,7 @@ impl RequestView {
             body_search: None,
             search_task: None,
             body_scroll: UniformListScrollHandle::new(),
+            diff_scroll: UniformListScrollHandle::new(),
             headers_scroll: gpui::ScrollHandle::new(),
             menu_anchor: None,
             diff_task: None,
@@ -626,6 +648,7 @@ impl RequestView {
         // A different request has no relationship to the last one's response.
         self.response = None;
         self.diff = None;
+        self.body_diff = None;
         self.history.clear();
         self.viewing = 0;
         self.body_view = None;
@@ -697,6 +720,22 @@ impl RequestView {
             self.response_view = view;
             cx.notify();
         }
+    }
+
+    /// The body diff, but only where it describes what is on screen.
+    ///
+    /// `body_diff` compares the live response with the one before it, so beside an older run it
+    /// is not merely uninteresting but **wrong** — it would label lines as added that the run
+    /// you are looking at never contained. The summary diff bar solves this by hiding itself; a
+    /// tab cannot hide without shifting the three tabs beside it, so the decision is made here
+    /// and the tab renders a note instead.
+    ///
+    /// A method rather than a check inside the renderer so a test can ask. Nothing in the
+    /// headless platform can observe that a region was not painted — `debug_bounds` reports the
+    /// last frame drawn and `is_none()` proves nothing — so the alternative is an assertion that
+    /// passes whether or not the guard is there.
+    pub fn diff_to_show(&self) -> Option<&BodyDiff> {
+        (self.viewing == 0).then_some(self.body_diff.as_ref()).flatten()
     }
 
     /// Every run that can be shown, newest first, as `(offset, response)`.
@@ -1142,9 +1181,10 @@ impl RequestView {
 
                 // The run this one replaces is the diff baseline, and then becomes history.
                 let previous = self.response.take();
-                // Cleared rather than left stale: it described a comparison that no longer holds,
-                // and the replacement arrives from a background task a frame or two later.
+                // Cleared rather than left stale: they described a comparison that no longer
+                // holds, and the replacements arrive from a background task a frame or two later.
                 self.diff = None;
+                self.body_diff = None;
                 // Cloned before the move, and cheap for it: `Bytes` is refcounted, so this copies
                 // a status line and a header list, not a body.
                 let current = (*response).clone();
@@ -1244,14 +1284,21 @@ impl RequestView {
         current: ResponseData,
         cx: &mut Context<Self>,
     ) {
-        let compute = cx
-            .background_executor()
-            .spawn(async move { ResponseDiff::between(&previous, &current) });
+        // Both comparisons in one task. They read the same two responses and land in the same
+        // frame, so splitting them would buy two background hops and a window in which the
+        // summary says the body changed while the Diff tab still shows nothing.
+        let compute = cx.background_executor().spawn(async move {
+            (
+                ResponseDiff::between(&previous, &current),
+                BodyDiff::between(&previous, &current),
+            )
+        });
 
         self.diff_task = Some(cx.spawn(async move |this, cx| {
-            let diff = compute.await;
+            let (diff, body_diff) = compute.await;
             let _ = this.update(cx, |this, cx| {
                 this.diff = Some(diff);
+                this.body_diff = Some(body_diff);
                 cx.notify();
             });
         }));

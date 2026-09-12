@@ -2093,6 +2093,97 @@ async fn the_diff_describes_the_two_most_recent_runs(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn the_body_diff_lands_on_the_field_that_changed(cx: &mut TestAppContext) {
+    // End-to-end over the real wiring, because every piece between the core comparison and the
+    // tab is a place this can silently stop: the diff is computed in the same background task
+    // as the summary, stored on the view, and read back by the renderer. Break any of them and
+    // the tab sits on "Comparing…" forever with nothing anywhere saying why.
+    //
+    // Both bodies arrive **minified**, which is the case the feature exists for: diffed as raw
+    // bytes these are one line each and the only honest answer is "it changed".
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[
+        (200, r#"{"id":7,"name":"ada","role":"admin"}"#),
+        (200, r#"{"id":7,"name":"grace","role":"admin"}"#),
+    ]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 200);
+
+    let diff = wait_for(&mut cx, "the body diff", |cx| {
+        cx.update(|_, cx| view.read(cx).body_diff.clone())
+    });
+
+    let (added, removed) = diff.counts();
+    assert_eq!(
+        (added, removed),
+        (1, 1),
+        "one field moved, so one line each way: {:?}",
+        diff.lines()
+    );
+    assert!(
+        diff.lines().iter().any(|line| {
+            line.kind == zuno_core::body_diff::LineKind::Insert && line.text.contains("grace")
+        }),
+        "the new value should be its own line: {:?}",
+        diff.lines()
+    );
+    assert!(
+        diff.lines().iter().any(|line| {
+            line.kind == zuno_core::body_diff::LineKind::Equal && line.text.contains("\"role\"")
+        }),
+        "an untouched field should survive as context: {:?}",
+        diff.lines()
+    );
+}
+
+#[gpui::test]
+async fn the_diff_is_withheld_while_an_older_run_is_on_screen(cx: &mut TestAppContext) {
+    // The diff compares the live response with the one before it. Beside an older run that is
+    // not merely uninteresting — it labels lines as added that the run on screen never had, so
+    // it is a *wrong answer presented as a right one*, which is worse than no answer.
+    //
+    // Asserted on `diff_to_show` rather than on whether the list was painted: `debug_bounds`
+    // reports the last frame drawn, so `is_none()` is true for a region that is still there and
+    // would read as coverage either way.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, r#"{"a":1}"#), (200, r#"{"a":2}"#)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    send_and_wait(&mut cx, &view, 200);
+
+    wait_for(&mut cx, "the body diff", |cx| {
+        cx.update(|_, cx| view.read(cx).body_diff.clone())
+    });
+    cx.update(|_, cx| {
+        assert!(
+            view.read(cx).diff_to_show().is_some(),
+            "the live run is what the diff describes"
+        );
+    });
+
+    cx.simulate_keystrokes("ctrl-h");
+    cx.simulate_keystrokes("down enter");
+    assert_eq!(viewing(&view, &mut cx), 1, "the older run is on screen");
+
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(
+            view.body_diff.is_some(),
+            "the comparison is still held — it is only the *showing* of it that is wrong here"
+        );
+        assert!(
+            view.diff_to_show().is_none(),
+            "and it must not be offered beside a run it does not describe"
+        );
+    });
+}
+
+#[gpui::test]
 async fn a_failure_clears_the_diff_but_keeps_the_baseline(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
@@ -4487,6 +4578,13 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     cx.simulate_keystrokes("alt-r");
     assert_eq!(
         response_view(&view, &mut cx),
+        ResponseView::Diff,
+        "Diff is the fourth stop — a question about an answer, after both answers"
+    );
+
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(
+        response_view(&view, &mut cx),
         ResponseView::Body,
         "and the cycle wraps"
     );
@@ -4494,7 +4592,23 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     // Backwards, which is the half `alt-shift-r` exists for: from Body, one step back is the
     // last tab rather than an error or a no-op.
     cx.simulate_keystrokes("alt-shift-r");
-    assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Diff);
+
+    // The cycle must visit every tab `ResponseView::ALL` declares. Asserting the *count* is
+    // what makes a fifth tab added to `ALL` and forgotten here a failure rather than a silently
+    // shorter loop — `step` wraps on `ALL.len()`, so a new variant changes this and nothing else.
+    let mut seen = vec![response_view(&view, &mut cx)];
+    for _ in 1..ResponseView::ALL.len() {
+        cx.simulate_keystrokes("alt-r");
+        seen.push(response_view(&view, &mut cx));
+    }
+    seen.sort_by_key(|tab| format!("{tab:?}"));
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        ResponseView::ALL.len(),
+        "cycling should reach every declared tab, saw {seen:?}"
+    );
 }
 
 #[gpui::test]

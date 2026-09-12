@@ -191,6 +191,7 @@ actions!(
         ShowResponseBody,
         ShowResponseHeaders,
         ShowResponseTiming,
+        ShowResponseDiff,
         FindInResponse,
         FindNext,
         FindPrev,

@@ -322,7 +322,8 @@ Three details that keep it from misleading:
 - The pane says **"Showing the run from N sends ago"** when you aren't on the live response.
   Without it the pane is indistinguishable from the current run.
 - The **diff is hidden** while browsing, because it describes live-vs-previous and is simply wrong
-  next to an older run.
+  next to an older run. The Diff *tab* follows the same rule by a different route: a tab cannot
+  hide without shifting the three beside it, so it stays and says why it is empty.
 - **Sending returns you to live.** A response arriving while you read an old one must not leave you
   parked in the past with no sign anything happened.
 
@@ -829,6 +830,25 @@ Both are testable *at the consequence* even though the paint isn't: a click in t
 WCAG ratio. That's the transferable lesson — when a rendering bug can't be observed, find the
 functional half of it and assert that instead. See architecture.md §12.
 
+**Inline body diff — done, and the structural-diff instinct was wrong.** This sat in "Named, not
+planned" reading: *"A structural diff over `Row` spans is probably better than a text diff, now
+that the JSON outline exists."* It is not, and the reason is worth keeping.
+
+A structural diff answers "which field changed" and cannot answer anything about a body that is
+not JSON — an HTML error page, a plain-text 500, a CSV export. A *line* diff answers both, but
+only once the lines mean something, and for a minified JSON body they do not: the whole document
+is one line. The outline earns its keep either way — not as the thing being compared, but through
+`json::format::pretty`, which turns one line into one field per line. **Normalize, then run an
+ordinary text diff** does the structural job on JSON and keeps working on everything else.
+
+The second correction is that the algorithm was never the expensive part. `similar` is one crate
+with no transitive dependencies (measured with `cargo tree`, against `imara-diff`'s four and
+`syntect`'s forty-six), and it brings Patience, hunk grouping and word-level refinement. What was
+actually ours to get right was the normalization, the three caps, and refusing to show the diff
+beside a run it does not describe.
+
+See architecture.md §6m.
+
 **Syntax highlighting — done, and principle 4 mispriced it.** Kept rather than deleted, because
 the correction is the useful part.
 
@@ -855,8 +875,6 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
-- **Inline body diff.** The summary diff answers "did my change do anything?". A structural diff
-  over `Row` spans is probably better than a text diff, now that the JSON outline exists.
 - **gRPC / WebSocket / SSE.** Each is a different transport and a different response viewer. Not
   extensions of the HTTP loop — separate products wearing the same coat.
 - **macOS and Windows builds.** Keybindings assume `ctrl`; `session.rs` assumes XDG paths. Both

@@ -88,6 +88,8 @@ pub struct Theme {
     /// the other means retuning "redirect orange" silently restyles the timeline.
     pub timeline: TimelineTheme,
 
+    pub diff: DiffTheme,
+
     /// Resolved at startup from what the OS actually has installed.
     pub mono: SharedString,
 }
@@ -112,6 +114,25 @@ pub struct SyntaxTheme {
     pub number: Hsla,
     pub literal: Hsla,
     pub punct: Hsla,
+}
+
+/// Colours for the inline body diff.
+///
+/// Its own group rather than `status_success` / `status_server_error` reused: those name an
+/// HTTP status class, and a reader who saw green on a diff row would reasonably ask which 2xx
+/// it referred to. The backgrounds carry **alpha** so a row tint composes over whichever
+/// surface it lands on — the pane, a hover, a selection — instead of replacing it and making
+/// the cursor disappear on exactly the rows being read.
+#[derive(Debug, Clone)]
+pub struct DiffTheme {
+    pub added: Hsla,
+    pub removed: Hsla,
+    pub added_bg: Hsla,
+    pub removed_bg: Hsla,
+    /// The character-level mark *inside* a changed line: the same hue as the row, stronger, so
+    /// it reads as "more of the same thing" rather than as a third state.
+    pub added_mark: Hsla,
+    pub removed_mark: Hsla,
 }
 
 impl Global for Theme {}
@@ -157,6 +178,15 @@ impl Theme {
             status_redirect: rgb(0x4ea8de).into(),
             status_client_error: rgb(0xe0a33e).into(),
             status_server_error: rgb(0xe06c6c).into(),
+
+            diff: DiffTheme {
+                added: rgb(0x8fd07a).into(),
+                removed: rgb(0xeb8f8f).into(),
+                added_bg: hsla(0.33, 0.45, 0.40, 0.16),
+                removed_bg: hsla(0.00, 0.55, 0.50, 0.16),
+                added_mark: hsla(0.33, 0.55, 0.45, 0.34),
+                removed_mark: hsla(0.00, 0.60, 0.55, 0.34),
+            },
 
             syntax: SyntaxTheme {
                 key: rgb(0x7cb7e8).into(),
@@ -210,6 +240,15 @@ impl Theme {
             status_redirect: rgb(0x1f6f9e).into(),
             status_client_error: rgb(0x92650b).into(),
             status_server_error: rgb(0xb32d2d).into(),
+
+            diff: DiffTheme {
+                added: rgb(0x2a6b20).into(),
+                removed: rgb(0xa52828).into(),
+                added_bg: hsla(0.33, 0.50, 0.42, 0.14),
+                removed_bg: hsla(0.00, 0.60, 0.50, 0.12),
+                added_mark: hsla(0.33, 0.55, 0.40, 0.28),
+                removed_mark: hsla(0.00, 0.65, 0.50, 0.24),
+            },
 
             syntax: SyntaxTheme {
                 key: rgb(0x1f5f9e).into(),

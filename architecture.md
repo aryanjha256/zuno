@@ -69,6 +69,7 @@ zuno/
 │       │   ├── mod.rs       ✅ Postman collection v2.x -> requests, folders, variables
 │       │   └── script.rs    ✅ test scripts -> captures, assertions, expect_status
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
+│       ├── body_diff.rs    ✅ BodyDiff — the line-by-line body comparison
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
 │       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
@@ -2647,6 +2648,77 @@ not HTTP's.
 
 ---
 
+## 6m. The inline body diff — normalize, then borrow
+
+`ResponseDiff` (§6, the diff bar) answers *whether* the body changed. `BodyDiff` answers *what*
+changed, and lives on a fourth response tab beside Body, Headers and Timing.
+
+**The normalization is the feature; the diff algorithm is a dependency.** A JSON API answers on
+one line — `{"id":1,"name":"ada"}` — so a line diff over the raw bytes has exactly one line to
+report and concludes "it changed", which is what the diff bar already said. Both sides go
+through `json::format::pretty` first, which puts one field per line, so the comparison lands on
+the field that moved. That reuses the formatter §6g already built and already trusts: it copies
+tokens from their spans rather than re-serializing, so key order and number formatting survive
+and two responses cannot come out different here because of how they were *printed*.
+
+Pretty-printing is **all-or-nothing across the pair**. Formatting one side and not the other
+makes every line differ. An endpoint that starts returning an HTML error page instead of JSON is
+a rewrite either way, but reformatting the JSON side buries the one line worth reading under a
+wall of re-indented ones.
+
+**Patience, not Myers — and Myers is the crate's default.** Pretty-printed JSON is full of
+interchangeable `},` and `],` lines, and Myers will happily pair a closing brace in one document
+with an unrelated one in the other to shorten the edit script, producing hunks that straddle
+object boundaries. Patience anchors only on lines *unique to both sides* — which for JSON means
+the keys. Same reason `git diff --patience` exists.
+
+**Refinement is by character, and that was measured rather than chosen.** `similar`'s
+`InlineChangeMode::Auto` resolves to *whitespace-separated words* without the `unicode` feature,
+and JSON has almost no whitespace: `"https://example.com/v1/users"` is a single token, so
+bumping a path segment marked the entire URL as changed — precisely the coarse answer refinement
+exists to improve on. The test `a_changed_line_marks_only_the_part_that_moved` was written
+against `Auto`, failed, and is what pins the mode. Character tokens fragment, so
+`semantic_cleanup` shifts the boundaries back out. The `unicode` feature would buy grapheme
+awareness and a `unicode-segmentation` dependency; the point of choosing this crate over
+`imara-diff` was that it brings none.
+
+**A flat line list, not nested hunks.** The renderer is a `uniform_list`, which addresses items
+by a single index, so hunks are flattened and the gap between two of them becomes a `Skipped`
+line carrying its own count. Every list mechanic — virtualization, the one-sampled-row
+horizontal sizing, the scroll indicator — is then the body viewer's, unchanged. The sampled row
+matters here in a way it does not there: `with_width_from_item` defaults to row 0, which in a
+diff is as likely as not to be the narrowest row in the list.
+
+**Three bounds, because two of them do not constrain the case that bites.** `MAX_DIFF_BYTES`
+(4MB) refuses the pair outright; `MAX_REFINE_BYTES` (2000) skips refinement on a line too long
+to read across, which is what stops a minified HTML body running Patience over half a million
+character tokens. Neither bounds two documents that *share nothing*: those produce a single hunk
+holding every line of both, so `MAX_DIFF_LINES` (5000) caps the output and the pane says it did.
+A diff that stops early while claiming to be complete is a lie about the one thing the reader
+came to establish.
+
+**Computed eagerly, beside the summary diff and in the same background task.** Lazily would save
+work whenever the tab is never opened, and costs the thing that decides whether opening it is
+worth a keystroke: the tab's label reads `Diff +3 -1`. The cost is bounded on both sides that
+matter — identical bodies settle on a byte compare, and anything over the cap returns without
+diffing. One task rather than two so the summary and the detail land in the same frame; split,
+there is a window where the bar says the body changed and the tab still shows nothing.
+
+**The guard against an older run is real state, not a render-time check.** `body_diff` compares
+the live response with the one before it, so beside a run from history it labels lines as added
+that the run on screen never contained — a wrong answer presented as a right one, which is worse
+than none. The diff bar solves this by hiding; a tab cannot hide without shifting the three
+beside it, so `RequestView::diff_to_show` returns `None` and the tab renders a note. A method
+rather than an `if` in the renderer because **nothing headless can observe that a region was not
+painted** — `cx.debug_bounds` reports the last frame drawn, so `is_none()` would read as coverage
+whether or not the guard existed.
+
+*Deliberately absent:* a side-by-side view. The response pane is a column roughly 500px wide;
+two of them side by side leave ~35 characters each, which is narrower than one line of indented
+JSON. Unified is not a compromise at this width, it is the only readable option.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains
@@ -2830,6 +2902,14 @@ trash        = { version = "5", default-features = false }
 # above, rather than written from memory.
 tower-layer   = "0.3.3"
 tower-service = "0.3.3"
+
+# The inline body diff (§6m). Chosen on **measured** dependency weight rather than reputation:
+# `cargo tree` on a scratch crate gives `similar` 1 crate, `imara-diff` 4, `html2text` 30 and
+# `syntect` 46. `imara-diff` is the faster engine and is what helix and gitoxide use, but it
+# stops at the edit script — the word-level refinement inside a changed line would be ours to
+# write, which is most of what was being borrowed. `inline` is **not** a default feature and is
+# what `iter_inline_changes` lives behind; it pulls nothing extra.
+similar       = { version = "3.2.0", features = ["inline"] }
 
 # `ropey` and `criterion` were listed here for a long time and neither is a dependency.
 # The rope was dropped deliberately (§7); the perf floor is an ordinary `#[test]` asserting

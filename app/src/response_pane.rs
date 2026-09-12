@@ -25,12 +25,13 @@ use zuno_core::{
 
 use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
-    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming, ToggleFold, UnfoldAll,
+    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseDiff, ShowResponseTiming, ToggleFold, UnfoldAll,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, TextSearch, ResponseView};
+use zuno_core::body_diff::{BodyDiff, DiffLine, LineKind};
 use crate::theme::Theme;
 
 /// Fixed row height. `uniform_list` measures one item and assumes the rest match, so
@@ -102,6 +103,7 @@ pub fn render(
                     pane.child(headers_region(&response.headers, &view.headers_scroll, theme))
                 }
                 ResponseView::Timing => pane.child(timing_region(response.timing, theme)),
+                ResponseView::Diff => pane.child(diff_region(view, theme, window)),
             }
         }
         None => pane.child(empty_state(theme, window)),
@@ -170,6 +172,18 @@ fn view_tabs(
             "Timing".to_string(),
             active == ResponseView::Timing,
             ShowResponseTiming,
+            theme,
+            cx,
+        ))
+        // The counts are on the label for the same reason the header count is: they are the
+        // one thing hiding this tab costs you. "Diff" alone cannot tell you whether opening it
+        // is worth the keystroke, and the answer is usually no — which is exactly why it has
+        // to be readable without going there.
+        .child(view_tab(
+            "response-tab-diff",
+            diff_tab_label(view),
+            active == ResponseView::Diff,
+            ShowResponseDiff,
             theme,
             cx,
         ))
@@ -1861,4 +1875,256 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.2} GB", bytes / GB)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diff tab
+// ---------------------------------------------------------------------------
+
+/// Line-number gutter width. Wide enough for four digits, which covers any diff the
+/// `MAX_DIFF_LINES` cap can produce.
+const DIFF_GUTTER: f32 = 30.0;
+
+fn diff_tab_label(view: &RequestView) -> String {
+    match &view.body_diff {
+        Some(diff @ BodyDiff::Changed { .. }) => {
+            let (added, removed) = diff.counts();
+            format!("Diff +{added} -{removed}")
+        }
+        _ => "Diff".to_string(),
+    }
+}
+
+fn diff_region(view: &RequestView, theme: &Theme, window: &Window) -> Div {
+    let container = div().flex_1().flex().flex_col().min_h(px(0.)).relative();
+
+    // `diff_to_show` rather than `body_diff`: see it for why the guard lives on the view.
+    if view.viewing() != 0 {
+        return container.child(centered_note(
+            "Showing an earlier run. The diff compares the live response with the one before it.",
+            theme,
+        ));
+    }
+
+    let Some(diff) = view.diff_to_show() else {
+        // Two different "nothing here" states that must not be confused: a request that has only
+        // run once has nothing to compare against and never will until it runs again, whereas a
+        // comparison in flight arrives within a frame or two.
+        let message = if view.history.is_empty() {
+            "Send this request again to compare the two responses."
+        } else {
+            "Comparing…"
+        };
+        return container.child(centered_note(message, theme));
+    };
+
+    match diff {
+        BodyDiff::Identical => container.child(centered_note(
+            "The body is byte-for-byte identical to the previous run.",
+            theme,
+        )),
+        BodyDiff::NotText => container.child(centered_note(
+            "One of the two responses is not text, so there are no lines to compare.",
+            theme,
+        )),
+        BodyDiff::TooLarge { len } => container.child(centered_note(
+            &format!(
+                "{} is over the {} diff limit.",
+                format_bytes(*len as u64),
+                format_bytes(zuno_core::body_diff::MAX_DIFF_BYTES as u64)
+            ),
+            theme,
+        )),
+        BodyDiff::Changed { lines, truncated } => {
+            let notice = truncated.then(|| {
+                div()
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .bg(theme.bg_elevated)
+                    .border_b_1()
+                    .border_color(theme.status_client_error)
+                    .text_xs()
+                    .text_color(theme.text)
+                    .child(format!(
+                        "Showing the first {} lines — the rest of the difference is not listed.",
+                        zuno_core::body_diff::MAX_DIFF_LINES
+                    ))
+            });
+
+            if lines.is_empty() {
+                return container.child(centered_note("No lines differ.", theme));
+            }
+
+            container.children(notice).child(diff_list(
+                lines.clone(),
+                content_width(view, theme, window),
+                view.diff_scroll.clone(),
+                theme,
+            ))
+        }
+    }
+}
+
+/// The virtualized diff list.
+///
+/// Virtualized like the body views for the same reason — `MAX_DIFF_LINES` is 5000 — and built
+/// from an owned `Arc<Vec<DiffLine>>` so the render closure holds one refcount rather than
+/// cloning the line table every frame.
+fn diff_list(
+    lines: Vec<DiffLine>,
+    content: Pixels,
+    scroll: UniformListScrollHandle,
+    theme: &Theme,
+) -> impl IntoElement {
+    let lines = Arc::new(lines);
+    let row_theme = theme.clone();
+    let mono = theme.mono.clone();
+    let indicator_scroll = scroll.clone();
+    let count = lines.len();
+
+    // Once per render rather than per row, and `len` is O(1), so this is a few thousand integer
+    // comparisons against a list that is capped at 5000. The list measures its scroll region
+    // from *one* sampled row, and the default sample is row 0 — which in a diff is as likely as
+    // not to be a `Skipped` marker, the narrowest row there is.
+    let widest = lines
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, line)| line.text.len())
+        .map(|(ix, _)| ix)
+        .unwrap_or(0);
+
+    uniform_list("response-diff", count, move |range, _window, _cx| {
+        range
+            .map(|ix| {
+                let line = &lines[ix];
+                diff_row(ix, line, content, &row_theme)
+            })
+            .collect()
+    })
+    .track_scroll(scroll)
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+    .with_width_from_item(Some(widest))
+    .with_decoration(HScrollIndicator {
+        scroll: indicator_scroll,
+        color: theme.text_faint,
+    })
+    .debug_selector(|| "response-diff".to_string())
+    .flex_1()
+    .px_2()
+    .font_family(mono)
+    .text_xs()
+}
+
+fn diff_row(ix: usize, line: &DiffLine, content: Pixels, theme: &Theme) -> Div {
+    let row = div()
+        .debug_selector(move || format!("diff-row-{ix}"))
+        .flex()
+        // See `json_row`: a `.flex()` row inside a `uniform_list` sizes to its *content*, so
+        // without this the row tint stops at the end of the text and a changed line reads as a
+        // coloured word rather than as a changed line.
+        .w_full()
+        .min_w(content)
+        .flex_row()
+        .items_center()
+        .h(px(ROW_HEIGHT))
+        // The list sets a text style, but a `uniform_list` measures its sampled row *before*
+        // that style applies, so the row carries its own.
+        .font_family(theme.mono.clone())
+        .text_xs();
+
+    if let LineKind::Skipped(n) = line.kind {
+        return row.child(
+            div()
+                .flex_none()
+                .pl(px(DIFF_GUTTER * 2.0 + 12.0))
+                .text_color(theme.text_faint)
+                .whitespace_nowrap()
+                .child(format!(
+                    "⋯ {n} unchanged {}",
+                    if n == 1 { "line" } else { "lines" }
+                )),
+        );
+    }
+
+    let (sign, fg, bg, mark) = match line.kind {
+        LineKind::Insert => (
+            "+",
+            theme.diff.added,
+            Some(theme.diff.added_bg),
+            theme.diff.added_mark,
+        ),
+        LineKind::Delete => (
+            "-",
+            theme.diff.removed,
+            Some(theme.diff.removed_bg),
+            theme.diff.removed_mark,
+        ),
+        // An unchanged line is context, and context that competes with the changed lines either
+        // side of it defeats the point of showing it.
+        LineKind::Equal => (" ", theme.text_muted, None, theme.text_muted),
+        LineKind::Skipped(_) => unreachable!("handled above"),
+    };
+
+    let mut row = row;
+    if let Some(bg) = bg {
+        row = row.bg(bg);
+    }
+
+    row.child(gutter(line.old, theme))
+        .child(gutter(line.new, theme))
+        .child(
+            div()
+                .flex_none()
+                .w(px(12.))
+                .text_color(fg)
+                .child(sign.to_string()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .child(diff_text(&line.text, &line.changed, fg, mark)),
+        )
+}
+
+fn gutter(number: Option<u32>, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .w(px(DIFF_GUTTER))
+        .pr(px(6.))
+        .justify_end()
+        .flex()
+        .text_color(theme.text_faint)
+        .whitespace_nowrap()
+        .child(number.map(|n| n.to_string()).unwrap_or_default())
+}
+
+/// One diff line, with the characters that actually moved marked.
+///
+/// The ranges arrive sorted and disjoint — they are accumulated in order as the segments are
+/// concatenated — which is exactly what `compute_runs` requires. Gaps between them are fine:
+/// it fills each with the default style and pads the tail, verified in
+/// `gpui-0.2.2/src/elements/text.rs:216`.
+fn diff_text(
+    text: &str,
+    changed: &[std::ops::Range<usize>],
+    fg: gpui::Hsla,
+    mark: gpui::Hsla,
+) -> gpui::StyledText {
+    let styled = gpui::StyledText::new(text.to_string());
+    if changed.is_empty() {
+        return styled;
+    }
+
+    styled.with_highlights(changed.iter().map(|range| {
+        (
+            range.clone(),
+            gpui::HighlightStyle {
+                color: Some(fg),
+                background_color: Some(mark),
+                ..Default::default()
+            },
+        )
+    }))
 }

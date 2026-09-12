@@ -47,7 +47,8 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
-    NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseHeaders, ShowResponseTiming,
+    NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
+    ShowResponseTiming,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
@@ -4921,6 +4922,10 @@ impl Workspace {
         self.show_response_view(ResponseView::Timing, cx);
     }
 
+    fn show_response_diff(&mut self, _: &ShowResponseDiff, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_response_view(ResponseView::Diff, cx);
+    }
+
     /// Open the find bar over the response body.
     ///
     /// Guarded by `modal_open` like every other opener: a find bar takes focus, and taking it
@@ -6143,6 +6148,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_response_body))
             .on_action(cx.listener(Self::show_response_headers))
             .on_action(cx.listener(Self::show_response_timing))
+            .on_action(cx.listener(Self::show_response_diff))
             .on_action(cx.listener(Self::find_in_body))
             .on_action(cx.listener(Self::body_find_next))
             .on_action(cx.listener(Self::body_find_prev))
