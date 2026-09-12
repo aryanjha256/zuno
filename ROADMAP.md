@@ -373,8 +373,20 @@ Three decisions worth keeping:
   body gets out.
 - **The suggested filename runs through `collection::slug`**, for the same reason saving a request
   does: it derives from the URL, so `https://x.test/../../.ssh/config` must not become a path. The
-  extension comes from the content type, ignoring parameters, and defaults to `.bin` because an
-  unknown type shouldn't claim to be text.
+  extension comes from the content type, ignoring parameters, and falls back to `.bin`.
+
+  **The `.bin` fallback used to be almost the whole behaviour, and that was wrong.** Five media
+  types were tabled and everything else — every image, every PDF, every zip — saved as `.bin`, on
+  the stated reasoning that an unknown type shouldn't claim to be text. Sound as far as it goes,
+  but `image/jpeg` is not unknown: a JPEG saved as `shot.bin` does not open by double-clicking it,
+  so "claiming nothing" moved work onto the person instead of avoiding a mistake. The table now
+  names the types worth naming and *derives* the extension under `image/`, `audio/`, `video/` and
+  `font/`, where the subtype usually is one. `application/*` still gets no derivation — its
+  subtypes are mostly not extensions.
+
+  That derivation added a second attacker-controlled string to the filename. `collection::slug`
+  guards the label half; a `Content-Type` of `image/../../.ssh/config` would have walked into the
+  other, so a derived subtype has to be short and alphanumeric or it is refused.
 
 *The rest of egress — done, in the slice after search.* Copying a single row's value or its path
 needed a selected row, which is why it waited: the pane had focus but no cursor. `up`/`down` and a

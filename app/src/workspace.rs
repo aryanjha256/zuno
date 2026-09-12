@@ -6789,17 +6789,92 @@ pub fn suggested_filename(label: &str, content_type: Option<&str>) -> String {
         .map(str::trim)
         .unwrap_or("");
 
-    let extension = match base {
-        "application/json" | "text/json" => "json",
-        "application/xml" | "text/xml" => "xml",
-        "text/html" => "html",
-        "text/csv" => "csv",
-        other if other.starts_with("text/") => "txt",
-        // Anything else could be an image, a protobuf, a zip. `.bin` claims nothing.
-        _ => "bin",
-    };
+    format!("{}.{}", collection::slug(label), extension_for(base))
+}
 
-    format!("{}.{extension}", collection::slug(label))
+/// Media types whose extension is not simply their subtype, plus the `application/*` types worth
+/// naming. Sorted, and `the_extension_table_is_sorted_and_unique` keeps it that way.
+///
+/// `application/*` is an allowlist rather than a derivation because its subtypes are mostly not
+/// extensions — `octet-stream`, `vnd.openxmlformats-officedocument.spreadsheetml.sheet` — whereas
+/// under `image/`, `audio/`, `video/` and `font/` the subtype usually *is* one.
+const EXTENSIONS: &[(&str, &str)] = &[
+    ("application/gzip", "gz"),
+    ("application/javascript", "js"),
+    ("application/json", "json"),
+    ("application/msword", "doc"),
+    ("application/pdf", "pdf"),
+    ("application/rtf", "rtf"),
+    ("application/sql", "sql"),
+    ("application/vnd.ms-excel", "xls"),
+    ("application/vnd.ms-powerpoint", "ppt"),
+    ("application/vnd.openxmlformats-officedocument.presentationml.presentation", "pptx"),
+    ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "xlsx"),
+    ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "docx"),
+    ("application/wasm", "wasm"),
+    ("application/x-gzip", "gz"),
+    ("application/x-ndjson", "ndjson"),
+    ("application/x-tar", "tar"),
+    ("application/x-yaml", "yaml"),
+    ("application/xml", "xml"),
+    ("application/yaml", "yaml"),
+    ("application/zip", "zip"),
+    ("audio/mpeg", "mp3"),
+    ("audio/vnd.wave", "wav"),
+    ("audio/x-wav", "wav"),
+    ("image/jpeg", "jpg"),
+    ("image/svg+xml", "svg"),
+    ("image/vnd.microsoft.icon", "ico"),
+    ("image/x-icon", "ico"),
+    ("text/csv", "csv"),
+    ("text/html", "html"),
+    ("text/javascript", "js"),
+    ("text/json", "json"),
+    ("text/markdown", "md"),
+    ("text/xml", "xml"),
+    ("text/yaml", "yaml"),
+];
+
+/// The table's keys, for the drift test that keeps it binary-searchable.
+#[cfg(test)]
+pub fn extension_table_names() -> Vec<&'static str> {
+    EXTENSIONS.iter().map(|(name, _)| *name).collect()
+}
+
+/// The extension for a media type's essence, or `bin` when nothing is known.
+///
+/// **`.bin` used to be the answer for everything outside a five-entry list**, on the reasoning
+/// that it claims nothing. Claiming nothing is the wrong goal: a JPEG saved as `blob.bin` does
+/// not open by double-clicking it, so the conservative choice moved work onto the person rather
+/// than avoiding a mistake. `image/jpeg` is not ambiguous.
+fn extension_for(base: &str) -> String {
+    let base = base.to_ascii_lowercase();
+    if let Ok(ix) = EXTENSIONS.binary_search_by(|(name, _)| (*name).cmp(base.as_str())) {
+        return EXTENSIONS[ix].1.to_string();
+    }
+
+    // Under these four the subtype is usually already an extension — `image/png`, `video/mp4`,
+    // `font/woff2` — so deriving covers the long tail (avif, heic, opus, jxl) without a table
+    // that goes stale each time a format ships. `application/*` gets no derivation because its
+    // subtypes are mostly not extensions: `octet-stream`, `vnd.openxmlformats-…`.
+    if let Some((family, subtype)) = base.split_once('/')
+        && matches!(family, "image" | "audio" | "video" | "font")
+    {
+        // A structured suffix names the *syntax*, not the format: `image/svg+xml` is an SVG.
+        let subtype = subtype.split('+').next().unwrap_or(subtype);
+        let subtype = subtype.strip_prefix("x-").unwrap_or(subtype);
+        // **This filter is a guard, not tidiness.** The string comes from a response header, so
+        // an `image/../../.ssh/config` would otherwise walk straight past `collection::slug`,
+        // which only sanitizes the *label* half of the name. Charset and length together mean
+        // nothing but a plausible extension can survive.
+        if (1..=5).contains(&subtype.len())
+            && subtype.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return subtype.to_string();
+        }
+    }
+
+    if base.starts_with("text/") { "txt" } else { "bin" }.to_string()
 }
 
 /// Bytes at human scale. The history picker shows sizes side by side, and `184320` next to

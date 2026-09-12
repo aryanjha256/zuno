@@ -7405,10 +7405,83 @@ fn a_suggested_filename_is_safe_and_matches_the_content_type() {
     // Any `text/*` is readable.
     assert_eq!(suggested_filename("notes", Some("text/plain")), "notes.txt");
 
+    // **The bug this table was widened for.** A JPEG saved as `shot.bin` does not open by
+    // double-clicking it, and `.bin` "claiming nothing" is no comfort to someone who now has to
+    // know to rename the file. `image/jpeg` is not ambiguous.
+    assert_eq!(suggested_filename("shot", Some("image/jpeg")), "shot.jpg");
+    assert_eq!(suggested_filename("shot", Some("image/jpeg; charset=binary")), "shot.jpg");
+    assert_eq!(suggested_filename("logo", Some("image/svg+xml")), "logo.svg");
+    assert_eq!(suggested_filename("icon", Some("image/x-icon")), "icon.ico");
+    assert_eq!(suggested_filename("invoice", Some("application/pdf")), "invoice.pdf");
+    assert_eq!(suggested_filename("export", Some("application/zip")), "export.zip");
+    assert_eq!(suggested_filename("clip", Some("audio/mpeg")), "clip.mp3");
+    assert_eq!(
+        suggested_filename(
+            "sheet",
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        ),
+        "sheet.xlsx"
+    );
+    // Case in a header is not meaningful.
+    assert_eq!(suggested_filename("shot", Some("IMAGE/JPEG")), "shot.jpg");
+
+    // Derived rather than tabled, so a format that shipped after this table did still lands.
+    assert_eq!(suggested_filename("shot", Some("image/png")), "shot.png");
+    assert_eq!(suggested_filename("shot", Some("image/avif")), "shot.avif");
+    assert_eq!(suggested_filename("clip", Some("video/mp4")), "clip.mp4");
+    assert_eq!(suggested_filename("face", Some("font/woff2")), "face.woff2");
+
+    // But `application/*` subtypes are mostly not extensions, so nothing is derived there.
+    assert_eq!(suggested_filename("thing", Some("application/x-custom")), "thing.bin");
+
     // The label comes from a URL, so the same traversal guard as saving a request applies.
     let escaped = suggested_filename("../../.ssh/config", Some("application/json"));
     assert!(!escaped.contains('/'), "{escaped:?}");
     assert!(!escaped.starts_with('.'), "{escaped:?}");
+}
+
+/// The *other* half of the same guard, and the one that did not exist before: `collection::slug`
+/// sanitizes the label, and until the extension was derived from a media type there was nothing
+/// on the right-hand side to sanitize. A `Content-Type` is attacker-controlled in exactly the
+/// same way a URL is.
+#[test]
+fn a_hostile_content_type_cannot_reach_into_the_suggested_path() {
+    use crate::workspace::suggested_filename;
+
+    for hostile in [
+        "image/../../.ssh/config",
+        "image/..",
+        "image//etc/passwd",
+        "image/a/b",
+        "image/\\windows\\system32",
+        "image/very-long-subtype-name",
+        "image/a b",
+        "image/.",
+    ] {
+        let name = suggested_filename("shot", Some(hostile));
+        assert!(!name.contains('/'), "{hostile:?} -> {name:?}");
+        assert!(!name.contains('\\'), "{hostile:?} -> {name:?}");
+        assert!(!name.contains(' '), "{hostile:?} -> {name:?}");
+        assert!(
+            name.matches('.').count() == 1,
+            "exactly one extension separator: {hostile:?} -> {name:?}"
+        );
+    }
+}
+
+#[test]
+fn the_extension_table_is_sorted_and_unique() {
+    // `extension_for` binary-searches it, so an out-of-order row is not a tidiness problem —
+    // it is a row that is silently never found.
+    let names = crate::workspace::extension_table_names();
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(names, sorted, "the media-type table must be sorted and free of duplicates");
+    assert!(
+        names.iter().all(|name| name.chars().all(|c| !c.is_ascii_uppercase())),
+        "lookup lowercases the header, so an uppercase row can never match"
+    );
 }
 
 #[gpui::test]
