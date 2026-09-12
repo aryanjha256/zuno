@@ -25,7 +25,7 @@ use zuno_core::{
 
 use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
-    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseDiff, ShowResponseTiming, ToggleFold, UnfoldAll,
+    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseDiff, ShowResponseTiming, ToggleFold, ToggleHtmlView, UnfoldAll,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
@@ -1130,7 +1130,15 @@ fn body_header(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
                 outline.len(),
                 body.row_count()
             )),
-            BodyKind::Text(lines) => SharedString::from(format!("{} lines", lines.len())),
+            BodyKind::Text(lines) => match body.html_view() {
+                // Which half is on screen has to be *stated*, not inferred from the content:
+                // extracted text and the markup it came from are both "some lines", and reading
+                // the wrong one as the response is the mistake this whole view could cause.
+                Some(showing) => {
+                    SharedString::from(format!("html · {} · {} lines", showing.label(), lines.len()))
+                }
+                None => SharedString::from(format!("{} lines", lines.len())),
+            },
         },
     };
 
@@ -1171,6 +1179,24 @@ fn body_header(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
                 UnfoldAll,
                 theme,
             ));
+    }
+
+    // Offered only where there are two halves to swap between, so it cannot appear inert on a
+    // JSON or plain-text body. `text_action` rather than `text_button` for the reason the fold
+    // pair uses it: it dispatches the action the palette row dispatches, so the two cannot
+    // drift, and its tooltip reads the keystroke out of the live keymap.
+    if let Some(showing) = view.body_view.as_ref().and_then(BodyView::html_view) {
+        let (label, tooltip) = match showing {
+            crate::body_view::HtmlView::Text => ("show markup", "Show the raw HTML"),
+            crate::body_view::HtmlView::Raw => ("show text", "Show the text in the HTML"),
+        };
+        actions = actions.child(text_action(
+            "toggle-html-view",
+            label.into(),
+            tooltip,
+            ToggleHtmlView,
+            theme,
+        ));
     }
 
     // The explicit escape hatch for an over-the-cap body. Never parse silently, and
@@ -1796,6 +1822,14 @@ fn notice_bar(notice: &BodyNotice, theme: &Theme) -> Div {
         BodyNotice::ParseFailed { message } => (
             theme.status_server_error,
             format!("not valid JSON: {message} — showing raw text"),
+        ),
+        BodyNotice::HtmlTooLarge { len } => (
+            theme.status_client_error,
+            format!(
+                "{} is over the {} limit for pulling text out of HTML — showing the markup",
+                format_bytes(*len as u64),
+                format_bytes(zuno_core::html::MAX_EXTRACT_BYTES as u64)
+            ),
         ),
     };
 

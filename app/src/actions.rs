@@ -192,6 +192,7 @@ actions!(
         ShowResponseHeaders,
         ShowResponseTiming,
         ShowResponseDiff,
+        ToggleHtmlView,
         FindInResponse,
         FindNext,
         FindPrev,

@@ -70,6 +70,7 @@ zuno/
 │       │   └── script.rs    ✅ test scripts -> captures, assertions, expect_status
 │       ├── diff.rs         ✅ ResponseDiff — summary comparison of two runs
 │       ├── body_diff.rs    ✅ BodyDiff — the line-by-line body comparison
+│       ├── html.rs         ✅ pulling readable text out of an HTML response
 │       ├── curl.rs         ✅ curl command line <-> RequestSpec, both directions
 │       ├── collection.rs   ✅ one-request-per-file on-disk format
 │       ├── environment.rs  ✅ variables: two-layer resolution + on-disk format
@@ -2719,6 +2720,63 @@ JSON. Unified is not a compromise at this width, it is the only readable option.
 
 ---
 
+## 6n. HTML bodies — read the page, not the markup
+
+An API client gets HTML for one reason above all others: something broke and a framework
+answered with a debug page. The traceback is in there, under forty kilobytes of markup. So the
+body view grows a second half — the text pulled out of the page — and `body_header` grows one
+control to swap between them.
+
+**"Preview" would be the wrong word and was deliberately not used.** gpui 0.2.2 has no webview,
+and rendering HTML means a CSS cascade, box layout, floats and images — a second product, not a
+feature. What is built is *extraction*: what the page **says**. What it **looks like** is a
+different question, and the honest answer to it is the user's own browser (see below).
+
+**The crate choice inverted on evidence, and that is the point of recording it.** `nanohtml2text`
+was chosen first and is better on every axis that is easy to measure: one crate against twelve,
+and ~7ms/MB against ~100ms/MB. It also passes `<pre>` contents through **raw** — entities
+undecoded, nested tags left as literal markup, and no separation from the block before it. Django,
+Flask and Rails all put the traceback in a `<pre>`, so the cheap crate was broken in exactly the
+case it was being bought for, and the benchmark that made it look fine did not contain one.
+`a_traceback_in_a_pre_block_keeps_its_text_and_its_indentation` is what settles it, and swapping
+the crate back fails it on the first assertion.
+
+`html2text` is configured with `TrivialDecorator` and `no_table_borders`, because its default
+output is shaped for a terminal: `#` before a heading, backticks around `<code>`, box-drawing
+rules around tables. **Decoration invented by the viewer is indistinguishable from decoration
+that was in the response**, which is the one thing a debugging tool must not do.
+`nothing_is_decorated_with_terminal_markup` holds that.
+
+**Both halves are indexed up front, and `kind` points at one of them.** `HtmlBody` holds the raw
+`LineIndex` and the extracted one; the toggle swaps which `Arc` sits inside `BodyKind::Text`. The
+tidier model is a `BodyKind::Html` variant, and it was rejected: ten accessors match on `kind` —
+`row_count`, `searchable_source`, `rows_for_offsets`, `select_visible` and the rest — and every
+one would have to re-ask which half is showing. Swapping the `Arc` means none of them change, and
+the text view inherits the raw view's search, selection and horizontal scrolling for free. The
+selection *is* cleared on a swap, because the two halves share no line numbering.
+
+**The preference lives on `RequestView`, not on `BodyView`.** `BodyView` is rebuilt on every
+response, so a preference held there resets on each send — silently, at the one moment the reader
+is least likely to notice and most likely to be re-reading the same endpoint. Threaded into
+`BodyView::build` exactly as `force_parse` is.
+
+**Text is the default**, and this was the one call put to the owner. In an API client, HTML
+arriving is overwhelmingly a framework saying something went wrong; the alternative considered
+was auto-switching on a 4xx/5xx, which is nicer in that exact moment and makes a 200 behave
+differently for reasons nobody asked for. Sticky beats clever: anyone here to read markup flips it
+once per buffer and never thinks about it again.
+
+*Deliberately absent, and designed for:* **Open in browser.** Writing the body to a temp file and
+calling `cx.open_with_system` — already in the tree for *Reveal in file manager* — is exactly what
+Postman's preview does, which is why relative assets break there and a styled page comes up naked.
+Injecting `<base href="{scheme}://{host}/">` from the request URL fixes that for one string
+concat, and is a genuine improvement on the thing being matched. Its limit has to be stated rather
+than discovered: `<base>` resolves public static assets, but the page opens from a `file://`
+origin, so no cookies go, the auth header Zuno sent is not replayed, and any `fetch()` back to the
+API is cross-origin. A server-rendered template comes up right; an SPA shell stays blank.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains
@@ -2910,6 +2968,15 @@ tower-service = "0.3.3"
 # write, which is most of what was being borrowed. `inline` is **not** a default feature and is
 # what `iter_inline_changes` lives behind; it pulls nothing extra.
 similar       = { version = "3.2.0", features = ["inline"] }
+
+# HTML -> readable text (§6n). The one place in this tree where the *heavier* crate won, and it
+# won on correctness rather than features: `nanohtml2text` is one crate to this one's twelve (as
+# resolved here — a bare `cargo tree` says thirty, but `thiserror`, `unicode-width` and friends
+# are already present) and twelve times faster, and it passes `<pre>` contents through **raw**,
+# entities undecoded and nested tags literal. `<pre>` is where every framework puts its
+# traceback. `default = []` keeps `css`, `xml` and tracing off — they would add `nom`,
+# `xml5ever`, `log` and `backtrace`.
+html2text     = { version = "0.17.1", default-features = false }
 
 # `ropey` and `criterion` were listed here for a long time and neither is a dependency.
 # The rope was dropped deliberately (§7); the perf floor is an ordinary `#[test]` asserting

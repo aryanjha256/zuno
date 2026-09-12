@@ -530,8 +530,19 @@ fn closed_port() -> String {
     format!("http://{addr}")
 }
 
+/// Put a URL in the URL bar, from wherever focus happens to be.
+///
+/// **`ctrl-l` first, and it is load-bearing.** Without it this was `ctrl-a` plus typing, which
+/// silently means "select all and type" *in whatever field has focus*. Called from a test that
+/// had just typed into a header name, it filled the header name with the URL and left the
+/// request pointed at the sample's `https://api.github.com/graphql` — so the suite fired a real
+/// request at GitHub, carrying an unresolved `Authorization: Bearer {{token}}`, on every run.
+///
+/// It presented as a **flaky test**: the assertion was `is_sending()`, and whether that was
+/// still true on the first probe depended on how quickly a network call nobody intended
+/// resolved. Under load it lost about one run in three.
 fn type_url(cx: &mut VisualTestContext, url: &str) {
-    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
     cx.simulate_input(url);
 }
 
@@ -2090,6 +2101,138 @@ async fn the_diff_describes_the_two_most_recent_runs(cx: &mut TestAppContext) {
         assert_eq!(view.history[0].status, 201);
         assert_eq!(view.response.as_ref().expect("live").status, 202);
     });
+}
+
+// ---- HTML bodies: reading the page, not the markup -------------------------
+
+/// A Django-shaped 500. `<pre>` is where the exception value lives, which is the element the
+/// first extraction crate got wrong.
+const HTML_500: &str = "HTTP/1.1 500 Internal Server Error\r\n\
+     Content-Type: text/html; charset=utf-8\r\n\
+     Content-Length: 226\r\n\
+     \r\n\
+     <!DOCTYPE html><html><head><title>ValueError at /api/users/</title>\
+     <style>body{font-family:sans-serif}</style></head><body>\
+     <h1>ValueError at /api/users/</h1>\
+     <pre>invalid literal for int() with base 10: &#39;abc&#39;</pre>\
+     </body></html>";
+
+fn body_lines(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> Vec<String> {
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        let body = view.body_view.as_ref().expect("a body index");
+        (0..body.row_count())
+            .filter_map(|ix| match &body.kind {
+                crate::body_view::BodyKind::Text(lines) => Some(lines.line(ix).0.to_string()),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn an_html_error_page_opens_as_readable_text(cx: &mut TestAppContext) {
+    // The whole point of the feature, end to end: you asked for JSON, a framework blew up, and
+    // the message you need is buried in markup. Every step between `looks_like_html` and the
+    // rendered rows can silently drop this and leave you reading tags.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_once(HTML_500);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 500);
+    wait_for_body(&view, &mut cx);
+
+    let lines = body_lines(&view, &mut cx);
+    let text = lines.join("\n");
+
+    assert!(
+        text.contains("invalid literal for int() with base 10: 'abc'"),
+        "the exception value should be readable, entity and all: {lines:?}"
+    );
+    assert!(
+        !text.contains("<pre>") && !text.contains("<h1>"),
+        "markup should be gone in the text view: {lines:?}"
+    );
+    assert!(
+        !text.contains("font-family"),
+        "stylesheet contents are not prose: {lines:?}"
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().and_then(BodyView::html_view)),
+        Some(crate::body_view::HtmlView::Text),
+        "an HTML body opens on the text"
+    );
+}
+
+#[gpui::test]
+async fn the_html_toggle_swaps_the_body_and_survives_the_next_send(cx: &mut TestAppContext) {
+    use crate::actions::ToggleHtmlView;
+    // Two halves of one bug. The swap is visible, so it would be caught by eye; the *stickiness*
+    // is not — `BodyView` is rebuilt on every response, so a preference that lived there would
+    // reset on the next send and nothing on screen would explain why.
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_html_sequence(2, "<html><body><h1>Boom</h1></body></html>");
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 500);
+    wait_for_body(&view, &mut cx);
+
+    assert!(
+        !body_lines(&view, &mut cx).join("\n").contains("<h1>"),
+        "starts on the text"
+    );
+
+    cx.dispatch_action(ToggleHtmlView);
+    cx.run_until_parked();
+
+    assert!(
+        body_lines(&view, &mut cx).join("\n").contains("<h1>"),
+        "the toggle shows the markup"
+    );
+
+    // And the choice is the buffer's, not the response's.
+    send_and_wait(&mut cx, &view, 500);
+    wait_for_body(&view, &mut cx);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().and_then(BodyView::html_view)),
+        Some(crate::body_view::HtmlView::Raw),
+        "a new response must not silently undo the choice"
+    );
+    assert!(
+        body_lines(&view, &mut cx).join("\n").contains("<h1>"),
+        "and the rows agree with it"
+    );
+}
+
+/// The dangerous misfire. If `looks_like_html` ever said yes to a JSON body, the response would
+/// be replaced by text pulled out of it — every brace and key gone — and it would look exactly
+/// like the API had changed rather than like a bug here.
+#[gpui::test]
+async fn a_json_body_is_never_treated_as_html(cx: &mut TestAppContext) {
+    use crate::actions::ToggleHtmlView;
+    let (_, view, mut cx) = boot(cx, None, None);
+    let url = serve_sequence(&[(200, r#"{"html":"<h1>not markup</h1>","n":1}"#)]);
+
+    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    let (is_json, ..) = wait_for_body(&view, &mut cx);
+
+    assert!(is_json, "a JSON body stays JSON even when it carries markup in a string");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).body_view.as_ref().and_then(BodyView::html_view)),
+        None,
+        "and so has no text/raw toggle to offer"
+    );
+
+    // The toggle is bound and in the palette unconditionally, so it has to be inert here rather
+    // than doing something to a body that has no two halves.
+    cx.dispatch_action(ToggleHtmlView);
+    cx.run_until_parked();
+    let (still_json, ..) = wait_for_body(&view, &mut cx);
+    assert!(still_json, "the toggle must be a no-op on a JSON body");
 }
 
 #[gpui::test]
@@ -4135,6 +4278,32 @@ fn serve_sequence(statuses: &'static [(u16, &'static str)]) -> String {
             let _ = stream.read(&mut discard);
             let response = format!(
                 "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    format!("http://{addr}")
+}
+
+/// `serve_sequence`'s twin for HTML, which needs its own because that one hard-codes
+/// `application/json` — and an explicit non-HTML content type is *respected* by the sniff, so
+/// serving markup as JSON is a fine way to write a test that asserts the opposite of what it
+/// means to. It did, once: this helper exists because the toggle test failed on exactly that.
+fn serve_html_sequence(count: usize, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    std::thread::spawn(move || {
+        for _ in 0..count {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut discard = [0u8; 4096];
+            let _ = stream.read(&mut discard);
+            let response = format!(
+                "HTTP/1.1 500 X\r\nContent-Type: text/html; charset=utf-8\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes());

@@ -830,6 +830,21 @@ Both are testable *at the consequence* even though the paint isn't: a click in t
 WCAG ratio. That's the transferable lesson — when a rendering bug can't be observed, find the
 functional half of it and assert that instead. See architecture.md §12.
 
+**HTML bodies — done, and the cheap dependency lost.** An API client gets HTML when a framework
+blew up, so the body view gained a text half and a toggle. See architecture.md §6n.
+
+Worth keeping for the crate decision, which inverted under a test. `nanohtml2text` is one crate
+to `html2text`'s twelve and twelve times faster, and it was chosen on exactly that. It passes
+`<pre>` contents through raw — undecoded entities, literal nested tags — and `<pre>` is where
+Django, Flask and Rails each put the traceback. **The benchmark that made it look fine had no
+`<pre>` in it.** The lesson is not "prefer the big crate"; it is that a sample which omits the
+one element the feature exists for measures nothing.
+
+Also recorded: XML and HTML *highlighting* stay deferred, now by decision rather than by cost.
+`quick-xml` would make XML cheap — a pull parser whose byte spans map straight onto the existing
+`Token` shape, and the response viewer needs none of the lexer tolerance the editor does — but
+the audience is thin enough that it is not worth the surface.
+
 **Inline body diff — done, and the structural-diff instinct was wrong.** This sat in "Named, not
 planned" reading: *"A structural diff over `Row` spans is probably better than a text diff, now
 that the JSON outline exists."* It is not, and the reason is worth keeping.
@@ -862,7 +877,9 @@ so the two closed together.
 
 What stands up is the shape of the reasoning, not the verdict: it really is the most expensive
 thing left *for a general language*. The mistake was pricing the general case when only JSON was
-wanted. XML and HTML are still deferred on exactly the original argument.
+wanted. XML and HTML are still deferred on exactly the original argument — see the HTML entry above for
+where that landed: the *text* of an HTML body is now readable, which is the half that mattered,
+and colouring its markup is not.
 
 See architecture.md §6.
 

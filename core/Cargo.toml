@@ -29,3 +29,5 @@ tower-layer.workspace = true
 tower-service.workspace = true
 # The inline body diff. See the workspace manifest for why this crate and not another.
 similar.workspace = true
+# HTML -> readable text for the response viewer. See the workspace manifest for the choice.
+html2text.workspace = true

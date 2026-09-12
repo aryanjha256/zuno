@@ -62,6 +62,18 @@ futures-util = "0.3"
 # difference is unmeasurable and the dependency tree is not. `inline` is **not** a default
 # feature and is what `iter_inline_changes` lives behind; it pulls nothing extra.
 similar = { version = "3.2.0", features = ["inline"] }
+# Pulling readable text out of an HTML response (architecture.md §6n).
+#
+# **Chosen over `nanohtml2text` on correctness, having started with it.** That crate is one
+# crate to this one's thirty and twelve times faster, and it passes `<pre>` contents through
+# **raw** — entities undecoded, nested tags left as literal markup. `<pre>` is where Django,
+# Flask and Rails all put the traceback, which is the entire reason this feature exists, so the
+# cheap option was broken in exactly the case it was bought for. Measured, not read: the test
+# `a_framework_error_page_reduces_to_its_message` fails against it.
+#
+# `default = []`, so `css`, `xml` and the tracing features stay off — they add `nom`,
+# `xml5ever`, `log` and `backtrace` respectively, none of which extraction needs.
+html2text = { version = "0.17.1", default-features = false }
 # Moving a request to the desktop trash rather than deleting it. Hand-rolling the XDG spec
 # (~/.local/share/Trash/files plus a .trashinfo naming the original path, with a
 # cross-filesystem fallback and collision handling) is the kind of "80 lines" that is wrong in

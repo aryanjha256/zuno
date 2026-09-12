@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use zuno_core::{JsonOutline, LineIndex, json};
+use zuno_core::{JsonOutline, LineIndex, html, json};
 
 /// Above this, JSON is not parsed automatically.
 ///
@@ -32,11 +32,57 @@ pub enum BodyKind {
 pub enum BodyNotice {
     TooLarge { len: usize },
     ParseFailed { message: String },
+    /// An HTML body past `html::MAX_EXTRACT_BYTES`, so there is no text view to offer.
+    HtmlTooLarge { len: usize },
+}
+
+/// Which half of an HTML body is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HtmlView {
+    /// The text pulled out of the markup — the default, because in an API client an HTML body
+    /// arriving is overwhelmingly a framework saying something went wrong, and the message is
+    /// what you came for. Anyone here to read markup flips it once and it sticks.
+    #[default]
+    Text,
+    Raw,
+}
+
+impl HtmlView {
+    pub fn other(self) -> Self {
+        match self {
+            Self::Text => Self::Raw,
+            Self::Raw => Self::Text,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Raw => "raw",
+        }
+    }
+}
+
+/// Both halves of an HTML body, and which is showing.
+///
+/// **Held here while `kind` points at one of them**, rather than becoming a `BodyKind` variant of
+/// its own. A variant would be the tidier model and would cost an arm in each of the ten
+/// accessors that match on `kind` — `row_count`, `searchable_source`, `rows_for_offsets`,
+/// `select_visible` and the rest — every one of which would then have to re-ask which half is
+/// showing. Swapping the `Arc` inside `BodyKind::Text` instead means *none* of them change, and
+/// the text view gets the raw view's search, selection and horizontal scrolling for free.
+struct HtmlBody {
+    raw: Arc<LineIndex>,
+    text: Arc<LineIndex>,
+    showing: HtmlView,
 }
 
 pub struct BodyView {
     pub kind: BodyKind,
     pub notice: Option<BodyNotice>,
+    /// `Some` only for an HTML body small enough to have been extracted. `None` is what makes
+    /// the toggle absent rather than present-and-inert on every other kind of body.
+    html: Option<HtmlBody>,
     /// Parallel to the outline's rows. Never cloned into a render closure — see
     /// `is_folded_at` for how the renderer infers fold state from `visible` instead.
     folded: Vec<bool>,
@@ -62,7 +108,12 @@ pub struct BodyView {
 
 impl BodyView {
     /// Classify and index a body. **Background executor only.**
-    pub fn build(body: Bytes, content_type: Option<String>, force_parse: bool) -> Self {
+    pub fn build(
+        body: Bytes,
+        content_type: Option<String>,
+        force_parse: bool,
+        html_view: HtmlView,
+    ) -> Self {
         if body.is_empty() {
             return Self::plain(BodyKind::Empty, None);
         }
@@ -82,6 +133,7 @@ impl BodyView {
                     let mut view = Self {
                         kind: BodyKind::Json(Arc::new(outline)),
                         notice: None,
+                        html: None,
                         folded,
                         visible: Arc::new(Vec::new()),
                         widest_visible: 0,
@@ -106,21 +158,73 @@ impl BodyView {
             }
         }
 
+        if html::looks_like_html(&body, content_type.as_deref()) {
+            return Self::html(body, html_view);
+        }
+
         Self::plain(text_or_binary(body), None)
+    }
+
+    /// An HTML body, indexed twice — once as markup, once as the text inside it.
+    ///
+    /// Both up front rather than on demand: the extraction is the expensive half and it is
+    /// already on the background executor here, whereas extracting at the moment of the toggle
+    /// would put a hundred-millisecond job behind a keystroke and need a second loading state
+    /// for a body that is, in the case this serves, a few kilobytes.
+    fn html(body: Bytes, showing: HtmlView) -> Self {
+        let len = body.len();
+        let BodyKind::Text(raw) = text_or_binary(body.clone()) else {
+            // Declared HTML but not valid UTF-8. Nothing to extract and nothing to toggle.
+            return Self::plain(BodyKind::Binary { len }, None);
+        };
+
+        let Some(text) = html::to_text(&body) else {
+            return Self::plain(
+                BodyKind::Text(raw),
+                (len > html::MAX_EXTRACT_BYTES).then_some(BodyNotice::HtmlTooLarge { len }),
+            );
+        };
+
+        let text = Arc::new(LineIndex::build(Bytes::from(text)));
+        let mut view = Self::plain(BodyKind::Text(Arc::clone(&raw)), None);
+        view.html = Some(HtmlBody { raw, text, showing: HtmlView::Text });
+        // Through the same path a later toggle takes, so the initial state cannot disagree with
+        // every subsequent one — the trick `rebuild_visible` already plays for folds.
+        view.set_html_view(showing);
+        view
+    }
+
+    /// Which half of an HTML body is showing, or `None` if this body has no two halves.
+    pub fn html_view(&self) -> Option<HtmlView> {
+        self.html.as_ref().map(|html| html.showing)
+    }
+
+    /// Swap between the markup and the text pulled out of it.
+    pub fn set_html_view(&mut self, view: HtmlView) {
+        let Some(html) = self.html.as_mut() else { return };
+        html.showing = view;
+        let lines = match view {
+            HtmlView::Text => Arc::clone(&html.text),
+            HtmlView::Raw => Arc::clone(&html.raw),
+        };
+        // The selection is an index into the half being left, and the two halves share no line
+        // numbering at all — row 40 of the markup is nowhere near row 40 of the text — so
+        // carrying it over would land the cursor somewhere arbitrary and call it where you were.
+        self.selected = None;
+        (self.widest_visible, self.widest_extent) = widest_of(&lines);
+        self.kind = BodyKind::Text(lines);
     }
 
     fn plain(kind: BodyKind, notice: Option<BodyNotice>) -> Self {
         let (widest_visible, widest_extent) = match &kind {
-            BodyKind::Text(lines) => {
-                let ix = lines.widest_line();
-                (ix, (0, lines.line(ix).0.chars().count() as u32))
-            }
+            BodyKind::Text(lines) => widest_of(lines),
             _ => (0, (0, 0)),
         };
 
         Self {
             kind,
             notice,
+            html: None,
             folded: Vec::new(),
             visible: Arc::new(Vec::new()),
             widest_visible,
@@ -487,6 +591,12 @@ pub fn is_folded_at(visible: &[u32], visible_ix: usize, row_ix: usize) -> bool {
     }
 }
 
+/// The widest line's `(visible index, (depth, characters))`, for the horizontal scroll region.
+fn widest_of(lines: &LineIndex) -> (usize, (u16, u32)) {
+    let ix = lines.widest_line();
+    (ix, (0, lines.line(ix).0.chars().count() as u32))
+}
+
 fn text_or_binary(body: Bytes) -> BodyKind {
     if std::str::from_utf8(&body).is_ok() {
         BodyKind::Text(Arc::new(LineIndex::build(body)))
@@ -533,6 +643,7 @@ mod tests {
             Bytes::from_static(body.as_bytes()),
             content_type.map(str::to_string),
             false,
+            HtmlView::default(),
         )
     }
 
@@ -547,7 +658,7 @@ mod tests {
         let long = "x".repeat(41);
         let deep = "y".repeat(31);
         let json = format!(r#"{{"k":"{long}","a":{{"b":{{"c":{{"d":{{"e":{{"f":{{"d":"{deep}"}}}}}}}}}}}}}}"#);
-        let view = BodyView::build(Bytes::from(json), Some("application/json".into()), false);
+        let view = BodyView::build(Bytes::from(json), Some("application/json".into()), false, HtmlView::default());
 
         let outline = view.outline().expect("json");
         let row = outline.row(view.widest_visible_ix()).expect("a row");
@@ -607,7 +718,7 @@ mod tests {
 
     #[test]
     fn a_non_utf8_body_is_binary() {
-        let view = BodyView::build(Bytes::from_static(&[0xff, 0xfe, 0x00]), None, false);
+        let view = BodyView::build(Bytes::from_static(&[0xff, 0xfe, 0x00]), None, false, HtmlView::default());
         assert!(matches!(view.kind, BodyKind::Binary { len: 3 }));
         assert_eq!(view.row_count(), 0);
     }
@@ -621,7 +732,7 @@ mod tests {
     #[test]
     fn an_oversized_body_is_not_parsed_but_is_still_shown() {
         let big = format!("[{}]", "1,".repeat(MAX_AUTO_PARSE / 2 + 8));
-        let view = BodyView::build(Bytes::from(big.clone()), Some("application/json".into()), false);
+        let view = BodyView::build(Bytes::from(big.clone()), Some("application/json".into()), false, HtmlView::default());
 
         assert!(!view.is_json(), "over the cap, JSON must not be parsed");
         assert!(matches!(view.notice, Some(BodyNotice::TooLarge { .. })));
@@ -629,7 +740,7 @@ mod tests {
 
         // ...and forcing it parses. (Malformed here, since the generator leaves a
         // trailing comma — what matters is that force bypasses the cap.)
-        let forced = BodyView::build(Bytes::from(big), Some("application/json".into()), true);
+        let forced = BodyView::build(Bytes::from(big), Some("application/json".into()), true, HtmlView::default());
         assert!(
             forced.is_json() || matches!(forced.notice, Some(BodyNotice::ParseFailed { .. })),
             "forcing should attempt a parse rather than report TooLarge"

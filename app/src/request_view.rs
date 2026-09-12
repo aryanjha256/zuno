@@ -433,6 +433,13 @@ pub struct RequestView {
     pub response_view: ResponseView,
     /// Sticky per buffer, like `response_view`: two requests are open for different reasons.
     pub request_tab: RequestTab,
+    /// Which half of an HTML body to show, for as long as this buffer is open.
+    ///
+    /// Here rather than on `BodyView` because `BodyView` is rebuilt on every response, so a
+    /// preference living there would silently reset on each send — which is the one moment the
+    /// reader is least likely to notice it and most likely to be re-reading the same endpoint.
+    /// Threaded into `BodyView::build` the same way `force_parse` is.
+    pub html_view: crate::body_view::HtmlView,
     /// The indexed body. `None` while it's still being built off-thread.
     pub body_view: Option<BodyView>,
     body_task: Option<Task<()>>,
@@ -513,6 +520,7 @@ impl RequestView {
             viewing: 0,
             response_view: ResponseView::default(),
             request_tab: RequestTab::default(),
+            html_view: crate::body_view::HtmlView::default(),
             body_view: None,
             body_task: None,
             search: None,
@@ -701,6 +709,26 @@ impl RequestView {
             self.request_tab = tab;
             cx.notify();
         }
+    }
+
+    /// Swap an HTML body between the extracted text and the markup.
+    ///
+    /// No re-index: `BodyView` holds both halves, so this is an `Arc` swap rather than a second
+    /// hundred-millisecond pass through html5ever. The preference is written to the buffer as
+    /// well as to the view, so the next response to this request opens the way this one is left.
+    ///
+    /// A no-op on anything that is not an extractable HTML body, which is what lets the palette
+    /// row exist unconditionally without doing something surprising on a JSON response.
+    pub fn toggle_html_view(&mut self, cx: &mut Context<Self>) {
+        let Some(showing) = self.body_view.as_ref().and_then(BodyView::html_view) else {
+            return;
+        };
+        let next = showing.other();
+        self.html_view = next;
+        if let Some(body) = self.body_view.as_mut() {
+            body.set_html_view(next);
+        }
+        cx.notify();
     }
 
     pub fn cycle_response_view(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -1324,11 +1352,12 @@ impl RequestView {
         let body = response.body.clone(); // Bytes: refcount bump, not a copy
         let content_type = response.content_type().map(str::to_string);
         let len = body.len();
+        let html_view = self.html_view;
 
         self.body_view = None;
         let build = cx
             .background_executor()
-            .spawn(async move { BodyView::build(body, content_type, force_parse) });
+            .spawn(async move { BodyView::build(body, content_type, force_parse, html_view) });
 
         self.body_task = Some(cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();

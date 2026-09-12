@@ -48,7 +48,7 @@ use crate::actions::{
     ChooseRootCa, OpenCertificates,
     CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
-    ShowResponseTiming,
+    ShowResponseTiming, ToggleHtmlView,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
@@ -4926,6 +4926,12 @@ impl Workspace {
         self.show_response_view(ResponseView::Diff, cx);
     }
 
+    fn toggle_html_view(&mut self, _: &ToggleHtmlView, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.toggle_html_view(cx));
+        }
+    }
+
     /// Open the find bar over the response body.
     ///
     /// Guarded by `modal_open` like every other opener: a find bar takes focus, and taking it
@@ -6149,6 +6155,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_response_headers))
             .on_action(cx.listener(Self::show_response_timing))
             .on_action(cx.listener(Self::show_response_diff))
+            .on_action(cx.listener(Self::toggle_html_view))
             .on_action(cx.listener(Self::find_in_body))
             .on_action(cx.listener(Self::body_find_next))
             .on_action(cx.listener(Self::body_find_prev))

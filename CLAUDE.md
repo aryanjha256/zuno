@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 870 tests, ~20s
+cargo test --workspace                   # 884 tests, ~25s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -260,6 +260,23 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   **The fifth one is worth a second look**, because the weak assertion was hiding a real bug rather
   than merely failing to catch one: the default that made it vacuous was itself the defect, so
   fixing the *code* turned the existing test load-bearing without touching it.
+- **A test helper silently typed into the wrong field, and the suite called GitHub on every run.**
+  `type_url` was `ctrl-a` then type — "select all and type" *in whatever has focus*, with no
+  `ctrl-l` to claim the URL bar. Every caller happened to be focused there already until one
+  wasn't: a test that had just typed a header name called it, so the URL went into the **header
+  name** and the request stayed pointed at the sample's `https://api.github.com/graphql`. The
+  suite therefore made a real network request, carrying an unresolved
+  `Authorization: Bearer {{token}}`, on every single run — against the rule that
+  `core/tests/engine.rs` is `#[ignore]`d precisely so CI never depends on the network.
+
+  **It presented as a flaky test**, which is why it survived. The assertion was `is_sending()`,
+  and whether that was still true on the first probe depended on how fast an unintended network
+  call resolved — about one full-suite run in three. A flake is a *symptom*; the two cheap
+  explanations are "slow CI" and "timing", and both are wrong often enough that neither is worth
+  guessing. Printing the actual `RequestSpec` at the point of the send named it in one run. The
+  general rule: **an input helper that does not first move focus is a helper that types
+  somewhere unpredictable**, and it will read as a timing bug rather than as a targeting one.
+
 - **Docs went stale twice while the code was right.** Both times a multi-file edit script aborted
   on a failed anchor assertion, so files listed *after* the failure were silently skipped, and the
   summary claimed work that hadn't happened. `git status` showed the untouched files both times.
