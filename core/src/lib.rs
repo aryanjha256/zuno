@@ -29,6 +29,7 @@ pub mod request;
 pub mod runner;
 pub mod response;
 pub mod search;
+pub mod headers;
 pub mod version;
 
 pub use collection::CollectionError;

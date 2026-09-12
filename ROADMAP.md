@@ -42,7 +42,11 @@ after M3 was finished; rewritten rather than patched, per the note at the top of
   (one command, because `apt-get install ./file.deb` is already both), the checksums and the two
   container smoke tests that keep it honest, and an update **notice** in the titlebar that copies
   that command. Deliberately not an updater — see architecture.md §6k, where the password prompt
-  turns out to be a consequence of a *window* asking for root rather than a requirement.
+  turns out to be a consequence of a *window* asking for root rather than a requirement. And a
+  **header-name dropdown** — a combobox under the cell you are typing in, which is the first
+  *inline* overlay in the app and the discoverability rule one level below `affordances()`: that
+  table proves every action has a mouse path, and says nothing about someone who cannot name the
+  header they need to type. See architecture.md §6l.
 
   Adding to this list rather than leaving it is deliberate: the paragraph below is about this
   exact list going stale, and a slice that updates architecture.md and skips the file owning

@@ -173,6 +173,12 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::CaptureValue", "acts on the selected response row"),
     ("zuno::AssertValue", "acts on the selected response row"),
     ("zuno::RunDismiss", "only valid while a run report is open"),
+    // Only meaningful while the header-name list is on screen, where they are already bound —
+    // and each acts on a cell the palette cannot show you.
+    ("zuno::SuggestNext", "only valid inside the header name list"),
+    ("zuno::SuggestPrev", "only valid inside the header name list"),
+    ("zuno::SuggestConfirm", "only valid inside the header name list"),
+    ("zuno::SuggestDismiss", "only valid inside the header name list"),
     // The chip in the titlebar is the entry point, and it only exists when there is something
     // to say. Same reasoning as `OpenAppMenu`: reaching a menu from the palette is backwards.
     ("zuno::OpenUpdateMenu", "a menu reached from the palette is backwards"),

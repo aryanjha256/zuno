@@ -75,6 +75,7 @@ zuno/
 │       ├── fuzzy.rs        ✅ subsequence scoring for the picker
 │       ├── highlight.rs    ✅ JSON lexer for syntax colouring — tolerant, no cache
 │       ├── search.rs       ✅ substring search over a response body
+│       ├── headers.rs      ✅ common request header names + matching a partial one
 │       └── version.rs      ✅ comparing a released version against the running one
 └── app/                    ✅ zuno — the GPUI binary
     ├── Cargo.toml
@@ -2571,6 +2572,78 @@ Three smaller decisions:
 
 `ZUNO_NO_UPDATE_CHECK=1` turns the request off entirely. An env var rather than a setting: the
 people who want it are already launching from a shell, and a toggle would need a home in a panel.
+
+---
+
+## 6l. The header-name dropdown — a combobox, not the picker
+
+Authoring a header meant typing its name from memory, including `Authorization`. The picker is
+the wrong instrument: it is a *centred modal* that owns the screen, which is right for a palette
+and absurd for filling a table cell. So this is the first **inline** overlay — anchored under the
+cell, with focus staying in the box behind it.
+
+**A combobox, not an autocomplete.** An empty cell offers the whole table; typing filters it. A
+list that only appears once you start typing is useless to the person who does not know what
+headers exist, who is the entire audience for the feature — the discoverability rule one level
+below `affordances()`, which proves every *action* has a mouse path and says nothing about a user
+who cannot name the thing they must type.
+
+`core/src/headers.rs` holds the table and the match, pure, for `fuzzy` and `version`'s reason.
+Three decisions in it:
+
+- **Not the IANA registry.** Hundreds of names, most response-only or protocol extensions; a list
+  you scroll past is worse than typing.
+- **Prefix before substring, and never fuzzy.** `fuzzy.rs` scores subsequences, which is right
+  for half-remembering a command name and wrong here: `cte` would match `Content-Type` and a
+  dozen others, and a list that reorders unpredictably as you type is one you stop reading.
+- **An unknown name offers nothing**, rather than falling back to the full list. `X-Trace-Id` is
+  an ordinary thing to type, and a list reappearing under it is noise at the exact moment you are
+  doing the thing the list cannot help with. A *finished* name offers nothing either.
+
+### Three mechanics, each of which decided the design
+
+- **Owned by `Workspace`, not by the row.** `request_pane` has ten `overflow_hidden` ancestors,
+  and an absolutely-positioned child is still masked by one — so an inline `anchored()` under the
+  cell is clipped. Rendered from the root there is nothing to escape. Same move `context_menu`
+  makes, and the same reason.
+- **No scrim and no focus transfer**, which is what separates it from that menu. A scrim swallows
+  the next click; focusing the list stops the typing it exists to accompany. It carries
+  `.occlude()` only so the wheel does not scroll the pane behind it, since scroll handlers
+  consult the hit test rather than propagation.
+- **The position comes from `TextInput::last_bounds`**, already recorded for hit-testing and the
+  IME rectangle and therefore already in window coordinates. It is written during *paint*, so on
+  the frame a brand-new row first appears the position is not yet known and the list is absent —
+  measured, `false` on frame one and `true` on frame two. That is why the list's **contents** are
+  derived from the focused row alone and only its *placement* reads bounds: folding the two
+  together made what the list would offer unobservable for a frame, which two tests then could
+  not assert.
+
+### The rule the feature turns on
+
+**Typing never highlights anything.** `Enter` accepts only an entry `up`/`down` explicitly moved
+to, so a half-typed custom header is never replaced by whatever ranked first. Break-tested: with
+the guard removed, `accept-c` silently becomes `Accept-Charset`, which is a wrong header sent to
+a real server and nothing on screen saying so.
+
+The highlight is *not* reset by typing, deliberately. It is an index into the list as currently
+derived and is rendered from that same list, so it always points at the row you can see — where
+clearing it on every keystroke would make `down`-then-type-one-more-character lose your place.
+
+**`escape` needed a fallback, and this is the part with no visible symptom.** The four keys are
+bound in `Some("HeaderCell")`, and a leaf-matching predicate *ties* with a context-less one, with
+the tie going to later registration — so this `escape` wins whenever a header name has focus.
+Without forwarding to `cancel_request` when no list is open, putting the cursor in a header cell
+would quietly disarm cancelling an in-flight request. Seventh time that ordering rule has decided
+behaviour here, and the first where the cost was a *different* feature silently stopping.
+
+Accepting writes through `select_all_text` plus the ordinary edit path rather than assigning the
+content, so `Ctrl+Z` undoes it and `Changed` still fires — body prettify's reasoning, applied to a
+single-line input.
+
+*Deliberately absent:* header **values**. `Content-Type` has a known short set and is the obvious
+second consumer, but doing both at once means debugging the anchoring and the data at the same
+time. Query parameter names get nothing at all, and never will: they are the API's vocabulary,
+not HTTP's.
 
 ---
 

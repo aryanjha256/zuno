@@ -51,6 +51,7 @@ use crate::actions::{
     OpenBodyType, PrevRequestTab,
     OpenAppMenu, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
+    SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
@@ -446,6 +447,16 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", CertsNext, Some("CertPanel")),
         KeyBinding::new("up", CertsPrev, Some("CertPanel")),
         KeyBinding::new("delete", CertsRemove, Some("CertPanel")),
+        // The header-name dropdown. Scoped to `HeaderCell`, and **after** the global `escape`
+        // above — a leaf-matching predicate ties with a context-less one and the tie goes to
+        // later registration, which is what makes these win while a header name has focus.
+        // That is also why `suggest_dismiss` forwards to cancel when no list is open: this
+        // binding wins unconditionally, so without the fallback, putting the cursor in a header
+        // cell would quietly disarm cancelling a request.
+        KeyBinding::new("down", SuggestNext, Some("HeaderCell")),
+        KeyBinding::new("up", SuggestPrev, Some("HeaderCell")),
+        KeyBinding::new("enter", SuggestConfirm, Some("HeaderCell")),
+        KeyBinding::new("escape", SuggestDismiss, Some("HeaderCell")),
         KeyBinding::new("enter", ConfirmClose, Some("CloseConfirm")),
         KeyBinding::new("escape", CancelClose, Some("CloseConfirm")),
         KeyBinding::new("right", CloseChoiceNext, Some("CloseConfirm")),

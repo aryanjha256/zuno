@@ -221,6 +221,11 @@ actions!(
         CopyResponse,
         SaveResponse,
         CopyAsCurl,
+        // Header name suggestions
+        SuggestNext,
+        SuggestPrev,
+        SuggestConfirm,
+        SuggestDismiss,
         // Updates
         OpenUpdateMenu,
         CopyInstallCommand,

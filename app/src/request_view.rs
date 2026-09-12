@@ -979,22 +979,29 @@ impl RequestView {
             .position(|part| part.row.is_focused(window, cx))
     }
 
-    /// The header-*name* cell that currently has focus, and where it painted.
+    /// The header-*name* cell that currently has focus.
     ///
     /// By entity, not by key context: a row's name and value inputs share `"HeaderCell"`, so a
     /// context predicate cannot tell them apart — only the row knows which of its two is which.
-    pub fn focused_header_name(
+    ///
+    /// Deliberately **not** returning bounds. What the suggestion list contains must not depend
+    /// on whether the cell has been painted yet: `last_bounds` is written during paint, so a
+    /// brand-new row has none on its first frame, and folding the two together made the list's
+    /// *contents* unobservable for a frame rather than just its position.
+    pub fn focused_header_name(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.headers
+            .iter()
+            .position(|row| row.name.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// Where a header name cell last painted, in window coordinates. `None` until it has been
+    /// drawn once.
+    pub fn header_name_bounds(
         &self,
-        window: &Window,
+        row: usize,
         cx: &App,
-    ) -> Option<(usize, gpui::Bounds<gpui::Pixels>)> {
-        self.headers.iter().enumerate().find_map(|(ix, row)| {
-            let input = row.name.read(cx);
-            if !input.focus_handle(cx).is_focused(window) {
-                return None;
-            }
-            input.last_bounds().map(|bounds| (ix, bounds))
-        })
+    ) -> Option<gpui::Bounds<gpui::Pixels>> {
+        self.headers.get(row)?.name.read(cx).last_bounds()
     }
 
     pub fn url_focus(&self, cx: &App) -> FocusHandle {

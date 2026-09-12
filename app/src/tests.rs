@@ -11754,27 +11754,32 @@ async fn dismissing_an_update_hides_it_until_a_newer_one(cx: &mut TestAppContext
     );
 }
 
-/// SPIKE — the three things that decide whether an inline header-name dropdown is buildable:
-/// it anchors under the cell, it escapes the request pane's `overflow_hidden` ancestors by
-/// being owned at the root, and focus stays in the input so typing still lands.
+// ---------------------------------------------------------------------------
+// The header-name dropdown
+//
+// A combobox under the cell you are typing in. What is testable here is placement, that focus
+// stays put, and the acceptance rules; whether it *looks* right is a paint, and nothing headless
+// observes one.
+
+/// It anchors under the cell, and — the half that would make the whole approach unusable —
+/// typing still lands while it is open.
 ///
-/// Clipping is the one part no assertion can reach — a clipped element still reports bounds,
-/// and nothing headless observes a paint. What is checked instead is the *ownership* that makes
-/// clipping impossible: the popup is positioned in window coordinates under a cell that sits
-/// inside those ancestors, which is only expressible from the root.
+/// Clipping is the one part no assertion can reach: a clipped element still reports bounds. What
+/// is checked instead is the *ownership* that makes clipping impossible — the list is positioned
+/// in window coordinates under a cell that sits inside ten `overflow_hidden` ancestors, which is
+/// only expressible from the root.
 ///
 /// It types before looking, and that is not incidental: `last_bounds` is written during paint,
-/// so on the frame a brand-new row first appears the position is not known yet and the list is
-/// absent. Measured — `false` on frame one, `true` on frame two.
+/// so on the frame a brand-new row first appears the position is not known yet.
 #[gpui::test]
-async fn spike_header_suggestions_anchor_under_the_cell_and_typing_still_lands(
+async fn the_header_suggestion_list_anchors_under_the_cell_and_typing_still_lands(
     cx: &mut TestAppContext,
 ) {
     let (view, mut cx) = open_workspace(cx);
 
     cx.simulate_keystrokes("ctrl-shift-h");
     cx.run_until_parked();
-    cx.simulate_input("X-Trace-Id");
+    cx.simulate_input("auth");
     cx.run_until_parked();
 
     let cell = cx
@@ -11782,7 +11787,7 @@ async fn spike_header_suggestions_anchor_under_the_cell_and_typing_still_lands(
         .expect("a header name cell is painted");
     let popup = cx
         .debug_bounds("header-suggestions")
-        .expect("the suggestion list is painted while a header name cell has focus");
+        .expect("the list is painted while a header name is being typed");
 
     assert!(
         popup.origin.y >= cell.bottom() - gpui::px(1.),
@@ -11796,12 +11801,126 @@ async fn spike_header_suggestions_anchor_under_the_cell_and_typing_still_lands(
         cell.left(),
         popup.origin.x
     );
-
-    // The half that would make the whole approach unusable: an overlay that takes focus stops
-    // the typing it exists to accompany.
     assert_eq!(
         spec_of(&view, &mut cx).headers.last().map(|h| h.name.clone()),
-        Some("X-Trace-Id".to_string()),
+        Some("auth".to_string()),
         "typing must still reach the cell while the list is open"
     );
+}
+
+/// **The rule the whole feature turns on.** Typing never highlights anything, so `Enter` on a
+/// half-typed custom header must do nothing — otherwise `X-Trace-Id` is silently replaced by
+/// whatever the list ranked first, which is a wrong header sent to a real server.
+#[gpui::test]
+async fn enter_does_nothing_until_a_suggestion_is_highlighted(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.run_until_parked();
+    // A prefix of a real header, so the list is definitely open and definitely non-empty —
+    // a name matching nothing would pass this test for the wrong reason.
+    cx.simulate_input("accept-c");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("header-suggestions").is_some(),
+        "the list has to be open, or this asserts nothing"
+    );
+
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        spec_of(&view, &mut cx).headers.last().map(|h| h.name.clone()),
+        Some("accept-c".to_string()),
+        "enter must not accept a suggestion nobody moved to"
+    );
+}
+
+/// The positive path: `down` highlights, `enter` accepts, and the name is written through the
+/// ordinary edit path so it lands in the spec.
+#[gpui::test]
+async fn down_then_enter_accepts_a_suggestion(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.run_until_parked();
+    cx.simulate_input("auth");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        spec_of(&view, &mut cx).headers.last().map(|h| h.name.clone()),
+        Some("Authorization".to_string()),
+        "the highlighted suggestion must replace what was typed"
+    );
+}
+
+/// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**
+/// whenever a header name has focus. Without the forward in `suggest_dismiss`, putting the
+/// cursor in a header cell would quietly disarm cancelling a request — invisible, and only
+/// noticed the one time you needed it.
+#[gpui::test]
+async fn escape_in_a_header_cell_still_cancels_an_in_flight_request(cx: &mut TestAppContext) {
+    let base = serve_never();
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    // A header whose name matches nothing, so no list is open and `escape` has to fall through.
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.run_until_parked();
+    cx.simulate_input("X-Trace-Id");
+    cx.run_until_parked();
+    // Real state, not `debug_bounds`: a removed element keeps its entry until another frame
+    // is drawn, so `is_none()` there cannot distinguish "closed" from "stale".
+    assert_eq!(
+        window
+            .update(&mut cx, |w, window, cx| w.suggestions_for_test(window, cx))
+            .expect("window"),
+        None,
+        "a custom name must not open the list, or this tests the wrong branch"
+    );
+
+    type_url(&mut cx, &format!("{base}/slow"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the request to start", |cx| {
+        cx.update(|_, cx| view.read(cx).is_sending().then_some(()))
+    });
+
+    // Back into the header cell, then escape.
+    let cell = cx.debug_bounds("hdr-name-0").expect("the header name cell");
+    cx.simulate_click(cell.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert!(
+            !view.read(cx).is_sending(),
+            "escape in a header cell must still cancel the request"
+        );
+    });
+}
+
+/// The combobox half: an empty cell offers the whole table, which is the entire value for
+/// someone who does not know what headers exist. An autocomplete that only appears once you
+/// type is useless to exactly that person.
+#[gpui::test]
+async fn an_empty_header_cell_offers_the_whole_table(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    let _ = &view;
+
+    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.run_until_parked();
+
+    // Asserted on the list's *contents* rather than on paint, which is the reason those two are
+    // separated: a brand-new row has not been drawn yet, so it does not know where it is — but
+    // what it would offer is already decided.
+    let items = window
+        .update(&mut cx, |w, window, cx| w.suggestions_for_test(window, cx))
+        .expect("window")
+        .expect("an empty header name cell should offer the full list");
+    assert_eq!(items.len(), zuno_core::headers::COMMON.len());
 }

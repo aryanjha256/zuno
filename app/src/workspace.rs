@@ -27,6 +27,7 @@ use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
+    SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
     AddAssertion, AddCapture, AssertValue, CaptureValue, CycleAssertOp, EditEnvironments,
     EnvConfirm, EnvDismiss, EnvNewEnvironment, ShowAssertTab,
@@ -205,6 +206,19 @@ pub struct Workspace {
     update: crate::update::Update,
     /// Held because dropping a `Task` cancels it.
     update_task: Option<Task<()>>,
+    /// The header-name suggestion list: which row it belongs to, and which entry the user has
+    /// explicitly moved to.
+    ///
+    /// **`None` for the highlight is the whole safety rule.** Typing never highlights anything,
+    /// so `Enter` on a half-typed custom header does nothing rather than silently replacing it
+    /// with whatever ranked first. Only `up`/`down` set it.
+    ///
+    /// The list itself is *derived* in render from the focused cell's text rather than stored —
+    /// `headers::suggestions` is pure and cheap, and a stored copy is a mirror that can
+    /// disagree with the box it describes.
+    suggest: Option<(usize, Option<usize>)>,
+    /// The row whose list was dismissed with `escape`, so it stays shut until focus moves.
+    suggest_dismissed: Option<usize>,
 }
 
 /// An in-progress inline rename.
@@ -418,6 +432,8 @@ impl Workspace {
             workspace_prompt: None,
             update: crate::update::Update::Unknown,
             update_task: None,
+            suggest: None,
+            suggest_dismissed: None,
         };
 
         // Off-thread and non-blocking, so a large collection cannot delay the first frame —
@@ -5339,28 +5355,112 @@ impl Workspace {
         cx.notify();
     }
 
-    /// SPIKE — a placeholder list under the focused header-name cell.
+    /// The header name being typed.
+    fn suggest_target(&self, window: &Window, cx: &App) -> Option<(usize, String)> {
+        let view = self.active()?.read(cx);
+        let row = view.focused_header_name(window, cx)?;
+        let typed = view.headers.get(row)?.name.read(cx).text().to_string();
+        Some((row, typed))
+    }
+
+    /// What the list holds right now. Read by tests directly — `debug_bounds` reports a stale
+    /// entry for a removed element until another frame is drawn, so `is_none()` there is not
+    /// evidence the list closed.
+    #[cfg(test)]
+    pub fn suggestions_for_test(&self, window: &Window, cx: &App) -> Option<Vec<&'static str>> {
+        self.suggest_items(window, cx).map(|(items, _)| items)
+    }
+
+    /// What the list would show right now, and which entry is highlighted.
     ///
-    /// Proving three things before the real feature is built: that the popup can be anchored
-    /// under a cell, that being owned *here* rather than inside the row escapes the request
-    /// pane's ten `overflow_hidden` ancestors, and that focus stays in the input so typing
-    /// still lands. The list is hardcoded; filtering and the data table come after.
+    /// Derived rather than stored, so it cannot disagree with the cell it describes. The
+    /// highlight only survives while focus stays on the row it was set for — a stale index
+    /// against a different row would highlight an unrelated entry.
+    fn suggest_items(&self, window: &Window, cx: &App) -> Option<(Vec<&'static str>, Option<usize>)> {
+        let (row, typed) = self.suggest_target(window, cx)?;
+        if self.suggest_dismissed == Some(row) {
+            return None;
+        }
+        let items = zuno_core::headers::suggestions(&typed);
+        if items.is_empty() {
+            return None;
+        }
+        let highlighted = match self.suggest {
+            Some((highlighted_row, ix)) if highlighted_row == row => {
+                ix.filter(|ix| *ix < items.len())
+            }
+            _ => None,
+        };
+        Some((items, highlighted))
+    }
+
+    /// The dropdown under the focused header-name cell.
+    ///
+    /// **Owned here rather than inside the row**, which is what makes it possible at all: the
+    /// request pane has ten `overflow_hidden` ancestors, and an absolutely-positioned child is
+    /// still masked by one. Rendered from the root there is nothing to escape — the same move
+    /// `context_menu` makes, for the same reason.
+    ///
+    /// **No scrim and no focus transfer**, which is what separates it from that menu. A scrim
+    /// would swallow the next click, and focusing the list would stop the typing it exists to
+    /// accompany.
     fn header_suggestions(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
         let theme = cx.theme().clone();
-        let (_, bounds) = self.active()?.read(cx).focused_header_name(window, cx)?;
+        let (row, _) = self.suggest_target(window, cx)?;
+        let (items, highlighted) = self.suggest_items(window, cx)?;
+        // The one thing that genuinely needs the cell to have been painted. A frame behind on
+        // the very first draw of a new row, and harmless: a cell does not move while you type.
+        let bounds = self.active()?.read(cx).header_name_bounds(row, cx)?;
 
-        // Bottom-left of the cell, in window coordinates — the same `AnchoredPositionMode`
-        // the context menu uses, and for the same reason: these bounds are already absolute,
-        // so reading them as local would add the parent origin a second time.
+        // Bottom-left of the cell, in window coordinates — `last_bounds` is already absolute,
+        // so reading it as local would add the parent origin twice.
         let at = gpui::point(bounds.left(), bounds.bottom());
 
-        // **No scrim and no focus transfer**, which is what separates this from the context
-        // menu. A scrim would swallow the next click and focusing the list would stop the
-        // typing this exists to accompany.
+        let rows: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(ix, name)| {
+                let selected = highlighted == Some(ix);
+                // Applied unconditionally rather than through a conditional builder: one
+                // highlight always says what Enter will do, so the unselected case needs a
+                // colour too, not the absence of one.
+                let (bg, fg) = if selected {
+                    (theme.bg_hover, theme.text)
+                } else {
+                    (theme.bg_elevated, theme.text_muted)
+                };
+                div()
+                    .id(SharedString::from(format!("suggest-{ix}")))
+                    .debug_selector(move || format!("suggest-{ix}"))
+                    .px_2()
+                    .py_0p5()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .bg(bg)
+                    .text_color(fg)
+                    // Hover moves the highlight rather than adding a second one, so there is
+                    // always exactly one row saying what Enter will do — `context_menu`'s rule.
+                    .on_mouse_move(cx.listener(move |workspace, _: &gpui::MouseMoveEvent, _, cx| {
+                        if let Some((row, _)) = workspace.suggest {
+                            workspace.suggest = Some((row, Some(ix)));
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |workspace, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            workspace.accept_suggestion(ix, window, cx);
+                        }),
+                    )
+                    .child(SharedString::from(*name))
+            })
+            .collect();
+
         Some(
             gpui::anchored()
                 .position(at)
@@ -5370,9 +5470,13 @@ impl Workspace {
                     div()
                         .id("header-suggestions")
                         .debug_selector(|| "header-suggestions".to_string())
+                        // Without this the wheel scrolls the pane behind the list, since scroll
+                        // handlers consult the hit test rather than propagation.
                         .occlude()
                         .flex()
                         .flex_col()
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
                         .min_w(px(180.))
                         .rounded_md()
                         .p_1()
@@ -5380,18 +5484,99 @@ impl Workspace {
                         .border_1()
                         .border_color(theme.border)
                         .shadow_md()
-                        .children(["Authorization", "Content-Type", "Accept"].into_iter().map(
-                            |name| {
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .text_xs()
-                                    .text_color(theme.text)
-                                    .child(name)
-                            },
-                        )),
+                        .font_family(theme.mono.clone())
+                        .text_xs()
+                        .children(rows),
                 ),
         )
+    }
+
+    /// Write the chosen name into the cell.
+    ///
+    /// Through select-all plus the ordinary edit path rather than by assigning the content, so
+    /// `Ctrl+Z` undoes it and `Changed` still fires — the same reasoning as body prettify going
+    /// through `Editor::replace_range`.
+    fn accept_suggestion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, _)) = self.suggest_target(window, cx) else {
+            return;
+        };
+        let Some((items, _)) = self.suggest_items(window, cx) else {
+            return;
+        };
+        let Some(name) = items.get(ix).copied() else {
+            return;
+        };
+        let Some(view) = self.active() else {
+            return;
+        };
+        view.update(cx, |view, cx| {
+            let Some(input) = view.headers.get(row).map(|row| row.name.clone()) else {
+                return;
+            };
+            input.update(cx, |input, cx| {
+                input.select_all_text(cx);
+                gpui::EntityInputHandler::replace_text_in_range(input, None, name, window, cx);
+            });
+        });
+        self.suggest = None;
+        // Not re-opened for the name just accepted: `suggestions` returns nothing for a
+        // finished name, so there is nothing to dismiss.
+        cx.notify();
+    }
+
+    fn suggest_next(&mut self, _: &SuggestNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_suggestion(1, window, cx);
+    }
+
+    fn suggest_prev(&mut self, _: &SuggestPrev, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_suggestion(-1, window, cx);
+    }
+
+    fn step_suggestion(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // Stepping is also how a dismissed list is reopened — pressing `down` is asking for it.
+        let Some((row, _)) = self.suggest_target(window, cx) else {
+            return;
+        };
+        self.suggest_dismissed = None;
+        let Some((items, highlighted)) = self.suggest_items(window, cx) else {
+            return;
+        };
+        let next = match highlighted {
+            // First press lands on the first entry going down, the last going up, rather than
+            // on whatever index happened to be stored.
+            None if delta > 0 => 0,
+            None => items.len() - 1,
+            Some(ix) => (ix as isize + delta).rem_euclid(items.len() as isize) as usize,
+        };
+        self.suggest = Some((row, Some(next)));
+        cx.notify();
+    }
+
+    fn suggest_confirm(&mut self, _: &SuggestConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        // Nothing highlighted means nothing was chosen. This is the rule that keeps a typed
+        // `X-Trace-Id` from being replaced by whatever the list happened to rank first.
+        let Some((_, Some(ix))) = self.suggest else {
+            return;
+        };
+        self.accept_suggestion(ix, window, cx);
+    }
+
+    /// `escape` in a header cell closes the list — and when there is no list, still cancels an
+    /// in-flight request.
+    ///
+    /// The fallback is not optional: this binding is scoped to `HeaderCell` and registered after
+    /// the global `escape`, so it *wins* whenever a header name has focus. Without forwarding,
+    /// putting the cursor in a header cell would quietly disarm cancelling a request.
+    fn suggest_dismiss(&mut self, _: &SuggestDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((row, _)) = self.suggest_target(window, cx)
+            && self.suggest_items(window, cx).is_some()
+        {
+            self.suggest = None;
+            self.suggest_dismissed = Some(row);
+            cx.notify();
+            return;
+        }
+        self.cancel_request(&CancelRequest, window, cx);
     }
 
     /// Put a menu on screen and wire it up. Shared by the row menu and the application menu,
@@ -5981,6 +6166,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_update_menu))
             .on_action(cx.listener(Self::copy_install_command))
             .on_action(cx.listener(Self::dismiss_update))
+            .on_action(cx.listener(Self::suggest_next))
+            .on_action(cx.listener(Self::suggest_prev))
+            .on_action(cx.listener(Self::suggest_confirm))
+            .on_action(cx.listener(Self::suggest_dismiss))
             .on_action(cx.listener(Self::menu_next))
             .on_action(cx.listener(Self::menu_prev))
             .on_action(cx.listener(Self::menu_confirm))
