@@ -533,6 +533,10 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   the reason a dialog must not act on its own. `prompt_for_paths` is `unimplemented!()` in the
   test platform, so every one of these is asserted at the layer below the dialog.
 
+- **An exported file must not land where `collection::scan` walks.** Scan takes *every* `.json`
+  under the collection root, so anything written there is read back as a request and reports
+  "is not a valid request" on each scan. Postman export defaults its dialog to `$HOME` for that
+  reason, not only because it is easier to find.
 - **Every verb needs a mouse path, not just a keybinding.** Keyboard-first is not keyboard-only: an
   audit found only six of ~40 actions were reachable by mouse, and nine had none at all — find,
   copy-as-curl, copy response, settings, import, new tab. A shortcut nobody can discover is a

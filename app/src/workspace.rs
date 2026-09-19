@@ -4406,7 +4406,15 @@ impl Workspace {
         let count = entries.len();
 
         let suggested = format!("{name}.postman_collection.json");
-        let prompt = cx.prompt_for_new_path(&collection, Some(&suggested));
+        // **Home, not the collection root**, and not only because it is easier to find:
+        // `collection::scan` walks *every* `.json` under the root, so an export saved beside
+        // the requests it came from is read back as a request, fails to parse, and reports
+        // "is not a valid request" on every scan from then on. The dialog still lets you put
+        // it anywhere — this is only where it opens.
+        let directory = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| collection.clone());
+        let prompt = cx.prompt_for_new_path(&directory, Some(&suggested));
 
         self.export_task = Some(cx.spawn(async move |workspace, cx| {
             // Cancelled, or the platform could not open a picker.

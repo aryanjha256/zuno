@@ -95,6 +95,22 @@ work. See architecture.md §3.1.
 Putting the format change in its own slice is what made its one real bug — an older Zuno
 overwriting a session it could not read — have exactly one candidate.
 
+**Postman export — done, and it closes an asymmetry.** Zuno read curl, OpenAPI and Postman and
+could write only a single curl command: easy to get in, impossible to get out. Right-click any
+folder → *Export as Postman…* writes a v2.1 collection, at any depth, because `collection::scan`
+takes a root and the export is the same code with a different one.
+
+**OpenAPI export was considered and rejected.** OpenAPI describes an *API*; a collection holds
+*example requests*. Emitting one means inventing parameter types, body schemas and response
+definitions a collection does not contain — a document that looks authoritative and is guessed.
+Postman's format holds what Zuno holds, so the mapping is real. Recorded so nobody builds it
+because the roadmap once implied symmetry with the importers.
+
+Settings, captures and assertions are **reported by name**, not dropped in silence — Postman has
+no per-request home for them. The save dialog opens in `$HOME` rather than the collection root,
+which is not only convenience: `scan` walks every `.json` under the root, so an export saved
+beside its own requests is read back as one and fails on every scan afterwards.
+
 What remains for GraphQL, in order: **introspection and assisted editing** — the *builder*, and
 the actual differentiator: a query you write with the schema helping, not a checkbox tree. Then a
 **schema browser**. That last one is
