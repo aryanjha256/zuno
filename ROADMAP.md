@@ -76,15 +76,37 @@ it, and **both were invisible to the audit because it only ever looked inward**:
 
 What is left after those two: **scripting**, which is the one item that would decide the ceiling
 and the one still blocked on a decision rather than on work — it needs a language and a sandbox
-chosen before anything else. And **GraphQL**, the last of the three capabilities item 4 found by
-comparing Zuno against what an API client is expected to do; the other two, OpenAPI import and
-the collection runner, have since shipped, as has request chaining, which this paragraph listed
-as unplanned for several slices after it landed. Read the audit, not the milestone headings.
+chosen before anything else. **GraphQL** was the last of the three capabilities item 4 found by
+comparing Zuno against what an API client is expected to do, and it has since shipped along with
+the other two. Read the audit, not the milestone headings.
 
-Worth noting what GraphQL now needs, since §6f argues part of it away: GraphQL over HTTP *is* a
-JSON body, so nothing is missing to *send* one. What is absent is authoring — a query editor,
-a variables pane, schema introspection — which is a different and much larger question than
-"support GraphQL".
+**GraphQL — done, as a request *kind*.** §6f used to argue half of it away: GraphQL over HTTP
+is a JSON body, so nothing was missing to *send* one. What was missing was authoring, and that
+turned out to need a model change rather than a body variant.
+
+It shipped in two slices, in that order deliberately — **a format change and a feature must
+never share a slice.** First the spine/kind split alone: `RequestSpec` holds what is true for
+every protocol and `RequestKind` holds what isn't, with no behaviour change and a serde shim
+that reads every collection file ever written. Then `RequestKind::GraphQl` on top of it: query
+and variables editors, the envelope, `{{var}}` substitution, curl export, and an exact Postman
+mapping. A kind chip beside the method switches between them, asking first when that discards
+work. See architecture.md §3.1.
+
+Putting the format change in its own slice is what made its one real bug — an older Zuno
+overwriting a session it could not read — have exactly one candidate.
+
+What remains for GraphQL, in order: **introspection and assisted editing** — the *builder*, and
+the actual differentiator: a query you write with the schema helping, not a checkbox tree. Then a
+**schema browser**. That last one is
+where the **buffer generalization** comes in — a schema browser is not a request, so it is the
+first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
+currently has exactly one document type and around ten overlays, and making the browser overlay
+eleven is the mistake this note exists to prevent.
+
+**Subscriptions are out of scope and stay out**, not by oversight: a subscription is a session
+over WebSocket, which is the transport this file already files under *Named, not planned*. It
+needs no new kind — see §3.1 on why lifecycle is a property of a run rather than of a saved
+request — so nothing here blocks it later.
 
 > **Test counts, once and not repeated.** `CLAUDE.md` carries the live total. Where a number appears
 > below it describes that milestone as shipped and is deliberately not updated — the same rule

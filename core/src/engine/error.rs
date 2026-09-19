@@ -47,6 +47,22 @@ pub enum EngineError {
     #[error("could not read the body file {path}: {reason}")]
     BodyFileUnreadable { path: PathBuf, reason: String },
 
+    /// GraphQL variables that are not a JSON object.
+    ///
+    /// Its own variant rather than a `Build`, because it names the one field the person has to
+    /// go and fix — and it is the only part of a GraphQL request that can be malformed while
+    /// everything around it is fine. Checked at the send boundary for `url`'s reason: the text
+    /// is invalid on most keystrokes and refusing to hold it would make the editor unusable.
+    #[error("the GraphQL variables are not valid JSON: {reason}")]
+    InvalidGraphQlVariables { reason: String },
+
+    /// A GraphQL request with nothing to send.
+    ///
+    /// Distinct from an empty body, which is legal for HTTP: a GraphQL request *is* its
+    /// document, so an empty one has no meaning to send rather than merely no payload.
+    #[error("enter a GraphQL query first")]
+    EmptyGraphQlQuery,
+
     /// Could not turn a valid-looking spec into a request. Distinct from a network
     /// failure: nothing left the machine.
     #[error("could not build the request: {reason}")]

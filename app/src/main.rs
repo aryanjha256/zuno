@@ -21,6 +21,7 @@ mod collections;
 mod commands;
 mod context_menu;
 mod engine;
+mod kinds;
 mod input;
 mod picker;
 mod run_panel;

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use zuno_core::runner::{self, Step};
-use zuno_core::{Body, Engine, Header, Method, RawKind, RequestSpec};
+use zuno_core::{Body, Engine, Header, HttpRequest, Method, RawKind, RequestKind, RequestSpec};
 
 /// Serve `bodies` in order, one connection each, recording every request text received.
 ///
@@ -370,8 +370,11 @@ fn a_folder_expands_to_steps_in_the_order_the_panel_shows() {
     ] {
         let spec = RequestSpec {
             url: url.into(),
-            method: Method::Get,
-            body: Body::Raw { text: String::new(), kind: RawKind::Json },
+            kind: RequestKind::Http(HttpRequest {
+                method: Method::Get,
+                body: Body::Raw { text: String::new(), kind: RawKind::Json },
+                ..HttpRequest::default()
+            }),
             ..RequestSpec::default()
         };
         std::fs::write(root.join(path), serde_json::to_vec(&spec).expect("json")).expect("write");

@@ -224,15 +224,25 @@ decisions worth keeping:
 ### 3.1 Request
 
 ```rust
-pub struct RequestSpec {
+pub struct RequestSpec {            // the spine — true for every protocol
     pub id: RequestId,
     pub name: String,
-    pub method: Method,
     pub url: String,               // RAW — may be invalid, may hold {{vars}}
-    pub query: Vec<QueryParam>,    // ordered, individually toggleable
     pub headers: Vec<Header>,      // ordered, individually toggleable
-    pub body: Body,
     pub settings: RequestSettings,
+    pub kind: RequestKind,         // everything that differs by protocol
+    // .. captures, expect_status, assertions
+}
+
+pub enum RequestKind {
+    Http(HttpRequest),
+    // Grpc, Mqtt, GraphQl … each a compile error until someone decides
+}
+
+pub struct HttpRequest {
+    pub method: Method,
+    pub query: Vec<QueryParam>,    // ordered, individually toggleable
+    pub body: Body,
 }
 
 pub struct Header { pub enabled: bool, pub name: String, pub value: String }
@@ -275,6 +285,122 @@ model itself is never in an "unparseable" state because it never claims to be pa
 
 Derive `Serialize + Deserialize` on all of it now, even though M1 barely persists anything
 (§7). It costs nothing today and keeps the storage decision cheap later.
+
+#### The spine/kind split — added when GraphQL forced the question
+
+Through M3 there was one request type and `RequestSpec` *was* an HTTP request. The split
+landed as groundwork for GraphQL, and the reasoning is worth keeping because the obvious
+cheaper answer was wrong.
+
+**The cheaper answer was `Body::GraphQl`** — a sixth body variant carrying query and
+variables. It is defensible on exactly one ground: GraphQL over HTTP really is a JSON body,
+so the wire format needs nothing else. It was rejected because that is the *only* thing about
+GraphQL that is HTTP-shaped. Its identity is the operation rather than the URL; its success
+signal is an `errors` array rather than the status; its authoring surface is a schema-aware
+editor rather than a text box; and its tooling — introspection — has no HTTP analogue.
+Modelling it by the one wire fact ranks that above four things the user actually experiences,
+and it does not generalise: gRPC and MQTT are not bodies at all, so the `Body` slot would have
+had to be joined by a second mechanism almost immediately.
+
+**Three rules decide where a field goes**, and they are the durable part:
+
+> A field goes on **the spine** only if it means the same thing for every protocol.
+> If it differs by protocol, it goes in **the kind**.
+> If it is shared *across requests*, it is not a request field at all — it is a collection
+> resource, and belongs in a reserved directory beside `environments/` and `flows/`.
+
+That third rule is what keeps a `.proto`, a WSDL and a cached GraphQL introspection out of
+`RequestSpec`: each is used by dozens of requests, so putting it on one is the same mistake as
+putting a shared environment on one.
+
+**`headers` is on the spine** because every protocol has ordered key/value metadata — HTTP
+headers, gRPC metadata, a WebSocket handshake, MQTT 5 user properties. The *name* is
+HTTP-flavoured and stays that way: it is the field name in every collection file on disk, and
+renaming it would rewrite all of them to say the same thing.
+
+**`expect_status` is the one spine field that is not universal.** HTTP and gRPC have a status;
+MQTT does not. It is an `Option`, so `None` is honest there — but it is the first thing to move
+if a statusless protocol ever needs a verdict of its own. Recorded rather than fixed, because
+inventing a verdict model for a protocol nobody has asked for is guessing.
+
+**A new kind is earned by needing a different authoring surface, not by being a different
+protocol.** SOAP and JSON-RPC are HTTP POST with a particular body, and `Http` sends both
+correctly today with no work; they would earn a kind only if someone wanted WSDL- or
+method-driven authoring. This is the test that stops the enum sprawling, and it is the same
+test that said GraphQL was a kind rather than a body.
+
+**Streaming is deliberately not expressed here**, and that is the subtlest part. Whether a
+request streams is decided in four different places depending on protocol — by the *server* for
+SSE (an ordinary GET that answers `text/event-stream`), by the *document text* for a GraphQL
+`subscription`, by the *schema* for a gRPC server-stream, and by the *protocol itself* for MQTT.
+One of those is only known at runtime, so `Http` and `HttpStreaming` as sibling variants would
+split a single saved request in two. Lifecycle is a property of a run, not of a saved request:
+it belongs to the response side and to `engine::Event`, which is already a stream over a channel
+with `Done` as one terminal variant among several (§4). A GraphQL subscription therefore needs
+no new *kind* at all — it is `GraphQl` whose document happens to begin with `subscription`, and
+what it needs is a transport and a response log.
+
+#### The app mirrors it: `KindEditor`
+
+`RequestView` holds one `kind: KindEditor` — `Http(HttpEditor)` or `GraphQl(GraphQlEditor)`,
+one module each under `app/src/kinds/`. It previously held twelve loose fields (`body_editor`,
+`form`, `multipart`, `binary_path`, `graphql_query`, …) behind a flat tag, so a third kind meant
+four more fields on a struct that already had 47. Adding gRPC is now a new file and a new arm,
+and **no other file grows a field**.
+
+**The tab strip is composed, not fixed.** `RequestTab` is `Headers | Kind(u8) | Capture | Assert`,
+and the slots come from `KindEditor::tabs()` with labels from `tab_label`. HTTP contributes
+Params and Body — reproducing the original strip exactly — and GraphQL contributes Query and
+Variables. Hardcoding the labels at the render site is what made a GraphQL request draw its
+document behind a tab called *Params*; the labels belong to the kind.
+
+Naming: **type names carry the kind (`HttpEditor`), field names don't** (`GraphQlEditor::query`,
+not `graphql_query`) — a struct is what namespaces a field. `Method` is shared and unprefixed
+because HTTP and GraphQL mean the same thing by it. gRPC's "method" is an address, not a verb,
+so it belongs as a field inside `GrpcEditor` rather than a type shadowing this one.
+
+**HTTP's verbs must refuse on another kind, not half-run.** `Workspace::active_http` is the
+guard. Without it `AddQuery`, `OpenBodyType` and `ChooseBodyFile` each revealed a tab and then
+did nothing — and `ChooseBodyFile` opened a *native file dialog* first. All three have palette
+rows, so hiding buttons was never the fix.
+
+#### The GraphQL envelope
+
+`{query, variables, operationName}`, built in `engine::build::graphql_envelope`. Three decisions:
+
+- **`variables` and `operationName` are absent, not empty**, when unset — several servers reject
+  `"operationName": ""`. Variables are held as JSON *text* (invalid on most keystrokes, like the
+  URL) and parsed at the send boundary; a non-object is a typed error, not forwarded.
+- **A GET carries the whole envelope in the query string**, which is why the method is variable
+  here at all: a GET GraphQL request is cacheable by ordinary HTTP machinery, and a body on a GET
+  is dropped by enough intermediaries to be undebuggable. `graphql_url` is shared with curl
+  export so the copied command cannot drift from the sent one.
+- **`{{name}}` is unambiguous in a GraphQL document.** `{` opens a selection set or an input
+  object, and in both the next token must be a name, `...` or `}` — so `{{` adjacent is invalid
+  except inside a string, which is where a placeholder belongs. Checked against compact and
+  nested shapes including `{a{b{c{d}}}}`, not assumed.
+
+The pane says **Query**, not "Document". The envelope field is named `query` and carries any
+operation — `{"query": "mutation Foo { … }"}` is ordinary GraphQL — and Query is the word every
+GraphQL client uses. "Document" is the spec's term and nobody's habit; it was tried and reverted.
+
+**On disk the change is additive, and that was not the first attempt.** Reading goes through a
+`TryFrom` shim, because collection files carry no version field to dispatch on. Writing emits
+**0.2.9's exact flat shape** for an HTTP request — `method`, `query`, `body` at the top level, no
+`kind` — so an older Zuno keeps reading files this build writes, and re-saving a request produces
+byte-identical output rather than a diff across the whole collection.
+
+The first attempt wrote the new shape unconditionally, and that was a bug rather than a
+preference. Forward compatibility is not the mirror of backward: a released build's behaviour is
+fixed, and 0.2.9 responds to a session it cannot parse by falling back to the sample and then
+*overwriting the file on quit*. A shape it cannot read is therefore silent data loss, not an
+inconvenience — it destroyed a workspace's open tabs once — and bumping `session::CURRENT_VERSION`
+does not help, because the "written by a newer Zuno" arm fails identically. Writing what the old
+build already understands is the only fix available from this side.
+
+Verified by round-tripping all 67 real collection files through both builds and diffing the
+output, and pinned in the suite by a byte-exact test in both directions. See CLAUDE.md
+invariant 11.
 
 ### 3.2 Response
 

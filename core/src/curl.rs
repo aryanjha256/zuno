@@ -25,7 +25,8 @@ use thiserror::Error;
 
 use crate::engine::build;
 use crate::request::{
-    Body, Header, Method, MultipartField, MultipartValue, RawKind, RequestSettings, RequestSpec,
+    Body, Header, HttpRequest, Method, MultipartField, MultipartValue, RawKind, RequestKind,
+    RequestSettings, RequestSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -259,18 +260,21 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
         ));
     }
 
-    spec.method = method.unwrap_or(if matches!(body, Body::Empty) {
+    // A curl command is an HTTP request by construction — there is no flag that makes it
+    // anything else, which is why the importer names the kind outright.
+    let http = spec.http_mut().expect("a new spec is HTTP");
+    http.method = method.unwrap_or(if matches!(body, Body::Empty) {
         Method::Get
     } else {
         Method::Post
     });
+    http.body = body;
     spec.name = derive_name(&url);
     // The query string stays in the URL rather than being split into rows. Splitting
     // would mean decoding and re-encoding every value, which can invalidate a signed
     // URL — and presigned URLs are exactly the kind of thing people paste in.
     spec.url = url;
     spec.headers = headers;
-    spec.body = body;
 
     Ok(CurlImport { spec, ignored })
 }
@@ -534,8 +538,10 @@ pub fn to_command(spec: &RequestSpec) -> String {
     // always is what makes the round trip exact, and it is how devtools writes it. The one case
     // it is load-bearing rather than decorative is a GET *with* a body, where omitting it would
     // silently turn the request into a POST.
-    if spec.method != Method::Get || has_body(spec) {
-        parts.push(format!("-X {}", spec.method.as_str()));
+    if spec.method() != Some(&Method::Get) || has_body(spec) {
+        if let Some(method) = spec.method() {
+            parts.push(format!("-X {}", method.as_str()));
+        }
     }
 
     for header in spec.enabled_headers() {
@@ -591,13 +597,23 @@ pub fn to_command(spec: &RequestSpec) -> String {
 /// design. The fallback appends the rows unencoded, which is the best that can be said about a
 /// command the recipient has to finish editing anyway.
 fn url_text(spec: &RequestSpec) -> String {
+    // A GET GraphQL request carries its envelope in the query string, so the exported URL has
+    // to be built the same way the sent one is — see `build::graphql_url`.
+    if let RequestKind::GraphQl(graphql) = &spec.kind
+        && let Ok(url) = build::graphql_url(spec, graphql)
+    {
+        return url.to_string();
+    }
+
     if let Ok(url) = build::resolve_url(spec) {
         return url.to_string();
     }
 
     let mut text = spec.url.trim().to_string();
     let pairs: Vec<String> = spec
-        .enabled_query()
+        .http()
+        .into_iter()
+        .flat_map(HttpRequest::enabled_query)
         .filter(|param| !param.name.trim().is_empty())
         .map(|param| format!("{}={}", param.name.trim(), param.value))
         .collect();
@@ -615,7 +631,16 @@ fn url_text(spec: &RequestSpec) -> String {
 /// a form or multipart body whose every field is disabled or unnamed. Getting this wrong would put
 /// a bare `-X GET` on a command that needs none.
 fn has_body(spec: &RequestSpec) -> bool {
-    match &spec.body {
+    let http = match &spec.kind {
+        RequestKind::Http(http) => http,
+        // A GraphQL request carries its envelope as a body unless it is a GET, where it goes
+        // in the query string instead — the same split `build_graphql` makes.
+        RequestKind::GraphQl(graphql) => {
+            return !graphql.query.trim().is_empty()
+                && !matches!(graphql.method, Method::Get | Method::Head);
+        }
+    };
+    match &http.body {
         Body::Empty => false,
         Body::Raw { text, .. } => !text.trim().is_empty(),
         Body::Form(fields) => !build::encode_form(fields).is_empty(),
@@ -629,7 +654,24 @@ fn has_body(spec: &RequestSpec) -> bool {
 /// The body flags. Exhaustive with no catch-all, for the reason `Resolver::apply` is: a new `Body`
 /// variant must fail the build until someone decides how curl expresses it.
 fn body_flags(spec: &RequestSpec) -> Vec<String> {
-    match &spec.body {
+    let http = match &spec.kind {
+        RequestKind::Http(http) => http,
+        // Exported as the envelope that actually goes on the wire, not as the two editors it
+        // was authored in — a copied command has to be runnable, and `query`/`variables` mean
+        // nothing to curl. Built by `graphql_envelope`, so the exported bytes and the sent
+        // bytes cannot drift; a query that will not build exports no body rather than a
+        // half-formed one.
+        RequestKind::GraphQl(graphql) => {
+            if matches!(graphql.method, Method::Get | Method::Head) {
+                return Vec::new();
+            }
+            return match build::graphql_envelope(graphql) {
+                Ok(envelope) => vec![format!("--data-raw {}", quote(&envelope.to_string()))],
+                Err(_) => Vec::new(),
+            };
+        }
+    };
+    match &http.body {
         Body::Empty => Vec::new(),
 
         Body::Raw { text, .. } => {
@@ -715,7 +757,7 @@ pub(crate) fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::{FormField, QueryParam};
+    use crate::request::{FormField, GraphQlRequest, QueryParam};
 
     fn import(input: &str) -> CurlImport {
         parse(input).expect("should parse")
@@ -731,7 +773,7 @@ mod tests {
     #[test]
     fn the_simplest_command() {
         let spec = import("curl https://api.example.com/users").spec;
-        assert_eq!(spec.method, Method::Get);
+        assert_eq!(spec.http().unwrap().method, Method::Get);
         assert_eq!(spec.url, "https://api.example.com/users");
         assert_eq!(spec.name, "users");
     }
@@ -759,12 +801,12 @@ mod tests {
         let import = import(input);
         let spec = &import.spec;
 
-        assert_eq!(spec.method, Method::Post, "data implies POST");
+        assert_eq!(spec.http().unwrap().method, Method::Post, "data implies POST");
         assert_eq!(spec.url, "https://api.example.com/v2/items?page=2");
         assert_eq!(spec.headers.len(), 3);
         assert_eq!(header_of(spec, "Authorization"), Some("Bearer abc.def"));
         assert_eq!(
-            spec.body,
+            spec.http().unwrap().body,
             Body::Raw {
                 text: r#"{"name":"zuno","tags":["a","b"]}"#.to_string(),
                 kind: RawKind::Json,
@@ -779,19 +821,19 @@ mod tests {
         // URL — and presigned URLs are exactly what people paste.
         let spec = import("curl 'https://x.test/o?X-Sig=a%2Bb%3D&t=1'").spec;
         assert_eq!(spec.url, "https://x.test/o?X-Sig=a%2Bb%3D&t=1");
-        assert!(spec.query.is_empty());
+        assert!(spec.http().unwrap().query.is_empty());
     }
 
     #[test]
     fn an_explicit_method_wins_over_inference() {
         let spec = import("curl -X PUT https://x.test/a -d 'body'").spec;
-        assert_eq!(spec.method, Method::Put);
+        assert_eq!(spec.http().unwrap().method, Method::Put);
     }
 
     #[test]
     fn custom_methods_survive() {
         let spec = import("curl -X PROPFIND https://x.test/a").spec;
-        assert_eq!(spec.method, Method::Other("PROPFIND".to_string()));
+        assert_eq!(spec.http().unwrap().method, Method::Other("PROPFIND".to_string()));
     }
 
     #[test]
@@ -803,14 +845,14 @@ mod tests {
             header_of(&spec, "content-type"),
             Some("application/x-www-form-urlencoded")
         );
-        assert_eq!(spec.method, Method::Post);
+        assert_eq!(spec.http().unwrap().method, Method::Post);
     }
 
     #[test]
     fn multiple_data_flags_are_joined_with_ampersands() {
         let spec = import("curl https://x.test/a -d one=1 -d two=2").spec;
-        let Body::Raw { text, .. } = &spec.body else {
-            panic!("expected a raw body: {:?}", spec.body);
+        let Body::Raw { text, .. } = &spec.http().unwrap().body else {
+            panic!("expected a raw body: {:?}", spec.http().unwrap().body);
         };
         assert_eq!(text, "one=1&two=2");
     }
@@ -821,7 +863,7 @@ mod tests {
         assert_eq!(header_of(&spec, "content-type"), Some("application/json"));
         assert_eq!(header_of(&spec, "accept"), Some("application/json"));
         assert!(matches!(
-            spec.body,
+            spec.http().unwrap().body,
             Body::Raw { kind: RawKind::Json, .. }
         ));
     }
@@ -829,9 +871,9 @@ mod tests {
     #[test]
     fn get_moves_data_into_the_query_string() {
         let spec = import("curl -G https://x.test/search -d q=rust -d page=2").spec;
-        assert_eq!(spec.method, Method::Get);
+        assert_eq!(spec.http().unwrap().method, Method::Get);
         assert_eq!(spec.url, "https://x.test/search?q=rust&page=2");
-        assert_eq!(spec.body, Body::Empty);
+        assert_eq!(spec.http().unwrap().body, Body::Empty);
     }
 
     #[test]
@@ -920,8 +962,8 @@ mod tests {
     #[test]
     fn multipart_forms_are_recognised_including_files() {
         let spec = import("curl https://x.test/up -F name=zuno -F 'file=@/tmp/a.png;type=image/png'").spec;
-        let Body::Multipart(fields) = &spec.body else {
-            panic!("expected multipart: {:?}", spec.body);
+        let Body::Multipart(fields) = &spec.http().unwrap().body else {
+            panic!("expected multipart: {:?}", spec.http().unwrap().body);
         };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].value, MultipartValue::Text("zuno".to_string()));
@@ -930,20 +972,20 @@ mod tests {
             MultipartValue::File(PathBuf::from("/tmp/a.png")),
             "the ;type= parameter should be stripped"
         );
-        assert_eq!(spec.method, Method::Post);
+        assert_eq!(spec.http().unwrap().method, Method::Post);
     }
 
     #[test]
     fn data_binary_with_an_at_sign_becomes_a_file_body() {
         let spec = import("curl https://x.test/a --data-binary @payload.bin").spec;
-        assert_eq!(spec.body, Body::Binary(PathBuf::from("payload.bin")));
+        assert_eq!(spec.http().unwrap().body, Body::Binary(PathBuf::from("payload.bin")));
     }
 
     #[test]
     fn equals_form_flags_work_too() {
         let spec = import("curl --url=https://x.test/a --request=DELETE").spec;
         assert_eq!(spec.url, "https://x.test/a");
-        assert_eq!(spec.method, Method::Delete);
+        assert_eq!(spec.http().unwrap().method, Method::Delete);
     }
 
     #[test]
@@ -974,7 +1016,7 @@ mod tests {
     #[test]
     fn double_quoted_bodies_with_escapes_survive() {
         let spec = import(r#"curl https://x.test/a -H "content-type: application/json" -d "{\"a\":\"b\"}""#).spec;
-        let Body::Raw { text, .. } = &spec.body else {
+        let Body::Raw { text, .. } = &spec.http().unwrap().body else {
             panic!("expected raw");
         };
         assert_eq!(text, r#"{"a":"b"}"#);
@@ -984,7 +1026,7 @@ mod tests {
     fn ansi_c_quoting_is_decoded() {
         // Chrome emits $'...' when the body contains a single quote.
         let spec = import(r#"curl https://x.test/a --data-raw $'{"name":"O\'Brien"}'"#).spec;
-        let Body::Raw { text, .. } = &spec.body else {
+        let Body::Raw { text, .. } = &spec.http().unwrap().body else {
             panic!("expected raw");
         };
         assert_eq!(text, r#"{"name":"O'Brien"}"#);
@@ -1122,7 +1164,7 @@ mod tests {
         assert!(!to_command(&plain("https://x.test/a")).contains("-X"));
 
         let mut spec = plain("https://x.test/a");
-        spec.method = Method::Delete;
+        spec.http_mut().unwrap().method = Method::Delete;
         assert!(to_command(&spec).contains("-X DELETE"));
     }
 
@@ -1131,11 +1173,11 @@ mod tests {
         // **The one case where -X is load-bearing rather than decorative.** curl infers POST from
         // the presence of a body, so omitting it here would silently change the request's method.
         let mut spec = plain("https://x.test/search");
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "{\"q\":\"ada\"}".to_string(),
             kind: RawKind::Json,
         };
-        assert_eq!(spec.method, Method::Get);
+        assert_eq!(spec.http().unwrap().method, Method::Get);
 
         let command = to_command(&spec);
         assert!(
@@ -1147,7 +1189,7 @@ mod tests {
     #[test]
     fn query_rows_reach_the_url_percent_encoded() {
         let mut spec = plain("https://x.test/search");
-        spec.query = vec![
+        spec.http_mut().unwrap().query = vec![
             QueryParam::new("q", "a b&c"),
             QueryParam::new("page", "2"),
         ];
@@ -1172,7 +1214,7 @@ mod tests {
                 value: "2".into(),
             },
         ];
-        spec.query = vec![QueryParam {
+        spec.http_mut().unwrap().query = vec![QueryParam {
             enabled: false,
             name: "hidden".into(),
             value: "yes".into(),
@@ -1189,10 +1231,10 @@ mod tests {
         // Pins the export to `build_body` rather than to a second encoder. Break `encode_form` and
         // both move together; re-implement it here and this fails.
         let mut spec = plain("https://x.test/token");
-        spec.method = Method::Post;
+        spec.http_mut().unwrap().method = Method::Post;
         // Struct literals: `FormField` has no `new`, unlike `Header` and `QueryParam`. Adding one
         // for two test call sites would be API ahead of a caller (invariant 1).
-        spec.body = Body::Form(vec![
+        spec.http_mut().unwrap().body = Body::Form(vec![
             FormField {
                 enabled: true,
                 name: "grant_type".into(),
@@ -1224,8 +1266,8 @@ mod tests {
         // `-d` strips newlines and reads a leading `@` as a filename. Both would corrupt a real
         // JSON body, and neither failure is visible in the command text.
         let mut spec = plain("https://x.test/a");
-        spec.method = Method::Post;
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().method = Method::Post;
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "{\n  \"at\": \"@home\"\n}".to_string(),
             kind: RawKind::Json,
         };
@@ -1240,7 +1282,7 @@ mod tests {
         // Matches `build_body`, which sends nothing for it — so the command must not claim a body
         // and must not gain a `-X` it doesn't need.
         let mut spec = plain("https://x.test/a");
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "   \n ".to_string(),
             kind: RawKind::Json,
         };
@@ -1253,8 +1295,8 @@ mod tests {
     #[test]
     fn multipart_parts_become_f_flags_with_file_syntax() {
         let mut spec = plain("https://x.test/upload");
-        spec.method = Method::Post;
-        spec.body = Body::Multipart(vec![
+        spec.http_mut().unwrap().method = Method::Post;
+        spec.http_mut().unwrap().body = Body::Multipart(vec![
             MultipartField {
                 enabled: true,
                 name: "caption".into(),
@@ -1277,8 +1319,8 @@ mod tests {
         // Only the path is ever held (see `RequestView::binary_path`), and a command that inlined
         // a 2GB upload would be useless anyway.
         let mut spec = plain("https://x.test/upload");
-        spec.method = Method::Put;
-        spec.body = Body::Binary(PathBuf::from("/tmp/blob.bin"));
+        spec.http_mut().unwrap().method = Method::Put;
+        spec.http_mut().unwrap().body = Body::Binary(PathBuf::from("/tmp/blob.bin"));
 
         assert!(to_command(&spec).contains("--data-binary '@/tmp/blob.bin'"));
     }
@@ -1317,8 +1359,8 @@ mod tests {
         // A shell-injection bug in a string the user is about to paste into a terminal. The
         // closing quote has to be escaped as '\'' — anything less and `; rm -rf /` would run.
         let mut spec = plain("https://x.test/a");
-        spec.method = Method::Post;
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().method = Method::Post;
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "it's '; echo pwned; '".to_string(),
             kind: RawKind::Text,
         };
@@ -1365,13 +1407,13 @@ mod tests {
         // The reason import and export share a file. Every flag the exporter emits must be one the
         // importer reads — anything else comes back in `ignored`, which is how the two drift.
         let mut original = plain("https://api.example.com/v1/things");
-        original.method = Method::Post;
+        original.http_mut().unwrap().method = Method::Post;
         original.headers = vec![
             Header::new("Content-Type", "application/json"),
             Header::new("X-Trace-Id", "abc123"),
         ];
-        original.query = vec![QueryParam::new("page", "2")];
-        original.body = Body::Raw {
+        original.http_mut().unwrap().query = vec![QueryParam::new("page", "2")];
+        original.http_mut().unwrap().body = Body::Raw {
             text: "{\"name\":\"ada\"}".to_string(),
             kind: RawKind::Json,
         };
@@ -1386,11 +1428,11 @@ mod tests {
             "the exporter emitted flags the importer drops: {:?}\n{command}",
             back.ignored
         );
-        assert_eq!(back.spec.method, Method::Post);
+        assert_eq!(back.spec.http().unwrap().method, Method::Post);
         // The query row moved into the URL, which is `parse`'s documented choice — so compare
         // against the resolved URL rather than the raw one.
         assert_eq!(back.spec.url, "https://api.example.com/v1/things?page=2");
-        assert_eq!(back.spec.body, original.body);
+        assert_eq!(back.spec.http().unwrap().body, original.http().unwrap().body);
         assert!(!back.spec.settings.verify_tls, "-k must survive");
         assert_eq!(
             back.spec.settings.timeout,
@@ -1431,8 +1473,8 @@ mod tests {
     #[test]
     fn a_multipart_command_round_trips() {
         let mut original = plain("https://x.test/upload");
-        original.method = Method::Post;
-        original.body = Body::Multipart(vec![
+        original.http_mut().unwrap().method = Method::Post;
+        original.http_mut().unwrap().body = Body::Multipart(vec![
             MultipartField {
                 enabled: true,
                 name: "caption".into(),
@@ -1447,6 +1489,54 @@ mod tests {
 
         let back = parse(&to_command(&original)).expect("re-import");
         assert!(back.ignored.is_empty(), "{:?}", back.ignored);
-        assert_eq!(back.spec.body, original.body);
+        assert_eq!(back.spec.http().unwrap().body, original.http().unwrap().body);
+    }
+
+    fn graphql(method: Method, query: &str, variables: &str) -> RequestSpec {
+        RequestSpec {
+            url: "https://api.test/graphql".to_string(),
+            kind: RequestKind::GraphQl(GraphQlRequest {
+                method,
+                query: query.to_string(),
+                variables: variables.to_string(),
+                operation: None,
+            }),
+            ..RequestSpec::default()
+        }
+    }
+
+    /// **Exported as the envelope that goes on the wire, not as the two editors it was typed
+    /// in.** `query` and `variables` mean nothing to curl, so a command carrying them would
+    /// paste into a terminal and fail.
+    #[test]
+    fn a_graphql_request_exports_the_envelope_curl_would_send() {
+        let spec = graphql(Method::Post, "query Me { me { id } }", r#"{"x": 1}"#);
+        let command = to_command(&spec);
+
+        assert!(command.contains("-X POST"), "got {command}");
+        let sent: serde_json::Value = {
+            let start = command.find("--data-raw '").expect("a body") + "--data-raw '".len();
+            let rest = &command[start..];
+            let end = rest.find('\'').expect("a closing quote");
+            serde_json::from_str(&rest[..end]).expect("the exported body must be valid JSON")
+        };
+        assert_eq!(sent["query"], "query Me { me { id } }");
+        // As JSON, not as the quoted string it is held as — the same envelope `build` sends.
+        assert_eq!(sent["variables"]["x"], 1);
+    }
+
+    /// A GET carries the envelope in the URL, and the exported command has to as well — a bare
+    /// endpoint would return an error when pasted, which is the failure copy-as-curl exists to
+    /// avoid.
+    #[test]
+    fn a_get_graphql_request_exports_its_envelope_in_the_url() {
+        let spec = graphql(Method::Get, "{ me { id } }", "");
+        let command = to_command(&spec);
+
+        assert!(command.contains("query="), "the URL must carry the query: {command}");
+        assert!(
+            !command.contains("--data-raw"),
+            "a GET must not also send a body: {command}"
+        );
     }
 }

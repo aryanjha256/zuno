@@ -66,11 +66,35 @@ impl Tab {
 /// `version` is what lets `parse` tell an envelope apart from M1's bare `RequestSpec`.
 /// Default `tabs` and a legacy file parses as an envelope with zero tabs, silently
 /// discarding the user's request instead of migrating it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A tab this build cannot read, kept verbatim so that opening a workspace in an older Zuno
+/// does not delete it.
+///
+/// **Carrying, not skipping, and the difference is the whole point.** A session is one file
+/// holding every open buffer, and serde fails an entire `Vec` on one bad element — so a tab of
+/// a kind this build predates would otherwise take every other tab in the window with it. That
+/// is what GraphQL does to 0.2.9 today.
+///
+/// Skipping it is only half a fix: the next save would write the survivors, and the skipped tab
+/// would be gone for good — the same silent data loss, one release later. Keeping the raw bytes
+/// and splicing them back at the same index means a round trip through an older build costs
+/// nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CarriedTab {
+    /// Position in the file's `tabs` array, so it goes back where it came from.
+    pub at: usize,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Session {
     version: u32,
+    /// Index into `tabs` — *this build's* tabs, with carried ones excluded. Converted to and
+    /// from the file's own indexing at the edges, so nothing else has to think about it.
     pub active: usize,
     pub tabs: Vec<Tab>,
+    /// Tabs written by a newer Zuno, passed through untouched. Never empty only in the
+    /// forward-compatibility case; a file this build fully understands carries none.
+    pub carried: Vec<CarriedTab>,
     /// The selected environment's name, or `None` for no environment.
     ///
     /// Window state rather than collection state: it's "what am I pointed at right now",
@@ -91,6 +115,101 @@ pub struct Session {
     pub panel_width: f32,
 }
 
+/// The on-disk shape of a v5 session.
+///
+/// `tabs` is a `Vec<Value>` rather than a `Vec<Tab>` so that each one can be parsed on its own
+/// and a failure confined to that entry — see `CarriedTab`.
+#[derive(Serialize, Deserialize)]
+struct StoredSession {
+    version: u32,
+    active: usize,
+    tabs: Vec<serde_json::Value>,
+    environment: Option<String>,
+    collection_panel: bool,
+    panel_width: f32,
+}
+
+impl Serialize for Session {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Carried tabs go back where they came from, so a file round-tripped through a build
+        // that could not read one of its tabs comes out with that tab still in it.
+        //
+        // **`at` is a hint, not a gate.** It is the position in the file this session was
+        // *loaded* from, and the window has moved on since: closing a readable tab leaves the
+        // recorded index pointing past the end of what is being written. An earlier version
+        // walked `0..total` and stopped when it ran out of readable tabs, which silently
+        // dropped any carried tab whose index it never reached — losing exactly the data this
+        // whole mechanism exists to keep. Anything unplaced is appended instead.
+        let mut carried: Vec<&CarriedTab> = self.carried.iter().collect();
+        carried.sort_by_key(|tab| tab.at);
+        let mut carried = carried.into_iter().peekable();
+
+        let mut tabs = Vec::with_capacity(self.tabs.len() + self.carried.len());
+        // Where each of *this build's* tabs landed, so `active` can be mapped without
+        // arithmetic that has to stay in step with the loop.
+        let mut placed = Vec::with_capacity(self.tabs.len());
+
+        for tab in &self.tabs {
+            while carried.peek().is_some_and(|next| next.at <= tabs.len()) {
+                tabs.push(carried.next().expect("peeked").raw.clone());
+            }
+            placed.push(tabs.len());
+            tabs.push(serde_json::to_value(tab).map_err(serde::ser::Error::custom)?);
+        }
+        // Whatever is left over — including indices past the end — rather than dropped.
+        for tab in carried {
+            tabs.push(tab.raw.clone());
+        }
+
+        StoredSession {
+            version: self.version,
+            active: placed.get(self.active).copied().unwrap_or(0),
+            tabs,
+            environment: self.environment.clone(),
+            collection_panel: self.collection_panel,
+            panel_width: self.panel_width,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Session {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let stored = StoredSession::deserialize(deserializer)?;
+
+        let mut tabs = Vec::new();
+        let mut carried = Vec::new();
+        let mut active = stored.active;
+
+        for (at, raw) in stored.tabs.into_iter().enumerate() {
+            match serde_json::from_value::<Tab>(raw.clone()) {
+                Ok(tab) => tabs.push(tab),
+                Err(_) => {
+                    // A tab of a kind this build predates. Kept, not dropped.
+                    carried.push(CarriedTab { at, raw });
+                    if at < active {
+                        active -= 1;
+                    } else if at == active {
+                        // The buffer that was in front is one this build cannot show; the
+                        // nearest readable one is the honest fallback.
+                        active = active.saturating_sub(1);
+                    }
+                }
+            }
+        }
+
+        Ok(Session {
+            version: stored.version,
+            active,
+            tabs,
+            carried,
+            environment: stored.environment,
+            collection_panel: stored.collection_panel,
+            panel_width: stored.panel_width,
+        })
+    }
+}
+
 impl Session {
     pub fn new(
         tabs: Vec<Tab>,
@@ -103,6 +222,7 @@ impl Session {
             version: CURRENT_VERSION,
             active,
             tabs,
+            carried: Vec::new(),
             environment,
             collection_panel,
             panel_width,
@@ -202,10 +322,26 @@ pub fn load(cx: &App) -> Option<Session> {
     match parse(&bytes) {
         Ok(session) => Some(session),
         Err(error) => {
+            // **Moved aside, not left in place, and this is the half that matters.**
+            // Returning `None` starts the window from the sample request — and the quit hook
+            // then saves *that* over the file, so an unreadable session is silently replaced
+            // by a one-tab default and whatever was open is gone. That is not hypothetical:
+            // a session written by a newer build did exactly this to a workspace's open tabs,
+            // and the read failure was only the visible half of it.
+            //
+            // Renaming rather than copying, so there is exactly one copy and no doubt about
+            // which file is live. A failure to rename is reported and otherwise ignored: the
+            // app still has to open, which is what the doc comment above promises.
+            let salvage = path.with_extension("json.bak");
+            let saved = std::fs::rename(&path, &salvage).is_ok();
+
             eprintln!(
                 "[zuno] ignoring unreadable session at {}: {error}",
                 path.display()
             );
+            if saved {
+                eprintln!("[zuno] the previous session was kept at {}", salvage.display());
+            }
             None
         }
     }
@@ -425,6 +561,206 @@ mod tests {
             session.tabs.iter().all(|tab| tab.path.is_none()),
             "no buffer had a collection file to remember"
         );
+    }
+
+    /// **The upgrade case the version number cannot see.** A session written by 0.2.9 is
+    /// already `version: 5`, so `parse` takes the current arm and hands the bytes straight to
+    /// serde — but the *specs* inside it are in the pre-`RequestKind` shape. Nothing about the
+    /// envelope says so, which is exactly why this needs its own test rather than relying on
+    /// the version dispatch: the only thing standing between a returning user and an empty
+    /// window is `RequestSpec`'s own compatibility shim.
+    ///
+    /// The spec bytes below are the shape 0.2.9 wrote, not a re-serialization of the current
+    /// struct, so this fails if that shim is removed.
+    /// **A tab this build cannot read must not take the rest of the window with it.**
+    ///
+    /// This is what GraphQL does to 0.2.9 today: one tab it cannot parse fails the whole `Vec`,
+    /// so every *readable* tab in that session is discarded too. The fix cannot reach 0.2.9,
+    /// but it means the next kind — gRPC, MQTT — cannot do the same to this build.
+    #[test]
+    fn a_tab_written_by_a_newer_zuno_does_not_discard_the_readable_ones() {
+        let known = serde_json::to_string(&named("keep-me")).expect("serialize");
+        // A kind this build has never heard of.
+        let json = format!(
+            r#"{{"version":5,"active":2,"tabs":[
+                {{"spec":{known},"path":null}},
+                {{"spec":{{"id":0,"name":"grpc","url":"https://a.test","headers":[],
+                   "settings":{{"timeout":{{"secs":30,"nanos":0}},"follow_redirects":true,
+                   "max_redirects":10,"verify_tls":true,"accept_encodings":true,
+                   "cookie_store":true}},
+                   "kind":{{"Grpc":{{"service":"S","method":"M"}}}},
+                   "captures":[],"expect_status":null,"assertions":[]}},"path":null}},
+                {{"spec":{known},"path":"/c/two.json"}}
+            ],"environment":null,"collection_panel":true,"panel_width":240.0}}"#
+        );
+
+        let session = parse(json.as_bytes()).expect("the readable tabs must still load");
+        assert_eq!(session.tabs.len(), 2, "both readable tabs must survive");
+        assert_eq!(session.carried.len(), 1, "the unreadable one must be carried, not dropped");
+        assert_eq!(session.carried[0].at, 1, "and remember where it sat");
+        // `active` was 2 in file terms; with one tab ahead of it unreadable, it is 1 here.
+        assert_eq!(session.active, 1);
+    }
+
+    /// **And carrying it is only half the fix — it has to be written back.**
+    ///
+    /// Skipping an unreadable tab on load and saving the survivors would delete it for good,
+    /// which is the same silent loss one release later. Asserted on the bytes: the unknown kind
+    /// must still be in the file, at the same index, after a round trip.
+    #[test]
+    fn a_carried_tab_survives_being_written_back_out() {
+        let known = serde_json::to_string(&named("keep-me")).expect("serialize");
+        let json = format!(
+            r#"{{"version":5,"active":0,"tabs":[
+                {{"spec":{known},"path":null}},
+                {{"spec":{{"id":0,"name":"grpc","url":"https://a.test","headers":[],
+                   "settings":{{"timeout":{{"secs":30,"nanos":0}},"follow_redirects":true,
+                   "max_redirects":10,"verify_tls":true,"accept_encodings":true,
+                   "cookie_store":true}},
+                   "kind":{{"Grpc":{{"service":"S","method":"M"}}}},
+                   "captures":[],"expect_status":null,"assertions":[]}},"path":null}}
+            ],"environment":null,"collection_panel":true,"panel_width":240.0}}"#
+        );
+
+        let session = parse(json.as_bytes()).expect("parse");
+        let written = serde_json::to_value(&session).expect("serialize");
+        let tabs = written["tabs"].as_array().expect("tabs");
+
+        assert_eq!(tabs.len(), 2, "the carried tab must be written back");
+        assert_eq!(
+            tabs[1]["spec"]["kind"]["Grpc"]["service"], "S",
+            "verbatim, and at its original index: {written}"
+        );
+
+        // And it still parses on the way back in, so repeated open/quit cycles are stable.
+        let again = parse(serde_json::to_vec(&session).unwrap().as_slice()).expect("reparse");
+        assert_eq!(again.tabs.len(), 1);
+        assert_eq!(again.carried.len(), 1);
+    }
+
+    /// **A carried tab survives the reader closing the tabs around it.**
+    ///
+    /// `CarriedTab::at` is a position in the file this session was *loaded* from, and closing a
+    /// readable tab leaves it pointing past the end of what gets written. The first version of
+    /// the splice walked `0..total` and stopped when it ran out of readable tabs, so a carried
+    /// tab it never reached was silently dropped — the exact loss the mechanism exists to
+    /// prevent. Both existing tests used a file whose counts happened to line up and saw none
+    /// of it.
+    #[test]
+    fn a_carried_tab_is_kept_even_when_its_index_is_past_the_end() {
+        let raw = serde_json::json!({"spec": {"kind": "future"}, "path": null});
+
+        // Every readable tab has since been closed; `at` still says 1.
+        let emptied = Session {
+            version: CURRENT_VERSION,
+            active: 0,
+            tabs: vec![],
+            carried: vec![CarriedTab { at: 1, raw: raw.clone() }],
+            environment: None,
+            collection_panel: true,
+            panel_width: 240.0,
+        };
+        let out = serde_json::to_value(&emptied).expect("serialize");
+        assert_eq!(
+            out["tabs"].as_array().map(Vec::len),
+            Some(1),
+            "a carried tab must not be dropped because its index outran the file: {out}"
+        );
+
+        // And one that still fits keeps its place, with `active` pointing at the right buffer.
+        let mixed = Session {
+            version: CURRENT_VERSION,
+            active: 1,
+            tabs: vec![Tab::scratch(named("one")), Tab::scratch(named("two"))],
+            carried: vec![CarriedTab { at: 0, raw }],
+            environment: None,
+            collection_panel: true,
+            panel_width: 240.0,
+        };
+        let out = serde_json::to_value(&mixed).expect("serialize");
+        assert_eq!(out["tabs"].as_array().map(Vec::len), Some(3));
+        assert_eq!(out["tabs"][0]["spec"]["kind"], "future", "carried tab keeps index 0");
+        assert_eq!(
+            out["active"], 2,
+            "active must follow the buffer it named, not its old index: {out}"
+        );
+    }
+
+    /// **An unreadable session is moved aside rather than left to be overwritten.**
+    ///
+    /// The failure this guards is not the read — it is what happens *next*: `load` returns
+    /// `None`, the window opens on the sample request, and the quit hook saves that over the
+    /// file. The user's open tabs are then gone with nothing to recover from. Asserted at the
+    /// consequence — the original bytes still exist somewhere — rather than by checking the
+    /// log line, which would pass against a version that printed and then let the file be
+    /// clobbered.
+    #[gpui::test]
+    fn an_unreadable_session_is_kept_rather_than_silently_replaced(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("zuno-salvage-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("workspace.json");
+
+        // A shape no build can read — stands in for "written by a newer Zuno".
+        let unreadable = br#"{"version":5,"active":0,"tabs":[{"spec":{"nope":true},"path":null}]}"#;
+        std::fs::write(&path, unreadable).expect("write");
+
+        let loaded = cx.update(|cx| {
+            install_at(cx, Some(path.clone()));
+            load(cx)
+        });
+
+        assert!(loaded.is_none(), "an unreadable session must not open");
+        assert!(
+            !path.exists(),
+            "the unreadable file must be moved, so the quit hook cannot overwrite it in place"
+        );
+
+        let salvage = path.with_extension("json.bak");
+        assert_eq!(
+            std::fs::read(&salvage).expect("the salvaged file must exist"),
+            unreadable,
+            "the original bytes must survive byte-for-byte, or there is nothing to recover"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_v5_session_holding_pre_kind_specs_still_restores_its_buffers() {
+        let legacy_spec = r#"{
+            "id": 0,
+            "name": "Untitled",
+            "method": "Delete",
+            "url": "https://a.test/one",
+            "query": [],
+            "headers": [],
+            "body": "Empty",
+            "settings": {
+                "timeout": {"secs": 30, "nanos": 0},
+                "follow_redirects": true,
+                "max_redirects": 10,
+                "verify_tls": true,
+                "accept_encodings": true,
+                "cookie_store": true
+            },
+            "captures": [],
+            "expect_status": null,
+            "assertions": []
+        }"#;
+
+        let json = format!(
+            r#"{{"version":5,"active":0,"tabs":[{{"spec":{legacy_spec},"path":"/c/one.json"}}],"environment":"dev","collection_panel":true,"panel_width":240.0}}"#
+        );
+
+        let session = parse(json.as_bytes()).expect("a 0.2.9 session must still load");
+        assert_eq!(session.tabs.len(), 1, "the buffer must survive the upgrade");
+        assert_eq!(session.tabs[0].spec.url, "https://a.test/one");
+        assert_eq!(
+            session.tabs[0].spec.method(),
+            Some(&zuno_core::Method::Delete),
+            "the method has to come through the kind split, not be defaulted to GET"
+        );
+        assert_eq!(session.tabs[0].path, Some(PathBuf::from("/c/one.json")));
     }
 
     #[test]

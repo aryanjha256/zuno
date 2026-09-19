@@ -11,8 +11,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use zuno_core::{
-    Body, Connection, Engine, EngineError, Event, Header, Method, MultipartField, MultipartValue,
-    PhaseKind, ProxyMode, RawKind, RequestSpec,
+    Body, Connection, Engine, EngineError, Event, GraphQlRequest, Header, Method, MultipartField,
+    MultipartValue, PhaseKind, ProxyMode, RawKind, RequestKind, RequestSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -203,8 +203,8 @@ fn a_post_sends_its_body_and_a_derived_content_type() {
     let engine = Engine::new().expect("engine");
 
     let mut spec = spec_for(format!("{base}/items"));
-    spec.method = Method::Post;
-    spec.body = Body::Raw {
+    spec.http_mut().unwrap().method = Method::Post;
+    spec.http_mut().unwrap().body = Body::Raw {
         text: "{\"name\":\"zuno\"}".to_string(),
         kind: RawKind::Json,
     };
@@ -230,7 +230,7 @@ fn query_params_reach_the_request_line() {
     let engine = Engine::new().expect("engine");
 
     let mut spec = spec_for(format!("{base}/search?q=rust"));
-    spec.query = vec![
+    spec.http_mut().unwrap().query = vec![
         zuno_core::QueryParam::new("page", "2"),
         zuno_core::QueryParam {
             enabled: false,
@@ -710,8 +710,8 @@ fn a_multipart_body_goes_out_with_a_boundary_and_both_part_kinds() {
     let (base, server) = serve_once(OK_JSON);
 
     let mut spec = spec_for(format!("{base}/upload"));
-    spec.method = Method::Post;
-    spec.body = Body::Multipart(vec![
+    spec.http_mut().unwrap().method = Method::Post;
+    spec.http_mut().unwrap().body = Body::Multipart(vec![
         MultipartField {
             enabled: true,
             name: "caption".into(),
@@ -1047,4 +1047,67 @@ fn with_the_proxy_off_a_request_goes_straight_to_the_server() {
         "the proxy port must see no connection at all when the proxy is off"
     );
     let _ = unused_addr;
+}
+
+/// **The GraphQL envelope, asserted on what a server actually receives.**
+///
+/// The unit tests pin `graphql_envelope`'s shape; this pins that the shape survives the whole
+/// send path — method, Content-Type, and the envelope as the request's bytes. Both bugs this
+/// layer has caught before were of exactly that form: a value that was right in the spec and
+/// wrong on the wire.
+#[test]
+fn a_graphql_request_sends_its_envelope_as_json() {
+    let (base, server) = serve_once(OK_JSON);
+    let engine = Engine::new().expect("engine");
+
+    let mut spec = spec_for(format!("{base}/graphql"));
+    spec.kind = RequestKind::GraphQl(GraphQlRequest {
+        method: Method::Post,
+        query: "query Me { me { id } }".to_string(),
+        variables: r#"{"n": 50}"#.to_string(),
+        operation: Some("Me".to_string()),
+    });
+
+    let (_, events) = engine.send(spec);
+    drain(&events);
+
+    let request = server.join().expect("server thread");
+    assert!(request.starts_with("POST /graphql HTTP/1.1\r\n"), "{request}");
+    assert!(
+        request.to_ascii_lowercase().contains("content-type: application/json"),
+        "a GraphQL request is JSON on the wire:\n{request}"
+    );
+
+    let body = request.rsplit("\r\n\r\n").next().expect("a body");
+    let sent: serde_json::Value = serde_json::from_str(body).expect("the body must be JSON");
+    assert_eq!(sent["query"], "query Me { me { id } }");
+    // A number, not the string "50" — the difference between a server accepting this against
+    // `Int!` and rejecting it.
+    assert_eq!(sent["variables"]["n"], 50);
+    assert_eq!(sent["operationName"], "Me");
+}
+
+/// A GET puts the envelope in the query string and sends no body at all.
+#[test]
+fn a_get_graphql_request_sends_no_body() {
+    let (base, server) = serve_once(OK_JSON);
+    let engine = Engine::new().expect("engine");
+
+    let mut spec = spec_for(format!("{base}/graphql"));
+    spec.kind = RequestKind::GraphQl(GraphQlRequest {
+        method: Method::Get,
+        query: "{ me { id } }".to_string(),
+        variables: String::new(),
+        operation: None,
+    });
+
+    let (_, events) = engine.send(spec);
+    drain(&events);
+
+    let request = server.join().expect("server thread");
+    assert!(request.starts_with("GET /graphql?query="), "{request}");
+    assert!(
+        !request.to_ascii_lowercase().contains("content-length"),
+        "a GET GraphQL request must carry no body:\n{request}"
+    );
 }

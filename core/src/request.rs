@@ -227,17 +227,130 @@ impl Default for RequestSettings {
     }
 }
 
+/// The HTTP-shaped half of a request: the parts that mean nothing to a protocol
+/// that isn't HTTP.
+///
+/// `method` lives here rather than on the spine because only some protocols have one.
+/// HTTP and GraphQL do; gRPC is always POST and never shows it; MQTT has no such concept.
+/// On the spine it would put a meaningless `GET` on every MQTT request.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpRequest {
+    pub method: Method,
+    pub query: Vec<QueryParam>,
+    pub body: Body,
+}
+
+impl HttpRequest {
+    /// Only the rows that will actually go on the wire.
+    pub fn enabled_query(&self) -> impl Iterator<Item = &QueryParam> {
+        self.query.iter().filter(|param| param.enabled)
+    }
+}
+
+/// What kind of request this is — the authoring surface, not the transport.
+///
+/// **A new variant is earned by needing a different authoring surface, not by being a
+/// different protocol.** SOAP and JSON-RPC are HTTP POST with a particular body and
+/// `Http` already sends them correctly; they would earn a variant only if someone wanted
+/// WSDL- or method-driven authoring. GraphQL earns one because a query plus variables over
+/// an introspected schema is nothing like a body editor.
+///
+/// Matched exhaustively with no catch-all everywhere it is read, for the reason
+/// `Body` is: adding a kind must fail the build until someone has decided how it is
+/// authored, substituted into, sent, and exported.
+///
+/// **Whether a request streams is deliberately not expressed here.** That is decided in
+/// four different places depending on protocol — by the server for SSE, by the document
+/// text for a GraphQL `subscription`, by the schema for a gRPC server-stream, by the
+/// protocol itself for MQTT — so it is a property of a *run*, not of a saved request.
+/// `Http` and `HttpStreaming` as sibling variants would split one saved request in two.
+/// A GraphQL request: one endpoint, and a document that says what you want back.
+///
+/// **`query` and `variables` are both plain `String`s**, for `url`'s reason (§3.1): they are
+/// invalid on most keystrokes, and a model that refuses to hold invalid text cannot back an
+/// editor. `variables` is JSON *text*, parsed at the send boundary into the envelope, so a
+/// malformed one is a typed error rather than an unrepresentable state.
+///
+/// **`operation` is only needed when the document holds more than one named operation** —
+/// GraphQL's `operationName`, which tells the server which of them to run. `None` means the
+/// document has one operation and the server can work it out.
+///
+/// `method` is here rather than on the spine for the reason `HttpRequest`'s is, and it is
+/// genuinely variable: POST is the norm, GET exists so a query can be cached by ordinary HTTP
+/// machinery, and `build` puts the envelope in the query string instead of the body for it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphQlRequest {
+    pub method: Method,
+    /// The document — one or more operations, plus any fragments they use.
+    pub query: String,
+    /// The variables, as JSON *text*. Empty means none.
+    pub variables: String,
+    /// Which operation to run, when the document holds several.
+    pub operation: Option<String>,
+}
+
+impl Default for GraphQlRequest {
+    fn default() -> Self {
+        Self {
+            // Not `Method::default()`, which is GET: a GraphQL request is a POST unless
+            // someone deliberately wants it cacheable.
+            method: Method::Post,
+            query: String::new(),
+            variables: String::new(),
+            operation: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestKind {
+    Http(HttpRequest),
+    GraphQl(GraphQlRequest),
+}
+
+impl RequestKind {
+    /// What this kind is called in the UI.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RequestKind::Http(_) => "HTTP",
+            RequestKind::GraphQl(_) => "GraphQL",
+        }
+    }
+}
+
+impl Default for RequestKind {
+    fn default() -> Self {
+        RequestKind::Http(HttpRequest::default())
+    }
+}
+
+/// One request, whatever protocol it speaks.
+///
+/// **The spine holds only what means the same thing for every protocol** — an endpoint,
+/// ordered key/value metadata, connection settings, an identity, and how the answer is
+/// checked and captured from. Anything that differs by protocol lives in `kind`; anything
+/// shared *between* requests (a `.proto`, a WSDL, a cached schema) is not a request field
+/// at all and belongs in a reserved directory beside `environments/` and `flows/`.
+///
+/// `headers` is on the spine because every protocol has ordered key/value metadata —
+/// HTTP headers, gRPC metadata, a WebSocket handshake, MQTT 5 user properties. The name is
+/// HTTP-flavoured and stays that way: it is the field name in every collection file on
+/// disk, and renaming it would rewrite every one of them to say the same thing.
+///
+/// `expect_status` is the one spine field that is *not* universal — HTTP and gRPC have a
+/// status, MQTT does not. It is an `Option`, so `None` is the honest answer there, but it
+/// is the first thing to move if a statusless protocol ever needs a verdict of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "StoredSpec")]
 pub struct RequestSpec {
     pub id: RequestId,
     pub name: String,
-    pub method: Method,
     /// Raw, unresolved, possibly invalid. Parsed only at the send boundary.
     pub url: String,
-    pub query: Vec<QueryParam>,
     pub headers: Vec<Header>,
-    pub body: Body,
     pub settings: RequestSettings,
+    /// What differs by protocol.
+    pub kind: RequestKind,
     /// What this request publishes into the environment after a successful send.
     ///
     /// `#[serde(default)]` per *field*, which is the pattern the note above `RequestSettings`
@@ -262,16 +375,173 @@ impl Default for RequestSpec {
         Self {
             id: RequestId(0),
             name: "Untitled".to_string(),
-            method: Method::Get,
             url: String::new(),
-            query: Vec::new(),
             headers: Vec::new(),
-            body: Body::Empty,
             settings: RequestSettings::default(),
+            kind: RequestKind::default(),
             captures: Vec::new(),
             expect_status: None,
             assertions: Vec::new(),
         }
+    }
+}
+
+/// The shape `RequestSpec` is *read* from, which is both the current one and every one
+/// written before `RequestKind` existed.
+///
+/// **Collection files carry no version field** — `collection::read` is a bare
+/// `serde_json::from_slice::<RequestSpec>` — so there is nothing to dispatch a migration
+/// on, and the two shapes have to be told apart structurally. A file written before this
+/// change has `method`/`query`/`body` at the top level and no `kind`; one written after has
+/// `kind` and none of the three. That is an unambiguous discriminator, which is why no
+/// version field had to be added: adding one would rewrite every committed collection file
+/// to say nothing, which is the diff churn invariant 9 exists to avoid.
+///
+/// **`TryFrom`, not `From`, and that is what keeps `RequestSpec` strict.** A file carrying
+/// *neither* shape is a corrupt or unrelated document, and the note above `RequestSettings`
+/// is explicit that `RequestSpec` must reject one rather than quietly become an empty
+/// request. Defaulting the three legacy fields would have accepted it.
+#[derive(Deserialize)]
+struct StoredSpec {
+    id: RequestId,
+    name: String,
+    url: String,
+    headers: Vec<Header>,
+    settings: RequestSettings,
+    #[serde(default)]
+    captures: Vec<crate::capture::Capture>,
+    #[serde(default)]
+    expect_status: Option<u16>,
+    #[serde(default)]
+    assertions: Vec<crate::assertion::Assertion>,
+
+    /// Present in files written by this build and later.
+    #[serde(default)]
+    kind: Option<RequestKind>,
+
+    // Present only in files written before `RequestKind` existed. Read once, here, and
+    // never anywhere else in the codebase.
+    #[serde(default)]
+    method: Option<Method>,
+    #[serde(default)]
+    query: Option<Vec<QueryParam>>,
+    #[serde(default)]
+    body: Option<Body>,
+}
+
+/// What `RequestSpec` is *written* as — and it is deliberately **not** the in-memory shape.
+///
+/// **An HTTP request serializes to the exact bytes 0.2.9 wrote**: `method`, `query` and `body`
+/// at the top level, no `kind`. `kind` appears only for a request that genuinely is not HTTP.
+/// That makes the format change **additive** rather than a rewrite, and buys two things that a
+/// straight rename of the fields would have cost:
+///
+/// - **An older Zuno keeps reading files this one writes.** Forward compatibility is not
+///   symmetric with backward: a released build's behaviour is fixed, and 0.2.9 responds to a
+///   session it cannot parse by falling back to the sample and then *overwriting the file on
+///   quit*. So a shape it cannot read is not an inconvenience, it is data loss — and bumping
+///   `session::CURRENT_VERSION` does not help, because its "written by a newer Zuno" arm fails
+///   in exactly the same way. Writing what it already understands is the only fix that works
+///   from this side. This is not hypothetical: it destroyed a workspace's open tabs once.
+/// - **Zero diff churn.** Collection files exist to be committed and reviewed (§12). Re-saving a
+///   request must not rewrite its shape, or the first save after an upgrade is a diff touching
+///   every file in the collection and saying nothing.
+///
+/// Field order matches 0.2.9's exactly, because "byte-identical" is what the test asserts and
+/// serde writes fields in declaration order. `kind` sits after `body` so that adding it cannot
+/// move anything that precedes it.
+///
+/// Borrowed rather than owned: `session::save` serializes every open buffer including its whole
+/// body, so a `#[serde(into = ...)]` conversion would clone all of it on every save.
+#[derive(Serialize)]
+struct StoredSpecRef<'a> {
+    id: RequestId,
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    method: Option<&'a Method>,
+    url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<&'a Vec<QueryParam>>,
+    headers: &'a Vec<Header>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<&'a Body>,
+    /// Absent for an HTTP request, which is the whole point of this type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'a RequestKind>,
+    settings: &'a RequestSettings,
+    captures: &'a Vec<crate::capture::Capture>,
+    expect_status: Option<u16>,
+    assertions: &'a Vec<crate::assertion::Assertion>,
+}
+
+impl Serialize for RequestSpec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Exhaustive with no catch-all: a new kind has to decide how it reaches disk, and
+        // whether an older build can still read the file it lands in.
+        let (method, query, body, kind) = match &self.kind {
+            RequestKind::Http(http) => {
+                (Some(&http.method), Some(&http.query), Some(&http.body), None)
+            }
+            // Written as `kind`, because there is no older shape to be compatible with — a
+            // GraphQL request could not exist before this field did. An older Zuno cannot read
+            // it, which is correct and unavoidable; what matters is that it cannot be *confused*
+            // for something else, and a file with `kind` and no `method` is refused outright.
+            RequestKind::GraphQl(_) => (None, None, None, Some(&self.kind)),
+        };
+
+        StoredSpecRef {
+            id: self.id,
+            name: &self.name,
+            method,
+            url: &self.url,
+            query,
+            headers: &self.headers,
+            body,
+            kind,
+            settings: &self.settings,
+            captures: &self.captures,
+            expect_status: self.expect_status,
+            assertions: &self.assertions,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl TryFrom<StoredSpec> for RequestSpec {
+    type Error = String;
+
+    fn try_from(stored: StoredSpec) -> Result<Self, Self::Error> {
+        let kind = match (stored.kind, stored.method, stored.query, stored.body) {
+            // Written by this build: the kind says everything.
+            (Some(kind), None, None, None) => kind,
+            // Written before `RequestKind` existed. `query` and `body` were not optional
+            // then, but an absent one is still readable as its empty value — only `method`
+            // has to be there, since its absence is what says the file is neither shape.
+            (None, Some(method), query, body) => RequestKind::Http(HttpRequest {
+                method,
+                query: query.unwrap_or_default(),
+                body: body.unwrap_or_default(),
+            }),
+            _ => {
+                return Err(
+                    "a request must carry either `kind` or a top-level `method`, not both \
+                     and not neither"
+                        .to_string(),
+                );
+            }
+        };
+
+        Ok(Self {
+            id: stored.id,
+            name: stored.name,
+            url: stored.url,
+            headers: stored.headers,
+            settings: stored.settings,
+            kind,
+            captures: stored.captures,
+            expect_status: stored.expect_status,
+            assertions: stored.assertions,
+        })
     }
 }
 
@@ -281,8 +551,53 @@ impl RequestSpec {
         self.headers.iter().filter(|header| header.enabled)
     }
 
-    pub fn enabled_query(&self) -> impl Iterator<Item = &QueryParam> {
-        self.query.iter().filter(|param| param.enabled)
+    /// The HTTP half, when this is an HTTP request.
+    ///
+    /// Deliberately an `Option` rather than a panicking accessor: a caller that has no
+    /// answer for another kind should be made to say so. Code that must *behave*
+    /// differently per kind matches on `kind` instead, so that adding one is a compile
+    /// error there — this is only for the places where a non-HTTP kind genuinely has
+    /// nothing to contribute.
+    pub fn http(&self) -> Option<&HttpRequest> {
+        match &self.kind {
+            RequestKind::Http(http) => Some(http),
+            RequestKind::GraphQl(_) => None,
+        }
+    }
+
+    pub fn http_mut(&mut self) -> Option<&mut HttpRequest> {
+        match &mut self.kind {
+            RequestKind::Http(http) => Some(http),
+            RequestKind::GraphQl(_) => None,
+        }
+    }
+
+    /// The GraphQL half, when this is a GraphQL request.
+    pub fn graphql(&self) -> Option<&GraphQlRequest> {
+        match &self.kind {
+            RequestKind::GraphQl(graphql) => Some(graphql),
+            RequestKind::Http(_) => None,
+        }
+    }
+
+    pub fn graphql_mut(&mut self) -> Option<&mut GraphQlRequest> {
+        match &mut self.kind {
+            RequestKind::GraphQl(graphql) => Some(graphql),
+            RequestKind::Http(_) => None,
+        }
+    }
+
+    /// The method this request will be sent with, when its kind has one.
+    ///
+    /// gRPC is always POST and never shows it; MQTT has no method at all. `None` is the
+    /// honest answer for those, and the reason `method` is not on the spine.
+    pub fn method(&self) -> Option<&Method> {
+        match &self.kind {
+            RequestKind::Http(http) => Some(&http.method),
+            // GraphQL rides HTTP, so it has one and it is variable: POST normally, GET when
+            // the query should be cacheable.
+            RequestKind::GraphQl(graphql) => Some(&graphql.method),
+        }
     }
 
     /// A populated request for the M1.0 shell to render. Replaced by real
@@ -291,20 +606,22 @@ impl RequestSpec {
         Self {
             id: RequestId(1),
             name: "List repositories".to_string(),
-            method: Method::Post,
             url: "https://api.github.com/graphql".to_string(),
-            query: vec![QueryParam::new("per_page", "50")],
             headers: vec![
                 Header::new("Content-Type", "application/json"),
                 Header::new("Accept", "application/vnd.github+json"),
                 Header::new("User-Agent", concat!("zuno/", env!("CARGO_PKG_VERSION"))),
                 Header::disabled("Authorization", "Bearer {{token}}"),
             ],
-            body: Body::Raw {
-                text: "{\n  \"query\": \"{ viewer { login } }\"\n}".to_string(),
-                kind: RawKind::Json,
-            },
             settings: RequestSettings::default(),
+            kind: RequestKind::Http(HttpRequest {
+                method: Method::Post,
+                query: vec![QueryParam::new("per_page", "50")],
+                body: Body::Raw {
+                    text: "{\n  \"query\": \"{ viewer { login } }\"\n}".to_string(),
+                    kind: RawKind::Json,
+                },
+            }),
             captures: Vec::new(),
             expect_status: None,
             assertions: Vec::new(),
@@ -600,5 +917,253 @@ mod tests {
         let json = serde_json::to_string(&spec).expect("serialize");
         let back: RequestSpec = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(spec, back);
+    }
+
+    /// **A collection file written before `RequestKind` existed still opens.**
+    ///
+    /// These bytes are not hand-written — they were emitted by the 0.2.9 build (the commit
+    /// before this change) serializing `RequestSpec::sample()`, so they are what is actually
+    /// sitting in people's collections rather than what this change assumes is. Hand-writing
+    /// the fixture would let a wrong assumption about the old shape pass as coverage.
+    ///
+    /// Break `TryFrom<StoredSpec>`'s legacy arm and this fails; a round-trip test would not,
+    /// because the new code agrees with itself either way.
+    const LEGACY_SAMPLE: &str = r#"{
+      "id": 0,
+      "name": "List repositories",
+      "method": "Post",
+      "url": "https://api.github.com/graphql",
+      "query": [{ "enabled": true, "name": "per_page", "value": "50" }],
+      "headers": [
+        { "enabled": true, "name": "Content-Type", "value": "application/json" },
+        { "enabled": false, "name": "Authorization", "value": "Bearer {{token}}" }
+      ],
+      "body": {
+        "Raw": { "text": "{ viewer { login } }", "kind": "Json" }
+      },
+      "settings": {
+        "timeout": { "secs": 30, "nanos": 0 },
+        "follow_redirects": true,
+        "max_redirects": 10,
+        "verify_tls": true,
+        "accept_encodings": true,
+        "cookie_store": true
+      },
+      "captures": [],
+      "expect_status": null,
+      "assertions": []
+    }"#;
+
+    #[test]
+    fn a_request_written_before_kinds_existed_still_opens() {
+        let spec: RequestSpec = serde_json::from_str(LEGACY_SAMPLE).expect("a 0.2.9 file parses");
+
+        assert_eq!(spec.url, "https://api.github.com/graphql");
+        assert_eq!(spec.headers.len(), 2);
+
+        let http = spec.http().expect("a legacy file is an HTTP request");
+        assert_eq!(http.method, Method::Post);
+        assert_eq!(http.query, vec![QueryParam::new("per_page", "50")]);
+        assert_eq!(
+            http.body,
+            Body::Raw {
+                text: "{ viewer { login } }".to_string(),
+                kind: RawKind::Json,
+            }
+        );
+    }
+
+    /// The same, for a body that is not `Raw` — the variant whose shape the old and new
+    /// files share least obviously.
+    #[test]
+    fn a_legacy_form_body_survives_the_kind_split() {
+        let legacy = r#"{
+          "id": 0,
+          "name": "Untitled",
+          "method": "Post",
+          "url": "https://auth.test/token",
+          "query": [],
+          "headers": [],
+          "body": {
+            "Form": [{ "enabled": true, "name": "grant_type", "value": "client_credentials" }]
+          },
+          "settings": {
+            "timeout": { "secs": 30, "nanos": 0 },
+            "follow_redirects": true,
+            "max_redirects": 10,
+            "verify_tls": true,
+            "accept_encodings": true,
+            "cookie_store": true
+          },
+          "captures": [],
+          "expect_status": null,
+          "assertions": []
+        }"#;
+
+        let spec: RequestSpec = serde_json::from_str(legacy).expect("a 0.2.9 form file parses");
+        assert_eq!(
+            spec.http().expect("HTTP").body,
+            Body::Form(vec![FormField {
+                enabled: true,
+                name: "grant_type".to_string(),
+                value: "client_credentials".to_string(),
+            }])
+        );
+    }
+
+    /// **The strictness the container-level `#[serde(default)]` note protects.**
+    ///
+    /// A document carrying neither shape is not an old request, it is a corrupt or unrelated
+    /// file, and `RequestSpec` has to reject it rather than quietly become an empty request —
+    /// which is exactly what defaulting the three legacy fields would have done. This is why
+    /// the shim is `TryFrom` rather than `From`.
+    #[test]
+    fn a_document_carrying_neither_shape_is_refused() {
+        let neither = r#"{
+          "id": 0,
+          "name": "Untitled",
+          "url": "https://a.test",
+          "headers": [],
+          "settings": {
+            "timeout": { "secs": 30, "nanos": 0 },
+            "follow_redirects": true,
+            "max_redirects": 10,
+            "verify_tls": true,
+            "accept_encodings": true,
+            "cookie_store": true
+          }
+        }"#;
+        assert!(serde_json::from_str::<RequestSpec>(neither).is_err());
+    }
+
+    /// And a file carrying *both* is ambiguous rather than generous: the two would disagree
+    /// the moment either was edited, and silently preferring one is how a saved change goes
+    /// missing.
+    #[test]
+    fn a_document_carrying_both_shapes_is_refused() {
+        let both = r#"{
+          "id": 0,
+          "name": "Untitled",
+          "url": "https://a.test",
+          "headers": [],
+          "settings": {
+            "timeout": { "secs": 30, "nanos": 0 },
+            "follow_redirects": true,
+            "max_redirects": 10,
+            "verify_tls": true,
+            "accept_encodings": true,
+            "cookie_store": true
+          },
+          "method": "Get",
+          "kind": { "Http": { "method": "Post", "query": [], "body": "Empty" } }
+        }"#;
+        assert!(serde_json::from_str::<RequestSpec>(both).is_err());
+    }
+
+    /// **The guard that makes a format change reviewable without reading the diff.**
+    ///
+    /// Pins the *bytes* an HTTP request is written as, against the exact shape 0.2.9 emitted.
+    /// Any future change to `RequestSpec`'s on-disk form fails here rather than needing a human
+    /// to notice it — which is the point, because the cost of missing one is not a wrong value
+    /// but an older build discarding the file and overwriting it.
+    ///
+    /// Paired with `a_request_written_before_kinds_existed_still_opens`, the two together say
+    /// the format is unchanged for HTTP in **both** directions. Backward compatibility alone is
+    /// what shipped the bug this exists to prevent: it was tested thoroughly, and forward
+    /// compatibility was never considered at all.
+    #[test]
+    fn an_http_request_is_written_in_the_shape_an_older_zuno_reads() {
+        let mut spec = RequestSpec::default();
+        spec.url = "https://a.test/one".to_string();
+        spec.headers = vec![Header::new("Accept", "application/json")];
+        spec.http_mut().expect("HTTP").method = Method::Delete;
+        spec.http_mut().expect("HTTP").query = vec![QueryParam::new("v", "2")];
+
+        // Compared as a string, not through `serde_json::Value`: without the `preserve_order`
+        // feature a `Value` is a sorted map, so it cannot see field order at all — and order is
+        // half of what "byte-identical" means.
+        let written = serde_json::to_string(&spec).expect("serialize");
+
+        assert_eq!(
+            written,
+            concat!(
+                r#"{"id":0,"name":"Untitled","method":"Delete","url":"https://a.test/one","#,
+                r#""query":[{"enabled":true,"name":"v","value":"2"}],"#,
+                r#""headers":[{"enabled":true,"name":"Accept","value":"application/json"}],"#,
+                r#""body":"Empty","#,
+                r#""settings":{"timeout":{"secs":30,"nanos":0},"follow_redirects":true,"#,
+                r#""max_redirects":10,"verify_tls":true,"accept_encodings":true,"#,
+                r#""cookie_store":true},"#,
+                r#""captures":[],"expect_status":null,"assertions":[]}"#,
+            ),
+            "an HTTP request must be written in 0.2.9's exact shape, field order included"
+        );
+        assert!(
+            !written.contains(r#""kind""#),
+            "`kind` must not reach disk for an HTTP request — an older Zuno cannot read it, \
+             and responds by discarding the file and overwriting it"
+        );
+    }
+
+    /// And the round trip through those legacy bytes is lossless, so "readable by an older
+    /// build" does not quietly mean "readable, minus something".
+    #[test]
+    fn writing_then_reading_an_http_request_changes_nothing() {
+        let mut spec = RequestSpec::sample();
+        spec.expect_status = Some(201);
+        spec.http_mut().expect("HTTP").body = Body::Form(vec![FormField {
+            enabled: true,
+            name: "grant_type".to_string(),
+            value: "client_credentials".to_string(),
+        }]);
+
+        let bytes = serde_json::to_vec(&spec).expect("serialize");
+        let back: RequestSpec = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(spec, back);
+    }
+
+    /// A GraphQL request is written as `kind`, and round-trips.
+    ///
+    /// There is no older shape to stay compatible with here — a GraphQL request could not exist
+    /// before the field did — so unlike an HTTP request this one *does* change the bytes, and
+    /// that is correct. What matters is that the two shapes stay mutually exclusive, which the
+    /// refusal tests above pin from the other side.
+    #[test]
+    fn a_graphql_request_is_written_as_a_kind_and_round_trips() {
+        let spec = RequestSpec {
+            url: "https://api.test/graphql".to_string(),
+            kind: RequestKind::GraphQl(GraphQlRequest {
+                method: Method::Post,
+                query: "query R($n: Int!) { repos(first: $n) { id } }".to_string(),
+                variables: r#"{"n": 50}"#.to_string(),
+                operation: Some("R".to_string()),
+            }),
+            ..RequestSpec::default()
+        };
+
+        let written = serde_json::to_string(&spec).expect("serialize");
+        assert!(written.contains(r#""kind""#), "a GraphQL request must carry its kind");
+        assert!(
+            !written.contains(r#""method":"Post","url""#),
+            "and must not also carry the flat HTTP shape, which would be ambiguous"
+        );
+
+        let back: RequestSpec = serde_json::from_str(&written).expect("deserialize");
+        assert_eq!(spec, back);
+    }
+
+    /// A GraphQL request still has a method, and it is POST by default rather than GET.
+    ///
+    /// Worth pinning because `Method::default()` is GET, so the obvious `#[derive(Default)]`
+    /// would have produced a GraphQL request that sends its envelope in the URL — which works,
+    /// and is not what anyone means by "a new GraphQL request".
+    #[test]
+    fn a_new_graphql_request_is_a_post() {
+        let spec = RequestSpec {
+            kind: RequestKind::GraphQl(GraphQlRequest::default()),
+            ..RequestSpec::default()
+        };
+        assert_eq!(spec.method(), Some(&Method::Post));
+        assert!(spec.http().is_none(), "a GraphQL request has no HTTP body table");
     }
 }

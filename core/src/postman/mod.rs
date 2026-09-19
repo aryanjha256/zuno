@@ -26,8 +26,8 @@ use serde_json::{Map, Value};
 
 use crate::import::{EnvironmentImport, Import, Imported, Variable};
 use crate::{
-    Body, FormField, Header, Method, MultipartField, MultipartValue, QueryParam, RawKind,
-    RequestId, RequestSpec,
+    Body, FormField, GraphQlRequest, Header, Method, MultipartField, MultipartValue, QueryParam,
+    RawKind, RequestId, RequestKind, RequestSpec,
 };
 
 /// How deep imported folders may nest.
@@ -273,7 +273,10 @@ fn request_from(
         _ => return None,
     };
 
-    spec.method = request
+    // Postman v2.x describes HTTP requests only; a GraphQL body is a *mode* on one, not a
+    // separate item type, so everything here fills the HTTP kind.
+    let http = spec.http_mut().expect("a new spec is HTTP");
+    http.method = request
         .get("method")
         .and_then(Value::as_str)
         .map(method_for)
@@ -281,14 +284,23 @@ fn request_from(
 
     if let Some(url) = request.get("url") {
         let (url, query) = url_and_query(url, name, skipped);
+        spec.http_mut().expect("HTTP").query = query;
         spec.url = url;
-        spec.query = query;
     }
 
     spec.headers = headers_from(request.get("header"), name, skipped);
 
     if let Some(body) = request.get("body") {
-        spec.body = body_from(body, name, skipped);
+        // **A `graphql` body is a different *kind*, not a different body.** Postman models it
+        // as a body mode because its request type is fixed; Zuno models GraphQL as a request
+        // kind, so the mapping is now exact — query and variables land in the fields they were
+        // authored in, rather than being flattened into a JSON envelope the reader then has to
+        // edit as escaped text. This is the one place an import changes a request's kind.
+        if body.get("mode").and_then(Value::as_str) == Some("graphql") {
+            spec.kind = RequestKind::GraphQl(graphql_from(body, spec.method().cloned()));
+        } else {
+            spec.http_mut().expect("HTTP").body = body_from(body, name, skipped);
+        }
     }
 
     // **A request's own auth sits inside `request`, not on the item** — only a folder's sits on
@@ -311,8 +323,9 @@ fn request_from(
                 }
             }
             AuthEffect::Query(param) => {
-                if !spec.query.iter().any(|existing| existing.name == param.name) {
-                    spec.query.push(param);
+                let query = &mut spec.http_mut().expect("HTTP").query;
+                if !query.iter().any(|existing| existing.name == param.name) {
+                    query.push(param);
                 }
             }
         }
@@ -546,33 +559,42 @@ fn body_from(body: &Value, name: &str, skipped: &mut Vec<String>) -> Body {
                 Body::Empty
             }
         },
-        // GraphQL over HTTP *is* a JSON body, so it imports as the one it will become. That is
-        // the whole of what Zuno needs to send these — no GraphQL model, no second body type,
-        // and the query stays editable as the text it already was.
-        "graphql" => {
-            let graphql = body.get("graphql");
-            let query = graphql
-                .and_then(|graphql| graphql.get("query"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            // Postman stores the variables as a *string* of JSON, not as JSON.
-            let variables = graphql
-                .and_then(|graphql| graphql.get("variables"))
-                .and_then(Value::as_str)
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                .unwrap_or_else(|| Value::Object(Map::new()));
-
-            let payload = serde_json::json!({ "query": query, "variables": variables });
-            Body::Raw {
-                text: serde_json::to_string_pretty(&payload).unwrap_or_default(),
-                kind: RawKind::Json,
-            }
-        }
+        // Handled by `graphql_from`, which returns a *kind* rather than a body — see the note
+        // on `body_from`'s caller. Reaching here at all would mean the sniff above missed it.
+        "graphql" => Body::Empty,
         "none" => Body::Empty,
         other => {
             skipped.push(format!("{name}: a {other} body"));
             Body::Empty
         }
+    }
+}
+
+/// A Postman `graphql` body as a `GraphQlRequest`.
+///
+/// **Postman stores `variables` as a *string* of JSON, not as JSON** — which happens to be
+/// exactly how Zuno holds it too, so it is carried across verbatim rather than parsed and
+/// re-printed. That keeps the reader's own formatting, and keeps a half-finished variables
+/// block importable instead of being rejected for not parsing.
+///
+/// The method comes from the request, not from a default: Postman exports GET GraphQL requests
+/// and they are legal.
+fn graphql_from(body: &Value, method: Option<Method>) -> GraphQlRequest {
+    let graphql = body.get("graphql");
+    let field = |name: &str| {
+        graphql
+            .and_then(|graphql| graphql.get(name))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let operation = field("operationName");
+    GraphQlRequest {
+        method: method.unwrap_or(Method::Post),
+        query: field("query"),
+        variables: field("variables"),
+        operation: (!operation.trim().is_empty()).then_some(operation),
     }
 }
 
@@ -970,16 +992,16 @@ mod tests {
         let import = imported();
         let list = &find(&import, "List").spec;
         assert_eq!(list.url, "{{baseUrl}}/invoices");
-        assert_eq!(list.query.len(), 2);
-        assert_eq!((list.query[0].name.as_str(), list.query[0].enabled), ("limit", true));
-        assert_eq!((list.query[1].name.as_str(), list.query[1].enabled), ("cursor", false));
+        assert_eq!(list.http().unwrap().query.len(), 2);
+        assert_eq!((list.http().unwrap().query[0].name.as_str(), list.http().unwrap().query[0].enabled), ("limit", true));
+        assert_eq!((list.http().unwrap().query[1].name.as_str(), list.http().unwrap().query[1].enabled), ("cursor", false));
 
         // And a bare string URL is split the same way, so an imported request presents
         // identically whichever form the export used.
         let ping = &find(&import, "Ping").spec;
         assert_eq!(ping.url, "https://api.test/ping");
-        assert_eq!(ping.query.len(), 1);
-        assert_eq!(ping.query[0].value, "1");
+        assert_eq!(ping.http().unwrap().query.len(), 1);
+        assert_eq!(ping.http().unwrap().query[0].value, "1");
     }
 
     #[test]
@@ -1001,7 +1023,7 @@ mod tests {
             .expect("a disabled header must still import");
         assert!(!debug.enabled);
 
-        let Body::Form(fields) = &find(&import, "Login").spec.body else {
+        let Body::Form(fields) = &find(&import, "Login").spec.http().unwrap().body else {
             panic!("urlencoded must import as a form");
         };
         assert_eq!(fields.len(), 2);
@@ -1057,14 +1079,14 @@ mod tests {
         let import = imported();
 
         assert_eq!(
-            find(&import, "Create").spec.body,
+            find(&import, "Create").spec.http().unwrap().body,
             Body::Raw {
                 text: "{\"amount\": 1}".to_string(),
                 kind: RawKind::Json
             }
         );
 
-        let Body::Multipart(fields) = &find(&import, "Upload").spec.body else {
+        let Body::Multipart(fields) = &find(&import, "Upload").spec.http().unwrap().body else {
             panic!("formdata must import as multipart");
         };
         assert_eq!(fields[0].value, MultipartValue::Text("hi".to_string()));
@@ -1076,28 +1098,40 @@ mod tests {
         );
     }
 
+    /// **A `graphql` body imports as a GraphQL *kind*, not as a flattened JSON body.**
+    ///
+    /// This test previously asserted the opposite, with a comment saying GraphQL "needs no
+    /// GraphQL model" — true while Zuno had none, and the reason the import was lossy: the
+    /// query arrived as escaped text inside a JSON envelope, so editing it meant editing
+    /// `\n` and `\"` by hand. Now the two models line up exactly.
     #[test]
-    fn a_graphql_body_imports_as_the_json_it_would_have_been_sent_as() {
-        // Which is all GraphQL is over HTTP — so this needs no GraphQL model, no second body
-        // type, and the query stays editable as the text it already was.
+    fn a_graphql_body_imports_as_a_graphql_request() {
         let import = imported();
-        let Body::Raw { text, kind } = &find(&import, "Graph").spec.body else {
-            panic!("graphql must import as a raw body");
-        };
-        assert_eq!(*kind, RawKind::Json);
+        let spec = &find(&import, "Graph").spec;
 
-        let sent: serde_json::Value = serde_json::from_str(text).expect("valid JSON");
-        assert_eq!(sent["query"], "query Me { me { id } }");
-        // Postman stores the variables as a *string* of JSON; sending that verbatim would put a
-        // quoted string where the server expects an object.
-        assert_eq!(sent["variables"]["x"], 1);
+        let graphql = spec
+            .graphql()
+            .expect("a graphql body must import as a GraphQL request, not an HTTP one");
+        assert_eq!(graphql.query, "query Me { me { id } }");
+        assert_eq!(graphql.method, Method::Post);
+
+        // Postman stores the variables as a *string* of JSON — which is how Zuno holds them
+        // too, so they carry across verbatim rather than being parsed and re-printed.
+        assert_eq!(graphql.variables, r#"{"x": 1}"#);
+
+        // And it still becomes a correct envelope on the wire, with the variables as JSON
+        // rather than as a quoted string.
+        let envelope =
+            crate::engine::build::graphql_envelope(graphql).expect("a sendable envelope");
+        assert_eq!(envelope["query"], "query Me { me { id } }");
+        assert_eq!(envelope["variables"]["x"], 1);
     }
 
     #[test]
     fn a_method_zuno_has_no_variant_for_still_imports() {
         let import = imported();
         assert_eq!(
-            find(&import, "Search").spec.method,
+            find(&import, "Search").spec.http().unwrap().method,
             Method::Other("PURGE".to_string())
         );
         // And the URL rebuilt from split fields keeps its port.

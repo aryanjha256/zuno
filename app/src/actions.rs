@@ -167,6 +167,7 @@ actions!(
         PrevTab,
         // Request editing
         OpenMethod,
+        OpenRequestKind,
         AddHeader,
         AddQuery,
         ToggleRow,

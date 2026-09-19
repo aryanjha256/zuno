@@ -21,7 +21,9 @@
 use serde_json::Value;
 
 use crate::import::{Import, Imported};
-use crate::{Body, Header, Method, QueryParam, RawKind, RequestId, RequestSpec};
+use crate::{
+    Body, Header, HttpRequest, Method, QueryParam, RawKind, RequestId, RequestKind, RequestSpec,
+};
 
 /// How deep to follow a schema when inventing an example body.
 ///
@@ -212,12 +214,14 @@ fn operation_to_request(
             // Collection files always store 0; a live handle is assigned when a buffer opens.
             id: RequestId(0),
             name,
-            method,
             url: format!("{base}{path}"),
-            query,
             headers,
-            body,
             settings: Default::default(),
+            kind: RequestKind::Http(HttpRequest {
+                method,
+                query,
+                body,
+            }),
             captures: Vec::new(),
             expect_status: None,
             assertions: Vec::new(),
@@ -461,7 +465,7 @@ mod tests {
         assert_eq!(import.requests.len(), 4);
 
         let list = find(&import, "listInvoices");
-        assert_eq!(list.spec.method, Method::Get);
+        assert_eq!(list.spec.http().unwrap().method, Method::Get);
         // The server's trailing slash is trimmed, or every URL would carry a double one.
         assert_eq!(list.spec.url, "https://api.test/v1/invoices");
         assert_eq!(list.folders, vec!["invoices".to_string()]);
@@ -495,11 +499,11 @@ mod tests {
         let import = read(SPEC).expect("parse");
         let list = find(&import, "listInvoices");
 
-        let limit = list.spec.query.iter().find(|q| q.name == "limit").expect("limit");
+        let limit = list.spec.http().unwrap().query.iter().find(|q| q.name == "limit").expect("limit");
         assert!(!limit.enabled, "an optional parameter must arrive muted");
         assert_eq!(limit.value, "25", "and carry its schema default");
 
-        let status = list.spec.query.iter().find(|q| q.name == "status").expect("status");
+        let status = list.spec.http().unwrap().query.iter().find(|q| q.name == "status").expect("status");
         assert!(status.enabled);
         assert_eq!(status.value, "open");
     }
@@ -528,8 +532,8 @@ mod tests {
         let import = read(SPEC).expect("parse");
         let create = find(&import, "Create an invoice");
 
-        let Body::Raw { text, kind } = &create.spec.body else {
-            panic!("expected a raw body, got {:?}", create.spec.body);
+        let Body::Raw { text, kind } = &create.spec.http().unwrap().body else {
+            panic!("expected a raw body, got {:?}", create.spec.http().unwrap().body);
         };
         assert_eq!(*kind, RawKind::Json);
 
@@ -557,7 +561,7 @@ mod tests {
     fn a_body_zuno_cannot_invent_is_skipped_by_name_rather_than_guessed() {
         // The `curl.rs` rule: never silently drop part of a document.
         let import = read(SPEC).expect("parse");
-        assert_eq!(find(&import, "upload").spec.body, Body::Empty);
+        assert_eq!(find(&import, "upload").spec.http().unwrap().body, Body::Empty);
         assert!(
             import.skipped.iter().any(|note| note.contains("multipart/form-data")),
             "the skipped body must be reported: {:?}",
@@ -578,7 +582,7 @@ mod tests {
         }"##;
 
         let import = read(spec).expect("parse");
-        let Body::Raw { text, .. } = &import.requests[0].spec.body else {
+        let Body::Raw { text, .. } = &import.requests[0].spec.http().unwrap().body else {
             panic!("expected a raw body");
         };
         let value: Value = serde_json::from_str(text).expect("json");
@@ -613,7 +617,7 @@ mod tests {
         }"##;
 
         let import = read(spec).expect("parse");
-        let Body::Raw { text, .. } = &import.requests[0].spec.body else {
+        let Body::Raw { text, .. } = &import.requests[0].spec.http().unwrap().body else {
             panic!("expected a raw body");
         };
         assert!(text.contains("manager"), "the cycle must still produce structure");

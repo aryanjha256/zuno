@@ -88,6 +88,13 @@ pub enum Target {
     Action(Box<dyn gpui::Action>),
     /// Set the active request's method.
     Method(zuno_core::Method),
+    /// Change what kind of request this is — HTTP, GraphQL, and later gRPC or MQTT.
+    RequestKind(crate::kinds::KindChoice),
+    /// The same, past the "this discards your body" prompt. A separate variant rather than a
+    /// flag, because one picker row must mean exactly one thing.
+    RequestKindConfirmed(crate::kinds::KindChoice),
+    /// Close the picker and do nothing — the "Keep editing" half of a confirm.
+    Dismiss,
     /// Select the active environment, or `None` for none.
     Environment(Option<String>),
     /// Show a retained response: `0` is live, `1` the run before it.
@@ -127,6 +134,9 @@ impl Clone for Target {
             Self::File(path) => Self::File(path.clone()),
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Method(method) => Self::Method(method.clone()),
+            Self::RequestKind(choice) => Self::RequestKind(*choice),
+            Self::RequestKindConfirmed(choice) => Self::RequestKindConfirmed(*choice),
+            Self::Dismiss => Self::Dismiss,
             Self::Proxy(mode) => Self::Proxy(mode.clone()),
             Self::RemoveProxy(url) => Self::RemoveProxy(url.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),

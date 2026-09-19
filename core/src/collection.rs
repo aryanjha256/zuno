@@ -673,7 +673,10 @@ pub enum NodeKind {
     /// Carries the method and URL rather than the whole `RequestSpec`: the panel draws both,
     /// and a spec holds the body, which for a large request would be cloned per scan and held
     /// for as long as the panel is open.
-    Request { method: Method, url: String },
+    /// `method` is an `Option` because only some kinds have one — gRPC is always POST and
+    /// never shows it, MQTT has none at all. The panel draws no badge rather than an
+    /// invented one.
+    Request { method: Option<Method>, url: String },
 }
 
 /// Arrange scanned entries into a flat, depth-tagged tree.
@@ -750,7 +753,7 @@ fn flatten_branch(branch: &Branch<'_>, parent: &Path, depth: u16, out: &mut Vec<
                 .to_string(),
             path: entry.path.clone(),
             kind: NodeKind::Request {
-                method: entry.spec.method.clone(),
+                method: entry.spec.method().cloned(),
                 url: entry.spec.url.clone(),
             },
         });
@@ -852,8 +855,8 @@ mod tests {
         assert_eq!(back.id, RequestId(0), "the session-local id must not be persisted");
         assert_eq!(back.url, spec.url);
         assert_eq!(back.headers, spec.headers);
-        assert_eq!(back.query, spec.query);
-        assert_eq!(back.body, spec.body);
+        assert_eq!(back.http().unwrap().query, spec.http().unwrap().query);
+        assert_eq!(back.http().unwrap().body, spec.http().unwrap().body);
         assert_eq!(back.settings, spec.settings);
 
         std::fs::remove_dir_all(&root).ok();
@@ -1257,7 +1260,7 @@ mod scan_tests {
         // And the method comes through, since the panel draws it.
         match &nodes[0].kind {
             NodeKind::Request { method, url } => {
-                assert_eq!(method, &RequestSpec::sample().method);
+                assert_eq!(method.as_ref(), RequestSpec::sample().method());
                 assert_eq!(url, "https://a.test/alpha");
             }
             other => panic!("expected a request, got {other:?}"),

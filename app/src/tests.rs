@@ -443,6 +443,14 @@ fn spec_of(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> Requ
     cx.update(|_, cx| view.read(cx).spec(cx))
 }
 
+/// The sample request with a different body, which is the only thing most of these tests
+/// vary. Reaches through the kind so the callers do not each have to.
+fn sample_with_body(body: zuno_core::Body) -> RequestSpec {
+    let mut spec = RequestSpec::sample();
+    spec.http_mut().expect("the sample is HTTP").body = body;
+    spec
+}
+
 /// The engine runs on its own OS thread, so its events arrive asynchronously from
 /// gpui's point of view. `run_until_parked` alone returns while the consuming task is
 /// still awaiting the channel, so poll it against a deadline.
@@ -607,17 +615,320 @@ async fn ctrl_m_opens_the_method_picker_with_the_current_one_marked(cx: &mut Tes
     );
 }
 
+/// **Switching kind asks before throwing work away.**
+///
+/// A kind change replaces the whole `KindEditor`, so the body you typed goes with it and there
+/// is no undo — unlike switching *body type*, which `set_body_type` documents as lossless.
+/// Asserted at the consequence: the request is still HTTP and the body is still there, because
+/// a silent discard would look identical to a successful switch on screen for a moment and then
+/// simply be gone.
+/// **A tab this build cannot read survives into the next save.**
+///
+/// The parse tests prove the bytes round-trip. This proves the *app* carries them: `session()`
+/// rebuilds the file from `views`, so a tolerant parser is worthless on its own — anything not
+/// held on `Workspace` is simply dropped at the next checkpoint.
+///
+/// Asserted on `session()` rather than on the file, and deliberately: the first version of this
+/// test forced a `ctrl-s` and read the file back, which **passed with the carry deleted** —
+/// `Ctrl+S` saves the request, not the session, so nothing had rewritten the file and "the tab
+/// is still there" was true either way. Another weak assertion that read exactly like a strong
+/// one, caught only by breaking it on purpose.
+#[gpui::test]
+async fn a_tab_from_a_newer_zuno_is_carried_into_the_next_save(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("zuno-carry-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("session.json");
+
+    let known = serde_json::to_string(&RequestSpec::sample()).expect("serialize");
+    let written = format!(
+        r#"{{"version":5,"active":0,"tabs":[
+            {{"spec":{known},"path":null}},
+            {{"spec":{{"id":0,"name":"mqtt","url":"mqtt://a.test","headers":[],
+               "settings":{{"timeout":{{"secs":30,"nanos":0}},"follow_redirects":true,
+               "max_redirects":10,"verify_tls":true,"accept_encodings":true,
+               "cookie_store":true}},
+               "kind":{{"Mqtt":{{"topic":"sensors/one"}}}},
+               "captures":[],"expect_status":null,"assertions":[]}},"path":null}}
+        ],"environment":null,"collection_panel":true,"panel_width":240.0}}"#
+    );
+    std::fs::write(&path, &written).expect("write");
+
+    let (window, view, mut cx) = boot(cx, Some(path.clone()), None);
+
+    // The readable tab opened; the unreadable one is not shown.
+    assert_eq!(spec_of(&view, &mut cx).url, "https://api.github.com/graphql");
+
+    // What the next checkpoint would write.
+    let next = window
+        .update(&mut cx, |workspace, _, cx| workspace.session(cx))
+        .expect("workspace");
+    let bytes = serde_json::to_value(&next).expect("serialize");
+    let tabs = bytes["tabs"].as_array().expect("tabs");
+
+    assert_eq!(tabs.len(), 2, "the carried tab must be written again: {bytes}");
+    assert_eq!(
+        tabs[1]["spec"]["kind"]["Mqtt"]["topic"], "sensors/one",
+        "verbatim, at its original index: {bytes}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **The tab strip is named by the kind, not hardcoded.**
+///
+/// This is the test that should have existed when the strip was first "composed": the *content*
+/// was routed by kind while `section_tabs` still had `"Params"` and `"Body"` written into it, so
+/// a GraphQL request drew a document behind a tab called Params and its variables behind one
+/// called Body. Nothing could catch it — a hardcoded string compiles perfectly — and I reported
+/// it as working without looking.
+#[gpui::test]
+async fn a_kinds_tab_strip_is_named_by_the_kind(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+
+    let labels = |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            RequestTab::for_kind(&view.kind)
+                .into_iter()
+                .map(|tab| match tab {
+                    RequestTab::Kind(slot) => view.kind.tab_label(slot).to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let http = labels(&view, &mut cx);
+    assert!(
+        http.iter().any(|l| l.starts_with("Params")) && http.iter().any(|l| l.starts_with("Body")),
+        "an HTTP request keeps Params and Body: {http:?}"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::GraphQl, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    let gql = labels(&view, &mut cx);
+    assert!(
+        gql.iter().any(|l| l == "Query"),
+        "a GraphQL request must have a Query tab: {gql:?}"
+    );
+    assert!(
+        gql.iter().any(|l| l == "Variables"),
+        "and a Variables tab: {gql:?}"
+    );
+    assert!(
+        !gql.iter().any(|l| l.starts_with("Params") || l.starts_with("Body")),
+        "and neither Params nor Body, which describe a kind it isn't: {gql:?}"
+    );
+}
+
+/// **Every tab a kind declares must be reachable.**
+///
+/// The strip maps slot 0 and slot 1 onto `ShowParamsTab` and `ShowBodyTab`; a kind declaring a
+/// third tab would render a control with no action behind it. That is a dead control, which is
+/// the failure `affordances()` exists to prevent — so it fails here instead, and the fix is a
+/// parameterised `ShowKindTab(u8)` at that point rather than speculatively now.
+#[gpui::test]
+async fn every_kinds_tabs_have_an_action(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+
+    for choice in crate::kinds::KindChoice::ALL {
+        let count = cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                let kind = crate::kinds::KindEditor::empty(choice, cx);
+                let count = kind.tabs().len();
+                view.set_kind(kind, cx);
+                count
+            })
+        });
+        assert!(
+            count <= 2,
+            "{} declares {count} tabs but only slots 0 and 1 have actions — add a \
+             parameterised ShowKindTab before declaring a third",
+            choice.label()
+        );
+    }
+}
+
+/// **The Variables tab must not offer a control that does nothing.**
+///
+/// It was drawn with `section_header`, which is for row tables and always renders an add
+/// control — pointed at `RowKind::Query`, so the button dispatched `AddQuery`, which shows slot
+/// 0 and adds a row to a table a GraphQL request does not have. The visible half was a button
+/// that navigated you away; the invisible half is that it silently added nothing.
+///
+/// Asserted through the consequence — you stay on Variables — rather than by looking for the
+/// button, because "no element here" is the thing `cx.debug_bounds` cannot answer honestly.
+#[gpui::test]
+async fn the_variables_tab_has_no_control_that_leaves_it(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::GraphQl, cx);
+            view.set_kind(kind, cx);
+            view.show_request_tab(RequestTab::Kind(1), cx);
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1), "on Variables");
+
+    // The add control's own action. If the tab still draws one, this is what it fires — and
+    // landing on slot 0 is exactly the bug.
+    cx.dispatch_action(crate::actions::AddQuery);
+    cx.run_until_parked();
+
+    assert_eq!(
+        request_tab(&view, &mut cx),
+        RequestTab::Kind(1),
+        "adding a query row is not a verb a GraphQL request has, and must not move the tab"
+    );
+}
+
+/// **Opening a request keeps the tab you were on.**
+///
+/// `request_tab` is documented as sticky per buffer, and `response_view`'s note beside it is
+/// explicit that not even `load` resets it. The kind split broke that: `load` set the tab to the
+/// kind's default unconditionally, so opening anything threw away which section you were
+/// editing. `the_request_tab_is_sticky_per_buffer` never saw it — that one switches buffers and
+/// sends, and never goes through `load`.
+#[gpui::test]
+async fn loading_a_request_keeps_the_tab_you_were_on(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+
+    cx.dispatch_action(crate::actions::ShowHeadersTab);
+    cx.run_until_parked();
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
+
+    // Loading another HTTP request — every tab it was on still exists.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let mut spec = RequestSpec::default();
+            spec.url = "https://b.test/other".into();
+            view.load(spec, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        request_tab(&view, &mut cx),
+        RequestTab::Headers,
+        "loading a request must not move you off the section you were editing"
+    );
+
+    // But a slot the incoming kind does not have has to be replaced rather than left dangling.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Kind(1), cx))
+    });
+    cx.run_until_parked();
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1));
+}
+
+/// **HTTP's body verbs refuse on a kind that has no body.**
+///
+/// `OpenBodyType` and `ChooseBodyFile` were unguarded: on a GraphQL request each jumped to slot
+/// 1 — the *Variables* tab — and then did nothing, because `set_body_type` and `set_binary_path`
+/// no-op off an HTTP kind. `ChooseBodyFile` was the worse of the two: it reached
+/// `prompt_for_paths` first, so it opened a **native modal dialog** and discarded whatever was
+/// chosen.
+///
+/// Both have palette rows, so removing buttons would not have helped. Asserted at the guard —
+/// the tab does not move and nothing opens — because the dialog itself is `unimplemented!()` in
+/// the test platform and cannot be driven.
+#[gpui::test]
+async fn http_body_verbs_refuse_on_a_graphql_request(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::GraphQl, cx);
+            view.set_kind(kind, cx);
+            view.show_request_tab(RequestTab::Headers, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    for action in [
+        Box::new(crate::actions::OpenBodyType) as Box<dyn gpui::Action>,
+        Box::new(crate::actions::ChooseBodyFile),
+    ] {
+        cx.update(|window, cx| window.dispatch_action(action.boxed_clone(), cx));
+        cx.run_until_parked();
+
+        assert_eq!(
+            request_tab(&view, &mut cx),
+            RequestTab::Headers,
+            "{action:?} must not drag a GraphQL request onto a body tab it does not have"
+        );
+        assert!(
+            !picker_is_open(&window, &mut cx),
+            "{action:?} must not open a picker that cannot change anything"
+        );
+    }
+}
+
+#[gpui::test]
+async fn switching_kind_asks_before_discarding_a_body(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    // The sample request carries a JSON body, so there is something to lose.
+    assert!(
+        !matches!(spec_of(&view, &mut cx).http().unwrap().body, zuno_core::Body::Empty),
+        "the sample must have a body for this test to mean anything"
+    );
+
+    cx.update(|window, cx| {
+        window.dispatch_action(Box::new(crate::actions::OpenRequestKind), cx)
+    });
+    cx.run_until_parked();
+    cx.simulate_input("GraphQL");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    // Not switched — a second picker is asking.
+    assert!(
+        picker_is_open(&window, &mut cx),
+        "choosing a kind that would discard a body must ask rather than act"
+    );
+    assert!(
+        spec_of(&view, &mut cx).http().is_some(),
+        "the request must still be HTTP until the prompt is answered"
+    );
+
+    // The prompt must name what it is about to destroy, not just say "the body" — an HTTP
+    // request loses its method and query params too.
+    let rows = picker_rows(&window, &mut cx);
+    assert!(
+        rows.iter().any(|row| row.contains("the body") && row.contains("the method")),
+        "the prompt must name everything a kind switch discards: {rows:?}"
+    );
+
+    // Answering it goes through.
+    cx.simulate_input("Switch to GraphQL");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(
+        spec_of(&view, &mut cx).graphql().is_some(),
+        "confirming must actually switch the kind"
+    );
+}
+
 #[gpui::test]
 async fn choosing_a_method_sets_it_on_the_request(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
-    assert_eq!(spec_of(&view, &mut cx).method, Method::Post);
+    assert_eq!(spec_of(&view, &mut cx).http().unwrap().method, Method::Post);
 
     cx.simulate_keystrokes("ctrl-m");
     cx.simulate_input("del");
     cx.simulate_keystrokes("enter");
 
     assert!(!picker_is_open(&window, &mut cx));
-    assert_eq!(spec_of(&view, &mut cx).method, Method::Delete);
+    assert_eq!(spec_of(&view, &mut cx).http().unwrap().method, Method::Delete);
 }
 
 #[gpui::test]
@@ -728,7 +1039,7 @@ async fn typing_an_unknown_verb_offers_it_as_a_custom_method(cx: &mut TestAppCon
     // The derived row is last, so this walks to it rather than assuming it's selected.
     cx.simulate_keystrokes("up enter");
     assert_eq!(
-        spec_of(&view, &mut cx).method,
+        spec_of(&view, &mut cx).http().unwrap().method,
         Method::Other("PURGE".to_string()),
         "and uppercase it, since nobody typing `purge` means a lowercase verb"
     );
@@ -759,7 +1070,7 @@ fn author_body(cx: &mut VisualTestContext, text: &str) {
 }
 
 fn body_text(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> String {
-    match &spec_of(view, cx).body {
+    match &spec_of(view, cx).http().unwrap().body {
         Body::Raw { text, .. } => text.clone(),
         other => panic!("expected a raw body, got {other:?}"),
     }
@@ -947,7 +1258,8 @@ async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut Te
 
     cx.simulate_keystrokes("ctrl-left");
     cx.simulate_input("Q");
-    let Body::Raw { text, .. } = &spec_of(&view, &mut cx).body else {
+    let spec_949 = spec_of(&view, &mut cx);
+    let Body::Raw { text, .. } = &spec_949.http().unwrap().body else {
         panic!("expected a raw body")
     };
     assert_eq!(
@@ -957,7 +1269,8 @@ async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut Te
 
     cx.simulate_keystrokes("ctrl-shift-right");
     cx.simulate_input("!");
-    let Body::Raw { text, .. } = &spec_of(&view, &mut cx).body else {
+    let spec_959 = spec_of(&view, &mut cx);
+    let Body::Raw { text, .. } = &spec_959.http().unwrap().body else {
         panic!("expected a raw body")
     };
     assert_eq!(text, "alpha beta Q!", "ctrl-shift-right selects to the word end in the editor");
@@ -1002,8 +1315,8 @@ async fn focus_body_never_lands_on_an_unpainted_handle(cx: &mut TestAppContext) 
     cx.simulate_keystrokes("ctrl-b");
     cx.simulate_input("part-name");
     let spec = spec_of(&view, &mut cx);
-    let Body::Multipart(parts) = &spec.body else {
-        panic!("expected a multipart body, got {:?}", spec.body)
+    let Body::Multipart(parts) = &spec.http().unwrap().body else {
+        panic!("expected a multipart body, got {:?}", spec.http().unwrap().body)
     };
     assert!(
         parts.iter().any(|p| p.name == "part-name"),
@@ -1038,7 +1351,7 @@ async fn the_body_region_reports_focus_for_every_body_type(cx: &mut TestAppConte
     // That cell belongs to the row, not to the editor.
     cx.simulate_keystrokes("ctrl-shift-f");
     assert!(
-        matches!(spec_of(&view, &mut cx).body, Body::Form(_)),
+        matches!(spec_of(&view, &mut cx).http().unwrap().body, Body::Form(_)),
         "ctrl-shift-f switches the body to a form"
     );
     assert!(
@@ -1067,7 +1380,7 @@ async fn a_picker_row_spans_the_full_width_of_the_list(cx: &mut TestAppContext) 
     // the test would pass against the bug — the exact shape of weak assertion this codebase
     // has been caught by five times. The container is the only honest reference.
     let (window, view, mut cx) = boot(cx, None, None);
-    assert_eq!(spec_of(&view, &mut cx).method, Method::Post);
+    assert_eq!(spec_of(&view, &mut cx).http().unwrap().method, Method::Post);
 
     cx.simulate_keystrokes("ctrl-m");
     cx.simulate_input("del");
@@ -1093,7 +1406,7 @@ async fn a_picker_row_spans_the_full_width_of_the_list(cx: &mut TestAppContext) 
 
     assert!(!picker_is_open(&window, &mut cx), "choosing a row closes the picker");
     assert_eq!(
-        spec_of(&view, &mut cx).method,
+        spec_of(&view, &mut cx).http().unwrap().method,
         Method::Delete,
         "clicking the empty right-hand side of a row must choose that row"
     );
@@ -1176,7 +1489,7 @@ async fn clicking_add_in_a_section_header_adds_a_row_to_that_section(cx: &mut Te
     cx.run_until_parked();
 
     let headers_before = spec_of(&view, &mut cx).headers.len();
-    let query_before = spec_of(&view, &mut cx).query.len();
+    let query_before = spec_of(&view, &mut cx).http().unwrap().query.len();
 
     let add = cx.debug_bounds("add-header").expect("the Headers section header carries an add");
     cx.simulate_click(add.center(), gpui::Modifiers::default());
@@ -1184,7 +1497,7 @@ async fn clicking_add_in_a_section_header_adds_a_row_to_that_section(cx: &mut Te
 
     let after = spec_of(&view, &mut cx);
     assert_eq!(after.headers.len(), headers_before + 1, "clicking add must add a header");
-    assert_eq!(after.query.len(), query_before, "and must not touch the query table");
+    assert_eq!(after.http().unwrap().query.len(), query_before, "and must not touch the query table");
 }
 
 #[gpui::test]
@@ -1196,7 +1509,7 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let before = spec_of(&view, &mut cx);
-    let fields_before = match &before.body {
+    let fields_before = match &before.http().unwrap().body {
         zuno_core::Body::Form(fields) => fields.len(),
         other => panic!("ctrl-shift-f should switch the body to a form, got {other:?}"),
     };
@@ -1205,7 +1518,7 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
     cx.simulate_click(add.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    match &spec_of(&view, &mut cx).body {
+    match &spec_of(&view, &mut cx).http().unwrap().body {
         zuno_core::Body::Form(fields) => {
             assert_eq!(fields.len(), fields_before + 1, "clicking add must add a field")
         }
@@ -1220,7 +1533,7 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
     cx.simulate_click(add_part.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    match &spec_of(&view, &mut cx).body {
+    match &spec_of(&view, &mut cx).http().unwrap().body {
         zuno_core::Body::Multipart(parts) => {
             assert!(parts.len() >= 2, "ctrl-shift-m added one, the click added another: {parts:?}")
         }
@@ -1262,7 +1575,7 @@ async fn focusing_a_multipart_row_is_what_targets_a_chosen_file(cx: &mut TestApp
     cx.simulate_click(add_part.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    let parts = match &spec_of(&view, &mut cx).body {
+    let parts = match &spec_of(&view, &mut cx).http().unwrap().body {
         zuno_core::Body::Multipart(parts) => parts.len(),
         other => panic!("expected a multipart body: {other:?}"),
     };
@@ -1417,7 +1730,7 @@ async fn a_file_picker_appears_only_where_it_can_do_something(cx: &mut TestAppCo
     );
 
     // And the switch reaches the wire, not just the pixels.
-    match &spec_of(&view, &mut cx).body {
+    match &spec_of(&view, &mut cx).http().unwrap().body {
         zuno_core::Body::Multipart(parts) => assert!(
             matches!(parts[0].value, zuno_core::MultipartValue::File(_)),
             "the part must actually send a file: {:?}",
@@ -1482,7 +1795,7 @@ async fn query_params_are_editable_independently_of_headers(cx: &mut TestAppCont
     cx.simulate_input("2");
 
     let spec = spec_of(&view, &mut cx);
-    let added = spec.query.last().expect("a query row was added");
+    let added = spec.http().unwrap().query.last().expect("a query row was added");
     assert_eq!(added.name, "page");
     assert_eq!(added.value, "2");
     assert_eq!(
@@ -2097,8 +2410,8 @@ async fn the_body_editor_accepts_multiple_lines(cx: &mut TestAppContext) {
     cx.simulate_input("}");
 
     let spec = spec_of(&view, &mut cx);
-    let Body::Raw { text, kind } = &spec.body else {
-        panic!("expected a raw body, got {:?}", spec.body);
+    let Body::Raw { text, kind } = &spec.http().unwrap().body else {
+        panic!("expected a raw body, got {:?}", spec.http().unwrap().body);
     };
     assert_eq!(*kind, RawKind::Json);
     assert!(text.contains('\n'), "newlines should survive: {text:?}");
@@ -2135,7 +2448,7 @@ async fn a_new_line_inherits_the_previous_indent(cx: &mut TestAppContext) {
     cx.simulate_input("next");
 
     let spec = spec_of(&view, &mut cx);
-    let Body::Raw { text, .. } = &spec.body else {
+    let Body::Raw { text, .. } = &spec.http().unwrap().body else {
         panic!("expected a raw body");
     };
     let second = text.lines().nth(1).expect("a second line");
@@ -2157,7 +2470,7 @@ async fn vertical_movement_lands_on_the_line_above(cx: &mut TestAppContext) {
     cx.simulate_input("X");
 
     let spec = spec_of(&view, &mut cx);
-    let Body::Raw { text, .. } = &spec.body else {
+    let Body::Raw { text, .. } = &spec.http().unwrap().body else {
         panic!("expected a raw body");
     };
     assert_eq!(text.lines().next(), Some("Xaaa"), "{text:?}");
@@ -2170,7 +2483,7 @@ async fn a_blank_body_sends_nothing_at_all(cx: &mut TestAppContext) {
     clear_body(&mut cx);
 
     // An empty editor must mean no body, not an empty JSON body with a Content-Type.
-    assert_eq!(spec_of(&view, &mut cx).body, Body::Empty);
+    assert_eq!(spec_of(&view, &mut cx).http().unwrap().body, Body::Empty);
 }
 
 #[gpui::test]
@@ -2180,7 +2493,7 @@ async fn the_body_sub_kind_is_chosen_by_name(cx: &mut TestAppContext) {
     clear_body(&mut cx);
     cx.simulate_input("x");
     assert!(matches!(
-        spec_of(&view, &mut cx).body,
+        spec_of(&view, &mut cx).http().unwrap().body,
         Body::Raw { kind: RawKind::Json, .. }
     ));
 
@@ -2190,7 +2503,7 @@ async fn the_body_sub_kind_is_chosen_by_name(cx: &mut TestAppContext) {
     cx.simulate_input("text");
     cx.simulate_keystrokes("enter");
     assert!(matches!(
-        spec_of(&view, &mut cx).body,
+        spec_of(&view, &mut cx).http().unwrap().body,
         Body::Raw { kind: RawKind::Text, .. }
     ));
 }
@@ -2680,12 +2993,12 @@ async fn a_curl_command_on_the_clipboard_becomes_the_request(cx: &mut TestAppCon
     // parse landing correctly, so it reads whatever is now in front.
     let (_, spec) = tabs_of(&window, &mut cx);
 
-    assert_eq!(spec.method, Method::Post);
+    assert_eq!(spec.http().unwrap().method, Method::Post);
     assert_eq!(spec.url, "https://api.example.com/v2/items?page=2");
     assert_eq!(spec.headers.len(), 2);
     assert_eq!(spec.name, "items");
     assert!(matches!(
-        spec.body,
+        spec.http().unwrap().body,
         Body::Raw { kind: RawKind::Json, .. }
     ));
 }
@@ -2706,7 +3019,7 @@ async fn an_unparseable_clipboard_reports_instead_of_wrecking_the_request(
     // `NoUrl` is the failure here, and the existing request must be untouched.
     let after = spec_of(&view, &mut cx);
     assert_eq!(before.url, after.url);
-    assert_eq!(before.method, after.method);
+    assert_eq!(before.http().unwrap().method, after.http().unwrap().method);
 
     let status = cx.update(|_, cx| view.read(cx).status.clone());
     assert!(
@@ -2886,6 +3199,48 @@ async fn a_buffer_is_clean_until_edited_and_clean_again_once_saved(cx: &mut Test
 }
 
 #[gpui::test]
+async fn a_graphql_request_survives_being_loaded_and_read_back(cx: &mut TestAppContext) {
+    // **The failure this guards is the one non-raw bodies actually shipped**: `spec()` derives
+    // from the editors, so anything `load` cannot express is destroyed, and the next Ctrl+S
+    // writes that emptiness over the file. A GraphQL request reaching the view through a
+    // Postman import is exactly that shape, so it is checked before any of it is on screen.
+    let (view, mut cx) = open_workspace(cx);
+
+    let original = RequestSpec {
+        url: "https://api.test/graphql".to_string(),
+        headers: vec![zuno_core::Header::new("Authorization", "Bearer {{token}}")],
+        kind: zuno_core::RequestKind::GraphQl(zuno_core::GraphQlRequest {
+            method: zuno_core::Method::Post,
+            query: "query Repos($n: Int!) {\n  viewer { repositories(first: $n) { id } }\n}"
+                .to_string(),
+            variables: "{\n  \"n\": 50\n}".to_string(),
+            operation: Some("Repos".to_string()),
+        }),
+        ..RequestSpec::default()
+    };
+
+    cx.update(|_, cx| {
+        view.update(cx, |v, cx| v.load(original.clone(), cx));
+    });
+    cx.run_until_parked();
+
+    let read_back = spec_of(&view, &mut cx);
+    assert_eq!(
+        read_back.kind, original.kind,
+        "a GraphQL request must come back through spec() exactly as it went in"
+    );
+    assert_eq!(read_back.headers, original.headers);
+
+    // And it must not read as edited the moment it opens, which is what a mismatched
+    // `is_dirty` arm would do — the same mirror-drift `a_freshly_loaded_request_is_clean`
+    // exists to catch, from the kind side.
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_dirty(cx)),
+        "a freshly loaded GraphQL request must read clean"
+    );
+}
+
+#[gpui::test]
 async fn a_freshly_loaded_request_is_clean_for_every_body_type(cx: &mut TestAppContext) {
     // `body_matches` mirrors `body()` by hand so `is_dirty` can avoid allocating, and a mirror
     // drifts. Each variant loaded and immediately compared is what catches that: a wrong arm
@@ -2914,7 +3269,7 @@ async fn a_freshly_loaded_request_is_clean_for_every_body_type(cx: &mut TestAppC
     for body in bodies {
         cx.update(|_, cx| {
             view.update(cx, |v, cx| {
-                v.load(RequestSpec { body: body.clone(), ..RequestSpec::sample() }, cx)
+                v.load(sample_with_body(body.clone()), cx)
             })
         });
         cx.run_until_parked();
@@ -2932,10 +3287,7 @@ async fn a_freshly_loaded_request_is_clean_for_every_body_type(cx: &mut TestAppC
     cx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.load(
-                RequestSpec {
-                    body: Body::Raw { text: "   ".into(), kind: RawKind::Json },
-                    ..RequestSpec::sample()
-                },
+                sample_with_body(Body::Raw { text: "   ".into(), kind: RawKind::Json }),
                 cx,
             )
         })
@@ -4454,7 +4806,8 @@ async fn a_variable_in_a_form_field_reaches_the_socket_substituted(cx: &mut Test
 
     // And the buffer keeps its placeholders, or a later Ctrl+S would write the secret into a
     // committed collection file.
-    let Body::Form(fields) = &spec_of(&view, &mut cx).body else {
+    let spec_4456 = spec_of(&view, &mut cx);
+    let Body::Form(fields) = &spec_4456.http().unwrap().body else {
         panic!("expected a form body");
     };
     assert_eq!(fields[1].value, "{{secret}}");
@@ -4940,7 +5293,7 @@ async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
     // is the visual order, deliberately not most-recently-used: with a fixed strip, MRU means
     // the same keystroke lands somewhere different each time.
     let (_, view, mut cx) = boot(cx, None, None);
-    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body, "authoring is the default");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1), "authoring is the default");
 
     cx.simulate_keystrokes("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Capture);
@@ -4949,12 +5302,12 @@ async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers, "forward wraps past the end");
     cx.simulate_keystrokes("alt-q");
-    assert_eq!(request_tab(&view, &mut cx), RequestTab::Query);
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(0));
     cx.simulate_keystrokes("alt-q");
-    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body);
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1));
 
     cx.simulate_keystrokes("alt-shift-q");
-    assert_eq!(request_tab(&view, &mut cx), RequestTab::Query, "and back the other way");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(0), "and back the other way");
     cx.simulate_keystrokes("alt-shift-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
 }
@@ -4975,13 +5328,17 @@ async fn clicking_a_request_tab_lands_on_that_tab(cx: &mut TestAppContext) {
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
 
     // Two tabs away from Headers, so a cycle would land on Params instead.
-    let body = cx.debug_bounds("request-tab-body").expect("the Body tab should be painted");
+    // Slot 1 — "Body" for an HTTP request, "Variables" for a GraphQL one. The selector is
+    // named by slot rather than by HTTP's label, because the label is the kind's to choose.
+    let body = cx
+        .debug_bounds("request-tab-kind-1")
+        .expect("the kind's second tab should be painted");
     cx.simulate_click(body.center(), gpui::Modifiers::default());
-    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body);
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1));
 
     // The active tab is inert, so clicking where you already are is not a no-op by accident.
     cx.simulate_click(body.center(), gpui::Modifiers::default());
-    assert_eq!(request_tab(&view, &mut cx), RequestTab::Body);
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1));
 }
 
 #[gpui::test]
@@ -5007,13 +5364,13 @@ async fn the_request_tab_is_sticky_per_buffer(cx: &mut TestAppContext) {
     let second = active_view(&window, &mut cx);
     assert_eq!(
         request_tab(&second, &mut cx),
-        RequestTab::Body,
+        RequestTab::Kind(1),
         "a new buffer gets the default, not the other buffer's choice"
     );
 
     cx.simulate_keystrokes("ctrl-shift-tab");
     assert_eq!(request_tab(&first, &mut cx), RequestTab::Headers);
-    assert_eq!(request_tab(&second, &mut cx), RequestTab::Body);
+    assert_eq!(request_tab(&second, &mut cx), RequestTab::Kind(1));
 }
 
 #[gpui::test]
@@ -7080,7 +7437,7 @@ async fn a_hand_scroll_in_the_editor_survives_the_next_paint(cx: &mut TestAppCon
     let editor = cx.debug_bounds("body-editor").expect("the body editor");
     wheel(&mut cx, editor.center(), -200., 0.);
 
-    let offset = cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).h_offset()));
+    let offset = cx.update(|_, cx| f32::from(view.read(cx).http().unwrap().body_editor.read(cx).h_offset()));
     assert!(
         offset > 0.,
         "a hand scroll must still be there on the next paint, not snap back to zero"
@@ -7102,7 +7459,7 @@ async fn a_sideways_swipe_in_the_editor_does_not_drift_vertically(cx: &mut TestA
         .collect::<Vec<_>>()
         .join("\n");
     let mut spec = RequestSpec::sample();
-    spec.body = Body::Raw {
+    spec.http_mut().unwrap().body = Body::Raw {
         text: body,
         kind: RawKind::Text,
     };
@@ -7115,7 +7472,7 @@ async fn a_sideways_swipe_in_the_editor_does_not_drift_vertically(cx: &mut TestA
     let editor = cx.debug_bounds("body-editor").expect("the body editor");
     wheel(&mut cx, editor.center(), 0., -400.);
     let before = cx.update(|_, cx| {
-        f32::from(view.read(cx).body_editor.read(cx).vertical_offset())
+        f32::from(view.read(cx).http().unwrap().body_editor.read(cx).vertical_offset())
     });
     assert_ne!(before, 0., "the document must actually be scrollable vertically");
 
@@ -7123,7 +7480,7 @@ async fn a_sideways_swipe_in_the_editor_does_not_drift_vertically(cx: &mut TestA
     wheel(&mut cx, editor.center(), -200., -6.);
 
     let after = cx.update(|_, cx| {
-        f32::from(view.read(cx).body_editor.read(cx).vertical_offset())
+        f32::from(view.read(cx).http().unwrap().body_editor.read(cx).vertical_offset())
     });
     assert_eq!(
         before, after,
@@ -7266,7 +7623,7 @@ async fn a_match_far_down_the_body_is_scrolled_to(cx: &mut TestAppContext) {
     let mut body = (0..200).map(|i| format!("\"line{i}\": 1,")).collect::<Vec<_>>();
     body.push("\"needle\": 2".to_string());
     let mut spec = RequestSpec::sample();
-    spec.body = Body::Raw {
+    spec.http_mut().unwrap().body = Body::Raw {
         text: format!("{{\n{}\n}}", body.join("\n")),
         kind: RawKind::Json,
     };
@@ -7287,14 +7644,14 @@ async fn a_match_far_down_the_body_is_scrolled_to(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("ctrl-home");
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).vertical_offset())),
+        cx.update(|_, cx| f32::from(view.read(cx).http().unwrap().body_editor.read(cx).vertical_offset())),
         0.
     );
 
     find_in_body(&view, &mut cx, "needle");
     assert_eq!(body_find_position(&view, &mut cx), Some((1, 1)));
     assert!(
-        cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).vertical_offset())) < 0.,
+        cx.update(|_, cx| f32::from(view.read(cx).http().unwrap().body_editor.read(cx).vertical_offset())) < 0.,
         "the view must follow the match down the document"
     );
 }
@@ -7436,7 +7793,7 @@ async fn the_editors_colouring_follows_the_body_kind(cx: &mut TestAppContext) {
 
     let highlighting =
         |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| -> bool {
-            cx.update(|_, cx| view.read(cx).body_editor.read(cx).highlights_json())
+            cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).highlights_json())
         };
 
     assert!(
@@ -7550,7 +7907,7 @@ async fn the_editor_cannot_be_scrolled_past_its_longest_line(cx: &mut TestAppCon
         wheel(&mut cx, editor.center(), -400., 0.);
     }
 
-    let offset = cx.update(|_, cx| f32::from(view.read(cx).body_editor.read(cx).h_offset()));
+    let offset = cx.update(|_, cx| f32::from(view.read(cx).http().unwrap().body_editor.read(cx).h_offset()));
     // 120 monospace characters is well under 4000px however it shapes, so anything past that
     // means the offset ran away rather than stopping at the end of the content.
     assert!(
@@ -7861,8 +8218,8 @@ async fn a_multipart_body_survives_a_curl_import(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let (_, spec) = tabs_of(&window, &mut cx);
-    let Body::Multipart(fields) = &spec.body else {
-        panic!("the multipart body was lost: {:?}", spec.body);
+    let Body::Multipart(fields) = &spec.http().unwrap().body else {
+        panic!("the multipart body was lost: {:?}", spec.http().unwrap().body);
     };
     assert_eq!(fields.len(), 2, "{fields:?}");
 }
@@ -7883,15 +8240,15 @@ async fn saving_a_request_does_not_overwrite_an_imported_body(cx: &mut TestAppCo
     let bytes = std::fs::read(root.join("upload.json")).expect("saved file");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
     assert!(
-        matches!(&saved.body, Body::Multipart(fields) if fields.len() == 1),
+        matches!(&saved.http().unwrap().body, Body::Multipart(fields) if fields.len() == 1),
         "the saved file must keep the body: {:?}",
-        saved.body
+        saved.http().unwrap().body
     );
 
     // And it round-trips: reopening must not lose it either.
     cx.simulate_keystrokes("ctrl-w");
     let reopened = zuno_core::collection::read(&root.join("upload.json")).expect("read");
-    assert!(matches!(reopened.body, Body::Multipart(_)));
+    assert!(matches!(reopened.http().unwrap().body, Body::Multipart(_)));
 
     remove_scratch(&mut cx, &session);
 }
@@ -7910,19 +8267,19 @@ async fn an_imported_binary_body_arrives_editable(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let (_, spec) = tabs_of(&window, &mut cx);
-    assert_eq!(spec.body, Body::Binary(PathBuf::from("/tmp/payload.bin")));
+    assert_eq!(spec.http().unwrap().body, Body::Binary(PathBuf::from("/tmp/payload.bin")));
 
     let imported = active_view(&window, &mut cx);
     // Asserts the *type*, not just the body: while non-raw bodies were held read-only in a
     // since-removed `preserved_body` field, `spec.body` and `body_label` both looked correct
     // either way, so only the body type distinguished "editable" from "held".
     assert_eq!(
-        cx.update(|_, cx| imported.read(cx).body_type),
+        cx.update(|_, cx| imported.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Binary,
         "an import must arrive as an editable body of the right type"
     );
     assert_eq!(
-        cx.update(|_, cx| imported.read(cx).binary_path.clone()),
+        cx.update(|_, cx| imported.read(cx).http().unwrap().binary_path.clone()),
         Some(PathBuf::from("/tmp/payload.bin"))
     );
     assert_eq!(cx.update(|_, cx| imported.read(cx).body_label()), "Binary");
@@ -7935,7 +8292,7 @@ async fn a_raw_body_is_still_editable_and_not_preserved(cx: &mut TestAppContext)
     let (_, view, mut cx) = boot(cx, None, None);
 
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_type),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Raw,
         "the sample's raw body must stay editable"
     );
@@ -7943,7 +8300,7 @@ async fn a_raw_body_is_still_editable_and_not_preserved(cx: &mut TestAppContext)
     clear_body(&mut cx);
     cx.simulate_input("{\"typed\":true}");
     let spec = spec_of(&view, &mut cx);
-    assert_eq!(spec.body.as_text(), Some("{\"typed\":true}"));
+    assert_eq!(spec.http().unwrap().body.as_text(), Some("{\"typed\":true}"));
 }
 
 #[gpui::test]
@@ -7956,7 +8313,7 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
     let view = active_view(&window, &mut cx);
 
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_type),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Empty,
         "a fresh buffer starts with no body"
     );
@@ -8044,7 +8401,7 @@ async fn a_body_less_request_says_none_rather_than_a_retained_sub_kind(cx: &mut 
     let view = active_view(&window, &mut cx);
 
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_type),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Empty
     );
     assert_eq!(
@@ -8103,7 +8460,7 @@ async fn a_form_body_reaches_the_wire_urlencoded(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("tab");
     cx.simulate_input("read write");
 
-    assert_eq!(spec_of(&view, &mut cx).body.label(), "Form");
+    assert_eq!(spec_of(&view, &mut cx).http().unwrap().body.label(), "Form");
 
     cx.simulate_keystrokes("ctrl-enter");
     wait_for(&mut cx, "the response", |cx| {
@@ -8138,8 +8495,8 @@ async fn a_disabled_form_field_is_left_out(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("alt-t");
 
     let spec = spec_of(&view, &mut cx);
-    let Body::Form(fields) = &spec.body else {
-        panic!("expected a form body: {:?}", spec.body);
+    let Body::Form(fields) = &spec.http().unwrap().body else {
+        panic!("expected a form body: {:?}", spec.http().unwrap().body);
     };
     assert_eq!(fields.len(), 2, "the muted row must still exist");
     assert!(!fields[1].enabled, "and be marked disabled: {fields:?}");
@@ -8161,8 +8518,8 @@ async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
 
     let bytes = std::fs::read(root.join("token.json")).expect("saved");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
-    let Body::Form(fields) = &saved.body else {
-        panic!("the form body was not persisted: {:?}", saved.body);
+    let Body::Form(fields) = &saved.http().unwrap().body else {
+        panic!("the form body was not persisted: {:?}", saved.http().unwrap().body);
     };
     assert_eq!(fields[0].name, "grant_type");
 
@@ -8177,13 +8534,14 @@ async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
 
     let reopened = active_view(&window, &mut cx);
     assert_eq!(
-        cx.update(|_, cx| reopened.read(cx).body_type),
+        cx.update(|_, cx| reopened.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Form,
         "a reopened form must come back as an editable form"
     );
     cx.simulate_keystrokes("ctrl-shift-f");
     cx.simulate_input("extra");
-    let Body::Form(fields) = &spec_of(&reopened, &mut cx).body else {
+    let spec_8185 = spec_of(&reopened, &mut cx);
+    let Body::Form(fields) = &spec_8185.http().unwrap().body else {
         panic!("expected a form body");
     };
     assert_eq!(fields.len(), 2, "the reopened form must be editable: {fields:?}");
@@ -8201,21 +8559,22 @@ async fn choosing_none_sends_no_body_and_switching_back_is_lossless(cx: &mut Tes
 
     cx.simulate_keystrokes("ctrl-shift-f");
     cx.simulate_input("field");
-    assert_eq!(spec_of(&view, &mut cx).body.label(), "Form");
+    assert_eq!(spec_of(&view, &mut cx).http().unwrap().body.label(), "Form");
 
     cx.simulate_keystrokes("ctrl-shift-b");
     cx.simulate_input("none");
     cx.simulate_keystrokes("enter");
     assert!(
-        matches!(spec_of(&view, &mut cx).body, Body::Empty),
+        matches!(spec_of(&view, &mut cx).http().unwrap().body, Body::Empty),
         "None must send nothing, whatever the editors still hold: {:?}",
-        spec_of(&view, &mut cx).body
+        spec_of(&view, &mut cx).http().unwrap().body
     );
 
     cx.simulate_keystrokes("ctrl-shift-b");
     cx.simulate_input("form");
     cx.simulate_keystrokes("enter");
-    let Body::Form(fields) = &spec_of(&view, &mut cx).body else {
+    let spec_8217 = spec_of(&view, &mut cx);
+    let Body::Form(fields) = &spec_8217.http().unwrap().body else {
         panic!("expected the form back");
     };
     assert_eq!(fields.len(), 1, "the form rows must survive a round trip: {fields:?}");
@@ -8264,7 +8623,7 @@ async fn an_imported_multipart_body_arrives_editable(cx: &mut TestAppContext) {
 
     let imported = active_view(&window, &mut cx);
     assert_eq!(
-        cx.update(|_, cx| imported.read(cx).body_type),
+        cx.update(|_, cx| imported.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Multipart
     );
     assert_eq!(cx.update(|_, cx| imported.read(cx).body_label()), "Multipart");
@@ -8273,14 +8632,15 @@ async fn an_imported_multipart_body_arrives_editable(cx: &mut TestAppContext) {
     let (text_parts, file_parts) = cx.update(|_, cx| {
         let view = imported.read(cx);
         (
-            view.multipart.iter().filter(|part| !part.is_file).count(),
-            view.multipart.iter().filter(|part| part.is_file).count(),
+            view.http().unwrap().multipart.iter().filter(|part| !part.is_file).count(),
+            view.http().unwrap().multipart.iter().filter(|part| part.is_file).count(),
         )
     });
     assert_eq!((text_parts, file_parts), (1, 1), "one text part and one file part");
 
     // And it still round-trips through the spec.
-    let Body::Multipart(fields) = &spec_of(&imported, &mut cx).body else {
+    let spec_8282 = spec_of(&imported, &mut cx);
+    let Body::Multipart(fields) = &spec_8282.http().unwrap().body else {
         panic!("expected multipart");
     };
     assert_eq!(fields.len(), 2);
@@ -8322,9 +8682,9 @@ async fn a_binary_body_with_no_file_chosen_sends_nothing(cx: &mut TestAppContext
 
     assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "Binary");
     assert!(
-        matches!(spec_of(&view, &mut cx).body, Body::Empty),
+        matches!(spec_of(&view, &mut cx).http().unwrap().body, Body::Empty),
         "{:?}",
-        spec_of(&view, &mut cx).body
+        spec_of(&view, &mut cx).http().unwrap().body
     );
 }
 
@@ -8349,7 +8709,7 @@ async fn a_chosen_file_becomes_the_body_and_its_bytes_reach_the_wire(cx: &mut Te
     // does and assert everything downstream of it.
     cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(file.clone(), cx)));
     assert_eq!(
-        spec_of(&view, &mut cx).body,
+        spec_of(&view, &mut cx).http().unwrap().body,
         Body::Binary(file.clone()),
         "the path should become the body"
     );
@@ -8426,7 +8786,7 @@ async fn a_binary_body_survives_a_save_and_reopen_as_editable(cx: &mut TestAppCo
 
     let bytes = std::fs::read(root.join("upload.json")).expect("saved");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
-    assert_eq!(saved.body, Body::Binary(file.clone()));
+    assert_eq!(saved.http().unwrap().body, Body::Binary(file.clone()));
 
     cx.simulate_keystrokes("ctrl-w");
     cx.simulate_keystrokes("ctrl-p");
@@ -8438,12 +8798,12 @@ async fn a_binary_body_survives_a_save_and_reopen_as_editable(cx: &mut TestAppCo
 
     let reopened = active_view(&window, &mut cx);
     assert_eq!(
-        cx.update(|_, cx| reopened.read(cx).body_type),
+        cx.update(|_, cx| reopened.read(cx).http().unwrap().body_type),
         crate::request_view::BodyType::Binary,
         "a reopened binary body must come back editable"
     );
     assert_eq!(
-        cx.update(|_, cx| reopened.read(cx).binary_path.clone()),
+        cx.update(|_, cx| reopened.read(cx).http().unwrap().binary_path.clone()),
         Some(file),
         "the chosen file must come back"
     );
@@ -8472,7 +8832,7 @@ async fn switching_from_binary_keeps_the_path_for_switching_back(cx: &mut TestAp
     cx.simulate_input("binary");
     cx.simulate_keystrokes("enter");
     assert_eq!(
-        spec_of(&view, &mut cx).body,
+        spec_of(&view, &mut cx).http().unwrap().body,
         Body::Binary(file),
         "the path should survive a round trip through another type"
     );
@@ -8488,8 +8848,9 @@ async fn ctrl_shift_m_adds_a_part_and_switches_the_body(cx: &mut TestAppContext)
     cx.simulate_input("hello");
 
     assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "Multipart");
-    let Body::Multipart(fields) = &spec_of(&view, &mut cx).body else {
-        panic!("expected multipart: {:?}", spec_of(&view, &mut cx).body);
+    let spec_8490 = spec_of(&view, &mut cx);
+    let Body::Multipart(fields) = &spec_8490.http().unwrap().body else {
+        panic!("expected multipart: {:?}", spec_of(&view, &mut cx).http().unwrap().body);
     };
     assert_eq!(fields.len(), 1);
     assert_eq!(fields[0].name, "caption");
@@ -8513,7 +8874,8 @@ async fn attaching_a_file_turns_a_part_into_a_file_part(cx: &mut TestAppContext)
     let file = PathBuf::from("/tmp/zuno-avatar.png");
     cx.update(|_, cx| view.update(cx, |view, cx| view.set_multipart_file(0, file.clone(), cx)));
 
-    let Body::Multipart(fields) = &spec_of(&view, &mut cx).body else {
+    let spec_8515 = spec_of(&view, &mut cx);
+    let Body::Multipart(fields) = &spec_8515.http().unwrap().body else {
         panic!("expected multipart");
     };
     assert_eq!(fields[0].value, MultipartValue::File(file), "part 0 became a file");
@@ -8561,7 +8923,8 @@ async fn a_disabled_part_is_left_out_but_kept(cx: &mut TestAppContext) {
     cx.simulate_input("drop");
     cx.simulate_keystrokes("alt-t");
 
-    let Body::Multipart(fields) = &spec_of(&view, &mut cx).body else {
+    let spec_8563 = spec_of(&view, &mut cx);
+    let Body::Multipart(fields) = &spec_8563.http().unwrap().body else {
         panic!("expected multipart");
     };
     assert_eq!(fields.len(), 2, "the muted part must still exist");
@@ -8592,8 +8955,8 @@ async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
 
     let bytes = std::fs::read(root.join("upload.json")).expect("saved");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
-    let Body::Multipart(fields) = &saved.body else {
-        panic!("the multipart body was not persisted: {:?}", saved.body);
+    let Body::Multipart(fields) = &saved.http().unwrap().body else {
+        panic!("the multipart body was not persisted: {:?}", saved.http().unwrap().body);
     };
     assert_eq!(fields[0].value, MultipartValue::Text("hello".to_string()));
     assert_eq!(fields[1].value, MultipartValue::File(file.clone()));
@@ -8611,7 +8974,7 @@ async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     let marks = cx.update(|_, cx| {
         reopened
             .read(cx)
-            .multipart
+            .http().unwrap().multipart
             .iter()
             .map(|part| part.is_file)
             .collect::<Vec<_>>()
@@ -10327,7 +10690,7 @@ async fn importing_a_spec_from_a_file_fills_the_collection(cx: &mut TestAppConte
     )
     .expect("parse");
     assert_eq!(created.url, "https://api.test/v1/invoices");
-    assert_eq!(created.method, zuno_core::Method::Post);
+    assert_eq!(created.http().unwrap().method, zuno_core::Method::Post);
 
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
@@ -12078,7 +12441,7 @@ async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAp
     cx.simulate_keystrokes("alt-shift-f");
     cx.run_until_parked();
 
-    let formatted = cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string());
+    let formatted = cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string());
     assert_eq!(
         formatted,
         "{\n  \"b\": 1,\n  \"a\": [\n    2,\n    3\n  ]\n}",
@@ -12088,7 +12451,7 @@ async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAp
     cx.simulate_keystrokes("ctrl-z");
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string()),
         r#"{"b":1,"a":[2,3]}"#,
         "a format has to be undoable"
     );
@@ -12099,7 +12462,7 @@ async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAp
     cx.simulate_keystrokes("alt-shift-m");
     cx.run_until_parked();
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string()),
         r#"{"b":1,"a":[2,3]}"#
     );
 }
@@ -12117,7 +12480,7 @@ async fn a_body_that_is_not_json_is_refused_with_a_reason_and_left_alone(cx: &mu
     cx.run_until_parked();
 
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string()),
         r#"{"a":1,}"#,
         "a broken body must be left exactly as it was"
     );
@@ -12138,7 +12501,7 @@ async fn a_body_that_is_not_json_is_refused_with_a_reason_and_left_alone(cx: &mu
     cx.run_until_parked();
 
     assert_eq!(
-        cx.update(|_, cx| view.read(cx).body_editor.read(cx).text().to_string()),
+        cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string()),
         r#"{"a":1}"#,
         "an XML-labelled body must not be reformatted as JSON"
     );

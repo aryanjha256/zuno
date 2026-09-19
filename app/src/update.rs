@@ -82,7 +82,10 @@ pub fn latest_request(settings: zuno_core::request::RequestSettings) -> RequestS
     RequestSpec {
         id: RequestId(0),
         url: LATEST_URL.to_string(),
-        method: zuno_core::Method::Get,
+        kind: zuno_core::RequestKind::Http(zuno_core::HttpRequest {
+            method: zuno_core::Method::Get,
+            ..Default::default()
+        }),
         settings: zuno_core::request::RequestSettings {
             follow_redirects: false,
             ..settings

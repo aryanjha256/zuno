@@ -20,11 +20,11 @@ use gpui::{
     px,
 };
 use zuno_core::{
-    Body, Engine, EngineError, Event, FormField, Header, Hits, JobId, Method, MultipartField,
+    RequestKind,
+    Body, BodyDiff, Engine, EngineError, Event, Header, Hits, JobId, RawKind, RequestId,
+    RequestSettings, RequestSpec, Resolver, ResponseData, ResponseDiff,
     assertion::{Assertion, Op},
     capture::Capture,
-    MultipartValue, QueryParam, RawKind, RequestId, RequestSettings, RequestSpec, Resolver,
-    BodyDiff, ResponseData, ResponseDiff,
 };
 
 /// Flip `enabled` on a row, reporting whether the index existed.
@@ -56,6 +56,7 @@ pub enum BodyType {
 }
 
 use crate::body_view::BodyView;
+use crate::kinds::{HttpEditor, KindEditor};
 use crate::input::text_input::Changed;
 use crate::input::{Editor, TextInput};
 use crate::theme::ActiveTheme;
@@ -107,7 +108,7 @@ pub struct KeyValueRow {
 }
 
 impl KeyValueRow {
-    fn new(
+    pub(crate) fn new(
         enabled: bool,
         name: &str,
         value: &str,
@@ -121,7 +122,7 @@ impl KeyValueRow {
         }
     }
 
-    fn is_focused(&self, window: &Window, cx: &App) -> bool {
+    pub(crate) fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.name.read(cx).focus_handle(cx).is_focused(window)
             || self.value.read(cx).focus_handle(cx).is_focused(window)
     }
@@ -198,38 +199,53 @@ impl CaptureRow {
 /// Headers, query and body used to stack, so the two you weren't editing still cost a header
 /// row and an empty-state row each — about 130px to say "nothing here". Tabbed, they cost one
 /// strip, and the body editor gets the pane's full height.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestTab {
     Headers,
-    /// Labelled "Params" but named Query throughout the code, matching `RowKind::Query` and
-    /// `RequestSpec::query` — that serde field is in every saved collection file, so renaming
-    /// it would break them with `missing field query`.
-    Query,
-    /// Default: authoring a body is where the time goes.
-    #[default]
-    Body,
+    /// One of the **active kind's own** tabs, by index into `KindEditor::tabs()`.
+    ///
+    /// **The strip is composed, not fixed.** HTTP contributes Params and Body; GraphQL
+    /// contributes Query and Variables; a future gRPC contributes Message. Before this, the
+    /// strip was a `const [RequestTab; 5]`, so a GraphQL request rendered **Params** and
+    /// **Body** tabs that meant nothing to it — and a new kind would have meant a new variant
+    /// here plus a new arm at every site that matched one.
+    Kind(u8),
     /// What this request publishes into the environment after a successful send.
     Capture,
     /// What a run checks in the response.
     Assert,
 }
 
+impl Default for RequestTab {
+    fn default() -> Self {
+        // Slot 1, which is the body for HTTP — where the time goes. A buffer that knows its
+        // kind uses `KindEditor::default_tab` instead; this is only the pre-load value.
+        RequestTab::Kind(1)
+    }
+}
+
 impl RequestTab {
     /// Visual order, which is also cycle order — deliberately not most-recently-used. With
     /// three tabs in a fixed strip, MRU sends the same keystroke somewhere different each time
     /// and throws away the muscle memory the strip gives for free.
-    pub const ALL: [RequestTab; 5] = [
-        RequestTab::Headers,
-        RequestTab::Query,
-        RequestTab::Body,
-        RequestTab::Capture,
-        RequestTab::Assert,
-    ];
+    /// The strip, in visual order, for the kind a buffer is currently authoring.
+    ///
+    /// Spine tabs bracket the kind's own: **who you are → what you send → what you check.**
+    /// That order happens to reproduce HTTP's original `Headers, Params, Body, Capture, Assert`
+    /// exactly, so the composed strip costs existing muscle memory nothing.
+    pub fn for_kind(kind: &KindEditor) -> Vec<RequestTab> {
+        let mut tabs = vec![RequestTab::Headers];
+        tabs.extend((0..kind.tabs().len() as u8).map(RequestTab::Kind));
+        tabs.push(RequestTab::Capture);
+        tabs.push(RequestTab::Assert);
+        tabs
+    }
 
-    fn step(self, delta: isize) -> Self {
-        let at = Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
-        let len = Self::ALL.len() as isize;
-        Self::ALL[(at + delta).rem_euclid(len) as usize]
+    fn step(self, delta: isize, kind: &KindEditor) -> Self {
+        let all = Self::for_kind(kind);
+        let at = all.iter().position(|tab| *tab == self).unwrap_or(0) as isize;
+        let len = all.len() as isize;
+        all[(at + delta).rem_euclid(len) as usize]
     }
 }
 
@@ -334,7 +350,7 @@ pub enum RowKind {
 const H_SCROLL_STEP: f32 = 70.;
 
 /// Compare a table of live rows against the baseline's, without building either.
-fn rows_match<T>(
+pub(crate) fn rows_match<T>(
     rows: &[KeyValueRow],
     base: &[T],
     field: impl Fn(&T) -> (bool, &str, &str),
@@ -364,28 +380,15 @@ pub struct RequestView {
     /// filename derived from the URL is *not* an identity: without remembering the file, a
     /// second Ctrl+S would derive the same name, find it taken, and write `posts-2.json`.
     pub path: Option<PathBuf>,
-    pub method: Method,
     pub url: Entity<TextInput>,
     pub headers: Vec<KeyValueRow>,
-    pub query: Vec<KeyValueRow>,
-    /// The editor owns the body text, exactly as the inputs own theirs — `spec()` reads
-    /// through to it rather than mirroring into a field.
-    pub body_editor: Entity<Editor>,
-    /// Which body this request sends. `Raw` is further qualified by `body_kind`.
+    /// **Everything that differs by protocol**, in one field instead of a dozen.
     ///
-    /// Stored rather than inferred: a `Form` body with no fields yet and an `Empty` body are
-    /// different intentions that look identical in the data, so nothing else records the
-    /// choice.
-    pub body_type: BodyType,
-    /// Private, and set only through `set_body_kind`. The editor's colouring is derived from it,
-    /// and a public field is how those two drift: assigning it directly compiles and silently
-    /// leaves JSON text painted as plain, or XML painted as JSON.
-    body_kind: RawKind,
-    /// Fields of a form body. Same widget as the header and query tables, since
-    /// `FormField` has the same shape as `Header`.
-    pub form: Vec<KeyValueRow>,
-    /// Parts of a multipart body.
-    pub multipart: Vec<MultipartRow>,
+    /// The app-side mirror of `RequestKind`: `KindEditor::Http` owns the method, query rows and
+    /// the five body editors; `KindEditor::GraphQl` owns the document, its variables and the
+    /// operation name. Adding gRPC or MQTT is a new variant and a new module, with the compiler
+    /// naming every site that has to respond — and nothing added here.
+    pub kind: KindEditor,
     /// What this request publishes. Held as rows for the same reason every other table is:
     /// `spec` derives from the inputs, so anything not represented here is destroyed on save.
     pub captures: Vec<CaptureRow>,
@@ -396,13 +399,6 @@ pub struct RequestView {
     /// alongside it, so what runs cannot disagree with what is on screen — and an empty or
     /// unparseable box simply means "this request states no expectation".
     pub expect_status: Entity<TextInput>,
-    /// The file a binary body sends.
-    ///
-    /// Only the path is held — the bytes are read at the send boundary by `build.rs`, so a
-    /// file edited between sends goes out in its new state, and a 2GB upload never sits in
-    /// this process's memory. A missing file surfaces as `BodyFileUnreadable` rather than
-    /// being checked here, which would mean a filesystem call on every frame.
-    pub binary_path: Option<PathBuf>,
     pub settings: RequestSettings,
 
     pub response: Option<ResponseData>,
@@ -505,21 +501,14 @@ impl RequestView {
             name: String::new(),
             baseline: RequestSpec::default(),
             path: None,
-            method: Method::Get,
             url: cx.new(|cx| TextInput::new("", "", "UrlBar", cx)),
             headers: Vec::new(),
-            query: Vec::new(),
-            body_editor: cx.new(|cx| Editor::new("", "Request body…", cx)),
-            body_type: BodyType::Empty,
-            body_kind: RawKind::Json,
-            form: Vec::new(),
-            multipart: Vec::new(),
+            kind: KindEditor::Http(HttpEditor::new(cx)),
             captures: Vec::new(),
             assertions: Vec::new(),
             expect_status: cx.new(|cx| TextInput::new("", "200", "ExpectStatus", cx)),
             capture_target: None,
             capture_task: None,
-            binary_path: None,
             settings: RequestSettings::default(),
             response: None,
             diff: None,
@@ -549,6 +538,9 @@ impl RequestView {
             response_focus: cx.focus_handle().tab_index(2).tab_stop(true),
         };
         view.load(spec, cx);
+        // A fresh buffer opens on its kind's home tab. `load` cannot decide this — it now
+        // preserves whatever tab the buffer was on, and a new one has no meaningful "was".
+        view.request_tab = RequestTab::Kind(view.kind.default_tab());
         view
     }
 
@@ -559,6 +551,43 @@ impl RequestView {
     /// the buffer's *identity* hasn't changed — only what's in it.
     ///
     /// `response_focus` is intentionally not rebuilt, so focus survives the swap.
+    /// The HTTP editors, when this buffer is authoring an HTTP request.
+    ///
+    /// `None` for any other kind, and callers are expected to *mean* it — a GraphQL request has
+    /// no body table, no form rows and no query rows, so a control for one would be a control
+    /// that does nothing. Same shape as `RequestSpec::http`, deliberately.
+    pub fn http(&self) -> Option<&HttpEditor> {
+        self.kind.as_http()
+    }
+
+    /// Replace the authoring state with another kind's.
+    ///
+    /// **Destructive by nature** — the outgoing `KindEditor` owns its editors, so its text goes
+    /// with it. `Workspace::switch_request_kind` asks first when there is anything to lose; see
+    /// `KindEditor::has_content`.
+    pub fn set_kind(&mut self, kind: KindEditor, cx: &mut Context<Self>) {
+        // A tab slot valid for the old kind may not exist in the new one.
+        self.request_tab = RequestTab::Kind(kind.default_tab());
+        self.kind = kind;
+        cx.notify();
+    }
+
+    /// The HTTP verb, for the kinds that have one.
+    pub fn method(&self) -> Option<&zuno_core::Method> {
+        self.kind.method()
+    }
+
+    pub fn set_method(&mut self, method: zuno_core::Method, cx: &mut Context<Self>) {
+        self.kind.set_method(method);
+        cx.notify();
+    }
+
+    /// The text surface this kind's find bar and formatter act on — the body editor for a raw
+    /// HTTP body, the document for GraphQL.
+    pub fn primary_editor(&self) -> Option<&Entity<Editor>> {
+        self.kind.primary_editor()
+    }
+
     pub fn load(&mut self, spec: RequestSpec, cx: &mut Context<Self>) {
         self.baseline = spec.clone();
 
@@ -580,72 +609,27 @@ impl RequestView {
             })
             .collect();
 
-        let query = spec
-            .query
-            .iter()
-            .map(|param| {
-                KeyValueRow::new(param.enabled, &param.name, &param.value, "QueryCell", cx)
-            })
-            .collect();
+        // **One call, and it is exhaustive on the kind.** Everything that differs by protocol
+        // is built inside `KindEditor::from_spec`, so a new kind is a new arm there rather than
+        // another twenty lines here — and `load` silently dropping a kind's fields is exactly
+        // how non-raw bodies were once emptied and then written over on save.
+        //
+        // Built before the fields below are replaced, so a failure part-way cannot leave the
+        // view half-loaded.
+        let kind = KindEditor::from_spec(&spec.kind, cx);
 
-        // Exhaustive on purpose — no catch-all. Every `Body` variant has an editor now, so
-        // adding one has to fail the build rather than be silently set aside. The catch-all
-        // this replaced was itself a fix for `load` *dropping* non-raw bodies, which a save
-        // then wrote to disk.
-        let (body_text, body_kind, body_type) = match &spec.body {
-            Body::Raw { text, kind } => (text.clone(), *kind, BodyType::Raw),
-            // Empty stays editable: typing into it is how you get a raw body.
-            Body::Empty => (String::new(), RawKind::Json, BodyType::Empty),
-            Body::Form(_) => (String::new(), RawKind::Json, BodyType::Form),
-            Body::Binary(_) => (String::new(), RawKind::Json, BodyType::Binary),
-            Body::Multipart(_) => (String::new(), RawKind::Json, BodyType::Multipart),
-        };
-
-        let binary_path = match &spec.body {
-            Body::Binary(path) => Some(path.clone()),
-            _ => None,
-        };
-
-        let multipart = match &spec.body {
-            Body::Multipart(fields) => fields
-                .iter()
-                .map(|field| {
-                    let (text, is_file) = match &field.value {
-                        MultipartValue::Text(text) => (text.clone(), false),
-                        MultipartValue::File(path) => (path.display().to_string(), true),
-                    };
-                    MultipartRow {
-                        row: KeyValueRow::new(field.enabled, &field.name, &text, "PartCell", cx),
-                        is_file,
-                    }
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        let form = match &spec.body {
-            Body::Form(fields) => fields
-                .iter()
-                .map(|field| {
-                    KeyValueRow::new(field.enabled, &field.name, &field.value, "FormCell", cx)
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        let body_editor = cx.new(|cx| Editor::new(body_text, "Request body…", cx));
-
+        // **Kept if it still exists, not reset.** `request_tab` is documented as sticky per
+        // buffer — `response_view`'s note is explicit that not even `load` resets it — and
+        // clearing it here threw away which section you were editing every time a request was
+        // opened. Only a slot the incoming kind does not have needs replacing.
+        if !RequestTab::for_kind(&kind).contains(&self.request_tab) {
+            self.request_tab = RequestTab::Kind(kind.default_tab());
+        }
         self.id = spec.id;
         self.name = spec.name;
-        self.method = spec.method;
+        self.kind = kind;
         self.url = url;
         self.headers = headers;
-        self.query = query;
-        self.body_editor = body_editor;
-        self.set_body_kind(body_kind, cx);
-        self.body_type = body_type;
-        self.form = form;
-        self.binary_path = binary_path;
-        self.multipart = multipart;
         self.captures = spec
             .captures
             .iter()
@@ -706,7 +690,7 @@ impl RequestView {
     /// Per-buffer, so switching tabs doesn't carry the choice with it — the pane belongs to
     /// the buffer, and two requests being read for different reasons is the normal case.
     pub fn cycle_request_tab(&mut self, delta: isize, cx: &mut Context<Self>) {
-        self.request_tab = self.request_tab.step(delta);
+        self.request_tab = self.request_tab.step(delta, &self.kind);
         cx.notify();
     }
 
@@ -843,17 +827,8 @@ impl RequestView {
                 .collect(),
             id: self.id,
             name: self.name.clone(),
-            method: self.method.clone(),
             url: self.url.read(cx).text().to_string(),
-            query: self
-                .query
-                .iter()
-                .map(|row| QueryParam {
-                    enabled: row.enabled,
-                    name: row.name.read(cx).text().to_string(),
-                    value: row.value.read(cx).text().to_string(),
-                })
-                .collect(),
+            kind: self.request_kind(cx),
             headers: self
                 .headers
                 .iter()
@@ -863,7 +838,6 @@ impl RequestView {
                     value: row.value.read(cx).text().to_string(),
                 })
                 .collect(),
-            body: self.body(cx),
             settings: self.settings.clone(),
         }
     }
@@ -886,136 +860,41 @@ impl RequestView {
             // Neither is edited here: a session-local handle, and a name derived from the URL.
             id: _,
             name: _,
-            method,
             url,
-            query,
             headers,
-            body,
             settings,
+            kind,
             captures,
             expect_status,
             assertions,
         } = &self.baseline;
 
-        self.method != *method
-            || self.settings != *settings
+        // Destructured with no `..` for the same reason the spec is: a field added to the
+        // kind must fail to compile here until someone decides whether editing it makes a
+        // buffer dirty. The kind itself is matched exhaustively so that *adding a kind*
+        // does too.
+        let spine_changed = self.settings != *settings
             || self.url.read(cx).text() != url
-            || !rows_match(&self.query, query, |p| (p.enabled, &p.name, &p.value), cx)
             || !rows_match(&self.headers, headers, |h| (h.enabled, &h.name, &h.value), cx)
-            || !self.body_matches(body, cx)
             || !self.captures_match(captures, cx)
             || self.expect_status_value(cx) != *expect_status
-            || !self.assertions_match(assertions, cx)
+            || !self.assertions_match(assertions, cx);
+
+        if spine_changed {
+            return true;
+        }
+
+        self.kind.is_dirty(kind, cx)
     }
 
-    /// `body()`'s mapping asked as a question instead of built as a value.
+    /// The kind half of `spec`, read back out of whichever editors are live.
     ///
-    /// **Must stay in step with `body()` directly below**, including its two collapses to
-    /// `Empty` — a blank editor and a binary body with no file chosen. Mirroring by hand is what
-    /// keeps `is_dirty` allocation-free; `a_freshly_loaded_request_is_clean` covers every variant
-    /// so the mirror cannot drift silently.
-    fn body_matches(&self, base: &Body, cx: &App) -> bool {
-        match self.body_type {
-            BodyType::Empty => matches!(base, Body::Empty),
-            BodyType::Raw => {
-                let text = self.body_editor.read(cx).text();
-                match base {
-                    Body::Empty => text.trim().is_empty(),
-                    Body::Raw { text: base, kind } => {
-                        !text.trim().is_empty() && base == text && *kind == self.body_kind
-                    }
-                    _ => false,
-                }
-            }
-            BodyType::Binary => match (&self.binary_path, base) {
-                (Some(path), Body::Binary(base)) => path == base,
-                (None, Body::Empty) => true,
-                _ => false,
-            },
-            BodyType::Form => match base {
-                Body::Form(base) => {
-                    rows_match(&self.form, base, |f| (f.enabled, &f.name, &f.value), cx)
-                }
-                _ => false,
-            },
-            BodyType::Multipart => match base {
-                Body::Multipart(base) => {
-                    self.multipart.len() == base.len()
-                        && self.multipart.iter().zip(base).all(|(row, part)| {
-                            let text = row.row.value.read(cx).text();
-                            row.row.enabled == part.enabled
-                                && row.row.name.read(cx).text() == part.name
-                                && match (&part.value, row.is_file) {
-                                    // `body()` builds this with `PathBuf::from(text)`, so the
-                                    // round trip back to a string is the comparison.
-                                    (MultipartValue::File(path), true) => {
-                                        path.display().to_string() == text
-                                    }
-                                    (MultipartValue::Text(base), false) => base == text,
-                                    _ => false,
-                                }
-                        })
-                }
-                _ => false,
-            },
-        }
-    }
-
-    /// A blank editor means no body at all, not an empty raw one — sending
-    /// `Content-Type: application/json` with zero bytes confuses servers.
-    fn body(&self, cx: &App) -> Body {
-        match self.body_type {
-            BodyType::Form => Body::Form(
-                self.form
-                    .iter()
-                    .map(|row| FormField {
-                        enabled: row.enabled,
-                        name: row.name.read(cx).text().to_string(),
-                        value: row.value.read(cx).text().to_string(),
-                    })
-                    .collect(),
-            ),
-            BodyType::Multipart => Body::Multipart(
-                self.multipart
-                    .iter()
-                    .map(|part| {
-                        let text = part.row.value.read(cx).text().to_string();
-                        MultipartField {
-                            enabled: part.row.enabled,
-                            name: part.row.name.read(cx).text().to_string(),
-                            value: if part.is_file {
-                                MultipartValue::File(PathBuf::from(text))
-                            } else {
-                                MultipartValue::Text(text)
-                            },
-                        }
-                    })
-                    .collect(),
-            ),
-            // No file chosen yet is `Empty`, not a broken `Binary("")` — the request is
-            // incomplete, not malformed, and sending nothing is the honest reading.
-            BodyType::Binary => match &self.binary_path {
-                Some(path) => Body::Binary(path.clone()),
-                None => Body::Empty,
-            },
-            // Unconditional: "None" means no body even though the editor may still hold
-            // text. Falling through to the editor here meant picking None sent the previous
-            // body anyway — the setting looked applied and wasn't.
-            BodyType::Empty => Body::Empty,
-            BodyType::Raw => {
-                let text = self.body_editor.read(cx).text();
-                // An empty raw body is `Empty`, not `Raw("")`: it keeps a blank editor from
-                // sending a Content-Type for content that isn't there.
-                if text.trim().is_empty() {
-                    Body::Empty
-                } else {
-                    Body::Raw {
-                        text: text.to_string(),
-                        kind: self.body_kind,
-                    }
-                }
-            }
-        }
+    /// **Only one side is ever read**, which is what keeps the two from fighting: an HTTP
+    /// request never carries a stray GraphQL document, and a GraphQL request never carries a
+    /// body the user cannot see. Switching kind is lossless in the same way switching body type
+    /// is — both sets of editors keep their text, and only what gets *sent* changes.
+    fn request_kind(&self, cx: &App) -> RequestKind {
+        self.kind.to_spec(cx)
     }
 
     /// Choose the body type.
@@ -1024,7 +903,8 @@ impl RequestView {
     /// binary path all stay put, so switching JSON → Form → JSON round-trips and only what
     /// gets *sent* changes. A mistaken type change is therefore never destructive.
     pub fn set_body_type(&mut self, body_type: BodyType, cx: &mut Context<Self>) {
-        self.body_type = body_type;
+        let Some(http) = self.kind.as_http_mut() else { return };
+        http.set_body_type(body_type);
         cx.notify();
     }
 
@@ -1039,7 +919,8 @@ impl RequestView {
     /// file only by choosing one, nothing on the row said which it was, and there was no way
     /// back. A form-data body routinely mixes the two.
     pub fn set_multipart_kind(&mut self, ix: usize, is_file: bool, cx: &mut Context<Self>) {
-        let Some(part) = self.multipart.get_mut(ix) else { return };
+        let Some(http) = self.kind.as_http_mut() else { return };
+        let Some(part) = http.multipart.get_mut(ix) else { return };
         if part.is_file == is_file {
             return;
         }
@@ -1049,7 +930,8 @@ impl RequestView {
 
     /// Point a multipart part at a file, marking it a file part.
     pub fn set_multipart_file(&mut self, ix: usize, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(part) = self.multipart.get_mut(ix) else {
+        let Some(http) = self.kind.as_http_mut() else { return };
+        let Some(part) = http.multipart.get_mut(ix) else {
             return;
         };
         part.is_file = true;
@@ -1070,7 +952,7 @@ impl RequestView {
     /// `Window::dispatch_action` reads it before deferring (`window.rs:1386` and `:1477`), so
     /// focusing here and dispatching on the next line reaches the row that was clicked.
     pub fn focus_multipart_value(&self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(part) = self.multipart.get(ix) else { return };
+        let Some(part) = self.http().and_then(|http| http.multipart.get(ix)) else { return };
         window.focus(&part.row.value.read(cx).focus_handle(cx));
     }
 
@@ -1079,10 +961,11 @@ impl RequestView {
     /// Lets one "choose a file" verb serve both bodies: with a part focused it fills that
     /// part, otherwise it sets the whole binary body.
     pub fn focused_multipart_row(&self, window: &Window, cx: &App) -> Option<usize> {
-        if self.body_type != BodyType::Multipart {
+        let http = self.http()?;
+        if http.body_type != BodyType::Multipart {
             return None;
         }
-        self.multipart
+        http.multipart
             .iter()
             .position(|part| part.row.is_focused(window, cx))
     }
@@ -1116,8 +999,14 @@ impl RequestView {
         self.url.read(cx).focus_handle(cx)
     }
 
-    pub fn body_focus(&self, cx: &App) -> FocusHandle {
-        self.body_editor.read(cx).focus_handle(cx)
+    /// The main text surface's focus handle, when this kind has one on screen.
+    ///
+    /// Kind-aware now: for GraphQL it is the document editor, not a body editor that is never
+    /// painted. Focusing an unpainted handle is what once killed the whole keymap — see
+    /// `body_focus_target`.
+    pub fn body_focus(&self, cx: &App) -> Option<FocusHandle> {
+        self.primary_editor()
+            .map(|editor| editor.read(cx).focus_handle(cx))
     }
 
     /// The handle `FocusBody` should move focus to, or `None` when this body has nothing to
@@ -1134,13 +1023,17 @@ impl RequestView {
     /// Exhaustive with no catch-all: a new `Body` variant has to say where focus goes rather than
     /// inheriting a handle that might not be rendered.
     pub fn body_focus_target(&self, cx: &App) -> Option<FocusHandle> {
-        match self.body_type {
-            BodyType::Raw => Some(self.body_focus(cx)),
-            BodyType::Form => self
+        let Some(http) = self.http() else {
+            // Every other kind's main surface is an editor that is always painted.
+            return self.body_focus(cx);
+        };
+        match http.body_type {
+            BodyType::Raw => self.body_focus(cx),
+            BodyType::Form => http
                 .form
                 .first()
                 .map(|row| row.name.read(cx).focus_handle(cx)),
-            BodyType::Multipart => self
+            BodyType::Multipart => http
                 .multipart
                 .first()
                 .map(|part| part.row.name.read(cx).focus_handle(cx)),
@@ -1160,11 +1053,16 @@ impl RequestView {
     /// Matched exhaustively with no catch-all, like `load`: a new `Body` variant should not
     /// silently inherit "never focused".
     pub fn body_region_focused(&self, window: &Window, cx: &App) -> bool {
-        match self.body_type {
-            BodyType::Raw => self.body_focus(cx).is_focused(window),
-            BodyType::Form => self.form.iter().any(|row| row.is_focused(window, cx)),
+        let Some(http) = self.http() else {
+            return self.kind.is_focused(window, cx);
+        };
+        match http.body_type {
+            BodyType::Raw => self
+                .body_focus(cx)
+                .is_some_and(|handle| handle.is_focused(window)),
+            BodyType::Form => http.form.iter().any(|row| row.is_focused(window, cx)),
             BodyType::Multipart => {
-                self.multipart.iter().any(|part| part.row.is_focused(window, cx))
+                http.multipart.iter().any(|part| part.row.is_focused(window, cx))
             }
             // Neither has anything focusable: a binary body is a path you click, and an empty
             // one is a sentence.
@@ -1552,7 +1450,7 @@ impl RequestView {
     /// Reveals the Body tab first, for the same reason the response bar switches to the Body
     /// view: a find bar that appears over a section you cannot see reads as doing nothing.
     pub fn open_body_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_tab = RequestTab::Body;
+        self.request_tab = RequestTab::Kind(1);
 
         if self.body_search.is_none() {
             let query = cx.new(|cx| {
@@ -1589,8 +1487,11 @@ impl RequestView {
     /// Close it, putting focus back in the editor rather than leaving it on a dropped input.
     pub fn close_body_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.body_search.take().is_some() {
-            let handle = self.body_editor.read(cx).focus_handle(cx);
-            window.focus(&handle);
+            // Whichever surface this kind searches — the body editor for a raw HTTP body, the
+            // document for GraphQL. Focusing an unpainted handle is what kills the keymap.
+            if let Some(handle) = self.body_focus(cx) {
+                window.focus(&handle);
+            }
             cx.notify();
         }
     }
@@ -1611,7 +1512,8 @@ impl RequestView {
     pub fn run_body_search(&mut self, cx: &mut Context<Self>) {
         let Some(search) = &self.body_search else { return };
         let query = search.query.read(cx).text().to_string();
-        let content = self.body_editor.read(cx).text().to_string();
+        let Some(editor) = self.primary_editor().cloned() else { return };
+        let content = editor.read(cx).text().to_string();
 
         let hits = if query.is_empty() {
             zuno_core::search::Hits::default()
@@ -1621,7 +1523,7 @@ impl RequestView {
 
         // Which line each match falls in, so the bar can scroll to it and the editor can paint
         // it. `rows` means display lines here — see `TextSearch`.
-        let rows = self.body_editor.read(cx).lines_for_offsets(&hits.offsets);
+        let rows = editor.read(cx).lines_for_offsets(&hits.offsets);
 
         let Some(search) = self.body_search.as_mut() else { return };
         search.offsets = hits.offsets;
@@ -1659,7 +1561,8 @@ impl RequestView {
         let Some(&start) = search.offsets.get(search.current) else { return };
         let len = search.query.read(cx).text().len();
 
-        self.body_editor.update(cx, |editor, cx| {
+        let Some(editor) = self.primary_editor().cloned() else { return };
+        editor.update(cx, |editor, cx| {
             editor.select_range(start as usize, start as usize + len, cx);
         });
         cx.notify();
@@ -1677,7 +1580,8 @@ impl RequestView {
         let with = replace.read(cx).text().to_string();
         let len = search.query.read(cx).text().len();
 
-        self.body_editor.update(cx, |editor, cx| {
+        let Some(editor) = self.primary_editor().cloned() else { return 0 };
+        editor.update(cx, |editor, cx| {
             editor.replace_range(start as usize..start as usize + len, &with, window, cx);
         });
         // The offsets after this one have all shifted, so re-scan rather than patch them. A few
@@ -1708,7 +1612,8 @@ impl RequestView {
             .rev()
             .map(|start| *start as usize..*start as usize + len)
             .collect();
-        self.body_editor.update(cx, |editor, cx| {
+        let Some(editor) = self.primary_editor().cloned() else { return 0 };
+        editor.update(cx, |editor, cx| {
             editor.replace_ranges(&ranges, &with, window, cx);
         });
 
@@ -1936,7 +1841,7 @@ impl RequestView {
     /// Test-only, like `Workspace::tab_count`: nothing in the UI reads the kind directly, it
     /// reads the label derived from it.
     pub fn body_kind(&self) -> RawKind {
-        self.body_kind
+        self.http().map(HttpEditor::body_kind).unwrap_or_default()
     }
 
     /// Set the raw body's flavour, and the editor's colouring with it.
@@ -1945,10 +1850,9 @@ impl RequestView {
     /// entities, so keeping them in step at each call site is a rule to remember rather than a
     /// thing that cannot be got wrong.
     pub fn set_body_kind(&mut self, kind: RawKind, cx: &mut Context<Self>) {
-        self.body_kind = kind;
-        let json = matches!(kind, RawKind::Json);
-        self.body_editor
-            .update(cx, |editor, cx| editor.set_highlight_json(json, cx));
+        if let Some(http) = self.kind.as_http_mut() {
+            http.set_body_kind(kind, cx);
+        }
         cx.notify();
     }
 
@@ -1961,7 +1865,7 @@ impl RequestView {
     }
 
     pub fn multipart_is_file(&self, ix: usize) -> bool {
-        self.multipart.get(ix).is_some_and(|part| part.is_file)
+        self.http().is_some_and(|http| http.multipart_is_file(ix))
     }
 
     /// The row whose type chip was clicked, and where it is. Consumed, so a stale click cannot
@@ -2056,22 +1960,37 @@ impl RequestView {
                 self.headers.push(row);
                 self.headers.last()
             }
+            // Params, form fields and multipart parts are HTTP's tables — a kind without them
+            // has nothing to add a row to, so the verb is a no-op rather than a panic.
             RowKind::Query => {
                 let row = KeyValueRow::new(true, "", "", "QueryCell", cx);
-                self.query.push(row);
-                self.query.last()
+                match self.kind.as_http_mut() {
+                    Some(http) => {
+                        http.query.push(row);
+                        http.query.last()
+                    }
+                    None => None,
+                }
             }
             RowKind::Form => {
                 let row = KeyValueRow::new(true, "", "", "FormCell", cx);
-                self.form.push(row);
-                self.form.last()
+                match self.kind.as_http_mut() {
+                    Some(http) => {
+                        http.form.push(row);
+                        http.form.last()
+                    }
+                    None => None,
+                }
             }
             RowKind::Multipart => {
-                self.multipart.push(MultipartRow {
-                    row: KeyValueRow::new(true, "", "", "PartCell", cx),
-                    is_file: false,
-                });
-                self.multipart.last().map(|part| &part.row)
+                let row = KeyValueRow::new(true, "", "", "PartCell", cx);
+                match self.kind.as_http_mut() {
+                    Some(http) => {
+                        http.multipart.push(MultipartRow { row, is_file: false });
+                        http.multipart.last().map(|part| &part.row)
+                    }
+                    None => None,
+                }
             }
             // A different row type, so it cannot ride the shared `Option<&KeyValueRow>` return.
             // It moves focus itself, into the path cell rather than a name cell.
@@ -2102,16 +2021,21 @@ impl RequestView {
         {
             return Some((RowKind::Header, ix));
         }
-        if let Some(ix) = self.query.iter().position(|row| row.is_focused(window, cx)) {
-            return Some((RowKind::Query, ix));
-        }
-        if let Some(ix) = self.form.iter().position(|row| row.is_focused(window, cx)) {
-            return Some((RowKind::Form, ix));
+        if let Some(http) = self.http() {
+            if let Some(ix) = http.query.iter().position(|row| row.is_focused(window, cx)) {
+                return Some((RowKind::Query, ix));
+            }
+            if let Some(ix) = http.form.iter().position(|row| row.is_focused(window, cx)) {
+                return Some((RowKind::Form, ix));
+            }
         }
         if let Some(ix) = self
-            .multipart
-            .iter()
-            .position(|part| part.row.is_focused(window, cx))
+            .http()
+            .and_then(|http| {
+                http.multipart
+                    .iter()
+                    .position(|part| part.row.is_focused(window, cx))
+            })
         {
             return Some((RowKind::Multipart, ix));
         }
@@ -2129,9 +2053,20 @@ impl RequestView {
     fn toggle(&mut self, kind: RowKind, ix: usize) -> bool {
         match kind {
             RowKind::Header => flip_enabled(&mut self.headers, ix),
-            RowKind::Query => flip_enabled(&mut self.query, ix),
-            RowKind::Form => flip_enabled(&mut self.form, ix),
-            RowKind::Multipart => match self.multipart.get_mut(ix) {
+            // HTTP's own tables: a kind without them has no row to toggle.
+            RowKind::Query => self
+                .kind
+                .as_http_mut()
+                .is_some_and(|http| flip_enabled(&mut http.query, ix)),
+            RowKind::Form => self
+                .kind
+                .as_http_mut()
+                .is_some_and(|http| flip_enabled(&mut http.form, ix)),
+            RowKind::Multipart => match self
+                .kind
+                .as_http_mut()
+                .and_then(|http| http.multipart.get_mut(ix))
+            {
                 Some(part) => {
                     part.row.enabled = !part.row.enabled;
                     true
@@ -2158,9 +2093,9 @@ impl RequestView {
     fn remove(&mut self, kind: RowKind, ix: usize) -> bool {
         let len = match kind {
             RowKind::Header => self.headers.len(),
-            RowKind::Query => self.query.len(),
-            RowKind::Form => self.form.len(),
-            RowKind::Multipart => self.multipart.len(),
+            RowKind::Query => self.http().map_or(0, |http| http.query.len()),
+            RowKind::Form => self.http().map_or(0, |http| http.form.len()),
+            RowKind::Multipart => self.http().map_or(0, |http| http.multipart.len()),
             RowKind::Capture => self.captures.len(),
             RowKind::Assert => self.assertions.len(),
         };
@@ -2169,9 +2104,20 @@ impl RequestView {
         }
         match kind {
             RowKind::Header => drop(self.headers.remove(ix)),
-            RowKind::Query => drop(self.query.remove(ix)),
-            RowKind::Form => drop(self.form.remove(ix)),
-            RowKind::Multipart => drop(self.multipart.remove(ix)),
+            // `len` above is 0 for a kind without these tables, so `ix >= len` has already
+            // returned — the `else` arms are unreachable rather than silently doing nothing.
+            RowKind::Query => match self.kind.as_http_mut() {
+                Some(http) => drop(http.query.remove(ix)),
+                None => return false,
+            },
+            RowKind::Form => match self.kind.as_http_mut() {
+                Some(http) => drop(http.form.remove(ix)),
+                None => return false,
+            },
+            RowKind::Multipart => match self.kind.as_http_mut() {
+                Some(http) => drop(http.multipart.remove(ix)),
+                None => return false,
+            },
             RowKind::Capture => drop(self.captures.remove(ix)),
             RowKind::Assert => drop(self.assertions.remove(ix)),
         }
@@ -2335,19 +2281,16 @@ impl RequestView {
     /// against the row labels, it marked *JSON* as current on every fresh buffer and could
     /// never mark None. The string has to stay equal to the picker's own "None" label.
     pub fn body_label(&self) -> SharedString {
-        match self.body_type {
-            BodyType::Empty => SharedString::from("None"),
-            BodyType::Form => SharedString::from("Form"),
-            BodyType::Binary => SharedString::from("Binary"),
-            BodyType::Multipart => SharedString::from("Multipart"),
-            BodyType::Raw => SharedString::from(self.body_kind.label()),
-        }
+        self.http()
+            .map(HttpEditor::body_label)
+            .unwrap_or_else(|| SharedString::from("None"))
     }
 
     /// Point a binary body at a file, switching the body type to match.
     pub fn set_binary_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.binary_path = Some(path);
-        self.set_body_type(BodyType::Binary, cx);
+        let Some(http) = self.kind.as_http_mut() else { return };
+        http.set_binary_path(path);
+        cx.notify();
     }
 
     /// An explicit `Content-Type` header that disagrees with the body being sent, if there
@@ -2359,7 +2302,7 @@ impl RequestView {
     /// server rejects or misparses it. Reported rather than rewritten — editing someone's
     /// headers behind their back is worse than telling them.
     pub fn conflicting_content_type(&self, cx: &App) -> Option<(String, &'static str)> {
-        let expected = match self.body(cx) {
+        let expected = match self.http()?.body(cx) {
             Body::Raw { kind, .. } => kind.content_type(),
             Body::Form(_) => "application/x-www-form-urlencoded",
             // Nothing to disagree with. `build.rs` deliberately sends no Content-Type for
@@ -2398,13 +2341,24 @@ impl Render for RequestView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
 
+        let url_focused = self.url_focus(cx).is_focused(window);
+
         div()
             .flex_1()
             .flex()
-            .flex_row()
+            .flex_col()
             .overflow_hidden()
-            .child(request_pane::render(self, &theme, window, cx))
-            .child(div().w(px(1.)).flex_none().bg(theme.border))
-            .child(response_pane::render(self, &theme, window, cx))
+            // Full width, above the split — see `request_pane::toolbar`.
+            .child(request_pane::toolbar(self, &theme, url_focused, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .overflow_hidden()
+                    .child(request_pane::render(self, &theme, window, cx))
+                    .child(div().w(px(1.)).flex_none().bg(theme.border))
+                    .child(response_pane::render(self, &theme, window, cx)),
+            )
     }
 }

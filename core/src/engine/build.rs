@@ -13,7 +13,10 @@ use http::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Request, Url};
 
 use crate::engine::error::EngineError;
-use crate::request::{Body, FormField, Method, MultipartValue, RequestSpec};
+use crate::request::{
+    Body, FormField, GraphQlRequest, HttpRequest, Method, MultipartValue, RequestKind,
+    RequestSpec,
+};
 
 /// A body that has been reduced to bytes, plus the Content-Type it implies.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,8 +111,12 @@ pub fn resolve_url(spec: &RequestSpec) -> Result<Url, EngineError> {
 
     // Params from the table are appended on top of anything already written into the
     // URL text, so both places work and neither silently wins.
+    // A kind with no query table contributes none — the endpoint is then whatever the URL
+    // text says, which is the honest reading for a protocol that has no such table.
     let params: Vec<_> = spec
-        .enabled_query()
+        .http()
+        .into_iter()
+        .flat_map(HttpRequest::enabled_query)
         .filter(|param| !param.name.trim().is_empty())
         .collect();
 
@@ -209,7 +216,16 @@ pub fn encode_form(fields: &[FormField]) -> String {
 }
 
 pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
-    match &spec.body {
+    // Exhaustive on the kind, with no catch-all: a new kind carries its own payload and
+    // must decide how it reaches the wire rather than silently sending nothing.
+    let http = match &spec.kind {
+        RequestKind::Http(http) => http,
+        // The envelope is built by `graphql_envelope` and attached in `build_graphql`, which
+        // also decides whether it travels as a body at all — a GET sends it in the query
+        // string, so "the body" is genuinely nothing here rather than merely empty.
+        RequestKind::GraphQl(_) => return Ok(PreparedBody::None),
+    };
+    match &http.body {
         Body::Empty => Ok(PreparedBody::None),
 
         Body::Raw { text, kind } => {
@@ -294,8 +310,132 @@ pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
 
 /// Compose the pieces into a request ready for `Client::execute`.
 pub fn build(client: &Client, spec: &RequestSpec) -> Result<Request, EngineError> {
+    match &spec.kind {
+        RequestKind::Http(http) => build_http(client, spec, http),
+        RequestKind::GraphQl(graphql) => build_graphql(client, spec, graphql),
+    }
+}
+
+/// The JSON envelope a GraphQL request sends: `query`, plus `variables` and `operationName`
+/// when there are any.
+///
+/// **Absent rather than empty for the two optional members.** A server is entitled to reject
+/// `"operationName": ""` or `"variables": null`, and several do; omitting a member it does not
+/// need is what every GraphQL client does and what the spec's transport note describes.
+///
+/// `variables` is parsed here rather than held parsed, so the editor can carry text that is
+/// invalid mid-keystroke (§3.1). It must be a JSON **object**: the spec defines it as a map,
+/// and a bare array or number is a mistake worth naming rather than forwarding.
+pub fn graphql_envelope(graphql: &GraphQlRequest) -> Result<serde_json::Value, EngineError> {
+    if graphql.query.trim().is_empty() {
+        return Err(EngineError::EmptyGraphQlQuery);
+    }
+
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("query".to_string(), graphql.query.clone().into());
+
+    let variables = graphql.variables.trim();
+    if !variables.is_empty() {
+        let parsed: serde_json::Value = serde_json::from_str(variables).map_err(|error| {
+            EngineError::InvalidGraphQlVariables {
+                reason: error.to_string(),
+            }
+        })?;
+        if !parsed.is_object() {
+            return Err(EngineError::InvalidGraphQlVariables {
+                reason: "expected a JSON object, like {\"id\": 1}".to_string(),
+            });
+        }
+        envelope.insert("variables".to_string(), parsed);
+    }
+
+    if let Some(operation) = graphql.operation.as_ref().map(|name| name.trim())
+        && !operation.is_empty()
+    {
+        envelope.insert("operationName".to_string(), operation.into());
+    }
+
+    Ok(serde_json::Value::Object(envelope))
+}
+
+/// Compose a GraphQL request.
+///
+/// **A GET carries the envelope in the query string, not the body.** That is the whole reason
+/// the method is variable here: a GET GraphQL request is cacheable by ordinary HTTP machinery,
+/// and a body on a GET is ignored by enough intermediaries that sending one would fail in ways
+/// nobody could debug.
+pub fn graphql_carries_a_body(graphql: &GraphQlRequest) -> bool {
+    !matches!(graphql.method, Method::Get | Method::Head)
+}
+
+/// The URL a GraphQL request is actually sent to — which for a GET carries the whole envelope
+/// in the query string.
+///
+/// **Shared with curl export rather than done twice.** `to_command` has to reproduce what goes
+/// on the wire, and a GET whose envelope lived only inside `build_graphql` would export a bare
+/// endpoint that returns an error when pasted — the copied command has to be runnable, which is
+/// the whole point of the feature.
+pub fn graphql_url(spec: &RequestSpec, graphql: &GraphQlRequest) -> Result<Url, EngineError> {
+    let mut url = resolve_url(spec)?;
+    if graphql_carries_a_body(graphql) {
+        return Ok(url);
+    }
+
+    let envelope = graphql_envelope(graphql)?;
+    let mut pairs = url.query_pairs_mut();
+    pairs.append_pair("query", &graphql.query);
+    if let Some(variables) = envelope.get("variables") {
+        pairs.append_pair("variables", &variables.to_string());
+    }
+    if let Some(operation) = envelope.get("operationName").and_then(|v| v.as_str()) {
+        pairs.append_pair("operationName", operation);
+    }
+    pairs.finish();
+    drop(pairs);
+
+    Ok(url)
+}
+
+fn build_graphql(
+    client: &Client,
+    spec: &RequestSpec,
+    graphql: &GraphQlRequest,
+) -> Result<Request, EngineError> {
+    let envelope = graphql_envelope(graphql)?;
+    let url = graphql_url(spec, graphql)?;
+    let method = build_method(&graphql.method)?;
+    let headers = build_headers(spec)?;
+
+    let carries_body = graphql_carries_a_body(graphql);
+
+    let mut builder = client.request(method, url).headers(headers.clone());
+
+    if carries_body {
+        // An explicit Content-Type still wins, as it does for every body except multipart —
+        // a gateway that wants `application/graphql+json` is entitled to say so.
+        if !headers.contains_key(CONTENT_TYPE) {
+            builder = builder.header(CONTENT_TYPE, "application/json");
+        }
+        builder = builder.body(
+            serde_json::to_vec(&envelope)
+                .map_err(|error| EngineError::Build { reason: error.to_string() })?,
+        );
+    }
+
+    builder
+        .build()
+        .map_err(|error| EngineError::Build { reason: error.to_string() })
+}
+
+/// Compose an HTTP request. Split from `build` so that the kind is matched exactly once,
+/// where adding one is a compile error rather than a silently skipped branch.
+fn build_http(
+    client: &Client,
+    spec: &RequestSpec,
+    http: &HttpRequest,
+) -> Result<Request, EngineError> {
     let url = resolve_url(spec)?;
-    let method = build_method(&spec.method)?;
+    let method = build_method(&http.method)?;
     let mut headers = build_headers(spec)?;
     let body = build_body(spec)?;
 
@@ -408,7 +548,7 @@ mod tests {
             url: "https://api.test/search".to_string(),
             ..RequestSpec::default()
         };
-        spec.query = vec![QueryParam::new("search", "{{q}}")];
+        spec.http_mut().unwrap().query = vec![QueryParam::new("search", "{{q}}")];
 
         let error = resolve_url(&spec).expect_err("must refuse to send");
         assert!(
@@ -448,7 +588,7 @@ mod tests {
     fn braces_in_a_body_are_left_alone() {
         // `{{` inside JSON must not be mistaken for a template.
         let mut spec = RequestSpec::default();
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "{\"nested\":{{\"a\":1}}}".into(),
             kind: RawKind::Json,
         };
@@ -458,7 +598,7 @@ mod tests {
     #[test]
     fn query_params_merge_with_params_already_in_the_url() {
         let mut spec = spec_with_url("https://x.test/search?q=rust");
-        spec.query = vec![
+        spec.http_mut().unwrap().query = vec![
             QueryParam::new("page", "2"),
             QueryParam {
                 enabled: false,
@@ -537,7 +677,7 @@ mod tests {
     #[test]
     fn raw_json_body_carries_its_content_type() {
         let mut spec = RequestSpec::default();
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "{\"a\":1}".into(),
             kind: RawKind::Json,
         };
@@ -554,7 +694,7 @@ mod tests {
     #[test]
     fn a_whitespace_only_raw_body_sends_nothing() {
         let mut spec = RequestSpec::default();
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "  \n ".into(),
             kind: RawKind::Json,
         };
@@ -564,7 +704,7 @@ mod tests {
     #[test]
     fn form_bodies_are_urlencoded_and_skip_disabled_fields() {
         let mut spec = RequestSpec::default();
-        spec.body = Body::Form(vec![
+        spec.http_mut().unwrap().body = Body::Form(vec![
             FormField {
                 enabled: true,
                 name: "name".into(),
@@ -587,7 +727,7 @@ mod tests {
     #[test]
     fn multipart_is_explicitly_unsupported_rather_than_silently_wrong() {
         let mut spec = RequestSpec::default();
-        spec.body = Body::Multipart(vec![]);
+        spec.http_mut().unwrap().body = Body::Multipart(vec![]);
         // Same rule as a form with no usable fields: nothing to send, rather than an empty
         // multipart envelope with a boundary and no parts.
         assert_eq!(build_body(&spec).unwrap(), PreparedBody::None);
@@ -601,7 +741,7 @@ mod tests {
         std::fs::write(&file, b"PNGDATA").expect("write");
 
         let mut spec = RequestSpec::default();
-        spec.body = Body::Multipart(vec![
+        spec.http_mut().unwrap().body = Body::Multipart(vec![
             MultipartField {
                 enabled: true,
                 name: "caption".into(),
@@ -649,7 +789,7 @@ mod tests {
     fn a_missing_multipart_file_is_reported_by_path() {
         let missing = std::env::temp_dir().join("zuno-no-such-part.bin");
         let mut spec = RequestSpec::default();
-        spec.body = Body::Multipart(vec![MultipartField {
+        spec.http_mut().unwrap().body = Body::Multipart(vec![MultipartField {
             enabled: true,
             name: "avatar".into(),
             value: MultipartValue::File(missing.clone()),
@@ -666,9 +806,9 @@ mod tests {
     fn an_explicit_content_type_is_not_overridden() {
         let client = Client::new();
         let mut spec = spec_with_url("https://x.test/");
-        spec.method = Method::Post;
+        spec.http_mut().unwrap().method = Method::Post;
         spec.headers = vec![Header::new("content-type", "application/vnd.custom+json")];
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "{}".into(),
             kind: RawKind::Json,
         };
@@ -684,8 +824,8 @@ mod tests {
     fn a_missing_content_type_is_filled_in_from_the_body_kind() {
         let client = Client::new();
         let mut spec = spec_with_url("https://x.test/");
-        spec.method = Method::Post;
-        spec.body = Body::Raw {
+        spec.http_mut().unwrap().method = Method::Post;
+        spec.http_mut().unwrap().body = Body::Raw {
             text: "{}".into(),
             kind: RawKind::Json,
         };
@@ -706,5 +846,97 @@ mod tests {
     #[test]
     fn nonsense_methods_are_rejected() {
         assert!(build_method(&Method::Other("bad method".into())).is_err());
+    }
+
+    fn graphql_spec(query: &str) -> RequestSpec {
+        RequestSpec {
+            url: "https://api.test/graphql".to_string(),
+            kind: RequestKind::GraphQl(GraphQlRequest {
+                query: query.to_string(),
+                ..GraphQlRequest::default()
+            }),
+            ..RequestSpec::default()
+        }
+    }
+
+    #[test]
+    fn a_graphql_envelope_omits_what_it_does_not_have() {
+        // Absent, not empty: a server is entitled to reject `"operationName": ""`, and several
+        // do. Asserted on the key set rather than on a value, because writing `null` would pass
+        // any assertion that only looked at what `query` contained.
+        let spec = graphql_spec("{ viewer { login } }");
+        let graphql = spec.graphql().expect("a GraphQL request");
+        let envelope = graphql_envelope(graphql).expect("an envelope");
+
+        let keys: Vec<&str> = envelope.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, ["query"], "variables and operationName must be absent, not empty");
+    }
+
+    #[test]
+    fn a_graphql_envelope_carries_variables_as_json_not_as_text() {
+        let mut spec = graphql_spec("query R($n: Int!) { repos(first: $n) { id } }");
+        let graphql = spec.graphql_mut().expect("GraphQL");
+        graphql.variables = r#"{"n": 50}"#.to_string();
+        graphql.operation = Some("R".to_string());
+
+        let envelope = graphql_envelope(spec.graphql().unwrap()).expect("an envelope");
+        // The number must arrive as a number. Sending `"50"` is the mistake a naive
+        // string-concatenated envelope makes, and a server rejects it against an `Int!`.
+        assert_eq!(envelope["variables"]["n"], serde_json::json!(50));
+        assert_eq!(envelope["operationName"], "R");
+    }
+
+    #[test]
+    fn graphql_variables_that_are_not_an_object_are_named_rather_than_forwarded() {
+        let mut spec = graphql_spec("{ a }");
+        spec.graphql_mut().unwrap().variables = "[1, 2]".to_string();
+        assert!(matches!(
+            graphql_envelope(spec.graphql().unwrap()),
+            Err(EngineError::InvalidGraphQlVariables { .. })
+        ));
+
+        spec.graphql_mut().unwrap().variables = "{oops".to_string();
+        assert!(matches!(
+            graphql_envelope(spec.graphql().unwrap()),
+            Err(EngineError::InvalidGraphQlVariables { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_graphql_query_is_refused_rather_than_sent() {
+        // An empty *body* is legal HTTP; an empty GraphQL document is not a request at all.
+        let spec = graphql_spec("   ");
+        assert!(matches!(
+            graphql_envelope(spec.graphql().unwrap()),
+            Err(EngineError::EmptyGraphQlQuery)
+        ));
+    }
+
+    /// **The whole reason `method` is variable on a GraphQL request.** A GET carries the
+    /// envelope in the query string; a body on a GET is dropped by enough intermediaries that
+    /// sending one fails in ways nobody can debug.
+    #[test]
+    fn a_get_graphql_request_puts_the_envelope_in_the_url_and_a_post_does_not() {
+        let mut spec = graphql_spec("query R { a }");
+        spec.graphql_mut().unwrap().variables = r#"{"n":1}"#.to_string();
+
+        spec.graphql_mut().unwrap().method = Method::Post;
+        let posted = graphql_url(&spec, spec.graphql().unwrap()).expect("a URL");
+        assert_eq!(posted.query(), None, "a POST sends the envelope as a body");
+        assert!(build_body(&spec).is_ok());
+
+        spec.graphql_mut().unwrap().method = Method::Get;
+        let got = graphql_url(&spec, spec.graphql().unwrap()).expect("a URL");
+        let query = got.query().expect("a GET must carry the envelope in the URL");
+        assert!(query.contains("query="), "got {query}");
+        assert!(query.contains("variables="), "got {query}");
+    }
+
+    /// `build_body` returning `None` for GraphQL is deliberate — the envelope is attached by
+    /// `build_graphql`, which also decides whether it travels as a body at all. Pinned so that
+    /// "GraphQL sends no body" cannot be read as "GraphQL bodies are unimplemented".
+    #[test]
+    fn graphql_does_not_go_through_the_http_body_path() {
+        assert_eq!(build_body(&graphql_spec("{ a }")).unwrap(), PreparedBody::None);
     }
 }

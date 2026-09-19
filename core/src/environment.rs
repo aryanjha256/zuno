@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{Body, FormField, MultipartField, MultipartValue, RequestSpec};
+use crate::{Body, FormField, MultipartField, MultipartValue, RequestKind, RequestSpec};
 
 /// The reserved directory name inside a collection. Skipped by `collection::scan`.
 pub const DIRECTORY: &str = "environments";
@@ -268,33 +268,48 @@ impl Resolver {
         // withheld from a command which never referenced one. This has to describe what was
         // exported, not what is merely typed on screen.
         scan(&spec.url);
-        for param in spec.enabled_query() {
-            scan(&param.name);
-            scan(&param.value);
+        // Exhaustive on the kind: a new one carries strings of its own, and a secret
+        // withheld from the export has to be announced for those too.
+        match &spec.kind {
+            RequestKind::Http(http) => {
+                for param in http.enabled_query() {
+                    scan(&param.name);
+                    scan(&param.value);
+                }
+            }
+            // The document and the variables both go on the wire, so a secret withheld from
+            // either has to be announced — a copied command that silently dropped a token out
+            // of the variables would be un-runnable with no sign why.
+            RequestKind::GraphQl(graphql) => {
+                scan(&graphql.query);
+                scan(&graphql.variables);
+            }
         }
         for header in spec.enabled_headers() {
             scan(&header.name);
             scan(&header.value);
         }
-        match &spec.body {
-            Body::Empty => {}
-            Body::Raw { text, .. } => scan(text),
-            Body::Form(fields) => {
-                for field in fields.iter().filter(|field| field.enabled) {
-                    scan(&field.name);
-                    scan(&field.value);
-                }
-            }
-            Body::Multipart(fields) => {
-                for field in fields.iter().filter(|field| field.enabled) {
-                    scan(&field.name);
-                    if let MultipartValue::Text(text) = &field.value {
-                        scan(text);
+        if let Some(http) = spec.http() {
+            match &http.body {
+                Body::Empty => {}
+                Body::Raw { text, .. } => scan(text),
+                Body::Form(fields) => {
+                    for field in fields.iter().filter(|field| field.enabled) {
+                        scan(&field.name);
+                        scan(&field.value);
                     }
                 }
+                Body::Multipart(fields) => {
+                    for field in fields.iter().filter(|field| field.enabled) {
+                        scan(&field.name);
+                        if let MultipartValue::Text(text) = &field.value {
+                            scan(text);
+                        }
+                    }
+                }
+                // A path, never substituted — see `apply`.
+                Body::Binary(_) => {}
             }
-            // A path, never substituted — see `apply`.
-            Body::Binary(_) => {}
         }
 
         found
@@ -317,12 +332,30 @@ impl Resolver {
         let mut resolved = spec.clone();
         resolved.url = self.resolve(&spec.url).into_owned();
 
-        for param in &mut resolved.query {
-            let name = self.resolve(&param.name).into_owned();
-            let value = self.resolve(&param.value).into_owned();
-            param.name = name;
-            param.value = value;
+        // Exhaustive on the kind with no catch-all, for the same reason the body match
+        // below is: a new kind holds text of its own, and a variable left unsubstituted in
+        // it reaches the wire literally with no error — which is exactly how form and
+        // multipart bodies shipped broken once they became authorable.
+        match &mut resolved.kind {
+            RequestKind::Http(http) => {
+                for param in &mut http.query {
+                    let name = self.resolve(&param.name).into_owned();
+                    let value = self.resolve(&param.value).into_owned();
+                    param.name = name;
+                    param.value = value;
+                }
+            }
+            // **Both halves, and `{{name}}` is unambiguous in a GraphQL document**: `{` opens a
+            // selection set or an input object, and in both the next token must be a name,
+            // `...`, or `}`, so `{{` adjacent is invalid GraphQL except inside a string — which
+            // is exactly where a placeholder is wanted. Checked against every compact and nested
+            // shape, including `{a{b{c{d}}}}`, rather than assumed.
+            RequestKind::GraphQl(graphql) => {
+                graphql.query = self.resolve(&graphql.query).into_owned();
+                graphql.variables = self.resolve(&graphql.variables).into_owned();
+            }
         }
+
         for header in &mut resolved.headers {
             let name = self.resolve(&header.name).into_owned();
             let value = self.resolve(&header.value).into_owned();
@@ -334,7 +367,14 @@ impl Resolver {
         // variant must fail the build until someone decides whether a variable belongs in it.
         // A catch-all here is what left form and multipart silently unsubstituted once they
         // became authorable.
-        resolved.body = match &spec.body {
+        let body = match spec.http().map(|http| &http.body) {
+            None => {
+                // A kind with no `Body` has already been substituted above. Returning early
+                // keeps the exhaustive `Body` match below meaningful rather than making it
+                // carry an arm that means "not applicable".
+                return resolved;
+            }
+            Some(body) => match body {
             Body::Empty => Body::Empty,
             Body::Raw { text, kind } => Body::Raw {
                 text: self.resolve(text).into_owned(),
@@ -368,8 +408,12 @@ impl Resolver {
             ),
             // A path, not text: substituting into it would let a variable choose which file
             // gets uploaded.
-            Body::Binary(path) => Body::Binary(path.clone()),
+                Body::Binary(path) => Body::Binary(path.clone()),
+            },
         };
+        if let Some(http) = resolved.http_mut() {
+            http.body = body;
+        }
 
         resolved
     }
@@ -746,7 +790,7 @@ pub fn ensure_gitignored(collection_root: &Path) -> Result<bool, EnvironmentErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Header, QueryParam, RawKind};
+    use crate::{GraphQlRequest, Header, HttpRequest, QueryParam, RawKind};
 
     fn env(name: &str, pairs: &[(&str, &str)]) -> Environment {
         Environment {
@@ -840,23 +884,26 @@ mod tests {
 
         let spec = RequestSpec {
             url: "https://{{host}}/v1".to_string(),
-            // The gap this closes: `build.rs` validates the URL and headers but not query
-            // rows, so a `{{var}}` here used to reach the wire literally.
-            query: vec![QueryParam::new("search", "{{q}}")],
             headers: vec![Header::new("Authorization", "Bearer {{tok}}")],
-            body: Body::Raw {
-                text: r#"{"host":"{{host}}","keep":"{{unknown}}"}"#.to_string(),
-                kind: RawKind::Json,
-            },
+            kind: RequestKind::Http(HttpRequest {
+                // The gap this closes: `build.rs` validates the URL and headers but not
+                // query rows, so a `{{var}}` here used to reach the wire literally.
+                query: vec![QueryParam::new("search", "{{q}}")],
+                body: Body::Raw {
+                    text: r#"{"host":"{{host}}","keep":"{{unknown}}"}"#.to_string(),
+                    kind: RawKind::Json,
+                },
+                ..HttpRequest::default()
+            }),
             ..RequestSpec::default()
         };
 
         let sent = resolver.apply(&spec);
         assert_eq!(sent.url, "https://api.test/v1");
-        assert_eq!(sent.query[0].value, "widgets");
+        assert_eq!(sent.http().unwrap().query[0].value, "widgets");
         assert_eq!(sent.headers[0].value, "Bearer abc");
         assert_eq!(
-            sent.body.as_text(),
+            sent.http().unwrap().body.as_text(),
             Some(r#"{"host":"api.test","keep":"{{unknown}}"}"#),
             "known names substituted, unknown ones left for the body to keep"
         );
@@ -877,7 +924,8 @@ mod tests {
         );
 
         let spec = RequestSpec {
-            body: Body::Form(vec![
+            kind: RequestKind::Http(HttpRequest {
+                body: Body::Form(vec![
                 FormField {
                     enabled: true,
                     name: "grant_type".into(),
@@ -894,10 +942,13 @@ mod tests {
                     value: "{{secret}}".into(),
                 },
             ]),
+                ..HttpRequest::default()
+            }),
             ..RequestSpec::default()
         };
 
-        let Body::Form(fields) = resolver.apply(&spec).body else {
+        let applied = resolver.apply(&spec);
+        let Body::Form(fields) = &applied.http().unwrap().body else {
             panic!("expected a form body");
         };
         assert_eq!(fields[1].value, "zuno-cli");
@@ -906,7 +957,7 @@ mod tests {
 
         // The stored request keeps its placeholders, or saving would bake the secret into a
         // committed collection file — the exact leak the `.local` split exists to prevent.
-        let Body::Form(stored) = &spec.body else { unreachable!() };
+        let Body::Form(stored) = &spec.http().unwrap().body else { unreachable!() };
         assert_eq!(stored[2].value, "{{secret}}");
     }
 
@@ -915,15 +966,19 @@ mod tests {
         // Names as well as values, matching how query and header rows are handled.
         let resolver = Resolver::new(None, Some(&env("dev", &[("key", "api_key")])));
         let spec = RequestSpec {
-            body: Body::Form(vec![FormField {
+            kind: RequestKind::Http(HttpRequest {
+                body: Body::Form(vec![FormField {
                 enabled: true,
                 name: "{{key}}".into(),
                 value: "x".into(),
             }]),
+                ..HttpRequest::default()
+            }),
             ..RequestSpec::default()
         };
 
-        let Body::Form(fields) = resolver.apply(&spec).body else {
+        let applied = resolver.apply(&spec);
+        let Body::Form(fields) = &applied.http().unwrap().body else {
             panic!("expected a form body");
         };
         assert_eq!(fields[0].name, "api_key");
@@ -937,7 +992,8 @@ mod tests {
         );
 
         let spec = RequestSpec {
-            body: Body::Multipart(vec![
+            kind: RequestKind::Http(HttpRequest {
+                body: Body::Multipart(vec![
                 MultipartField {
                     enabled: true,
                     name: "caption".into(),
@@ -949,10 +1005,13 @@ mod tests {
                     value: MultipartValue::File(PathBuf::from("{{p}}")),
                 },
             ]),
+                ..HttpRequest::default()
+            }),
             ..RequestSpec::default()
         };
 
-        let Body::Multipart(fields) = resolver.apply(&spec).body else {
+        let applied = resolver.apply(&spec);
+        let Body::Multipart(fields) = &applied.http().unwrap().body else {
             panic!("expected a multipart body");
         };
         assert_eq!(fields[0].value, MultipartValue::Text("hello".to_string()));
@@ -968,10 +1027,13 @@ mod tests {
         // A variable choosing which file gets uploaded is not a feature.
         let resolver = Resolver::new(None, Some(&env("dev", &[("p", "/etc/passwd")])));
         let spec = RequestSpec {
-            body: Body::Binary(PathBuf::from("{{p}}")),
+            kind: RequestKind::Http(HttpRequest {
+                body: Body::Binary(PathBuf::from("{{p}}")),
+                ..HttpRequest::default()
+            }),
             ..RequestSpec::default()
         };
-        assert_eq!(resolver.apply(&spec).body, Body::Binary(PathBuf::from("{{p}}")));
+        assert_eq!(resolver.apply(&spec).http().unwrap().body, Body::Binary(PathBuf::from("{{p}}")));
     }
 
     #[test]
@@ -1227,6 +1289,56 @@ mod tests {
         assert_eq!(
             read(&root, GLOBALS).expect("read").committed.get("a").map(String::as_str),
             Some("1")
+        );
+    }
+
+    /// **`{{name}}` is unambiguous inside a GraphQL document**, which is what makes substituting
+    /// it safe without an escape syntax. `{` opens a selection set or an input object, and in
+    /// both the next token must be a name, `...` or `}` — so `{{` adjacent is invalid GraphQL
+    /// except inside a string, which is exactly where a placeholder belongs.
+    ///
+    /// The negative half is the load-bearing one: a false positive here would corrupt a valid
+    /// query silently, and the compact shapes are where a naive scanner would trip.
+    #[test]
+    fn a_graphql_document_has_no_accidental_placeholders() {
+        for doc in [
+            "query { viewer { login repositories(first: 5) { nodes { name } } } }",
+            "{viewer{login}}",
+            "{a{b{c{d}}}}",
+            "mutation { create(input: {name: \"x\", meta: {k: 1}}) { id } }",
+            "mutation { many(in: [{a: 1}, {b: 2}]) { id } }",
+            "query($d: Boolean!) { a @include(if: $d) { b } }",
+        ] {
+            assert!(
+                placeholders(doc).is_empty(),
+                "no placeholder should be found in {doc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_substitutes_both_the_document_and_the_variables() {
+        let resolver = Resolver::new(
+            None,
+            Some(&env("dev", &[("login", "octocat"), ("count", "50")])),
+        );
+
+        let spec = RequestSpec {
+            url: "https://api.test/graphql".to_string(),
+            kind: RequestKind::GraphQl(GraphQlRequest {
+                query: "query { user(login: \"{{login}}\") { id } }".to_string(),
+                variables: r#"{"n": "{{count}}"}"#.to_string(),
+                ..GraphQlRequest::default()
+            }),
+            ..RequestSpec::default()
+        };
+
+        let sent = resolver.apply(&spec);
+        let graphql = sent.graphql().expect("still GraphQL");
+        assert_eq!(graphql.query, "query { user(login: \"octocat\") { id } }");
+        assert_eq!(
+            graphql.variables, r#"{"n": "50"}"#,
+            "the variables are text on the way through, and substituted the same as the document"
         );
     }
 }

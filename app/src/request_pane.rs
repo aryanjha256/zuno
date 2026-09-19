@@ -20,7 +20,10 @@ use crate::actions::{
     ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
 };
 use crate::ui::{Icon, icon_button};
-use crate::request_view::{BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind};
+use crate::kinds::{GraphQlEditor, KindEditor};
+use crate::request_view::{
+    BodyType, KeyValueRow, MultipartRow, RequestTab, RequestView, RowKind,
+};
 use crate::theme::Theme;
 
 pub fn render(
@@ -31,17 +34,19 @@ pub fn render(
 ) -> Div {
     // Read focus state before any `&mut cx` use below — the immutable borrow from
     // `read` has to end first.
-    let url_focused = view.url_focus(cx).is_focused(window);
     let body_focused = view.body_region_focused(window, cx);
-    let body_lines = view.body_editor.read(cx).line_count();
+    let body_lines = view
+        .primary_editor()
+        .map_or(0, |editor| editor.read(cx).line_count());
 
     let header_detail = count_label(
         view.headers.iter().filter(|row| row.enabled).count(),
         view.headers.len(),
     );
+    let query_rows: &[KeyValueRow] = view.http().map_or(&[], |http| &http.query);
     let query_detail = count_label(
-        view.query.iter().filter(|row| row.enabled).count(),
-        view.query.len(),
+        query_rows.iter().filter(|row| row.enabled).count(),
+        query_rows.len(),
     );
 
     let pane = div()
@@ -51,26 +56,52 @@ pub fn render(
         .min_w(px(0.))
         .overflow_hidden()
         .bg(theme.bg)
-        .child(toolbar(view, theme, url_focused, cx))
         .child(section_tabs(view, theme, cx));
 
     match view.request_tab {
         RequestTab::Headers => pane
             .child(section_header("Headers", header_detail, RowKind::Header, theme))
             .child(rows_table(&view.headers, RowKind::Header, theme, window, cx)),
-        RequestTab::Query => pane
-            .child(section_header("Params", query_detail, RowKind::Query, theme))
-            .child(rows_table(&view.query, RowKind::Query, theme, window, cx)),
-        RequestTab::Body => pane
-            .child(body_header(view, body_lines, theme))
-            // Above the editor, matching where the response pane puts its own bar — and above
-            // rather than below so it does not move as the body grows.
-            .children(
-                view.body_search
-                    .as_ref()
-                    .map(|search| body_find_bar(search, theme, cx)),
-            )
-            .child(body_region(view, theme, body_focused, window, cx)),
+        // **The kind's own tabs.** Which content a slot holds is the kind's business, not this
+        // match's — that is what keeps adding gRPC to one module instead of to every site that
+        // renders a tab.
+        RequestTab::Kind(slot) => match (&view.kind, slot) {
+            (KindEditor::Http(_), 0) => pane
+                .child(section_header("Params", query_detail, RowKind::Query, theme))
+                .child(rows_table(query_rows, RowKind::Query, theme, window, cx)),
+            (KindEditor::Http(_), _) => pane
+                .child(body_header(view, body_lines, theme))
+                // Above the editor, matching where the response pane puts its own bar — and
+                // above rather than below so it does not move as the body grows.
+                .children(
+                    view.body_search
+                        .as_ref()
+                        .map(|search| body_find_bar(search, theme, cx)),
+                )
+                .child(body_region(view, theme, body_focused, window, cx)),
+            (KindEditor::GraphQl(graphql), 0) => pane
+                .child(graphql_query_header(graphql, theme))
+                .children(
+                    view.body_search
+                        .as_ref()
+                        .map(|search| body_find_bar(search, theme, cx)),
+                )
+                .child(
+                    editor_region(theme, focused_editor(&graphql.query, window, cx))
+                        .child(graphql.query.clone()),
+                ),
+            (KindEditor::GraphQl(graphql), _) => pane
+                // **Not `section_header`.** That one is for row tables and draws an add
+                // control unconditionally — pointed here at `RowKind::Query`, it rendered an
+                // "add" button on a text editor whose only effect was to jump you to the
+                // document tab, because `AddQuery` shows slot 0 and then adds a row to a table
+                // a GraphQL request does not have.
+                .child(editor_header("Variables", "", theme))
+                .child(
+                    editor_region(theme, focused_editor(&graphql.variables, window, cx))
+                        .child(graphql.variables.clone()),
+                ),
+        },
         RequestTab::Capture => pane
             .child(section_header(
                 "Capture",
@@ -97,14 +128,21 @@ pub fn render(
 /// Counts ride on the labels for the reason the response pane's `Headers 24` does: what a
 /// hidden section costs you is knowing there's anything in it. Zero is omitted rather than
 /// shown, since `Headers 0` is noise where `Headers 3` is information.
+/// The request pane's tab strip — **composed from the kind, not hardcoded.**
+///
+/// Spine tabs bracket the kind's own: Headers, then whatever this kind contributes, then
+/// Capture and Assert. For HTTP that reproduces `Headers · Params · Body · Capture · Assert`
+/// exactly, so nothing moved for existing requests; for GraphQL it reads
+/// `Headers · Query · Variables · Capture · Assert`.
+///
+/// It used to be five hand-written `section_tab` calls with `"Params"` and `"Body"` baked in, so
+/// a GraphQL request drew two tabs whose labels described a kind it wasn't — the document behind
+/// one called "Params", the variables behind one called "Body". `a_kinds_tab_strip_is_named_by_
+/// the_kind` is what keeps that from coming back.
 fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<RequestView>) -> Div {
     let active = view.request_tab;
-    let body_label = match view.body_type {
-        BodyType::Empty => "Body".to_string(),
-        _ => format!("Body {}", view.body_label()),
-    };
 
-    div()
+    let mut strip = div()
         .flex()
         .flex_row()
         .items_center()
@@ -113,49 +151,40 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
         .px_2()
         .bg(theme.bg_panel)
         .border_b_1()
-        .border_color(theme.border)
-        .child(section_tab(
-            "request-tab-headers",
-            count_suffix("Headers", view.headers.len()),
-            active == RequestTab::Headers,
-            ShowHeadersTab,
-            theme,
-            cx,
-        ))
-        .child(section_tab(
-            "request-tab-params",
-            count_suffix("Params", view.query.len()),
-            active == RequestTab::Query,
-            ShowParamsTab,
-            theme,
-            cx,
-        ))
-        .child(section_tab(
-            "request-tab-body",
-            body_label,
-            active == RequestTab::Body,
-            ShowBodyTab,
-            theme,
-            cx,
-        ))
-        .child(section_tab(
-            "request-tab-capture",
-            count_suffix("Capture", view.captures.len()),
-            active == RequestTab::Capture,
-            ShowCaptureTab,
-            theme,
-            cx,
-        ))
-        .child(section_tab(
-            "request-tab-assert",
-            count_suffix("Assert", view.assertions.len()),
-            active == RequestTab::Assert,
-            ShowAssertTab,
-            theme,
-            cx,
-        ))
-        .child(div().flex_1())
-        .child(request_actions(theme))
+        .border_color(theme.border);
+
+    for tab in RequestTab::for_kind(&view.kind) {
+        let (id, label, action): (&'static str, SharedString, Box<dyn gpui::Action>) = match tab {
+            RequestTab::Headers => (
+                "request-tab-headers",
+                SharedString::from(count_suffix("Headers", view.headers.len())),
+                Box::new(ShowHeadersTab),
+            ),
+            // **Two slot actions, because no kind has a third tab yet.** A kind that declares
+            // one would have no way to reach it, which `every_kinds_tabs_have_an_action` fails
+            // on rather than leaving as a dead control — that is the point to add a
+            // parameterised `ShowKindTab(u8)`, not before.
+            RequestTab::Kind(slot) => (
+                if slot == 0 { "request-tab-kind-0" } else { "request-tab-kind-1" },
+                view.kind.tab_label(slot),
+                if slot == 0 { Box::new(ShowParamsTab) } else { Box::new(ShowBodyTab) },
+            ),
+            RequestTab::Capture => (
+                "request-tab-capture",
+                SharedString::from(count_suffix("Capture", view.captures.len())),
+                Box::new(ShowCaptureTab),
+            ),
+            RequestTab::Assert => (
+                "request-tab-assert",
+                SharedString::from(count_suffix("Assert", view.assertions.len())),
+                Box::new(ShowAssertTab),
+            ),
+        };
+
+        strip = strip.child(section_tab_boxed(id, label, active == tab, action, theme, cx));
+    }
+
+    strip.child(div().flex_1()).child(request_actions(theme))
 }
 
 fn count_suffix(label: &str, count: usize) -> String {
@@ -166,14 +195,20 @@ fn count_suffix(label: &str, count: usize) -> String {
     }
 }
 
-fn section_tab<A: gpui::Action + Clone + 'static>(
+/// One tab in the strip.
+///
+/// Takes a **boxed** action rather than a generic one, because the strip is now built by
+/// iterating a heterogeneous list — `Headers`, the kind's own, `Capture`, `Assert` — and those
+/// carry different action types. `Action::boxed_clone` is the trait's own answer to
+/// `Box<dyn Action>` not being `Clone`.
+fn section_tab_boxed(
     id: &'static str,
-    label: String,
+    label: SharedString,
     active: bool,
-    action: A,
+    action: Box<dyn gpui::Action>,
     theme: &Theme,
     cx: &mut gpui::Context<RequestView>,
-) -> impl IntoElement + use<A> {
+) -> impl IntoElement + use<> {
     let tab = div()
         .id(id)
         .debug_selector(move || id.to_string())
@@ -198,7 +233,7 @@ fn section_tab<A: gpui::Action + Clone + 'static>(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |_, _: &MouseDownEvent, window, cx| {
-                window.dispatch_action(Box::new(action.clone()), cx);
+                window.dispatch_action(action.boxed_clone(), cx);
             }),
         )
 }
@@ -239,15 +274,15 @@ fn body_header(view: &RequestView, lines: usize, theme: &Theme) -> Div {
                 // to add a row to one was `Ctrl+Shift+F` / `Ctrl+Shift+M` — no button anywhere,
                 // because the Body tab draws this header rather than `section_header`. The other
                 // body types have nothing to add to.
-                .children(match view.body_type {
-                    BodyType::Form => Some(add_control(RowKind::Form, theme)),
-                    BodyType::Multipart => Some(add_control(RowKind::Multipart, theme)),
+                .children(match view.http().map(|http| http.body_type) {
+                    Some(BodyType::Form) => Some(add_control(RowKind::Form, theme)),
+                    Some(BodyType::Multipart) => Some(add_control(RowKind::Multipart, theme)),
                     _ => None,
                 })
                 // Offered only where it applies, rather than shown greyed out: the verb is
                 // JSON-only, and a control that is present-but-dead teaches nothing.
                 .children(
-                    (view.body_type == BodyType::Raw
+                    (view.http().map(|http| http.body_type) == Some(BodyType::Raw)
                         && view.body_kind() == zuno_core::RawKind::Json)
                         .then(|| {
                             crate::ui::text_action(
@@ -296,7 +331,13 @@ fn body_header(view: &RequestView, lines: usize, theme: &Theme) -> Div {
 /// hover to go and the method would look dead. Worth knowing: in the light theme `bg_elevated`
 /// sits at 1.04:1 against `bg_panel`, so there the bottom border does most of the work of saying
 /// the field is a field. A dedicated `bg_field` token is the fix whenever that starts to grate.
-fn toolbar(
+/// The method, the URL and Send — **spanning the whole window, not just the request pane.**
+///
+/// Emitted by `RequestView::render` above the request/response split rather than inside the
+/// request pane, because the endpoint is the one thing that describes the *whole* exchange:
+/// confined to the left half it was cramped by the pane divider while a long URL had nowhere to
+/// go, and the response beside it is an answer from that same URL.
+pub(crate) fn toolbar(
     view: &RequestView,
     theme: &Theme,
     url_focused: bool,
@@ -311,6 +352,8 @@ fn toolbar(
         .bg(theme.bg_elevated)
         .border_b_2()
         .border_color(if url_focused { theme.accent } else { theme.border })
+        .child(kind_chip(view, theme))
+        .child(div().w(px(1.)).h(px(16.)).flex_none().bg(theme.border))
         .child(method_chip(view, theme))
         .child(segment_divider(theme))
         .child(url_bar(view, theme))
@@ -371,6 +414,31 @@ fn request_actions(theme: &Theme) -> Div {
 /// popover". It doesn't: the picker is a centred modal, and reusing it means one selection
 /// interaction instead of two — plus a filter input, which is how a custom verb becomes
 /// reachable at all.
+/// Which kind of request this is — HTTP, GraphQL, and whatever comes after.
+///
+/// **Left of the method, in the toolbar**, because the kind is the request's identity: it
+/// decides which tabs exist, whether there is a verb at all, and what goes on the wire. It is
+/// deliberately *not* a row in the body-type picker — that picker answers "what body am I
+/// sending", and gRPC and MQTT can never be bodies.
+fn kind_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
+    div()
+        .id("kind-chip")
+        .flex()
+        .items_center()
+        .flex_none()
+        .h_full()
+        .px(px(10.))
+        .text_xs()
+        .text_color(theme.text_muted)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.bg_hover))
+        // Dispatches rather than mutating the view, so the chip and the palette run one path.
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            window.dispatch_action(Box::new(crate::actions::OpenRequestKind), cx);
+        })
+        .child(view.kind.choice().label())
+}
+
 fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
     div()
         .id("method-chip")
@@ -381,7 +449,7 @@ fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
         .px(px(10.))
         .text_xs()
         .font_weight(FontWeight::BOLD)
-        .text_color(theme.method_color(&view.method))
+        .text_color(view.method().map_or(theme.text_muted, |m| theme.method_color(m)))
         .cursor_pointer()
         .hover(|style| style.bg(theme.bg_hover))
         // Dispatches rather than mutating the view directly, so the button and Ctrl+M run
@@ -393,7 +461,7 @@ fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
                 window.dispatch_action(Box::new(crate::actions::OpenMethod), cx);
             },
         )
-        .child(view.method.as_str().to_string())
+        .child(view.method().map_or_else(String::new, |m| m.as_str().to_string()))
 }
 
 fn url_bar(view: &RequestView, theme: &Theme) -> Div {
@@ -531,6 +599,27 @@ fn add_control(kind: RowKind, theme: &Theme) -> gpui::AnyElement {
 
 /// No `cx`: the add control dispatches an action rather than calling `add_row` through a
 /// listener, so nothing here needs the view.
+/// A header for a text surface — a title and a note, and **no add control**.
+///
+/// `section_header` is for row tables and always draws one; using it over an editor puts a
+/// button there that adds a row to a table that isn't on screen.
+fn editor_header(title: &str, note: &str, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(title.to_string())
+        .child(div().text_color(theme.text_faint).child(note.to_string()))
+}
+
 fn section_header(title: &str, detail: SharedString, kind: RowKind, theme: &Theme) -> Div {
 
     div()
@@ -1193,14 +1282,26 @@ fn render_row(
 
 /// The editor entity renders itself; this only supplies the frame, the focus ring, and
 /// the inherited text style it shapes with.
-fn body_region(
-    view: &RequestView,
-    theme: &Theme,
-    focused: bool,
+/// Whether this particular editor holds focus.
+///
+/// Per editor, not per pane: a GraphQL request has two on screen at different times and the
+/// ring has to say which one you are in.
+fn focused_editor(
+    editor: &gpui::Entity<crate::input::Editor>,
     window: &Window,
-    cx: &mut gpui::Context<RequestView>,
-) -> impl IntoElement + use<> {
-    let region = div()
+    cx: &gpui::App,
+) -> bool {
+    use gpui::Focusable;
+    editor.read(cx).focus_handle(cx).is_focused(window)
+}
+
+/// The box a multi-line editor sits in — margin, padding, background, and a focus ring.
+///
+/// **One definition, used by every editor surface.** The HTTP body had all of this and the
+/// GraphQL editors were hand-rolled without it: no padding, no background, and no focus border,
+/// so nothing on screen said which of the two you were typing into.
+fn editor_region(theme: &Theme, focused: bool) -> Div {
+    div()
         .flex_1()
         .min_h(px(0.))
         .m_2()
@@ -1210,20 +1311,35 @@ fn body_region(
         .border_color(theme.focus_border(focused))
         .font_family(theme.mono.clone())
         .text_xs()
-        .text_color(theme.text);
+        .text_color(theme.text)
+}
+
+fn body_region(
+    view: &RequestView,
+    theme: &Theme,
+    focused: bool,
+    window: &Window,
+    cx: &mut gpui::Context<RequestView>,
+) -> impl IntoElement + use<> {
+    let region = editor_region(theme, focused);
 
     // A form, multipart, or binary body can be *held* but not yet edited. Showing the empty
     // editor here would be a lie in the worst way: it looks like the request has no body,
     // and it's the state from which a save would overwrite the real one.
-    match view.body_type {
+    let Some(http) = view.http() else {
+        // Only HTTP has a body region; every other kind renders its own tabs.
+        return region;
+    };
+
+    match http.body_type {
         // A form body is a table, not text — the same widget as headers and query params,
         // because `FormField` has the same shape as `Header`.
         BodyType::Form => region
             .font_family(theme.mono.clone())
-            .child(rows_table(&view.form, RowKind::Form, theme, window, cx)),
+            .child(rows_table(&http.form, RowKind::Form, theme, window, cx)),
         BodyType::Multipart => region
             .font_family(theme.mono.clone())
-            .child(multipart_table(&view.multipart, theme, window, cx)),
+            .child(multipart_table(&http.multipart, theme, window, cx)),
         BodyType::Binary => region.child(binary_body(view, theme, window)),
         // Not the editor: its text is retained so switching back is lossless, but showing it
         // under a body type of "None" would imply it gets sent.
@@ -1232,8 +1348,57 @@ fn body_region(
                 .text_color(theme.text_muted)
                 .child(crate::workspace::hint_sentence("No body", &[(&OpenBodyType, "to pick a type")], window)),
         ),
-        BodyType::Raw => region.child(view.body_editor.clone()),
+        BodyType::Raw => region.child(http.body_editor.clone()),
     }
+}
+
+/// The header over the GraphQL query editor: what it is, and which operation to run.
+///
+/// **`operationName` lives here rather than beside the URL**, because it names one of the
+/// operations *in this document* — it is a property of the text below it, not of the endpoint.
+/// Blank is the common case: a document with one operation needs no name, and the server works
+/// it out.
+fn graphql_query_header(
+    graphql: &GraphQlEditor,
+    theme: &Theme,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(div().flex_none().child("Query"))
+        .child(div().flex_1().min_w(px(0.)))
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.text_faint)
+                .child("operation"),
+        )
+        // Styled like `expect_status`, the other small labelled input in a header row, rather
+        // than hand-rolled: **`overflow_hidden` is what keeps a long name inside its box** —
+        // without it the text simply paints past the edge — and the border is the only thing
+        // that says this is somewhere you can type. A placeholder alone vanishes the moment
+        // there is a character in it.
+        .child(
+            div()
+                .flex_none()
+                .w(px(140.))
+                .overflow_hidden()
+                .px_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .font_family(theme.mono.clone())
+                .text_color(theme.text)
+                .child(graphql.operation.clone()),
+        )
 }
 
 /// Find and replace over the request body.
@@ -1342,7 +1507,7 @@ fn body_find_bar(
 /// Clicking anywhere here reopens the picker, so the path doubles as the control — there's
 /// nothing else in this region to click.
 fn binary_body(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoElement + use<> {
-    let chosen = view.binary_path.clone();
+    let chosen = view.http().and_then(|http| http.binary_path.clone());
 
     let headline = match &chosen {
         Some(path) => path.display().to_string(),

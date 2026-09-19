@@ -671,7 +671,12 @@ fn row(
             // The chevron's column is held open on a request row too, so a request and a
             // sibling directory start their names at the same x.
             .child(div().flex_none().w(px(CHEVRON)))
-            .child(method_cell(method, theme))
+            .child(match method {
+                Some(method) => method_cell(method, theme).into_any_element(),
+                // A kind with no method still holds the column, so names stay aligned
+                // down the tree whatever the rows above it are.
+                None => div().flex_none().w(px(METHOD_WIDTH)).into_any_element(),
+            })
             // The rename box takes the name's place rather than overlaying the row, so the
             // method and the indentation stay put and the name appears to become editable
             // where it already was.

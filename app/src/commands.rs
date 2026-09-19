@@ -83,6 +83,7 @@ pub fn palette() -> Vec<Command> {
         command("Toggle focused row", ToggleRow),
         command("Remove focused row", RemoveRow),
         command("Change method", OpenMethod),
+        command("Change request kind", OpenRequestKind),
         command("Change body type", OpenBodyType),
         command("Add form field", AddFormField),
         command("Show request headers", ShowHeadersTab),

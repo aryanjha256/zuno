@@ -39,7 +39,7 @@ use crate::actions::{
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
     MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ScrollLeft, ScrollRight,
     ScrollStart, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
-    OpenBodyType, PrevRequestTab, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
+    OpenBodyType, PrevRequestTab, OpenMethod, OpenRequestKind, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     OpenAppMenu, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
@@ -78,6 +78,13 @@ pub struct Workspace {
     /// goes through `activate`, which is what keeps focus and `active_ix` from disagreeing.
     views: Vec<Entity<RequestView>>,
     active_ix: usize,
+    /// Tabs in the session file that this build could not read, kept so that saving does not
+    /// delete them.
+    ///
+    /// **Held here for exactly one reason: `session()` rebuilds the file from `views`.** Parsing
+    /// them tolerantly is worthless on its own — the next save would write only the buffers this
+    /// build understands and the rest would be gone. See `session::CarriedTab`.
+    carried_tabs: Vec<crate::session::CarriedTab>,
     /// The picker, while it's open. `None` is the closed state, so a closed picker costs
     /// nothing to render and cannot hold stale results.
     picker: Option<PickerState>,
@@ -341,6 +348,16 @@ impl Workspace {
         let session = crate::session::load(cx)
             .unwrap_or_else(|| crate::session::Session::single(RequestSpec::sample()));
         let active_ix = session.active;
+        let carried_tabs = session.carried.clone();
+        if !carried_tabs.is_empty() {
+            // Said out loud rather than left as invisible state: the window shows fewer tabs
+            // than the file holds, and silence there reads as "they were lost".
+            eprintln!(
+                "[zuno] {} tab(s) in this session were written by a newer Zuno — \
+                 not shown, and kept as they are",
+                carried_tabs.len()
+            );
+        }
         let environment = session.environment.clone();
         let session_panel = session.collection_panel;
         let session_width = session.panel_width;
@@ -384,6 +401,7 @@ impl Workspace {
             _quit_subscription: quit_subscription,
             views,
             active_ix,
+            carried_tabs,
             picker: None,
             picker_scan: None,
             settings: None,
@@ -2667,7 +2685,10 @@ impl Workspace {
         let spec = RequestSpec {
             id: RequestId(0),
             url: source.clone(),
-            method: zuno_core::Method::Get,
+            kind: zuno_core::RequestKind::Http(zuno_core::HttpRequest {
+                method: zuno_core::Method::Get,
+                ..Default::default()
+            }),
             settings: crate::app_state::defaults(cx),
             ..RequestSpec::default()
         };
@@ -2922,7 +2943,14 @@ impl Workspace {
     fn rewrite_body(&mut self, indent: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
 
-        if view.read(cx).body_type != crate::request_view::BodyType::Raw {
+        // Named by kind rather than by HTTP's vocabulary: "needs a raw body" means nothing to
+        // someone editing a GraphQL document, and the formatter is JSON-only either way.
+        let Some(http) = view.read(cx).http().map(|http| http.body_type) else {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Formatting a {kind} request is not supported yet"), cx);
+            return;
+        };
+        if http != crate::request_view::BodyType::Raw {
             self.set_status("Formatting needs a raw body", cx);
             return;
         }
@@ -2937,7 +2965,11 @@ impl Workspace {
             return;
         }
 
-        let before = view.read(cx).body_editor.read(cx).text().to_string();
+        let Some(editor) = view.read(cx).primary_editor().cloned() else {
+            self.set_status("Formatting needs a raw body", cx);
+            return;
+        };
+        let before = editor.read(cx).text().to_string();
         if before.trim().is_empty() {
             self.set_status("The body is empty", cx);
             return;
@@ -2967,7 +2999,7 @@ impl Workspace {
                 Ok(text) => {
                     // Typing continued while this was in flight, so the result describes a buffer
                     // that no longer exists. Replacing it would discard those keystrokes.
-                    if view.read(cx).body_editor.read(cx).text() != before {
+                    if editor.read(cx).text() != before {
                         return;
                     }
                     if text == before {
@@ -2978,7 +3010,8 @@ impl Workspace {
                     let end = before.len();
                     let size = format_bytes(text.len() as u64);
                     view.update(cx, |view, cx| {
-                        view.body_editor.update(cx, |editor, cx| {
+                        let _ = &view;
+                        editor.update(cx, |editor, cx| {
                             editor.replace_range(0..end, &text, window, cx);
                         });
                     });
@@ -3613,10 +3646,19 @@ impl Workspace {
                     );
                 }
             }
+            // Chosen "Keep editing" on a confirm: the picker has already closed, which is the
+            // whole action.
+            picker::Target::Dismiss => {}
+            picker::Target::RequestKind(choice) => {
+                self.switch_request_kind(choice, false, window, cx);
+            }
+            picker::Target::RequestKindConfirmed(choice) => {
+                self.switch_request_kind(choice, true, window, cx);
+            }
             picker::Target::Method(method) => {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| {
-                        view.method = method;
+                        view.set_method(method, cx);
                         cx.notify();
                     });
                 }
@@ -3872,7 +3914,7 @@ impl Workspace {
     /// Walks *all* views, not just the active one. Saving only `active()` was correct
     /// while one buffer was the only buffer; with a tab strip coming it would quietly
     /// discard every other open request on quit.
-    fn session(&self, cx: &App) -> crate::session::Session {
+    pub(crate) fn session(&self, cx: &App) -> crate::session::Session {
         let tabs = self
             .views
             .iter()
@@ -3884,13 +3926,15 @@ impl Workspace {
                 }
             })
             .collect();
-        crate::session::Session::new(
+        let mut session = crate::session::Session::new(
             tabs,
             self.active_ix,
             self.environment.clone(),
             self.panel_visible,
             self.panel_width,
-        )
+        );
+        session.carried = self.carried_tabs.clone();
+        session
     }
 
     /// `Window::focus` refreshes the whole window internally, so there's no
@@ -3922,7 +3966,7 @@ impl Workspace {
     /// A body with nothing focusable says so rather than moving focus somewhere useless; a silent
     /// no-op here reads as the keystroke being broken.
     fn focus_body(&mut self, _: &FocusBody, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_request_tab(RequestTab::Body, cx);
+        self.show_request_tab(RequestTab::Kind(1), cx);
         let Some(view) = self.active() else { return };
         match view.read(cx).body_focus_target(cx) {
             Some(handle) => window.focus(&handle),
@@ -3972,7 +4016,7 @@ impl Workspace {
             return;
         }
         let Some(view) = self.active() else { return };
-        let current = view.read(cx).method.clone();
+        let current = view.read(cx).method().cloned().unwrap_or_default();
 
         let items = zuno_core::Method::common()
             .into_iter()
@@ -3991,6 +4035,81 @@ impl Workspace {
 
         let picker = self.show_picker(items, "No methods", window, cx);
         picker.update(cx, |picker, cx| picker.set_fallback(custom_method_row, cx));
+    }
+
+    /// Choose what kind of request this is.
+    ///
+    /// The picker rather than a toggle, because the list will grow — gRPC and MQTT are the
+    /// reason the kind is modelled at all, and a toggle cannot hold three.
+    fn open_request_kind(&mut self, _: &OpenRequestKind, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+        let current = view.read(cx).kind.choice();
+
+        let items = crate::kinds::KindChoice::ALL
+            .into_iter()
+            .map(|choice| picker::Item {
+                label: SharedString::from(choice.label()),
+                detail: if choice == current {
+                    SharedString::from("current")
+                } else {
+                    SharedString::from(choice.detail())
+                },
+                target: picker::Target::RequestKind(choice),
+            })
+            .collect();
+
+        self.show_picker(items, "No request kinds", window, cx);
+    }
+
+    /// Switch the active buffer to another kind, asking first when that would throw work away.
+    ///
+    /// **Two steps when there is something to lose, one when there isn't** — the same shape as
+    /// deleting a saved request, and for the same reason: a kind change replaces the whole
+    /// `KindEditor`, so the body you typed goes with it and there is no undo. On a fresh buffer
+    /// `has_content` is false, so picking a kind up front costs no extra keystroke.
+    fn switch_request_kind(
+        &mut self,
+        choice: crate::kinds::KindChoice,
+        confirmed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        if view.read(cx).kind.choice() == choice {
+            return;
+        }
+
+        if !confirmed && view.read(cx).kind.has_content(cx) {
+            // **Names everything that goes, not just the body.** `KindEditor::empty` replaces
+            // the whole kind, so an HTTP request loses its method and query params too — a
+            // prompt that mentioned only the body was telling a half-truth about an action
+            // with no undo. The URL, headers and settings are spine state and survive.
+            let losing = view.read(cx).kind.discards(cx);
+            let items = vec![
+                picker::Item {
+                    label: SharedString::from(format!("Switch to {}", choice.label())),
+                    detail: SharedString::from(format!("discards {losing} — cannot be undone")),
+                    target: picker::Target::RequestKindConfirmed(choice),
+                },
+                picker::Item {
+                    label: SharedString::from("Keep editing"),
+                    detail: SharedString::default(),
+                    target: picker::Target::Dismiss,
+                },
+            ];
+            self.show_picker(items, "", window, cx);
+            return;
+        }
+
+        let kind = view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(choice, cx);
+            view.set_kind(kind, cx);
+            choice
+        });
+        self.set_status(&format!("Switched to {}", kind.label()), cx);
     }
 
     /// Choose where requests are routed.
@@ -4239,13 +4358,31 @@ impl Workspace {
         }
     }
 
-    fn add_query(&mut self, _: &AddQuery, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(view) = self.active() {
-            view.update(cx, |view, cx| {
-                view.show_request_tab(RequestTab::Query, cx);
-                view.add_row(RowKind::Query, window, cx);
-            });
+    /// The active buffer, but only when it is an HTTP request — otherwise says why not.
+    ///
+    /// **HTTP's verbs must refuse on another kind rather than half-run.** `AddQuery`,
+    /// `AddFormField` and `AddMultipartField` each used to reveal a tab and then add a row to a
+    /// table that kind does not have: nothing appeared, you were thrown onto a different tab,
+    /// and `AddFormField` reported "Switched the body to a form" while having switched nothing.
+    /// They stay reachable from the palette, so hiding the buttons was never enough.
+    fn active_http(&mut self, what: &str, cx: &mut Context<Self>) -> Option<Entity<RequestView>> {
+        let view = self.active()?;
+        match view.read(cx).http() {
+            Some(_) => Some(view),
+            None => {
+                let kind = view.read(cx).kind.choice().label();
+                self.set_status(&format!("A {kind} request has no {what}"), cx);
+                None
+            }
         }
+    }
+
+    fn add_query(&mut self, _: &AddQuery, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active_http("query params", cx) else { return };
+        view.update(cx, |view, cx| {
+            view.show_request_tab(RequestTab::Kind(0), cx);
+            view.add_row(RowKind::Query, window, cx);
+        });
     }
 
     fn next_request_tab(&mut self, _: &NextRequestTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -4265,11 +4402,11 @@ impl Workspace {
     }
 
     fn show_params_tab(&mut self, _: &ShowParamsTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_request_tab(RequestTab::Query, cx);
+        self.show_request_tab(RequestTab::Kind(0), cx);
     }
 
     fn show_body_tab(&mut self, _: &ShowBodyTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_request_tab(RequestTab::Body, cx);
+        self.show_request_tab(RequestTab::Kind(1), cx);
     }
 
     fn show_capture_tab(&mut self, _: &ShowCaptureTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -4759,8 +4896,8 @@ impl Workspace {
         if self.modal_open() {
             return;
         }
-        let Some(view) = self.active() else { return };
-        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
+        let Some(view) = self.active_http("body to pick a type for", cx) else { return };
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Kind(1), cx));
         let current = view.read(cx).body_label();
 
         let choices: [(&str, BodyType, Option<RawKind>, &str); 8] = [
@@ -4800,8 +4937,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(view) = self.active() else { return };
-        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
+        // Guarded *before* `prompt_for_paths`: on a kind with no file body this used to open a
+        // native modal dialog and then discard whatever was chosen, which is worse than a
+        // no-op — it takes over the screen first.
+        let Some(view) = self.active_http("body to attach a file to", cx) else { return };
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Kind(1), cx));
 
         // One verb, two meanings, decided by where focus is: with a multipart part focused it
         // fills that part, otherwise it sets the whole binary body. Two separate actions for
@@ -4846,12 +4986,12 @@ impl Workspace {
     }
 
     fn add_form_field(&mut self, _: &AddFormField, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(view) = self.active() else { return };
+        let Some(view) = self.active_http("form body", cx) else { return };
 
         // Adding a field to a body that isn't a form would put a row somewhere invisible, so
         // switch first and say so — it's what the keystroke plainly means.
-        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
-        if view.read(cx).body_type != BodyType::Form {
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Kind(1), cx));
+        if view.read(cx).http().map(|http| http.body_type) != Some(BodyType::Form) {
             view.update(cx, |view, cx| view.set_body_type(BodyType::Form, cx));
             self.set_status("Switched the body to a form", cx);
         }
@@ -4864,10 +5004,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(view) = self.active() else { return };
+        let Some(view) = self.active_http("multipart body", cx) else { return };
 
-        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Body, cx));
-        if view.read(cx).body_type != BodyType::Multipart {
+        view.update(cx, |view, cx| view.show_request_tab(RequestTab::Kind(1), cx));
+        if view.read(cx).http().map(|http| http.body_type) != Some(BodyType::Multipart) {
             view.update(cx, |view, cx| view.set_body_type(BodyType::Multipart, cx));
             self.set_status("Switched the body to multipart", cx);
         }
@@ -4900,7 +5040,10 @@ impl Workspace {
 
         // An import never silently drops part of the command — anything skipped is named.
         let message = if import.ignored.is_empty() {
-            format!("Imported {}", import.spec.method.as_str())
+            match import.spec.method() {
+                Some(method) => format!("Imported {}", method.as_str()),
+                None => "Imported".to_string(),
+            }
         } else {
             format!("Imported — ignored {}", import.ignored.join(", "))
         };
@@ -6007,7 +6150,7 @@ impl Workspace {
         if view.url_focus(cx).is_focused(window) {
             return SharedString::from("URL");
         }
-        if view.body_focus(cx).is_focused(window) {
+        if view.body_focus(cx).is_some_and(|handle| handle.is_focused(window)) {
             return SharedString::from("Body");
         }
         if view.response_focus.is_focused(window) {
@@ -6181,6 +6324,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_tab))
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_method))
+            .on_action(cx.listener(Self::open_request_kind))
             .on_action(cx.listener(Self::add_header))
             .on_action(cx.listener(Self::add_query))
             .on_action(cx.listener(Self::toggle_row))

@@ -31,7 +31,7 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 916 tests, ~25s
+cargo test --workspace                   # 950 tests, ~25s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -89,6 +89,47 @@ Breaking any of these is a bug, not a tradeoff.
     `dev.local.json` is gitignored and overrides it, and that split *is* the secret marking —
     there's no per-variable flag to forget to set. Anything that writes environment values back to
     disk must preserve the split, or the collection format starts leaking tokens by design.
+11. **An on-disk shape change must be *additive*, and tested in both directions.** Collection
+    files carry no version — `collection::read` is a bare `serde_json::from_slice::<RequestSpec>` —
+    so there is nothing to dispatch a migration on and invariant 8's procedure cannot be borrowed.
+    `RequestSpec` is therefore `#[serde(try_from = "StoredSpec")]` for reading, accepting every
+    shape ever written and telling them apart *structurally*; and a hand-written `Serialize` for
+    writing, which emits **0.2.9's exact flat shape for an HTTP request** and `kind` only for a
+    request that genuinely isn't HTTP. `TryFrom`, not `From`, so a file carrying neither shape is
+    still refused rather than becoming an empty request.
+
+    **Forward compatibility is not the mirror of backward, and it is the one that loses data.**
+    A released build's behaviour is fixed. 0.2.9 answers a session it cannot parse by falling back
+    to the sample and then *overwriting the file on quit* — so a shape it cannot read is not an
+    inconvenience, it is silent data loss, and it destroyed a workspace's open tabs exactly once.
+    Bumping `session::CURRENT_VERSION` does **not** help: its "written by a newer Zuno" arm fails
+    the same way, producing a better message and the same overwrite. Writing what the old build
+    already understands is the only fix available from this side.
+
+    So both directions get a test, and neither substitutes for the other:
+    `a_request_written_before_kinds_existed_still_opens` reads bytes emitted by the previous
+    release, and `an_http_request_is_written_in_the_shape_an_older_zuno_reads` pins the bytes this
+    one emits, **as a string** — `serde_json::Value` is a sorted map without `preserve_order`, so
+    it cannot see field order, and order is half of what byte-identical means. A round-trip test
+    sees neither failure, because the new code agrees with itself either way.
+
+    `session.rs` needs its own backward test for a reason the version number hides: a 0.2.9 session
+    is already `version: 5`, so the dispatch waves it through and only `RequestSpec`'s shim stands
+    between a returning user and an empty window.
+
+    **And `session::load` moves an unreadable file to `.json.bak` before falling back**, so the
+    next format mistake is recoverable rather than overwritten on quit. That guard is what should
+    have existed all along; it protects future builds, not released ones.
+
+    **A tab this build cannot read is *carried*, not skipped.** `Session.tabs` parses per entry,
+    so one unreadable tab no longer fails the whole `Vec` — that is what GraphQL does to 0.2.9.
+    But tolerance alone is slower data loss: `session()` rebuilds the file from `views`, so
+    anything not held on `Workspace::carried_tabs` is deleted at the next checkpoint. `CarriedTab`
+    keeps the raw JSON, and `Serialize` splices it back. **`at` is a hint, not a gate** — it is a
+    position in the file this session was *loaded* from, and closing a readable tab leaves it
+    pointing past the end; anything unplaced is appended rather than dropped. The first version
+    walked `0..total` and silently lost those, with both tests passing because their counts
+    happened to line up.
 
 ## GPUI 0.2.2 — verify, don't remember
 
@@ -276,6 +317,25 @@ end-to-end over sockets (`core/tests/`), full-stack through keystrokes (`app/src
   guessing. Printing the actual `RequestSpec` at the point of the send named it in one run. The
   general rule: **an input helper that does not first move focus is a helper that types
   somewhere unpredictable**, and it will read as a timing bug rather than as a targeting one.
+
+- **A format change tested in one direction only, which cost a workspace's open tabs.** The
+  spine/kind split was verified hard *backwards* — three break-tests, fixtures emitted by the
+  previous release — and the reverse was never considered. But a developer runs `cargo run` and
+  the installed `zuno` on the same machine, so the new build wrote a shape 0.2.9 could not read,
+  0.2.9 fell back to the sample, and its quit hook saved that over the file. **The read error was
+  the visible half; the overwrite was the damage**, and it arrived from the direction invariant 8
+  does not cover.
+
+  Three things came out of it, and the third is the general one. The format is now *additive* —
+  an HTTP request still serializes to 0.2.9's exact bytes, proven by round-tripping all 67 real
+  collection files through both builds and diffing. `session::load` moves an unreadable file
+  aside instead of letting it be overwritten. And **the bytes are pinned by a test**, because a
+  foundation change that relies on a human spotting it in a diff has the wrong mechanism: the
+  reviewer cannot end-to-end test every path, and "purely additive" is a claim a machine can check.
+
+  The transferable rule: **when a change touches a format, ask what the *previous* release does
+  with what this one writes** — and remember that a released build's failure mode is fixed and may
+  be destructive rather than inert.
 
 - **Docs went stale twice while the code was right.** Both times a multi-file edit script aborted
   on a failed anchor assertion, so files listed *after* the failure were silently skipped, and the
@@ -491,6 +551,13 @@ what was tried and rejected; **CLAUDE.md** commands, invariants, traps.
   is the thing a palette exists to prevent.
 - Every action handler lives on `Workspace`, because dispatch travels up the focus tree and
   `Workspace` is always on it.
+- **A verb that only makes sense for one request kind asks `Workspace::active_http` first.**
+  Without it the handler reveals a tab and then does nothing, because the setters no-op off the
+  wrong kind — `AddQuery`, `AddFormField`, `AddMultipartField`, `OpenBodyType` and
+  `ChooseBodyFile` all shipped that way, and the last opened a *native file dialog* before
+  discarding the result. Every one has a palette row, so hiding the button is not the fix. Found
+  once and fixed at three sites; the other two needed a second pass. **Grep every handler that
+  touches `http()` when a kind is added**, rather than patching the ones you remember.
 - **Anything that opens a modal, or moves focus, asks `Workspace::modal_open` first.** Written out
   at each site it drifts: `open_request` and `open_palette` checked only `picker` while four other
   openers checked both, so `Ctrl+P` over the settings panel stacked two modals. And because the

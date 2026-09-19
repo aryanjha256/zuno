@@ -47,8 +47,8 @@ pub use highlight::{Token, TokenKind};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;
 pub use request::{
-    Body, FormField, Header, Method, MultipartField, MultipartValue, QueryParam, RawKind,
-    RequestId, RequestSettings, RequestSpec, label_for,
+    Body, FormField, GraphQlRequest, Header, HttpRequest, Method, MultipartField, MultipartValue,
+    QueryParam, RawKind, RequestId, RequestKind, RequestSettings, RequestSpec, label_for,
 };
 pub use response::{
     Connection, HttpVersion, Phase, PhaseKind, ResponseData, SizeInfo, StatusClass, Timing,
