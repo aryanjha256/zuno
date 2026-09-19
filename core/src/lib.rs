@@ -12,6 +12,7 @@
 
 pub mod assertion;
 pub mod body_diff;
+pub mod bundle;
 pub mod capture;
 pub mod collection;
 pub mod curl;

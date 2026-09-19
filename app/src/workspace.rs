@@ -1810,7 +1810,7 @@ impl Workspace {
                 MenuRow::Separator,
                 // On the folder menu because a folder is the unit you export — any folder, at
                 // any depth, is a collection root as far as `scan` is concerned.
-                MenuItem::new("Export as Postman…", ExportCollection, &focus, window).into(),
+                MenuItem::new("Export…", ExportCollection, &focus, window).into(),
                 MenuRow::Separator,
                 MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
                 MenuItem::new("Copy relative path", CopyRequestRelativePath, &focus, window)
@@ -2794,6 +2794,26 @@ impl Workspace {
         }
 
         let variables = self.import_variables(root, &title, &import, cx);
+        // A bundle carries environments already named, so they cannot share the single
+        // collection-level list Postman flattens into one. Written under their own names,
+        // merged rather than overwritten — an import lands *beside* what is there.
+        let mut environments = 0;
+        for named in &import.environments {
+            if environment::merge_imported(
+                root,
+                environment::Target::Named(&named.name),
+                &named.variables,
+            )
+            .is_ok()
+            {
+                environments += 1;
+            }
+        }
+        let variables = match (variables, environments) {
+            (existing, 0) => existing,
+            (_, 1) => Some(" — 1 environment".to_string()),
+            (_, n) => Some(format!(" — {n} environments")),
+        };
 
         self.refresh_tree(cx);
         self.import = None;
@@ -3656,6 +3676,9 @@ impl Workspace {
             // Chosen "Keep editing" on a confirm: the picker has already closed, which is the
             // whole action.
             picker::Target::Dismiss => {}
+            picker::Target::Export(format) => {
+                self.write_export(format, window, cx);
+            }
             picker::Target::RequestKind(choice) => {
                 self.switch_request_kind(choice, false, window, cx);
             }
@@ -4365,31 +4388,65 @@ impl Workspace {
         }
     }
 
-    /// Write the selected folder — or the whole collection — as a Postman v2.1 file.
+    /// Ask what to write the selected folder as, then write it.
     ///
-    /// **Any folder, at any depth**, because `collection::scan` takes a root and the export is
-    /// the same code with a different one. With a directory selected in the panel that is the
-    /// root; otherwise it is the collection itself.
-    ///
-    /// Postman only, and deliberately not OpenAPI: a spec would mean inventing parameter types,
-    /// body schemas and responses a collection does not hold. See `postman::export`.
+    /// **Any folder, at any depth**, because `collection::scan` takes a root and both exporters
+    /// are the same code with a different one. With a directory selected in the panel that is
+    /// the root; with a request selected it is that request's folder — refusing because the
+    /// cursor is one row off would be pedantry; with nothing selected, the collection itself.
     fn export_collection(
         &mut self,
         _: &ExportCollection,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(collection) = crate::collections::root(cx).map(Path::to_path_buf) else {
+        if self.modal_open() {
+            return;
+        }
+        if crate::collections::root(cx).is_none() {
             self.set_status("No collection to export", cx);
             return;
-        };
+        }
 
-        // A selected *request* exports the folder it sits in — the verb acts on a folder, and
-        // refusing because the cursor is one row off would be pedantry.
+        let items = vec![
+            picker::Item {
+                label: SharedString::from("Zuno bundle"),
+                detail: SharedString::from("one file, nothing lost — for another Zuno"),
+                target: picker::Target::Export(picker::ExportFormat::Bundle),
+            },
+            picker::Item {
+                label: SharedString::from("Postman collection"),
+                detail: SharedString::from("v2.1 — settings, captures and assertions are dropped"),
+                target: picker::Target::Export(picker::ExportFormat::Postman),
+            },
+        ];
+        self.show_picker(items, "", window, cx);
+    }
+
+    /// The root a export acts on, and what to call it.
+    fn export_root(&self, cx: &App) -> Option<(PathBuf, PathBuf, String)> {
+        let collection = crate::collections::root(cx).map(Path::to_path_buf)?;
         let root = match self.selected_node() {
             Some(node) if node.path.is_dir() => node.path.clone(),
             Some(node) => node.path.parent().map_or(collection.clone(), Path::to_path_buf),
             None => collection.clone(),
+        };
+        let name = root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "collection".to_string());
+        Some((collection, root, name))
+    }
+
+    fn write_export(
+        &mut self,
+        format: picker::ExportFormat,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_collection, root, name)) = self.export_root(cx) else {
+            self.set_status("No collection to export", cx);
+            return;
         };
 
         let entries = zuno_core::collection::scan(&root);
@@ -4397,23 +4454,51 @@ impl Workspace {
             self.set_status("Nothing to export in that folder", cx);
             return;
         }
-
-        let name = root
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "collection".to_string());
-        let export = zuno_core::postman::export::to_collection(&name, &entries);
         let count = entries.len();
 
-        let suggested = format!("{name}.postman_collection.json");
+        let (contents, skipped, suggested) = match format {
+            picker::ExportFormat::Postman => {
+                let export = zuno_core::postman::export::to_collection(&name, &entries);
+                (
+                    export.json,
+                    export.skipped,
+                    format!("{name}.postman_collection.json"),
+                )
+            }
+            picker::ExportFormat::Bundle => {
+                let folders = zuno_core::collection::folders(&root);
+                // **The committed half only** — see `bundle::StoredEnvironment`. A bundle is a
+                // thing you send someone, and `dev.local.json` is gitignored because it holds
+                // secrets.
+                // `scan` gives the resolved view; `read` gives the committed/local split,
+                // which is what lets the local half be left behind.
+                let environments: Vec<_> = zuno_core::environment::scan(&root)
+                    .iter()
+                    .filter_map(|env| zuno_core::environment::read(&root, &env.name).ok())
+                    .collect();
+                let json = zuno_core::bundle::to_bundle(&name, &entries, &folders, &environments);
+                let note = if environments.iter().any(|file| !file.local.is_empty()) {
+                    vec![
+                        "secrets from the .local files were left out, by design".to_string(),
+                    ]
+                } else {
+                    Vec::new()
+                };
+                (
+                    json,
+                    note,
+                    format!("{name}.{}", zuno_core::bundle::EXTENSION),
+                )
+            }
+        };
+
         // **Home, not the collection root**, and not only because it is easier to find:
         // `collection::scan` walks *every* `.json` under the root, so an export saved beside
         // the requests it came from is read back as a request, fails to parse, and reports
-        // "is not a valid request" on every scan from then on. The dialog still lets you put
-        // it anywhere — this is only where it opens.
+        // "is not a valid request" on every scan from then on.
         let directory = std::env::var_os("HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| collection.clone());
+            .unwrap_or_else(|| root.clone());
         let prompt = cx.prompt_for_new_path(&directory, Some(&suggested));
 
         self.export_task = Some(cx.spawn(async move |workspace, cx| {
@@ -4422,23 +4507,15 @@ impl Workspace {
                 return;
             };
 
-            let written = std::fs::write(&path, export.json.as_bytes());
+            let written = std::fs::write(&path, contents.as_bytes());
             workspace
                 .update(cx, |workspace, cx| match written {
                     Ok(()) => {
-                        // **The skipped list is part of the result, not a footnote.** A
-                        // collection that arrives in Postman missing its assertions, with
-                        // nothing having said so, is the silent-loss shape this codebase keeps
-                        // getting caught by.
-                        let message = if export.skipped.is_empty() {
+                        // **What did not travel is part of the result, not a footnote.**
+                        let message = if skipped.is_empty() {
                             format!("Exported {count} request(s)")
                         } else {
-                            format!(
-                                "Exported {count} request(s) — {} thing(s) Postman has no place \
-                                 for: {}",
-                                export.skipped.len(),
-                                export.skipped.join("; ")
-                            )
+                            format!("Exported {count} request(s) — {}", skipped.join("; "))
                         };
                         workspace.set_status(&message, cx);
                     }

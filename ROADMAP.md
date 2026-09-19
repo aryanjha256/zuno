@@ -95,6 +95,23 @@ work. See architecture.md §3.1.
 Putting the format change in its own slice is what made its one real bug — an older Zuno
 overwriting a session it could not read — have exactly one candidate.
 
+**Two exports, for two audiences — done.** *Export…* on any folder asks which: a **Zuno
+bundle** (one file, nothing lost) or a **Postman collection** (v2.1, for other tools).
+
+The bundle exists because Postman export is lossy by necessity — it has no home for per-request
+settings, captures, assertions or `expect_status`, which is exactly what Zuno adds. Sending a
+collection to another *Zuno* should not go through a format that drops them. It is an
+**envelope, not a second schema**: each request is its existing `RequestSpec` serialization
+embedded verbatim, so a new kind travels for free and there is no second description of a
+request to keep in step with the model. Import goes through the same sniff as every other
+document, so `Ctrl+Shift+I` reads one with no new verb.
+
+It carries a `version` where collection files deliberately do not (invariant 9): a bundle is
+written once and opened *somewhere else, possibly by an older build*, which is the one case
+where "written by a newer Zuno" beats a cryptic parse error. Environments travel as the
+**committed half only** — `dev.local.json` is gitignored because it holds secrets, and a bundle
+is a thing you send someone.
+
 **Postman export — done, and it closes an asymmetry.** Zuno read curl, OpenAPI and Postman and
 could write only a single curl command: easy to get in, impossible to get out. Right-click any
 folder → *Export as Postman…* writes a v2.1 collection, at any depth, because `collection::scan`

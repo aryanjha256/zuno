@@ -76,6 +76,17 @@ fn split_budget(label: usize, detail: usize) -> (usize, usize) {
 const VISIBLE_ROWS: f32 = 12.;
 
 /// What choosing a row does. Opaque to the picker itself.
+/// What an export writes.
+///
+/// Two, and they are not alternatives so much as different audiences: **Postman** is how a
+/// collection reaches another *tool*, and loses what Postman has no field for; a **bundle** is
+/// how it reaches another *Zuno*, and loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Postman,
+    Bundle,
+}
+
 pub enum Target {
     /// Switch to an already-open buffer, by index into `Workspace::views`.
     ///
@@ -95,6 +106,8 @@ pub enum Target {
     RequestKindConfirmed(crate::kinds::KindChoice),
     /// Close the picker and do nothing — the "Keep editing" half of a confirm.
     Dismiss,
+    /// Which format to write a collection as.
+    Export(ExportFormat),
     /// Select the active environment, or `None` for none.
     Environment(Option<String>),
     /// Show a retained response: `0` is live, `1` the run before it.
@@ -137,6 +150,7 @@ impl Clone for Target {
             Self::RequestKind(choice) => Self::RequestKind(*choice),
             Self::RequestKindConfirmed(choice) => Self::RequestKindConfirmed(*choice),
             Self::Dismiss => Self::Dismiss,
+            Self::Export(format) => Self::Export(*format),
             Self::Proxy(mode) => Self::Proxy(mode.clone()),
             Self::RemoveProxy(url) => Self::RemoveProxy(url.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),

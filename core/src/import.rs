@@ -27,8 +27,15 @@ pub enum ImportError {
     Swagger,
     #[error("this is a Postman v1 collection — re-export it from Postman as v2.1")]
     PostmanV1,
-    #[error("not a document Zuno can read — expected an OpenAPI 3.x spec or a Postman collection")]
+    #[error("not a document Zuno can read — expected a Zuno bundle, an OpenAPI 3.x spec, or a Postman collection")]
     Unrecognised,
+    #[error("this bundle is malformed: {0}")]
+    Malformed(String),
+    /// **Refused, not partially read.** A bundle written by a newer Zuno may hold request kinds
+    /// and fields this build cannot express, and importing the subset it understands would drop
+    /// the rest in silence — the failure 0.2.9 demonstrated with sessions.
+    #[error("this bundle was written by a newer Zuno (format v{found}, this build reads v{supported})")]
+    NewerBundle { found: u32, supported: u32 },
 }
 
 /// What a document turned out to be.
@@ -78,9 +85,22 @@ pub struct Variable {
     pub secret: bool,
 }
 
+/// One environment an import brought with it, by name.
+///
+/// Separate from `Import::variables`, which is the *collection-level* set Postman flattens into
+/// a single environment named for the collection. A bundle can carry several, each already
+/// named, so they cannot share one list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedVariables {
+    pub name: String,
+    pub variables: Vec<Variable>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Import {
     pub requests: Vec<Imported>,
+    /// Environments carried by name. Empty for every importer but the bundle.
+    pub environments: Vec<NamedVariables>,
     /// What to name the folder everything lands in: `info.title` or `info.name`.
     pub title: Option<String>,
     /// Collection-level variables, for the environment written alongside the requests. An
@@ -115,6 +135,12 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, ImportError> {
         .get("collection")
         .filter(|collection| collection.get("item").is_some())
         .unwrap_or(&root);
+
+    // Ours first: `zuno` plus `requests` is a pair no other format uses, and a bundle must
+    // never be read by a parser that would drop the fields only Zuno has.
+    if crate::bundle::claims(root) {
+        return Ok(Parsed::Collection(crate::bundle::parse(root)?));
+    }
 
     // Ordered most specific first. Every arm below `openapi` is a shape we can name but not
     // read, and naming it is the whole point — see the module note.
