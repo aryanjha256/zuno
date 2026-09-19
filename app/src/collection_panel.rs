@@ -171,23 +171,41 @@ pub fn render(
     .pb_2()
     .flex_1();
 
+    // **The reveal is a window over a panel that never changes size, not a panel that grows.**
+    // The inner column keeps its settled width the whole way in and rides a negative margin,
+    // so it arrives from off the left edge with the seam. Animating the panel's own `w()`
+    // instead would re-run layout inside it on every tick: rows would re-elide their labels and
+    // the header's four controls would reshuffle as they fit, which reads as the contents
+    // twitching rather than as the panel arriving.
+    let revealed = workspace.revealed_panel_width(window);
+
     div()
-        .id("collection-panel")
-        .debug_selector(|| "collection-panel".to_string())
-        .key_context("CollectionPanel")
-        .track_focus(&workspace.panel_focus)
         .flex()
-        .flex_col()
         .flex_none()
-        .w(px(width))
+        .w(px(revealed))
         .h_full()
         .overflow_hidden()
-        .bg(theme.bg_panel)
-        .border_r_1()
-        .border_color(theme.focus_border(focused))
-        .child(header(workspace, theme, cx))
-        .child(list)
-        .children(empty_notice(workspace, theme))
+        .child(
+            div()
+                .id("collection-panel")
+                .debug_selector(|| "collection-panel".to_string())
+                .key_context("CollectionPanel")
+                .track_focus(&workspace.panel_focus)
+                .flex()
+                .flex_col()
+                .flex_none()
+                // Negative until the slide finishes, which is the whole animation. `width`
+                // rather than `revealed` here on purpose — see the note above.
+                .ml(px(revealed - width))
+                .w(px(width))
+                .h_full()
+                .bg(theme.bg_panel)
+                .border_r_1()
+                .border_color(theme.focus_border(focused))
+                .child(header(workspace, theme, cx))
+                .child(list)
+                .children(empty_notice(workspace, theme)),
+        )
 }
 
 /// The panel width a pointer at `pointer_x` is asking for.
@@ -247,7 +265,9 @@ pub fn resize_handle(
     window: &Window,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let width = workspace.clamped_panel_width(window);
+    // The edge the seam names is the one being drawn, so this follows the panel in rather than
+    // waiting at the settled width with nothing under it.
+    let width = workspace.revealed_panel_width(window);
     // Nothing else in the app calls `on_drag`, so an active drag is *this* drag. Read rather
     // than stored, which is what keeps it honest: the flag cannot outlive the gesture.
     let dragging = cx.has_active_drag();

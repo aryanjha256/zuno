@@ -144,6 +144,15 @@ pub struct Workspace {
     /// because the window happened to be narrow when it was set, and the user would find it
     /// changed after maximizing.
     panel_width: f32,
+    /// How much of the panel's width is on screen right now, `0.0`–`1.0`.
+    ///
+    /// A multiplier rather than an animated width, because `panel_width` is the number the user
+    /// dragged to and the session records it — animating that field directly would persist
+    /// whatever the slide happened to be passing through if the app quit mid-reveal.
+    panel_reveal: f32,
+    /// The running reveal. Held so a second toggle **replaces** it: dropping a `Task` cancels,
+    /// so two slides can never fight over the same multiplier.
+    panel_reveal_anim: Option<Task<()>>,
     /// **An index into `tree`, not into `tree_visible`.** Folding rewrites `tree_visible`
     /// underneath the selection, so a visible index would silently retarget it at whatever
     /// row slid into that slot — the lesson the response viewer's row cursor already records
@@ -422,6 +431,8 @@ impl Workspace {
             tree_skipped: 0,
             panel_visible: session_panel,
             panel_width: session_width,
+            panel_reveal: 1.0,
+            panel_reveal_anim: None,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
             cert_prompt: None,
@@ -572,6 +583,11 @@ impl Workspace {
         self.globals_active = globals_has_values(cx);
         self.panel_visible = session.collection_panel;
         self.panel_width = session.panel_width;
+        // Switching workspaces is not a toggle, so there is nothing to reveal: a slide here
+        // would be motion that reports no decision. Any reveal still in flight belongs to the
+        // workspace being left, and dropping the task cancels it.
+        self.panel_reveal = 1.0;
+        self.panel_reveal_anim = None;
 
         // Every handle into the old buffers is dead, so focus has to move or the keymap goes
         // with them. `activate` is the one funnel that does both.
@@ -1340,6 +1356,65 @@ impl Workspace {
         }));
     }
 
+    /// The panel width to *draw* this frame: the settled width, scaled by the reveal.
+    ///
+    /// Everything that has to agree with the panel's right edge reads this — the panel itself,
+    /// the resize handle, and the width the tab strip is told it has. Reading
+    /// `clamped_panel_width` in one of them and this in another is how a seam ends up detached
+    /// from the edge it is supposed to name.
+    pub(crate) fn revealed_panel_width(&self, window: &Window) -> f32 {
+        self.clamped_panel_width(window) * self.panel_reveal
+    }
+
+    /// Slide the panel in from the window's left edge.
+    ///
+    /// **Only on show, never on hide.** An exit animation means painting the panel *after* the
+    /// decision to hide it, and the panel owns a focus handle and a rename input — so for those
+    /// frames `Tab` could walk back into a panel on its way out. `toggle_collection_panel` moves
+    /// focus off the panel as it hides precisely so nothing is left on an unpainted element;
+    /// keeping it painted to animate would undo that. A ghost with no focus handle would work
+    /// and is not worth it for 140ms.
+    ///
+    /// **Driven by a timer rather than gpui's `with_animation`**, which computes its delta from
+    /// `Instant::now()` and asks for animation frames — and the headless platform's
+    /// `on_request_frame` is an empty stub, so nothing ever delivers one. An element animated
+    /// that way does not freeze at its start value either; it sits at whatever delta some
+    /// unrelated repaint happened to compute, which is a flake generator rather than a fixed
+    /// state to assert. This is the same shape as `animate_tabs_to`, and `advance_clock` drives
+    /// it deterministically.
+    fn reveal_panel(&mut self, cx: &mut Context<Self>) {
+        /// Matches the tab strip's travel, so the two moving things in the app agree.
+        const TRAVEL: Duration = Duration::from_millis(140);
+        /// Roughly a frame. `timer` is not a frame clock — the eased position comes from elapsed
+        /// wall time, so this only decides how often it is recomputed.
+        const TICK: Duration = Duration::from_millis(8);
+
+        self.panel_reveal = 0.;
+        self.panel_reveal_anim = Some(cx.spawn(async move |this, cx| {
+            let started = Instant::now();
+
+            loop {
+                let t = (started.elapsed().as_secs_f32() / TRAVEL.as_secs_f32()).min(1.);
+                // Ease-out cubic: leaves immediately and settles, which is what makes a short
+                // travel read as deliberate rather than clipped.
+                let eased = 1. - (1. - t).powi(3);
+                if this
+                    .update(cx, |this, cx| {
+                        this.panel_reveal = eased;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                if t >= 1. {
+                    break;
+                }
+                cx.background_executor().timer(TICK).await;
+            }
+        }));
+    }
+
     pub(crate) fn clamped_panel_width(&self, window: &Window) -> f32 {
         crate::collection_panel::clamp_width(
             self.panel_width,
@@ -1464,6 +1539,7 @@ impl Workspace {
     ) {
         if !self.panel_visible {
             self.panel_visible = true;
+            self.reveal_panel(cx);
             // Cheap, and a collection edited outside Zuno is the normal case — it is a git
             // directory, so it changes under us on every pull.
             self.refresh_tree(cx);
@@ -6602,7 +6678,7 @@ impl Render for Workspace {
                 // What the editor column will actually get: the row is the window less the
                 // panel, and the column takes the rest. Zero when the panel is hidden.
                 let panel_width = if self.panel_visible {
-                    self.clamped_panel_width(window)
+                    self.revealed_panel_width(window)
                 } else {
                     0.
                 };
