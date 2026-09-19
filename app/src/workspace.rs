@@ -39,7 +39,7 @@ use crate::actions::{
     ClearCookies, CloseTab, CopyResponse, CopyRowPath, CopyRowValue, MenuConfirm, MenuDismiss,
     MenuNext, MenuPrev, OpenRowMenu, ResponseRowNext, ResponseRowPrev, ScrollLeft, ScrollRight,
     ScrollStart, ToggleFold, FocusBody, FocusNext, FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
-    OpenBodyType, PrevRequestTab, OpenMethod, OpenRequestKind, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
+    ExportCollection, OpenBodyType, PrevRequestTab, OpenMethod, OpenRequestKind, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     OpenAppMenu, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
@@ -85,6 +85,8 @@ pub struct Workspace {
     /// them tolerantly is worthless on its own — the next save would write only the buffers this
     /// build understands and the rest would be gone. See `session::CarriedTab`.
     carried_tabs: Vec<crate::session::CarriedTab>,
+    /// Holds the export dialog and its write alive; dropping the task cancels both.
+    export_task: Option<Task<()>>,
     /// The picker, while it's open. `None` is the closed state, so a closed picker costs
     /// nothing to render and cannot hold stale results.
     picker: Option<PickerState>,
@@ -402,6 +404,7 @@ impl Workspace {
             views,
             active_ix,
             carried_tabs,
+            export_task: None,
             picker: None,
             picker_scan: None,
             settings: None,
@@ -1804,6 +1807,10 @@ impl Workspace {
                 // gesture most invites is the one that puts a request in it.
                 MenuItem::new("New request", NewRequest, &focus, window).into(),
                 MenuItem::new("New folder", NewFolder, &focus, window).into(),
+                MenuRow::Separator,
+                // On the folder menu because a folder is the unit you export — any folder, at
+                // any depth, is a collection root as far as `scan` is concerned.
+                MenuItem::new("Export as Postman…", ExportCollection, &focus, window).into(),
                 MenuRow::Separator,
                 MenuItem::new("Copy path", CopyRequestPath, &focus, window).into(),
                 MenuItem::new("Copy relative path", CopyRequestRelativePath, &focus, window)
@@ -4358,6 +4365,83 @@ impl Workspace {
         }
     }
 
+    /// Write the selected folder — or the whole collection — as a Postman v2.1 file.
+    ///
+    /// **Any folder, at any depth**, because `collection::scan` takes a root and the export is
+    /// the same code with a different one. With a directory selected in the panel that is the
+    /// root; otherwise it is the collection itself.
+    ///
+    /// Postman only, and deliberately not OpenAPI: a spec would mean inventing parameter types,
+    /// body schemas and responses a collection does not hold. See `postman::export`.
+    fn export_collection(
+        &mut self,
+        _: &ExportCollection,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(collection) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.set_status("No collection to export", cx);
+            return;
+        };
+
+        // A selected *request* exports the folder it sits in — the verb acts on a folder, and
+        // refusing because the cursor is one row off would be pedantry.
+        let root = match self.selected_node() {
+            Some(node) if node.path.is_dir() => node.path.clone(),
+            Some(node) => node.path.parent().map_or(collection.clone(), Path::to_path_buf),
+            None => collection.clone(),
+        };
+
+        let entries = zuno_core::collection::scan(&root);
+        if entries.is_empty() {
+            self.set_status("Nothing to export in that folder", cx);
+            return;
+        }
+
+        let name = root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "collection".to_string());
+        let export = zuno_core::postman::export::to_collection(&name, &entries);
+        let count = entries.len();
+
+        let suggested = format!("{name}.postman_collection.json");
+        let prompt = cx.prompt_for_new_path(&collection, Some(&suggested));
+
+        self.export_task = Some(cx.spawn(async move |workspace, cx| {
+            // Cancelled, or the platform could not open a picker.
+            let Ok(Ok(Some(path))) = prompt.await else {
+                return;
+            };
+
+            let written = std::fs::write(&path, export.json.as_bytes());
+            workspace
+                .update(cx, |workspace, cx| match written {
+                    Ok(()) => {
+                        // **The skipped list is part of the result, not a footnote.** A
+                        // collection that arrives in Postman missing its assertions, with
+                        // nothing having said so, is the silent-loss shape this codebase keeps
+                        // getting caught by.
+                        let message = if export.skipped.is_empty() {
+                            format!("Exported {count} request(s)")
+                        } else {
+                            format!(
+                                "Exported {count} request(s) — {} thing(s) Postman has no place \
+                                 for: {}",
+                                export.skipped.len(),
+                                export.skipped.join("; ")
+                            )
+                        };
+                        workspace.set_status(&message, cx);
+                    }
+                    Err(error) => {
+                        workspace.set_status(&format!("Could not write the export: {error}"), cx)
+                    }
+                })
+                .ok();
+        }));
+    }
+
     /// The active buffer, but only when it is an HTTP request — otherwise says why not.
     ///
     /// **HTTP's verbs must refuse on another kind rather than half-run.** `AddQuery`,
@@ -6325,6 +6409,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_tab))
             .on_action(cx.listener(Self::open_method))
             .on_action(cx.listener(Self::open_request_kind))
+            .on_action(cx.listener(Self::export_collection))
             .on_action(cx.listener(Self::add_header))
             .on_action(cx.listener(Self::add_query))
             .on_action(cx.listener(Self::toggle_row))

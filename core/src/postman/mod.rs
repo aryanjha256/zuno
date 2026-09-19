@@ -20,6 +20,7 @@
 //! settings Zuno models differently; and request descriptions, for which `RequestSpec` has no
 //! field — counted and reported once rather than per request.
 
+pub mod export;
 pub mod script;
 
 use serde_json::{Map, Value};

@@ -168,6 +168,7 @@ actions!(
         // Request editing
         OpenMethod,
         OpenRequestKind,
+        ExportCollection,
         AddHeader,
         AddQuery,
         ToggleRow,

@@ -45,6 +45,7 @@ pub fn palette() -> Vec<Command> {
         command("Send request", SendRequest),
         command("Cancel request", CancelRequest),
         command("Save request to collection", SaveRequest),
+        command("Export as a Postman collection", ExportCollection),
         command("Import request from curl on the clipboard", ImportCurl),
         command("New request in the selected folder", NewRequest),
         command("Format the request body as JSON", FormatBody),
