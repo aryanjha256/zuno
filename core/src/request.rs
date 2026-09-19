@@ -309,6 +309,18 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
+    /// The short tag a collection row wears: `GQL`, and later `WS`, `gRPC`, `MQTT`.
+    ///
+    /// `None` for HTTP, where the *method* is the useful distinction and the row shows that
+    /// instead. For every other kind the method is noise — every GraphQL request is a POST —
+    /// so the kind is what tells two rows apart.
+    pub fn badge(&self) -> Option<&'static str> {
+        match self {
+            RequestKind::Http(_) => None,
+            RequestKind::GraphQl(_) => Some("GQL"),
+        }
+    }
+
     /// What this kind is called in the UI.
     pub fn label(&self) -> &'static str {
         match self {

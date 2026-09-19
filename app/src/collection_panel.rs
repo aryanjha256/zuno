@@ -23,7 +23,7 @@ use gpui::{
     Window, div, px, uniform_list,
 };
 use zuno_core::Method;
-use zuno_core::collection::{Node, NodeKind};
+use zuno_core::collection::{Badge, Node, NodeKind};
 
 use crate::actions::{
     CollectionCollapseAll, CollectionExpandAll, NewFolder, NewRequest, OpenCollectionMenu, OpenWorkspaceMenu,
@@ -413,7 +413,7 @@ fn new_node_cell(
                 glyph_cell().child(glyph(Icon::Folder, theme.text_faint, theme.text_faint, 13.))
             }
             crate::workspace::NewNode::Request => {
-                method_cell(&zuno_core::Method::default(), theme)
+                badge_cell(&Badge::Method(zuno_core::Method::default()), theme)
             }
         })
         .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(input))
@@ -511,13 +511,22 @@ pub(crate) fn method_label(method: &Method) -> String {
     }
 }
 
-fn method_cell(method: &Method, theme: &Theme) -> Div {
+/// The first column of a request row: its verb, or its kind.
+///
+/// **HTTP keeps its per-verb colour; every other kind gets one neutral colour.** The verb
+/// palette means something — red for DELETE — and mapping `GQL`, `WS` and `gRPC` onto it would
+/// invent a meaning the tag does not have.
+fn badge_cell(badge: &Badge, theme: &Theme) -> Div {
+    let (text, color) = match badge {
+        Badge::Method(method) => (method_label(method), theme.method_color(method)),
+        Badge::Kind(tag) => ((*tag).to_string(), theme.text_muted),
+    };
     div()
         .flex_none()
         .w(px(METHOD_WIDTH))
         .font_family(theme.mono.clone())
-        .text_color(theme.method_color(method))
-        .child(method_label(method))
+        .text_color(color)
+        .child(text)
 }
 
 /// The folder glyph's slot: its own narrow width, so the icon sits beside its name. Sharing the
@@ -667,16 +676,11 @@ fn row(
                 None => name_cell(&node.name, panel_width, node.depth, true, theme.text, row_ix)
                     .into_any_element(),
             }),
-        NodeKind::Request { method, .. } => row
+        NodeKind::Request { badge, .. } => row
             // The chevron's column is held open on a request row too, so a request and a
             // sibling directory start their names at the same x.
             .child(div().flex_none().w(px(CHEVRON)))
-            .child(match method {
-                Some(method) => method_cell(method, theme).into_any_element(),
-                // A kind with no method still holds the column, so names stay aligned
-                // down the tree whatever the rows above it are.
-                None => div().flex_none().w(px(METHOD_WIDTH)).into_any_element(),
-            })
+            .child(badge_cell(badge, theme))
             // The rename box takes the name's place rather than overlaying the row, so the
             // method and the indentation stay put and the name appears to become editable
             // where it already was.

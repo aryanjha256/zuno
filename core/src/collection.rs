@@ -667,16 +667,25 @@ pub struct Node {
     pub kind: NodeKind,
 }
 
+/// What a collection row shows in its first column.
+///
+/// **The kind wins over the method wherever it says more.** Every GraphQL request is a POST, so
+/// a column of `POST` tells two rows nothing apart; `GQL` tells you what they are. HTTP is the
+/// case where the verb *is* the distinction, so it keeps it — and keeps its per-verb colour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Badge {
+    Method(Method),
+    /// `GQL`, and later `WS`, `gRPC`, `MQTT`.
+    Kind(&'static str),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeKind {
     Directory,
-    /// Carries the method and URL rather than the whole `RequestSpec`: the panel draws both,
+    /// Carries the badge and URL rather than the whole `RequestSpec`: the panel draws both,
     /// and a spec holds the body, which for a large request would be cloned per scan and held
     /// for as long as the panel is open.
-    /// `method` is an `Option` because only some kinds have one — gRPC is always POST and
-    /// never shows it, MQTT has none at all. The panel draws no badge rather than an
-    /// invented one.
-    Request { method: Option<Method>, url: String },
+    Request { badge: Badge, url: String },
 }
 
 /// Arrange scanned entries into a flat, depth-tagged tree.
@@ -753,7 +762,10 @@ fn flatten_branch(branch: &Branch<'_>, parent: &Path, depth: u16, out: &mut Vec<
                 .to_string(),
             path: entry.path.clone(),
             kind: NodeKind::Request {
-                method: entry.spec.method().cloned(),
+                badge: match entry.spec.kind.badge() {
+                    Some(tag) => Badge::Kind(tag),
+                    None => Badge::Method(entry.spec.method().cloned().unwrap_or_default()),
+                },
                 url: entry.spec.url.clone(),
             },
         });
@@ -772,6 +784,45 @@ mod tests {
         ));
         std::fs::remove_dir_all(&dir).ok();
         dir
+    }
+
+    /// **A GraphQL row is badged by its kind, not its verb.**
+    ///
+    /// Every GraphQL request is a POST, so a column of `POST` tells two rows nothing apart —
+    /// the badge's whole job is saying what a row is. HTTP is the case where the verb *is* the
+    /// distinction, so it keeps it.
+    #[test]
+    fn a_row_is_badged_by_whichever_says_more() {
+        let root = std::env::temp_dir().join(format!("zuno-badge-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+
+        let mut http = RequestSpec::sample();
+        http.url = "https://a.test/users".into();
+        http.http_mut().expect("HTTP").method = Method::Delete;
+        write(&root.join("a-http.json"), &http).expect("write");
+
+        let mut gql = RequestSpec::default();
+        gql.url = "https://a.test/graphql".into();
+        gql.kind = crate::RequestKind::GraphQl(crate::GraphQlRequest::default());
+        write(&root.join("b-gql.json"), &gql).expect("write");
+
+        let nodes = tree(&root, &scan(&root), &folders(&root));
+        let badges: Vec<&Badge> = nodes
+            .iter()
+            .filter_map(|node| match &node.kind {
+                NodeKind::Request { badge, .. } => Some(badge),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(badges[0], &Badge::Method(Method::Delete), "HTTP keeps its verb");
+        assert_eq!(
+            badges[1],
+            &Badge::Kind("GQL"),
+            "a GraphQL row must not be labelled POST like every other GraphQL row"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -1257,10 +1308,14 @@ mod scan_tests {
 
         // The extension is dropped: it is identical on every row, so it says nothing.
         assert!(nodes.iter().all(|node| !node.name.ends_with(".json")));
-        // And the method comes through, since the panel draws it.
+        // And the badge comes through, since the panel draws it.
         match &nodes[0].kind {
-            NodeKind::Request { method, url } => {
-                assert_eq!(method.as_ref(), RequestSpec::sample().method());
+            NodeKind::Request { badge, url } => {
+                assert_eq!(
+                    badge,
+                    &Badge::Method(RequestSpec::sample().method().cloned().unwrap()),
+                    "an HTTP row is badged with its verb"
+                );
                 assert_eq!(url, "https://a.test/alpha");
             }
             other => panic!("expected a request, got {other:?}"),
