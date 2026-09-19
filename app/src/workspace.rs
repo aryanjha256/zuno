@@ -3300,7 +3300,10 @@ impl Workspace {
             return;
         }
 
-        let items = crate::commands::palette()
+        // The active buffer's kind names the two tab rows, so the palette offers them by the
+        // words on screen rather than by HTTP's.
+        let editor = self.active().map(|view| view.read(cx));
+        let items = crate::commands::palette(editor.as_ref().map(|view| &view.kind))
             .into_iter()
             .map(|command| picker::Item {
                 label: SharedString::from(command.label),

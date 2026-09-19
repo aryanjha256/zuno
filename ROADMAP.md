@@ -128,6 +128,21 @@ no per-request home for them. The save dialog opens in `$HOME` rather than the c
 which is not only convenience: `scan` walks every `.json` under the root, so an export saved
 beside its own requests is read back as one and fails on every scan afterwards.
 
+**Known and deliberately left, because GraphQL is not yet used much.** Written down rather than
+carried in someone's head — the failure this file's own header predicts:
+
+- **A `subscription` gets no guidance.** Against a **graphql-sse** server it works, badly: the
+  whole stream is buffered and shown as flat text only once it ends, and an unbounded one dies at
+  the request timeout instead. Against a server that does not speak SSE it errors obscurely. A
+  leading-keyword check could say "subscriptions need a streaming transport" — see the SSE note
+  under *Named, not planned*, which is the cheaper half of the WebSocket work.
+- **`graphql_envelope` is built twice on a GET** — once in `build_graphql`, once inside
+  `graphql_url`. Threading a prebuilt envelope through a function curl export also calls, to save
+  one small JSON build on GET-only requests, was not worth the churn.
+- **`RequestTab::for_kind` allocates a `Vec` per render** of the tab strip. A stack-allocated
+  vector means a new dependency; an iterator complicates the call site. Five elements in a path
+  that already builds an element tree.
+
 What remains for GraphQL, in order: **introspection and assisted editing** — the *builder*, and
 the actual differentiator: a query you write with the schema helping, not a checkbox tree. Then a
 **schema browser**. That last one is

@@ -23,13 +23,16 @@ use crate::actions::*;
 pub struct Command {
     /// Sentence case, imperative, and phrased as the thing it does rather than as the
     /// action's type name: "Save request to collection", not "SaveRequest".
-    pub label: &'static str,
+    ///
+    /// Owned rather than `&'static str` because two rows are named by the **active kind** —
+    /// see `palette`. Call sites are unchanged; `command` takes anything that converts.
+    pub label: String,
     pub action: Box<dyn Action>,
 }
 
-fn command(label: &'static str, action: impl Action) -> Command {
+fn command(label: impl Into<String>, action: impl Action) -> Command {
     Command {
-        label,
+        label: label.into(),
         action: action.boxed_clone(),
     }
 }
@@ -39,7 +42,22 @@ fn command(label: &'static str, action: impl Action) -> Command {
 /// Ordered by how often you'd reach for it, not alphabetically — the fuzzy filter handles
 /// finding things by name, so the unfiltered list should read like a list of what Zuno
 /// does. `fuzzy::rank` is stable, so this order survives ties.
-pub fn palette() -> Vec<Command> {
+/// `kind` names the two tab rows. `None` — in the drift test, or with no buffer open — falls
+/// back to HTTP's words, which is what the table said unconditionally before.
+///
+/// **Those two rows used to lie.** `ShowParamsTab` and `ShowBodyTab` select tab *slots*, and
+/// the slots are named by the kind: Params and Body for HTTP, Query and Variables for GraphQL.
+/// The palette advertised them as "request params" and "request body" whatever was open, so on
+/// a GraphQL request it offered two commands by names nothing on screen used — in the one
+/// surface whose whole job is teaching people what the verbs are called.
+pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
+    // Lowercased to sit inside the sentence, the way "params" and "body" already did.
+    let slot = |at: usize, fallback: &str| -> String {
+        kind.and_then(|kind| kind.tabs().get(at))
+            .map(|tab| tab.label.to_lowercase())
+            .unwrap_or_else(|| fallback.to_string())
+    };
+
     vec![
         // The loop.
         command("Send request", SendRequest),
@@ -88,8 +106,8 @@ pub fn palette() -> Vec<Command> {
         command("Change body type", OpenBodyType),
         command("Add form field", AddFormField),
         command("Show request headers", ShowHeadersTab),
-        command("Show request params", ShowParamsTab),
-        command("Show request body", ShowBodyTab),
+        command(format!("Show request {}", slot(0, "params")), ShowParamsTab),
+        command(format!("Show request {}", slot(1, "body")), ShowBodyTab),
         command("Show request captures", ShowCaptureTab),
         command("Show request assertions", ShowAssertTab),
         command("Run the selected folder", RunFolder),
@@ -324,9 +342,9 @@ mod tests {
     #[test]
     fn labels_are_unique_and_readable() {
         let mut seen = BTreeSet::new();
-        for command in palette() {
+        for command in palette(None) {
             assert!(
-                seen.insert(command.label),
+                seen.insert(command.label.clone()),
                 "duplicate label {:?} — two rows would be indistinguishable",
                 command.label
             );
@@ -364,7 +382,7 @@ mod tests {
                 .filter(|name| name.starts_with("zuno::"))
                 .collect();
             let offered: BTreeSet<&str> =
-                palette().iter().map(|command| command.action.name()).collect();
+                palette(None).iter().map(|command| command.action.name()).collect();
             (registered, offered)
         });
 

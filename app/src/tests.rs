@@ -872,6 +872,49 @@ async fn http_body_verbs_refuse_on_a_graphql_request(cx: &mut TestAppContext) {
     }
 }
 
+/// **The palette names the tabs the way the screen does.**
+///
+/// `ShowParamsTab` and `ShowBodyTab` select tab *slots*, and the slots are named by the kind.
+/// The palette advertised them as "request params" and "request body" unconditionally, so on a
+/// GraphQL request it offered two commands by names appearing nowhere in the window — in the one
+/// surface whose entire job is teaching people what the verbs are called.
+#[gpui::test]
+async fn the_palette_names_tabs_by_the_active_kind(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Show request");
+    let http = picker_rows(&window, &mut cx);
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    assert!(
+        http.iter().any(|row| row.contains("params")) && http.iter().any(|row| row.contains("body")),
+        "an HTTP request keeps the words it always had: {http:?}"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::GraphQl, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("ctrl-k");
+    cx.simulate_input("Show request");
+    let gql = picker_rows(&window, &mut cx);
+
+    assert!(
+        gql.iter().any(|row| row.contains("query")) && gql.iter().any(|row| row.contains("variables")),
+        "a GraphQL request must be offered its own tab names: {gql:?}"
+    );
+    assert!(
+        !gql.iter().any(|row| row.contains("params") || row.contains("body")),
+        "and not tabs it does not have: {gql:?}"
+    );
+}
+
 #[gpui::test]
 async fn switching_kind_asks_before_discarding_a_body(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
