@@ -20,6 +20,7 @@ pub mod build;
 pub mod error;
 mod probe;
 mod run;
+mod session;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,8 +35,64 @@ use url::Url;
 
 pub use error::EngineError;
 
+use bytes::Bytes;
+
 use crate::request::{Header, RequestSettings, RequestSpec};
 use crate::response::{HttpVersion, ResponseData};
+
+/// Which way one frame of a session travelled.
+///
+/// A transcript is the only response shape where this question exists — an HTTP response has
+/// exactly one direction and never needs to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Sent,
+    Received,
+}
+
+/// One message on an open connection.
+///
+/// **Deliberately not `ResponseData`.** A frame has no status, no headers and no timing of its
+/// own; it is a payload and a moment. Modelling it as a tiny response would mean five fields
+/// that are always empty and a viewer that has to know they are meaningless.
+///
+/// `Text` is a `String` rather than `Bytes`, which is the one place this crate departs from
+/// invariant 4 and does so on a guarantee rather than a hope: a WebSocket text frame is
+/// *defined* as UTF-8 and tungstenite rejects the connection outright if one is not. Binary
+/// frames stay `Bytes`, where the invariant's reasoning still holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
+    Text(String),
+    Binary(Bytes),
+    Ping(Bytes),
+    Pong(Bytes),
+}
+
+impl Frame {
+    /// Bytes on the wire, for a transcript that reports sizes.
+    pub fn len(&self) -> usize {
+        match self {
+            Frame::Text(text) => text.len(),
+            Frame::Binary(bytes) | Frame::Ping(bytes) | Frame::Pong(bytes) => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// What the UI asks of a socket that is already open.
+///
+/// Its own channel rather than more `Command` variants on the engine's inbox: a frame has to
+/// reach *one running task*, and routing it through the engine loop would mean the loop owning
+/// a sender per job and answering for the case where the job has already finished. The engine
+/// still holds the sender — see `Job` — it just does not interpret what goes down it.
+pub(crate) enum Outbound {
+    Frame(Frame),
+    /// Begin the closing handshake. Not an abort: the peer still gets its Close frame.
+    Close,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct JobId(pub u64);
@@ -191,6 +248,39 @@ pub enum Event {
         job: JobId,
         error: EngineError,
     },
+
+    /// The handshake succeeded and the socket is open.
+    ///
+    /// The session's answer to `Head`, and it carries the same things for the same reason: the
+    /// status line and the response headers are worth showing, and this is the moment they are
+    /// known. `protocol` is whichever subprotocol the server picked from the offers, which is
+    /// the one thing about a socket you cannot see by watching it.
+    Opened {
+        job: JobId,
+        status: u16,
+        /// `Switching Protocols`. Carried for the same reason `Head` carries it: the pane
+        /// prints the reason phrase beside the code, and deriving it here would be a second
+        /// table that can disagree with the server's own words.
+        status_text: String,
+        headers: Vec<Header>,
+        protocol: Option<String>,
+        elapsed: Duration,
+    },
+    /// One message, either way. `at` is measured from the send, so a transcript can show the
+    /// gap between frames without every row carrying a wall clock.
+    Frame {
+        job: JobId,
+        at: Duration,
+        direction: Direction,
+        frame: Frame,
+    },
+    /// The socket closed. `code` is absent when the peer vanished without a Close frame,
+    /// which is a real and common ending rather than an error.
+    Closed {
+        job: JobId,
+        code: Option<u16>,
+        reason: String,
+    },
 }
 
 impl Event {
@@ -200,13 +290,19 @@ impl Event {
             | Event::Head { job, .. }
             | Event::Progress { job, .. }
             | Event::Done { job, .. }
-            | Event::Failed { job, .. } => *job,
+            | Event::Failed { job, .. }
+            | Event::Opened { job, .. }
+            | Event::Frame { job, .. }
+            | Event::Closed { job, .. } => *job,
         }
     }
 
     /// True for the last event a job will ever emit.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Event::Done { .. } | Event::Failed { .. })
+        matches!(
+            self,
+            Event::Done { .. } | Event::Failed { .. } | Event::Closed { .. }
+        )
     }
 }
 
@@ -219,12 +315,26 @@ enum Command {
     Cancel {
         job: JobId,
     },
+    /// Hand something to a job that is still running. Silently dropped if it is not — a frame
+    /// typed into a socket that has just closed is a race, not a mistake to report.
+    ToJob {
+        job: JobId,
+        outbound: Outbound,
+    },
     /// Throw away every cached client, and with them every cookie jar.
     ClearCookies,
     /// Change where requests are routed. Future clients are built with it.
     SetProxy(ProxyMode),
     /// Change which certificates future clients are built with.
     SetTls(TlsFiles),
+}
+
+/// A running job, and the way in if it has one.
+struct Job {
+    handle: tokio::task::JoinHandle<()>,
+    /// `Some` only for a session. Held here rather than in the task so the engine loop can
+    /// route a frame to it without the task having to be awake to receive one.
+    outbound: Option<mpsc::UnboundedSender<Outbound>>,
 }
 
 pub struct Engine {
@@ -275,6 +385,31 @@ impl Engine {
         }
 
         (job, receiver)
+    }
+
+    /// Send one frame down an open session.
+    ///
+    /// Fire-and-forget on purpose: the frame's fate is reported through the job's own event
+    /// stream as either an `Event::Frame` with `Direction::Sent` or an `Event::Failed`, which
+    /// is where the caller is already looking. A `Result` here would be a second, earlier
+    /// answer to the same question and the two could disagree.
+    pub fn send_frame(&self, job: JobId, frame: Frame) {
+        let _ = self.commands.send(Command::ToJob {
+            job,
+            outbound: Outbound::Frame(frame),
+        });
+    }
+
+    /// Ask a session to close politely, so the peer receives a Close frame.
+    ///
+    /// **Not `cancel`.** Cancelling aborts the task, which drops the socket where it stands and
+    /// looks like a reset from the other end. Both exist because both are wanted: this is the
+    /// Disconnect button, `cancel` is what a closing tab does.
+    pub fn close(&self, job: JobId) {
+        let _ = self.commands.send(Command::ToJob {
+            job,
+            outbound: Outbound::Close,
+        });
     }
 
     /// Abort an in-flight job.
@@ -337,36 +472,61 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
 
     runtime.block_on(async move {
         let mut clients = ClientCache::default();
-        let mut jobs: HashMap<JobId, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut jobs: HashMap<JobId, Job> = HashMap::new();
         let mut proxy = ProxyMode::default();
         let mut tls = TlsFiles::default();
 
         while let Some(command) = commands.recv().await {
             // Opportunistic reaping: without this the map grows for the life of the
             // process.
-            jobs.retain(|_, handle| !handle.is_finished());
+            jobs.retain(|_, job| !job.handle.is_finished());
 
             match command {
-                Command::Send { job, spec, events } => match clients.get(&spec.settings, &proxy, &tls) {
-                    Ok(client) => {
-                        jobs.insert(
-                            job,
-                            tokio::spawn(run::execute(
-                                job,
-                                client,
-                                *spec,
-                                events,
-                                run::MAX_BODY_BYTES,
-                            )),
-                        );
+                Command::Send { job, spec, events } => {
+                    // **A session gets an HTTP/1.1-only client**, because there is no 101 in
+                    // HTTP/2 — see `ClientKey::http1_only`. Its own cache entry, so ordinary
+                    // requests keep negotiating h2 as they always did.
+                    //
+                    // The timeout needs no such handling: it is applied per *request* in
+                    // `build.rs`, and `build_websocket` never sets one, so a socket already
+                    // outlives it.
+                    match clients.get(&spec.settings, &proxy, &tls, spec.kind.is_session()) {
+                        Ok(client) => {
+                            let entry = if spec.kind.is_session() {
+                                let (sender, receiver) = mpsc::unbounded_channel();
+                                Job {
+                                    handle: tokio::spawn(session::connect(
+                                        job, client, *spec, events, receiver,
+                                    )),
+                                    outbound: Some(sender),
+                                }
+                            } else {
+                                Job {
+                                    handle: tokio::spawn(run::execute(
+                                        job,
+                                        client,
+                                        *spec,
+                                        events,
+                                        run::MAX_BODY_BYTES,
+                                    )),
+                                    outbound: None,
+                                }
+                            };
+                            jobs.insert(job, entry);
+                        }
+                        Err(error) => {
+                            let _ = events.try_send(Event::Failed { job, error });
+                        }
                     }
-                    Err(error) => {
-                        let _ = events.try_send(Event::Failed { job, error });
+                }
+                Command::ToJob { job, outbound } => {
+                    if let Some(sender) = jobs.get(&job).and_then(|job| job.outbound.as_ref()) {
+                        let _ = sender.send(outbound);
                     }
-                },
+                }
                 Command::Cancel { job } => {
-                    if let Some(handle) = jobs.remove(&job) {
-                        handle.abort();
+                    if let Some(job) = jobs.remove(&job) {
+                        job.handle.abort();
                     }
                 }
                 // In-flight jobs hold their own `Client` clone, so they finish against the
@@ -403,10 +563,30 @@ struct ClientKey {
     /// In the key for the same reason the proxy is: a changed certificate must miss the cache
     /// rather than leave every pooled client presenting the old one.
     tls: TlsFiles,
+    /// **Forces ALPN to offer only `http/1.1`, and a WebSocket does not work without it.**
+    ///
+    /// There is no 101 in HTTP/2 — the upgrade mechanism was replaced by extended CONNECT —
+    /// and `Connection`/`Upgrade` are illegal headers there, so hyper strips them. A `wss://`
+    /// URL whose TLS handshake settles on h2 therefore reaches the server as a *plain GET*,
+    /// and the server answers 200 or 404 like any other request to that path. Nothing errors;
+    /// it simply is not a WebSocket.
+    ///
+    /// Setting `Request::version` is **not** enough and was the first attempt: that names the
+    /// version for a connection already chosen, while ALPN is negotiated by the connector
+    /// underneath it. Only the builder decides what gets offered.
+    ///
+    /// In the key rather than applied per-request, because it is a property of the *connection*
+    /// — a pooled h2 connection cannot be talked out of being h2 afterwards.
+    http1_only: bool,
 }
 
 impl ClientKey {
-    fn new(settings: &RequestSettings, proxy: &ProxyMode, tls: &TlsFiles) -> Self {
+    fn new(
+        settings: &RequestSettings,
+        proxy: &ProxyMode,
+        tls: &TlsFiles,
+        http1_only: bool,
+    ) -> Self {
         Self {
             verify_tls: settings.verify_tls,
             follow_redirects: settings.follow_redirects,
@@ -415,6 +595,7 @@ impl ClientKey {
             cookie_store: settings.cookie_store,
             proxy: proxy.clone(),
             tls: tls.clone(),
+            http1_only,
         }
     }
 }
@@ -440,8 +621,9 @@ impl ClientCache {
         settings: &RequestSettings,
         proxy: &ProxyMode,
         tls: &TlsFiles,
+        http1_only: bool,
     ) -> Result<Client, EngineError> {
-        let key = ClientKey::new(settings, proxy, tls);
+        let key = ClientKey::new(settings, proxy, tls, http1_only);
 
         if let Some(client) = self.clients.get(&key) {
             return Ok(client.clone());
@@ -460,7 +642,7 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         reqwest::redirect::Policy::none()
     };
 
-    let builder = Client::builder()
+    let mut builder = Client::builder()
         .user_agent(concat!("zuno/", env!("CARGO_PKG_VERSION")))
         .danger_accept_invalid_certs(!key.verify_tls)
         .redirect(redirect)
@@ -476,6 +658,12 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         .deflate(key.accept_encodings)
         .zstd(key.accept_encodings)
         .cookie_store(key.cookie_store);
+
+    // ALPN offers only `http/1.1` when set. See `ClientKey::http1_only` — without this a
+    // `wss://` handshake silently becomes a plain GET over h2.
+    if key.http1_only {
+        builder = builder.http1_only();
+    }
 
     let builder = match &key.proxy {
         // Nothing to do: reqwest's default already reads the environment.
@@ -556,14 +744,14 @@ mod tests {
         // (and with it, the connection pool).
         let system = ProxyMode::System;
         assert_eq!(
-            ClientKey::new(&a, &system, &TlsFiles::default()),
-            ClientKey::new(&b, &system, &TlsFiles::default())
+            ClientKey::new(&a, &system, &TlsFiles::default(), false),
+            ClientKey::new(&b, &system, &TlsFiles::default(), false)
         );
 
         b.verify_tls = false;
         assert_ne!(
-            ClientKey::new(&a, &system, &TlsFiles::default()),
-            ClientKey::new(&b, &system, &TlsFiles::default())
+            ClientKey::new(&a, &system, &TlsFiles::default(), false),
+            ClientKey::new(&b, &system, &TlsFiles::default(), false)
         );
     }
 
@@ -574,12 +762,12 @@ mod tests {
         // on screen would say so.
         let settings = RequestSettings::default();
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::System, &TlsFiles::default()),
-            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default())
+            ClientKey::new(&settings, &ProxyMode::System, &TlsFiles::default(), false),
+            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default(), false)
         );
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default()),
-            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()), &TlsFiles::default())
+            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default(), false),
+            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()), &TlsFiles::default(), false)
         );
     }
 
@@ -621,8 +809,8 @@ mod tests {
             ..TlsFiles::default()
         };
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::System, &none),
-            ClientKey::new(&settings, &ProxyMode::System, &with_identity)
+            ClientKey::new(&settings, &ProxyMode::System, &none, false),
+            ClientKey::new(&settings, &ProxyMode::System, &with_identity, false)
         );
     }
 
@@ -640,6 +828,7 @@ mod tests {
                 identity: Some(PathBuf::from("/definitely/not/here.pem")),
                 ..TlsFiles::default()
             },
+            false,
         );
         let error = build_client(&missing).expect_err("a missing certificate must fail");
         assert!(
@@ -656,6 +845,7 @@ mod tests {
                 identity: Some(PathBuf::from(fixture)),
                 ..TlsFiles::default()
             },
+            false,
         );
         assert!(build_client(&ok).is_ok(), "a valid PEM identity should build");
     }

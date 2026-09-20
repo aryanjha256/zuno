@@ -26,6 +26,7 @@ use zuno_core::{
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
+    SaveMessage,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -4125,7 +4126,17 @@ impl Workspace {
             return;
         }
         let Some(view) = self.active() else { return };
-        let current = view.read(cx).method().cloned().unwrap_or_default();
+
+        // **A kind with no verb gets no picker.** The sibling of `active_http`, and guarded on
+        // `method()` rather than on `http()` because GraphQL genuinely has one — it is POST
+        // normally and GET when the query should be cacheable. Without this, `Ctrl+M` and the
+        // palette row both opened a list on a WebSocket, where `set_method` is a no-op: you
+        // could pick, and nothing would happen.
+        let Some(current) = view.read(cx).method().cloned() else {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("A {kind} request has no method"), cx);
+            return;
+        };
 
         let items = zuno_core::Method::common()
             .into_iter()
@@ -6170,8 +6181,26 @@ impl Workspace {
     /// silently copying mojibake.
     fn copy_response(&mut self, _: &CopyResponse, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
+
+        // **A session has no response, so "the response" is the frame you are reading.** Read
+        // from the transcript rather than from `body_view`, which is only the *indexed* copy
+        // and is absent for the frame or two while it is being built — copying nothing because
+        // a background task had not finished would be a race the user sees as a dead key.
+        // Without this the handler fell through to "No response to copy yet" on every socket.
+        if let Some(text) = view.read(cx).selected_frame_text() {
+            let size = format_bytes(text.len() as u64);
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            self.set_status(&format!("Copied {size} to the clipboard"), cx);
+            return;
+        }
+
         let Some(response) = view.read(cx).displayed().cloned() else {
-            self.set_status("No response to copy yet", cx);
+            let what = if view.read(cx).session.is_some() {
+                "Select a frame to copy it"
+            } else {
+                "No response to copy yet"
+            };
+            self.set_status(what, cx);
             return;
         };
 
@@ -6280,13 +6309,27 @@ impl Workspace {
         cx.refresh_windows();
     }
 
-    fn send_request(&mut self, _: &SendRequest, _: &mut Window, cx: &mut Context<Self>) {
+    fn send_request(&mut self, _: &SendRequest, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
 
         let Some(engine) = cx.engine() else {
             self.set_status("The HTTP engine failed to start — restart Zuno", cx);
             return;
         };
+
+        // **On an open socket this means "send the message", not "reconnect".** One key, and
+        // it keeps meaning what it always meant: send what I have written. Reconnecting on
+        // Ctrl+Enter would drop a live conversation on the keystroke people press most.
+        //
+        // No session checkpoint here: nothing on disk changed, and writing every buffer on
+        // each frame of a chatty socket would put a file write in a loop the user drives.
+        if view.read(cx).is_connected() {
+            let resolver = self.resolver(cx);
+            view.update(cx, |view, cx| {
+                view.send_frame(&engine, &resolver, window, cx)
+            });
+            return;
+        }
 
         // A send is a natural checkpoint: persist here so a crash costs at most the
         // edits made since the last one. Every buffer is written, not just the one being
@@ -6368,9 +6411,30 @@ impl Workspace {
         cx.quit();
     }
 
+    /// Keep the composed message with the socket.
+    ///
+    /// A no-op off a WebSocket buffer rather than reaching for `active_http`'s twin: there is
+    /// nothing to reveal first, so the guard would only be stating what the setter already does.
+    fn save_message(&mut self, _: &SaveMessage, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        view.update(cx, |view, cx| view.save_message(cx));
+    }
+
     fn cancel_request(&mut self, _: &CancelRequest, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
         let Some(engine) = cx.engine() else { return };
+
+        // **A connected socket is closed, not aborted.** `cancel` drops the task where it
+        // stands, which reaches the server as a reset; `close` runs the closing handshake so
+        // the peer is told. The transcript stays on screen either way — it is the result of
+        // the run, and hanging up is the end of the run, not the end of wanting to read it.
+        if view.read(cx).is_connected() {
+            if let Some(job) = view.read(cx).session.as_ref().map(|session| session.job) {
+                engine.close(job);
+                self.set_status("Disconnecting", cx);
+            }
+            return;
+        }
 
         let cancelled = view.update(cx, |view, cx| view.cancel(&engine, cx));
         if cancelled {
@@ -6645,6 +6709,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
+            .on_action(cx.listener(Self::save_message))
             .on_action(cx.listener(Self::next_request_tab))
             .on_action(cx.listener(Self::prev_request_tab))
             .on_action(cx.listener(Self::show_headers_tab))

@@ -43,13 +43,14 @@ pub use import::{Import, ImportError, Imported};
 pub use curl::{CurlError, CurlImport};
 pub use body_diff::{BodyDiff, DiffLine, LineKind};
 pub use diff::ResponseDiff;
-pub use engine::{Engine, EngineError, Event, JobId, ProxyMode, TlsFiles};
+pub use engine::{Direction, Engine, EngineError, Event, Frame, JobId, ProxyMode, TlsFiles};
 pub use highlight::{Token, TokenKind};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;
 pub use request::{
     Body, FormField, GraphQlRequest, Header, HttpRequest, Method, MultipartField, MultipartValue,
-    QueryParam, RawKind, RequestId, RequestKind, RequestSettings, RequestSpec, label_for,
+    QueryParam, RawKind, RequestId, RequestKind, RequestSettings, RequestSpec, SavedMessage,
+    WebSocketRequest, label_for,
 };
 pub use response::{
     Connection, HttpVersion, Phase, PhaseKind, ResponseData, SizeInfo, StatusClass, Timing,

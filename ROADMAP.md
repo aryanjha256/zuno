@@ -12,9 +12,11 @@ directional, and anything beyond that is a name and a reason.
 
 ## Where we are
 
-**M1, M2 and M3 are all complete**, and §11 of `architecture.md` — the list of engine capability
-with no way to reach it — is empty. This section said "what's left is reuse, see M3" for a while
-after M3 was finished; rewritten rather than patched, per the note at the top of this file.
+**M1, M2 and M3 are all complete.** §11 of `architecture.md` — the list of engine capability
+with no way to reach it — was empty and has one entry again: the engine sends any WebSocket frame
+type and the composer can only ask for text. This section said "what's left is reuse, see M3" for
+a while after M3 was finished; rewritten rather than patched, per the note at the top of this
+file.
 
 - **M1 — the loop.** Author a request, send it over real HTTP with streaming progress and
   cancellation, read the response through a virtualized JSON viewer, diff it against the previous
@@ -1004,8 +1006,93 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
-- **gRPC / WebSocket / SSE.** Each is a different transport and a different response viewer. Not
-  extensions of the HTTP loop — separate products wearing the same coat.
+- **gRPC.** Shipped WebSocket first, deliberately, and the ordering is the point: both need a
+  request that stays open and a transcript instead of a response, and WebSocket forces that to
+  be built with the simplest possible payload story — you type text and send it. gRPC would have
+  meant building the session model *and* a schema pipeline at once, with no way to tell which
+  half was wrong when something broke. Its real cost is schema, not transport: you cannot compose
+  a single call without knowing the service and message types, and both routes are expensive —
+  server reflection is itself a *bidirectional streaming* call, so learning the schema means
+  implementing the hardest of gRPC's four shapes first, and the `.proto` route needs a protobuf
+  compiler plus a dynamic encoder (`protox`, `prost-reflect`) in `zuno-core`. Transport is the
+  easy part and is already proven: gRPC needs HTTP/2 and reports its status in **trailers**,
+  which reqwest names nowhere — but `reqwest::Body` implements `http_body::Body` and forwards
+  hyper's `Frame` verbatim, and a `Frame` carries trailers.
+
+- **WebSocket, the parts deliberately left.** The loop is complete and used — handshake through
+  the real client, `wss://`, frames both ways, a transcript with the response body's own viewer,
+  saved messages, clean close. What is not built, and why each is a fair deferral rather than an
+  oversight:
+
+  - **Sending a binary, ping or pong frame.** The engine sends whichever `Frame` variant it is
+    handed and the transcript labels all four on the way in; only the *composer* is text-only.
+    Recorded in architecture.md §11, because it is engine capability with no UI path rather than
+    something unbuilt. A manual ping is the one worth reaching first — it answers "is this quiet
+    socket still alive", which nothing else on screen can.
+  - **A close code and reason.** Disconnect always sends `close(None)`. Servers that care about
+    *why* a client left — and some log it — get no answer. Needs a control on the disconnect
+    path rather than any engine work.
+  - **Reconnect.** No button, no automatic retry, no backoff. Reconnecting today means pressing
+    Connect again, which works and loses the transcript. Auto-retry in particular wants a
+    decision first: a client that silently reconnects is a client that hides a server problem.
+  - **Loading a saved message by keyboard.** Click only. Every other verb has a shortcut.
+  - **The subprotocol field overrides a hand-typed `Sec-WebSocket-Protocol` header**, silently —
+    `build_websocket` uses `insert`, not `append`. Defensible (the field is the specific answer,
+    the header is the general one) but undocumented in the UI, so someone will hit it once.
+
+  - **Nothing caps the transcript, and one frame can be 64 MiB.** `Transcript::frames` grows
+    without bound — `history` has `HISTORY_LIMIT`, this has nothing — and
+    `WebSocketStream::from_raw_socket` is handed a `None` config, so tungstenite's default
+    maximum message size applies. A chatty subscription grows memory until the process dies; a
+    hostile server does it faster. **The shape it should take**, decided and not yet built:
+
+    - **Two caps, whichever is hit first dropping oldest.** ~16 MiB of retained payload, which
+      is the one that actually prevents the OOM because a single frame can be large; and
+      ~10,000 frames, so the list and its scroll stay sane when every frame is twenty bytes.
+    - **A ring buffer, not "stop recording at N".** The recent frames are the ones being
+      debugged; dropping the newest would make the cap worse than useless.
+    - **Announced.** A `1,204 earlier frames dropped` marker at the head of the list. Silently
+      losing the start of a conversation is worse than the memory it saved — someone would
+      debug a subscription and never learn the beginning was gone.
+    - **Separately, lower `max_message_size` to ~8 MiB** through `WebSocketConfig`. Not a
+      transcript concern: at the default, one frame is four times the whole budget, and a
+      larger one should fail the connection loudly rather than quietly consume memory.
+
+    Worth knowing when it is built: it pairs with the render fix in this same slice. Now that
+    only visible rows are formatted, a large transcript costs nothing to *draw* — so the cap is
+    purely about memory and the numbers can be generous.
+
+  From the audit of the slice, kept rather than fixed. Each is real; none is a lie on screen,
+  which is where the line was drawn:
+
+  - **An unresolved `{{var}}` in a frame reaches the server literally.** `send_frame` resolves
+    and does not check, while the URL, the query params and the headers all call
+    `find_unresolved_variable` and refuse. It is the same shape as the bug that once sent
+    `search={{q}}` to a real server, and the fix is one call — it is here rather than done
+    because a *frame* is not a request and refusing to send one mid-conversation may be worse
+    than sending it; that is a decision, not an oversight.
+  - **A close the peer ignores never ends.** After `stream.close(None)` the loop waits on
+    `stream.next()` forever, so a server that neither answers the Close nor drops the connection
+    leaves the task alive and the strip reading open. RFC 6455 says wait a reasonable time and
+    then drop; nothing here does.
+  - **A frame sent to a socket that just closed vanishes silently.** `Engine::send_frame` is
+    fire-and-forget and the engine drops it when the job is gone. True of the race and false of
+    the experience: you typed, pressed send, and nothing appeared.
+  - **The transcript never shows the Pong we send.** tungstenite answers a Ping itself
+    (`protocol/mod.rs:672`) outside our `send` path, so the record shows an inbound Ping and no
+    reply — which reads as ignoring it. A transcript's job is being a faithful record.
+  - **The resolver is re-read from disk on every frame send.** Sized for once per request, not
+    once per message.
+  - **A scheme-less URL becomes `wss://`.** Matches `resolve_url`'s https default, but local
+    socket development is overwhelmingly plaintext, so `localhost:8080/ws` fails a TLS handshake
+    against a plaintext server.
+
+- **SSE.** Now a content-type check rather than a feature. The session machinery is built, and
+  `Event::Head` already fires at TTFB with the response headers — which is exactly where
+  `text/event-stream` is knowable. The design constraint that makes this cheap was decided when
+  the kind split landed: **lifecycle is not part of the kind**, because with SSE the *server*
+  decides. `RequestKind::is_session` is only what the request can promise before anything leaves
+  the machine; the response side has the final say.
 - **macOS and Windows builds.** Keybindings assume `ctrl`; `session.rs` assumes XDG paths. Both
   are marked in code.
 

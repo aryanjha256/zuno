@@ -277,6 +277,15 @@ impl Resolver {
                     scan(&param.value);
                 }
             }
+            // A socket's subprotocols and saved messages both reach the wire.
+            RequestKind::WebSocket(socket) => {
+                for protocol in &socket.subprotocols {
+                    scan(protocol);
+                }
+                for message in &socket.messages {
+                    scan(&message.body);
+                }
+            }
             // The document and the variables both go on the wire, so a secret withheld from
             // either has to be announced — a copied command that silently dropped a token out
             // of the variables would be un-runnable with no sign why.
@@ -353,6 +362,17 @@ impl Resolver {
             RequestKind::GraphQl(graphql) => {
                 graphql.query = self.resolve(&graphql.query).into_owned();
                 graphql.variables = self.resolve(&graphql.variables).into_owned();
+            }
+            // A saved message is sent verbatim, so `{{token}}` in one has to be substituted
+            // here or it reaches the server literally — the same failure form bodies had.
+            // The *name* is not resolved: it is a label in a list on screen, never sent.
+            RequestKind::WebSocket(socket) => {
+                for protocol in &mut socket.subprotocols {
+                    *protocol = self.resolve(protocol).into_owned();
+                }
+                for message in &mut socket.messages {
+                    message.body = self.resolve(&message.body).into_owned();
+                }
             }
         }
 

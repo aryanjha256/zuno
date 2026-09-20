@@ -28,9 +28,11 @@ use crate::request_view::RequestView;
 
 pub mod graphql;
 pub mod http;
+pub mod websocket;
 
 pub use graphql::GraphQlEditor;
 pub use http::HttpEditor;
+pub use websocket::WebSocketEditor;
 
 /// One tab a kind contributes to the request pane's strip.
 ///
@@ -58,15 +60,19 @@ impl KindTab {
 pub enum KindChoice {
     Http,
     GraphQl,
+    WebSocket,
 }
 
 impl KindChoice {
-    pub const ALL: [KindChoice; 2] = [KindChoice::Http, KindChoice::GraphQl];
+    /// What the kind picker offers.
+    pub const ALL: [KindChoice; 3] =
+        [KindChoice::Http, KindChoice::GraphQl, KindChoice::WebSocket];
 
     pub fn label(self) -> &'static str {
         match self {
             KindChoice::Http => "HTTP",
             KindChoice::GraphQl => "GraphQL",
+            KindChoice::WebSocket => "WebSocket",
         }
     }
 
@@ -76,6 +82,7 @@ impl KindChoice {
         match self {
             KindChoice::Http => "a verb, params and a body",
             KindChoice::GraphQl => "a query and variables",
+            KindChoice::WebSocket => "a connection you send messages down",
         }
     }
 }
@@ -84,6 +91,7 @@ impl KindChoice {
 pub enum KindEditor {
     Http(HttpEditor),
     GraphQl(GraphQlEditor),
+    WebSocket(WebSocketEditor),
 }
 
 impl KindEditor {
@@ -98,6 +106,9 @@ impl KindEditor {
             RequestKind::GraphQl(graphql) => {
                 KindEditor::GraphQl(GraphQlEditor::from_spec(graphql, cx))
             }
+            RequestKind::WebSocket(socket) => {
+                KindEditor::WebSocket(WebSocketEditor::from_spec(socket, cx))
+            }
         }
     }
 
@@ -106,6 +117,7 @@ impl KindEditor {
         match choice {
             KindChoice::Http => KindEditor::Http(HttpEditor::new(cx)),
             KindChoice::GraphQl => KindEditor::GraphQl(GraphQlEditor::new(cx)),
+            KindChoice::WebSocket => KindEditor::WebSocket(WebSocketEditor::new(cx)),
         }
     }
 
@@ -113,6 +125,7 @@ impl KindEditor {
         match self {
             KindEditor::Http(_) => KindChoice::Http,
             KindEditor::GraphQl(_) => KindChoice::GraphQl,
+            KindEditor::WebSocket(_) => KindChoice::WebSocket,
         }
     }
 
@@ -128,6 +141,7 @@ impl KindEditor {
         match self {
             KindEditor::Http(http) => http.has_content(cx),
             KindEditor::GraphQl(graphql) => graphql.has_content(cx),
+            KindEditor::WebSocket(socket) => socket.has_content(cx),
         }
     }
 
@@ -162,6 +176,17 @@ impl KindEditor {
                     parts.push("the operation name");
                 }
             }
+            KindEditor::WebSocket(socket) => {
+                if !socket.compose.read(cx).text().trim().is_empty() {
+                    parts.push("the message you are composing");
+                }
+                if !socket.subprotocols.read(cx).text().trim().is_empty() {
+                    parts.push("the subprotocols");
+                }
+                if !socket.messages.is_empty() {
+                    parts.push("the saved messages");
+                }
+            }
         }
         match parts.len() {
             0 => "nothing".to_string(),
@@ -175,6 +200,7 @@ impl KindEditor {
         match self {
             KindEditor::Http(http) => RequestKind::Http(http.to_spec(cx)),
             KindEditor::GraphQl(graphql) => RequestKind::GraphQl(graphql.to_spec(cx)),
+            KindEditor::WebSocket(socket) => RequestKind::WebSocket(socket.to_spec(cx)),
         }
     }
 
@@ -189,6 +215,9 @@ impl KindEditor {
             (KindEditor::GraphQl(editor), RequestKind::GraphQl(base)) => {
                 editor.is_dirty(base, cx)
             }
+            (KindEditor::WebSocket(editor), RequestKind::WebSocket(base)) => {
+                editor.is_dirty(base, cx)
+            }
             _ => true,
         }
     }
@@ -200,10 +229,14 @@ impl KindEditor {
         // reason these are `&'static` and not owned.
         const HTTP: [KindTab; 2] = [KindTab::new("Params"), KindTab::new("Body")];
         const GRAPHQL: [KindTab; 2] = [KindTab::new("Query"), KindTab::new("Variables")];
+        // Handshake first: it is what you set once, and Message is where the time goes — the
+        // same reasoning that puts Body second for HTTP and opens on it.
+        const WEBSOCKET: [KindTab; 2] = [KindTab::new("Handshake"), KindTab::new("Message")];
 
         match self {
             KindEditor::Http(_) => &HTTP,
             KindEditor::GraphQl(_) => &GRAPHQL,
+            KindEditor::WebSocket(_) => &WEBSOCKET,
         }
     }
 
@@ -229,6 +262,28 @@ impl KindEditor {
             // No count: lines are a useful number for a table of rows, not for prose.
             (KindEditor::GraphQl(_), 0) => SharedString::from("Query"),
             (KindEditor::GraphQl(_), _) => SharedString::from("Variables"),
+            (KindEditor::WebSocket(_), 0) => SharedString::from("Handshake"),
+            (KindEditor::WebSocket(socket), _) => match socket.messages.len() {
+                0 => SharedString::from("Message"),
+                saved => SharedString::from(format!("Message {saved}")),
+            },
+        }
+    }
+
+    /// Whether the spine's Capture and Assert tabs mean anything here.
+    ///
+    /// **Both are defined against a single finished response** — a capture reads one body and
+    /// publishes into the environment, an assertion returns one verdict — and a session has no
+    /// such thing. They ran off `Event::Done`, which a socket never emits, so a socket drew two
+    /// tabs that silently did nothing: the same dead-control shape as the Variables tab's add
+    /// button, and found the same way.
+    ///
+    /// Asked of the kind rather than matched in `RequestTab::for_kind`, so the next kind
+    /// answers for itself instead of someone remembering to add a case.
+    pub fn checks_a_response(&self) -> bool {
+        match self {
+            KindEditor::Http(_) | KindEditor::GraphQl(_) => true,
+            KindEditor::WebSocket(_) => false,
         }
     }
 
@@ -239,6 +294,8 @@ impl KindEditor {
             KindEditor::Http(_) => 1,
             // The document.
             KindEditor::GraphQl(_) => 0,
+            // The composer. The handshake is set once and rarely revisited.
+            KindEditor::WebSocket(_) => 1,
         }
     }
 
@@ -250,6 +307,7 @@ impl KindEditor {
         match self {
             KindEditor::Http(http) => http.primary_editor(),
             KindEditor::GraphQl(graphql) => Some(graphql.primary_editor()),
+            KindEditor::WebSocket(socket) => Some(socket.primary_editor()),
         }
     }
 
@@ -261,6 +319,8 @@ impl KindEditor {
         match self {
             KindEditor::Http(http) => Some(&http.method),
             KindEditor::GraphQl(graphql) => Some(&graphql.method),
+            // The handshake is a GET and nothing else is legal, so there is no choice to show.
+            KindEditor::WebSocket(_) => None,
         }
     }
 
@@ -268,20 +328,37 @@ impl KindEditor {
         match self {
             KindEditor::Http(http) => http.method = method,
             KindEditor::GraphQl(graphql) => graphql.method = method,
+            // Nothing to set. Reached only if something dispatches a method change at a kind
+            // that reports `None` from `method()`, which the chip does not draw.
+            KindEditor::WebSocket(_) => {}
         }
     }
 
     pub fn as_http(&self) -> Option<&HttpEditor> {
         match self {
             KindEditor::Http(http) => Some(http),
-            KindEditor::GraphQl(_) => None,
+            KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
         }
     }
 
     pub fn as_http_mut(&mut self) -> Option<&mut HttpEditor> {
         match self {
             KindEditor::Http(http) => Some(http),
-            KindEditor::GraphQl(_) => None,
+            KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
+        }
+    }
+
+    pub fn as_websocket(&self) -> Option<&WebSocketEditor> {
+        match self {
+            KindEditor::WebSocket(socket) => Some(socket),
+            KindEditor::Http(_) | KindEditor::GraphQl(_) => None,
+        }
+    }
+
+    pub fn as_websocket_mut(&mut self) -> Option<&mut WebSocketEditor> {
+        match self {
+            KindEditor::WebSocket(socket) => Some(socket),
+            KindEditor::Http(_) | KindEditor::GraphQl(_) => None,
         }
     }
 
@@ -289,6 +366,7 @@ impl KindEditor {
         match self {
             KindEditor::Http(http) => http.is_focused(window, cx),
             KindEditor::GraphQl(graphql) => graphql.is_focused(window, cx),
+            KindEditor::WebSocket(socket) => socket.is_focused(window, cx),
         }
     }
 }

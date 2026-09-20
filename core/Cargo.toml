@@ -27,6 +27,10 @@ trash.workspace = true
 # re-export the traits. See `engine/probe.rs`.
 tower-layer.workspace = true
 tower-service.workspace = true
+# WebSocket. See the workspace manifest for why these three and why `connect` is off.
+hyper.workspace = true
+hyper-util.workspace = true
+tokio-tungstenite.workspace = true
 # The inline body diff. See the workspace manifest for why this crate and not another.
 similar.workspace = true
 # HTML -> readable text for the response viewer. See the workspace manifest for the choice.

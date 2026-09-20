@@ -171,6 +171,7 @@ actions!(
         ExportCollection,
         AddHeader,
         AddQuery,
+        SaveMessage,
         ToggleRow,
         RemoveRow,
         OpenBodyType,

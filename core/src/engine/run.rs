@@ -224,7 +224,7 @@ async fn run(
 /// the *same* name do stay in received order, so a stable sort by name gives
 /// deterministic, readable output without scrambling those. True wire order would
 /// require a lower-level client than reqwest.
-fn collect_headers(headers: &http::HeaderMap) -> Vec<Header> {
+pub(crate) fn collect_headers(headers: &http::HeaderMap) -> Vec<Header> {
     let mut collected: Vec<Header> = headers
         .iter()
         .map(|(name, value)| Header {

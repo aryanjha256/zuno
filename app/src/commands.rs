@@ -52,6 +52,7 @@ fn command(label: impl Into<String>, action: impl Action) -> Command {
 /// surface whose whole job is teaching people what the verbs are called.
 pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
     // Lowercased to sit inside the sentence, the way "params" and "body" already did.
+    let session = kind.is_some_and(|kind| kind.as_websocket().is_some());
     let slot = |at: usize, fallback: &str| -> String {
         kind.and_then(|kind| kind.tabs().get(at))
             .map(|tab| tab.label.to_lowercase())
@@ -60,8 +61,18 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
 
     vec![
         // The loop.
-        command("Send request", SendRequest),
-        command("Cancel request", CancelRequest),
+        // Named by the kind, for the same reason the tab rows are: a socket's `Ctrl+Enter`
+        // sends a message and its `Escape` hangs up, so a palette reading "Cancel request"
+        // would be describing something the key no longer does.
+        command(
+            if session { "Send message" } else { "Send request" },
+            SendRequest,
+        ),
+        command("Save the composed message", SaveMessage),
+        command(
+            if session { "Disconnect" } else { "Cancel request" },
+            CancelRequest,
+        ),
         command("Save request to collection", SaveRequest),
         command("Export this folder as a collection", ExportCollection),
         command("Import request from curl on the clipboard", ImportCurl),

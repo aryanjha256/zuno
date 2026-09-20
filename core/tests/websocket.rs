@@ -1,0 +1,300 @@
+//! WebSocket, end to end over a real socket.
+//!
+//! The server here is `tungstenite`'s own synchronous half, which is the point: it performs a
+//! genuine RFC 6455 handshake and genuine framing, so a client that only *looks* right does not
+//! pass. A hand-written fake would agree with whatever this code happened to send — which is
+//! exactly the shape of assertion CLAUDE.md's Lessons section is about.
+
+use std::net::TcpListener;
+use std::time::{Duration, Instant};
+
+use tokio_tungstenite::tungstenite;
+use tungstenite::Message;
+use zuno_core::engine::{Direction, Engine, Event, Frame};
+use zuno_core::request::{RequestKind, RequestSpec, WebSocketRequest};
+
+/// Every wait in this file is bounded. A WebSocket test that can hang is a CI outage — the
+/// keep-alive incident in `tests/engine.rs` cost six hours of a runner once.
+const DEADLINE: Duration = Duration::from_secs(10);
+
+/// Pull events until `want` returns `Some`, or give up with what was seen.
+fn wait_for<T>(
+    events: &async_channel::Receiver<Event>,
+    seen: &mut Vec<String>,
+    what: &str,
+    mut want: impl FnMut(&Event) -> Option<T>,
+) -> T {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(!left.is_zero(), "timed out waiting for {what}; saw {seen:?}");
+        match events.recv_blocking() {
+            Ok(event) => {
+                seen.push(describe(&event));
+                if let Some(found) = want(&event) {
+                    return found;
+                }
+            }
+            Err(_) => panic!("the event stream closed before {what}; saw {seen:?}"),
+        }
+    }
+}
+
+fn describe(event: &Event) -> String {
+    match event {
+        Event::Started { .. } => "Started".into(),
+        Event::Opened { status, protocol, .. } => format!("Opened({status}, {protocol:?})"),
+        Event::Frame { direction, frame, .. } => format!("Frame({direction:?}, {frame:?})"),
+        Event::Closed { code, reason, .. } => format!("Closed({code:?}, {reason:?})"),
+        Event::Failed { error, .. } => format!("Failed({error})"),
+        other => format!("{other:?}"),
+    }
+}
+
+fn socket_spec(url: String, socket: WebSocketRequest) -> RequestSpec {
+    let mut spec = RequestSpec::default();
+    spec.url = url;
+    spec.kind = RequestKind::WebSocket(socket);
+    spec
+}
+
+/// **The whole loop: handshake, both directions, close.**
+///
+/// Asserted on what the *server* received as well as on what the client reported, because a
+/// client that never sent the frame and a server that never got it produce the same silence.
+#[test]
+fn a_socket_opens_carries_frames_both_ways_and_closes() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+
+        // `accept_hdr` is what makes the *request* observable — the upgrade headers and the
+        // subprotocol offer are only provable from this side.
+        let mut ws = tungstenite::accept_hdr(
+            stream,
+            |request: &tungstenite::handshake::server::Request, response| {
+                let headers = request
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        format!("{}: {}", name.as_str(), value.to_str().unwrap_or_default())
+                    })
+                    .collect::<Vec<_>>();
+                let _ = seen_tx.send(headers);
+                Ok(response)
+            },
+        )
+        .expect("handshake");
+
+        let from_client = ws.read().expect("a frame from the client");
+        ws.send(Message::Text(
+            format!("echo:{}", from_client.to_text().expect("text")).into(),
+        ))
+        .expect("echo");
+        ws.close(None).expect("close");
+        // Drain until the peer's Close comes back, so the handshake completes rather than the
+        // socket being torn down under it.
+        while ws.read().is_ok() {}
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (job, events) = engine.send(socket_spec(
+        format!("ws://127.0.0.1:{port}/chat"),
+        WebSocketRequest {
+            subprotocols: vec!["graphql-transport-ws".to_string()],
+            messages: Vec::new(),
+        },
+    ));
+
+    let mut seen = Vec::new();
+
+    let status = wait_for(&events, &mut seen, "the socket to open", |event| match event {
+        Event::Opened { status, .. } => Some(*status),
+        Event::Failed { error, .. } => panic!("the handshake failed: {error}"),
+        _ => None,
+    });
+    assert_eq!(status, 101);
+
+    engine.send_frame(job, Frame::Text("hello".to_string()));
+
+    let echoed = wait_for(&events, &mut seen, "the server's echo", |event| match event {
+        Event::Frame {
+            direction: Direction::Received,
+            frame: Frame::Text(text),
+            ..
+        } => Some(text.clone()),
+        Event::Failed { error, .. } => panic!("the socket failed: {error}"),
+        _ => None,
+    });
+    assert_eq!(
+        echoed, "echo:hello",
+        "the server must have received exactly what was typed"
+    );
+
+    // The sent frame is reported too, and only after the write succeeded — a transcript that
+    // shows a frame the socket refused is worse than one that shows nothing.
+    assert!(
+        seen.iter().any(|event| event.contains("Sent")),
+        "the frame this side sent must appear in the transcript; saw {seen:?}"
+    );
+
+    wait_for(&events, &mut seen, "the close", |event| match event {
+        Event::Closed { .. } => Some(()),
+        _ => None,
+    });
+
+    let headers = seen_rx.recv_timeout(DEADLINE).expect("the handshake headers");
+    let joined = headers.join("\n").to_lowercase();
+    assert!(
+        joined.contains("upgrade: websocket") && joined.contains("connection: upgrade"),
+        "the upgrade headers must reach the server:\n{joined}"
+    );
+    assert!(
+        joined.contains("sec-websocket-protocol: graphql-transport-ws"),
+        "the subprotocol offer must reach the server:\n{joined}"
+    );
+
+    server.join().expect("server thread");
+}
+
+/// **The accept key is checked, and that is a security property rather than a nicety.**
+///
+/// RFC 6455 requires the client to fail the connection when `Sec-WebSocket-Accept` does not
+/// match the key it sent. Without it, anything that can answer 101 — a confused proxy, a
+/// cache, an attacker who can reach the port — is talking to you as if it understood the
+/// handshake. The server here answers a *well-formed* 101 with a wrong accept value, which is
+/// precisely the case a status check alone would wave through.
+#[test]
+fn a_wrong_accept_key_is_refused() {
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+            }
+        }
+        let _ = stream.write_all(
+            b"HTTP/1.1 101 Switching Protocols\r\n\
+              Upgrade: websocket\r\n\
+              Connection: Upgrade\r\n\
+              Sec-WebSocket-Accept: totally-wrong\r\n\r\n",
+        );
+        let _ = stream.flush();
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_job, events) = engine.send(socket_spec(
+        format!("ws://127.0.0.1:{port}/"),
+        WebSocketRequest::default(),
+    ));
+
+    let mut seen = Vec::new();
+    let reason = wait_for(&events, &mut seen, "the refusal", |event| match event {
+        Event::Failed { error, .. } => Some(error.to_string()),
+        Event::Opened { .. } => panic!("a wrong accept key must never open the socket"),
+        _ => None,
+    });
+    assert!(
+        reason.to_lowercase().contains("accept"),
+        "the error has to name what was wrong, got {reason:?}"
+    );
+
+    server.join().expect("server thread");
+}
+
+/// An ordinary endpoint answering an upgrade says so in words, not in a framing error.
+#[test]
+fn a_plain_http_endpoint_is_reported_as_not_a_websocket() {
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let _ = stream.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        let _ = stream.flush();
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_job, events) = engine.send(socket_spec(
+        format!("ws://127.0.0.1:{port}/"),
+        WebSocketRequest::default(),
+    ));
+
+    let mut seen = Vec::new();
+    let reason = wait_for(&events, &mut seen, "the refusal", |event| match event {
+        Event::Failed { error, .. } => Some(error.to_string()),
+        _ => None,
+    });
+    assert!(
+        reason.contains("200") && reason.contains("101"),
+        "the message has to say what happened instead, got {reason:?}"
+    );
+
+    server.join().expect("server thread");
+}
+
+/// **A real `wss://` endpoint, over TLS.** `#[ignore]`d so CI never depends on the network —
+/// the same rule `tests/engine.rs` follows.
+///
+/// This covers the half the local tests cannot: a plaintext `ws://` never negotiates ALPN, so
+/// every test above proves the framing and none of them prove that a TLS connection still
+/// arrives as HTTP/1.1. There is no 101 in HTTP/2.
+#[test]
+#[ignore]
+fn a_real_wss_endpoint_opens() {
+    let engine = Engine::new().expect("engine");
+    let (job, events) = engine.send(socket_spec(
+        std::env::var("ZUNO_WS_URL").unwrap_or_else(|_| "wss://echo.websocket.org".to_string()),
+        WebSocketRequest::default(),
+    ));
+
+    let mut seen = Vec::new();
+    let status = wait_for(&events, &mut seen, "the socket to open", |event| match event {
+        Event::Opened { status, .. } => Some(*status),
+        Event::Failed { error, .. } => panic!("handshake failed: {error}"),
+        _ => None,
+    });
+    assert_eq!(status, 101);
+
+    engine.send_frame(job, Frame::Text("hello".to_string()));
+    // Skipped rather than asserted on: a public echo server is entitled to greet you first,
+    // and `echo.websocket.org` does. What is being proven here is the TLS handshake and the
+    // round trip, not the server's manners.
+    let echoed = wait_for(&events, &mut seen, "the echo", |event| match event {
+        Event::Frame {
+            direction: Direction::Received,
+            frame: Frame::Text(text),
+            ..
+        } if text == "hello" => Some(text.clone()),
+        Event::Failed { error, .. } => panic!("socket failed: {error}"),
+        _ => None,
+    });
+    assert_eq!(echoed, "hello");
+    println!("wss:// works — saw {seen:?}");
+}

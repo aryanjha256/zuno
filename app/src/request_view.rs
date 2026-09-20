@@ -21,8 +21,8 @@ use gpui::{
 };
 use zuno_core::{
     RequestKind,
-    Body, BodyDiff, Engine, EngineError, Event, Header, Hits, JobId, RawKind, RequestId,
-    RequestSettings, RequestSpec, Resolver, ResponseData, ResponseDiff,
+    Body, BodyDiff, Direction, Engine, EngineError, Event, Frame, Header, Hits, JobId, RawKind,
+    RequestId, RequestSettings, RequestSpec, Resolver, ResponseData, ResponseDiff,
     assertion::{Assertion, Op},
     capture::Capture,
 };
@@ -88,6 +88,41 @@ pub struct InFlight {
     /// return `true` instead, or add work after the `while` loop in `send`, and that work silently
     /// never happens: the future would go back to awaiting a channel nothing will poll again.
     _task: Task<()>,
+}
+
+/// One message in a conversation, with when it happened and which way it went.
+pub struct TranscriptFrame {
+    /// Since the connect, so the gaps between frames are readable without a wall clock on
+    /// every row — which is what you actually want to see in a heartbeat or a subscription.
+    pub at: Duration,
+    pub direction: Direction,
+    pub frame: Frame,
+}
+
+/// A conversation, live or finished.
+///
+/// **Kept after the socket closes, deliberately.** A transcript is the *result* of a session
+/// the way a response is the result of a request: closing the connection is the end of the run,
+/// not the end of wanting to read it. Clearing it on close would make the most common ending —
+/// the server hanging up — also erase what it said on the way out.
+///
+/// Runtime state, like `ResponseData`: it survives switching tabs, because it lives on the
+/// view, and does not survive a restart, because nothing serializes it.
+pub struct Transcript {
+    pub job: JobId,
+    /// Whichever subprotocol the server picked from the offers. The one thing about an open
+    /// socket you cannot learn by watching it.
+    pub protocol: Option<String>,
+    pub frames: Vec<TranscriptFrame>,
+    /// `Some` once the socket has closed, carrying the close code and reason. A `None` code
+    /// inside means the peer vanished without a Close frame, which is an ordinary ending.
+    pub closed: Option<(Option<u16>, String)>,
+}
+
+impl Transcript {
+    pub fn is_open(&self) -> bool {
+        self.closed.is_none()
+    }
 }
 
 /// One part of a multipart body: a key-value row plus whether its value is a file path.
@@ -236,8 +271,13 @@ impl RequestTab {
     pub fn for_kind(kind: &KindEditor) -> Vec<RequestTab> {
         let mut tabs = vec![RequestTab::Headers];
         tabs.extend((0..kind.tabs().len() as u8).map(RequestTab::Kind));
-        tabs.push(RequestTab::Capture);
-        tabs.push(RequestTab::Assert);
+        // Not unconditional: see `KindEditor::checks_a_response`. A socket has no single
+        // response to capture from or assert on, and drawing the tabs anyway was two controls
+        // that did nothing.
+        if kind.checks_a_response() {
+            tabs.push(RequestTab::Capture);
+            tabs.push(RequestTab::Assert);
+        }
         tabs
     }
 
@@ -488,6 +528,16 @@ pub struct RequestView {
     /// superseded diff harmless — see `diff_against`.
     diff_task: Option<Task<()>>,
     pub inflight: Option<InFlight>,
+    /// The conversation, when this buffer is a session. Outlives `inflight`, which ends at the
+    /// close — see `Transcript`.
+    pub session: Option<Transcript>,
+    /// The transcript's scroll, held so a newly arrived frame can be revealed.
+    ///
+    /// A handle is the only way in: `scroll_to_item` writes a deferred request that nothing
+    /// consumes unless the list was built with `track_scroll`, and omitting it fails silently.
+    pub session_scroll: gpui::UniformListScrollHandle,
+    /// Which frame the detail pane is showing, as an index into `Transcript::frames`.
+    pub session_selected: Option<usize>,
     pub error: Option<EngineError>,
     pub status: Option<SharedString>,
 
@@ -530,6 +580,9 @@ impl RequestView {
             part_kind_menu: None,
             diff_task: None,
             inflight: None,
+            session: None,
+            session_scroll: gpui::UniformListScrollHandle::new(),
+            session_selected: None,
             error: None,
             status: None,
             // Higher than the inputs' default 0, so Tab reaches every text field first
@@ -1099,6 +1152,10 @@ impl RequestView {
         self.body_view = None;
         self.body_task = None;
         self.status = None;
+        // A reconnect is a new conversation. The old transcript is kept until *here* rather
+        // than cleared at the close, so it stays readable for as long as nobody starts again.
+        self.session = None;
+        self.session_selected = None;
         // `response` and `diff` are deliberately left in place until the new response
         // lands, so `apply` can diff against them.
 
@@ -1137,6 +1194,66 @@ impl RequestView {
         }
 
         match event {
+            Event::Opened {
+                status,
+                status_text,
+                headers,
+                protocol,
+                elapsed,
+                ..
+            } => {
+                // The handshake response is a response, so it fills the same fields the status
+                // line already reads — the pane shows `101 Switching Protocols` and the server's
+                // headers without a second code path for them.
+                if let Some(inflight) = self.inflight.as_mut() {
+                    inflight.status = Some((status, status_text));
+                    inflight.headers = headers;
+                    inflight.ttfb = Some(elapsed);
+                }
+                self.session = Some(Transcript {
+                    job: current,
+                    protocol,
+                    frames: Vec::new(),
+                    closed: None,
+                });
+                cx.notify();
+                true
+            }
+            Event::Frame {
+                at,
+                direction,
+                frame,
+                ..
+            } => {
+                if let Some(session) = self.session.as_mut() {
+                    session.frames.push(TranscriptFrame {
+                        at,
+                        direction,
+                        frame,
+                    });
+                    // Follow the conversation. Unconditional on purpose for now: a socket you
+                    // are watching should not need scrolling, and the "don't yank the view
+                    // while I read scrollback" refinement needs a notion of *being* scrolled
+                    // back that `UniformListScrollHandle` cannot answer at this point in the
+                    // frame — its offset is written during prepaint and so reads a frame behind.
+                    self.session_scroll.scroll_to_item(
+                        session.frames.len().saturating_sub(1),
+                        gpui::ScrollStrategy::Top,
+                    );
+                }
+                cx.notify();
+                true
+            }
+            Event::Closed { code, reason, .. } => {
+                if let Some(session) = self.session.as_mut() {
+                    session.closed = Some((code, reason));
+                }
+                // Dropping `inflight` drops the task running this very closure, which is why
+                // this arm returns `false` — see `InFlight::_task`.
+                self.inflight = None;
+                cx.notify();
+                false
+            }
             Event::Done { response, .. } => {
                 timing!(
                     "request  ttfb {:>9.2?}  total {:>9.2?}  {} bytes",
@@ -1172,6 +1289,17 @@ impl RequestView {
                 false
             }
             Event::Failed { error, .. } => {
+                // **A failed session is a closed one.** Without this the transcript kept
+                // `closed: None` while `inflight` went away, so a socket killed by a network
+                // drop or a protocol error drew a strip reading "open" with a live Disconnect
+                // button — and the error never appeared, because `render` returns the
+                // transcript before it reaches the error arm. The reason travels in the close
+                // reason so it lands where the person is already looking.
+                if let Some(session) = self.session.as_mut()
+                    && session.closed.is_none()
+                {
+                    session.closed = Some((None, error.to_string()));
+                }
                 self.inflight = None;
                 // The last successful response is deliberately kept: the pane shows the
                 // error instead (a failure outranks a stale success), but keeping it
@@ -1228,6 +1356,168 @@ impl RequestView {
 
     pub fn is_sending(&self) -> bool {
         self.inflight.is_some()
+    }
+
+    /// Show one frame in full, through the response body's own viewer.
+    ///
+    /// **The frame is indexed into `body_view`, the same field a response uses**, and that
+    /// reuse is the design rather than a shortcut: a socket has no response body competing for
+    /// it, so for a session "the body" simply *is* the selected frame. Everything built on that
+    /// field then works with no second implementation — the JSON outline, folding, `Ctrl+F`,
+    /// copy, the too-large notice. Writing a second viewer would have meant a second set of
+    /// fold state, scroll state and search state that could drift from the first.
+    ///
+    /// Indexed on the background executor like any other body (invariant 3): a subscription can
+    /// push a megabyte down a socket, and `JsonOutline::parse` on the UI thread would drop
+    /// frames on a click.
+    pub fn select_frame(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(frame) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.frames.get(ix))
+        else {
+            return;
+        };
+
+        let body: bytes::Bytes = match &frame.frame {
+            zuno_core::Frame::Text(text) => bytes::Bytes::from(text.clone().into_bytes()),
+            zuno_core::Frame::Binary(bytes)
+            | zuno_core::Frame::Ping(bytes)
+            | zuno_core::Frame::Pong(bytes) => bytes.clone(),
+        };
+
+        self.session_selected = Some(ix);
+        self.body_view = None;
+
+        // `None` content type, honestly: a WebSocket frame carries no such header. `BodyView`
+        // sniffs the bytes, which is the only evidence there is.
+        //
+        // `HtmlView::Raw` rather than the `Text` default: the readable-text extraction exists
+        // because an HTML *response* is usually a framework's error page, and a frame that
+        // happens to contain markup is payload — showing it as prose would hide what was sent.
+        let build = cx
+            .background_executor()
+            .spawn(async move { BodyView::build(body, None, false, crate::body_view::HtmlView::Raw) });
+
+        self.body_task = Some(cx.spawn(async move |this, cx| {
+            let view = build.await;
+            let _ = this.update(cx, |this, cx| {
+                this.body_view = Some(view);
+                // No `run_captures` here, unlike `index_body`: a session has no captures — see
+                // `KindEditor::checks_a_response`, which is why it has no Capture tab either.
+                if this.is_searching() {
+                    this.run_search(cx);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Keep the composed message with the request, so it survives the session and the restart.
+    ///
+    /// Does **not** clear the composer: saving and sending are different intentions, and the
+    /// common order is to write something, save it, then send it.
+    pub fn save_message(&mut self, cx: &mut Context<Self>) {
+        let Some(socket) = self.kind.as_websocket() else {
+            return;
+        };
+        let body = socket.compose.read(cx).text().to_string();
+        if body.trim().is_empty() {
+            return;
+        }
+        if let Some(socket) = self.kind.as_websocket_mut() {
+            socket.save(body);
+        }
+        cx.notify();
+    }
+
+    /// Put a saved message back in the composer, ready to edit or send.
+    ///
+    /// Loaded rather than sent directly: the saved text is usually a template with one field to
+    /// change, and a click that fired it at the server would make that a mistake you cannot
+    /// take back.
+    pub fn load_message(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(socket) = self.kind.as_websocket() else {
+            return;
+        };
+        let Some(body) = socket.messages.get(ix).map(|message| message.body.clone()) else {
+            return;
+        };
+        let composer = socket.compose.clone();
+        composer.update(cx, |editor, cx| {
+            let end = editor.text().len();
+            editor.replace_range(0..end, &body, window, cx);
+        });
+        cx.notify();
+    }
+
+    pub fn forget_message(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(socket) = self.kind.as_websocket_mut() {
+            socket.forget(ix);
+            cx.notify();
+        }
+    }
+
+    /// The selected frame's payload as text, when there is one and it is text.
+    ///
+    /// `None` for a binary frame rather than lossy bytes: the clipboard is for things you can
+    /// paste, and `SaveResponse` is the counterpart that handles the rest — the same split the
+    /// response body already makes.
+    pub fn selected_frame_text(&self) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let frame = session.frames.get(self.session_selected?)?;
+        match &frame.frame {
+            zuno_core::Frame::Text(text) => Some(text.clone()),
+            zuno_core::Frame::Binary(_) | zuno_core::Frame::Ping(_) | zuno_core::Frame::Pong(_) => {
+                None
+            }
+        }
+    }
+
+    /// Whether a socket is open right now, as opposed to merely having been.
+    pub fn is_connected(&self) -> bool {
+        self.session.as_ref().is_some_and(Transcript::is_open) && self.inflight.is_some()
+    }
+
+    /// Send whatever is in the composer down the open socket.
+    ///
+    /// **Clears the composer on success**, which is what makes it a composer rather than a
+    /// buffer: the next message starts empty, the way every chat box works. What was sent is
+    /// not lost — it is the last row of the transcript, which is a better record than a box
+    /// still holding it.
+    ///
+    /// `{{vars}}` are resolved here, so a saved message can carry `{{token}}` and mean it.
+    pub fn send_frame(
+        &mut self,
+        engine: &Arc<Engine>,
+        resolver: &Resolver,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(job) = self
+            .session
+            .as_ref()
+            .filter(|session| session.is_open())
+            .map(|session| session.job)
+        else {
+            return;
+        };
+        let Some(socket) = self.kind.as_websocket() else {
+            return;
+        };
+
+        let composer = socket.compose.clone();
+        let text = composer.read(cx).text().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+
+        engine.send_frame(job, Frame::Text(resolver.resolve(&text).into_owned()));
+        composer.update(cx, |editor, cx| {
+            let end = editor.text().len();
+            editor.replace_range(0..end, "", window, cx);
+        });
+        cx.notify();
     }
 
     /// Compare this response with the one it replaced, **on a background thread**.

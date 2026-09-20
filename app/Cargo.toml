@@ -39,6 +39,11 @@ resvg = "0.45"
 
 gpui = { workspace = true, features = ["test-support"] }
 
+# A **real** WebSocket server for the end-to-end session test. tungstenite's synchronous half,
+# reached through the copy `zuno-core` already links, so a client that merely looks correct does
+# not pass — the same reason `core/tests/websocket.rs` uses it rather than a hand-written fake.
+tokio-tungstenite.workspace = true
+
 [[bin]]
 name = "zuno"
 path = "src/main.rs"

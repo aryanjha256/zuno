@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use crate::actions::{
+    SaveMessage,
     AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext, BodyFindPrev,
     CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl, OpenBodyType,
     AddAssertion, AddCapture, OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest,
@@ -101,6 +102,31 @@ pub fn render(
                     editor_region(theme, focused_editor(&graphql.variables, window, cx))
                         .child(graphql.variables.clone()),
                 ),
+            // What is offered at the handshake. One line rather than a row table: an ordered
+            // list of bare tokens has no second column to fill.
+            (KindEditor::WebSocket(socket), 0) => pane
+                .child(editor_header(
+                    "Subprotocols",
+                    "comma separated, in preference order",
+                    theme,
+                ))
+                .child(
+                    div()
+                        .p_3()
+                        .child(crate::ui::field_box(socket.subprotocols.clone(), theme)),
+                ),
+            (KindEditor::WebSocket(socket), _) => pane
+                .child(message_header(socket.messages.len(), theme))
+                .children(
+                    view.body_search
+                        .as_ref()
+                        .map(|search| body_find_bar(search, theme, cx)),
+                )
+                .child(
+                    editor_region(theme, focused_editor(&socket.compose, window, cx))
+                        .child(socket.compose.clone()),
+                )
+                .children(saved_messages(socket, theme, cx)),
         },
         RequestTab::Capture => pane
             .child(section_header(
@@ -354,10 +380,13 @@ pub(crate) fn toolbar(
         .border_color(if url_focused { theme.accent } else { theme.border })
         .child(kind_chip(view, theme))
         .child(div().w(px(1.)).h(px(16.)).flex_none().bg(theme.border))
-        .child(method_chip(view, theme))
-        .child(segment_divider(theme))
+        .children(method_chip(view, theme))
+        // Conditional with the chip it follows. Left unconditional, a kind with no verb drew
+        // this rule straight after the one above it — two dividers with nothing between them,
+        // which reads as a 2px seam rather than as an absent control.
+        .children(view.method().is_some().then(|| segment_divider(theme)))
         .child(url_bar(view, theme))
-        .child(send_button(theme, view.is_sending(), cx))
+        .child(send_button(theme, view, cx))
 }
 
 /// The rule between two segments. A filled 1px child rather than a border on either neighbour,
@@ -439,9 +468,20 @@ fn kind_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
         .child(view.kind.choice().label())
 }
 
-fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
-    div()
+/// The verb, for the kinds that have one.
+///
+/// **`None` means nothing is drawn, not an empty box.** It used to render unconditionally and
+/// fall back to an empty label, which on a WebSocket left a 20px strip of nothing that lit up on
+/// hover and opened the method picker — a control that was invisible, clickable, and could not
+/// change anything even once you found it. `OpenMethod` refuses for the same reason, because
+/// the keystroke and the palette row reach it without going past this.
+fn method_chip(view: &RequestView, theme: &Theme) -> Option<impl IntoElement + use<>> {
+    let method = view.method()?.clone();
+
+    Some(
+        div()
         .id("method-chip")
+        .debug_selector(|| "method-chip".to_string())
         .flex()
         .items_center()
         .flex_none()
@@ -449,7 +489,7 @@ fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
         .px(px(10.))
         .text_xs()
         .font_weight(FontWeight::BOLD)
-        .text_color(view.method().map_or(theme.text_muted, |m| theme.method_color(m)))
+        .text_color(theme.method_color(&method))
         .cursor_pointer()
         .hover(|style| style.bg(theme.bg_hover))
         // Dispatches rather than mutating the view directly, so the button and Ctrl+M run
@@ -461,7 +501,8 @@ fn method_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
                 window.dispatch_action(Box::new(crate::actions::OpenMethod), cx);
             },
         )
-        .child(view.method().map_or_else(String::new, |m| m.as_str().to_string()))
+        .child(method.as_str().to_string()),
+    )
 }
 
 fn url_bar(view: &RequestView, theme: &Theme) -> Div {
@@ -478,12 +519,24 @@ fn url_bar(view: &RequestView, theme: &Theme) -> Div {
         .child(view.url.clone())
 }
 
-/// One button, two states. While a request is in flight the only useful thing it can
-/// do is abandon it, so it says so rather than offering a second Send.
+/// One button. What it says depends on what the buffer can usefully do next.
 ///
-/// Both branches dispatch an action rather than calling the logic directly, so the
-/// button and its keybinding can never drift apart.
-fn send_button(theme: &Theme, sending: bool, cx: &mut gpui::Context<RequestView>) -> impl IntoElement {
+/// **A connected socket reads Send, not Connect**, and that is the whole reason this is not a
+/// two-state boolean any more. You connect once and then send many times, so after the
+/// handshake the frequent verb has to be the one under the cursor — and `Ctrl+Enter` means the
+/// same thing it always did, "send what I have written", which is why no second keybinding was
+/// invented for it. Disconnecting is `Escape`, the same key that abandons a request.
+///
+/// Every branch dispatches an action rather than calling the logic directly, so the button and
+/// its keybinding can never drift apart.
+fn send_button(
+    theme: &Theme,
+    view: &RequestView,
+    cx: &mut gpui::Context<RequestView>,
+) -> impl IntoElement {
+    let connected = view.is_connected();
+    let sending = view.is_sending();
+    let session = view.kind.as_websocket().is_some();
     let base = div()
         .id("send-button")
         .flex()
@@ -496,6 +549,21 @@ fn send_button(theme: &Theme, sending: bool, cx: &mut gpui::Context<RequestView>
         .text_color(theme.text_on_accent)
         .cursor_pointer()
         .hover(|style| style.opacity(0.85));
+
+    // Connected: the button is for talking. Hanging up is `Escape` and the Disconnect control
+    // on the transcript's status strip — `response_pane::session_line`. Making the primary
+    // button Disconnect would put the rare, destructive verb where the frequent one belongs.
+    if connected {
+        return base
+            .bg(theme.accent)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                    window.dispatch_action(Box::new(SendRequest), cx);
+                }),
+            )
+            .child("Send".to_string());
+    }
 
     if sending {
         base.bg(theme.status_client_error)
@@ -514,7 +582,7 @@ fn send_button(theme: &Theme, sending: bool, cx: &mut gpui::Context<RequestView>
                     window.dispatch_action(Box::new(SendRequest), cx);
                 }),
             )
-            .child("Send".to_string())
+            .child(if session { "Connect" } else { "Send" }.to_string())
     }
 }
 
@@ -1542,3 +1610,170 @@ fn binary_body(view: &RequestView, theme: &Theme, window: &Window) -> impl IntoE
         }))
 }
 
+
+/// The Message tab's header: the title, and the control that keeps what you have written.
+///
+/// Not `editor_header`, which is `justify_between` with exactly two children — a third would be
+/// spread across the row rather than grouped at the end. The note and the control travel
+/// together on the right, and the title is the only thing allowed to shrink: it is content, its
+/// neighbours are controls, and a `flex_none` title is what carried four controls off the
+/// collection header once.
+fn message_header(saved: usize, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(
+            div()
+                .flex_shrink()
+                .min_w(px(0.))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child("Message".to_string()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_color(theme.text_faint)
+                        .child(match saved {
+                            0 => "sent down the open socket".to_string(),
+                            1 => "1 saved".to_string(),
+                            n => format!("{n} saved"),
+                        }),
+                )
+                .child(crate::ui::icon_text_action(
+                    "save-message",
+                    Icon::Plus,
+                    "Save".into(),
+                    "Keep this message with the request",
+                    SaveMessage,
+                    theme.accent,
+                    theme,
+                )),
+        )
+}
+
+/// The library of messages kept with this socket.
+///
+/// **A click loads, it does not send.** A saved message is nearly always a template with one
+/// field to change, so firing it at the server on a click would make a misclick something you
+/// cannot take back — and `Ctrl+Enter` is one keystroke away once it is loaded.
+///
+/// Not a `uniform_list`: this is a handful of rows under an editor, and a virtualized list
+/// needs a fixed height to live in, which would take that height from the composer.
+fn saved_messages(
+    socket: &crate::kinds::WebSocketEditor,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Option<impl IntoElement + use<>> {
+    if socket.messages.is_empty() {
+        return None;
+    }
+
+    let rows = socket.messages.iter().enumerate().map(|(ix, message)| {
+        let preview = zuno_core::request::elide(
+            message.body.trim().lines().next().unwrap_or_default(),
+            60,
+        )
+        .into_owned();
+
+        div()
+            .id(("saved-message", ix))
+            .debug_selector(move || format!("saved-message-{ix}"))
+            .group(crate::ui::ICON_GROUP)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .w_full()
+            .px_3()
+            .py_1()
+            .text_xs()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.bg_hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _: &MouseDownEvent, window, cx| {
+                    view.load_message(ix, window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text)
+                    .child(SharedString::from(message.name.clone())),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .font_family(theme.mono.clone())
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(preview)),
+            )
+            .child(
+                div()
+                    .id(("forget-message", ix))
+                    .flex_none()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _: &MouseDownEvent, _window, cx| {
+                            // Without this the row's own handler runs too and the message is
+                            // loaded into the composer on its way out — a Bubble-phase listener
+                            // on an ancestor fires for a click on its child.
+                            cx.stop_propagation();
+                            view.forget_message(ix, cx);
+                        }),
+                    )
+                    .child(crate::ui::glyph(
+                        Icon::Close,
+                        theme.text_muted,
+                        theme.status_server_error,
+                        crate::ui::GLYPH,
+                    )),
+            )
+    });
+
+    Some(
+        div()
+            // `overflow_y_scroll` lives on `StatefulInteractiveElement`, so the id is not
+            // decoration — without it this was `overflow_hidden` and every saved message past
+            // the sixth was unreachable: present in the file, counted in the tab label, and
+            // impossible to see or click.
+            .id("saved-messages")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .max_h(px(140.))
+            .overflow_y_scroll()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .text_color(theme.text_faint)
+                    .child("Saved".to_string()),
+            )
+            .children(rows),
+    )
+}

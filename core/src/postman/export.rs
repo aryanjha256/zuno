@@ -125,6 +125,17 @@ fn item_for(label: &str, spec: &RequestSpec, skipped: &mut Vec<String>) -> Value
 /// **Named per request, not counted.** "3 settings were dropped" makes you go and find which;
 /// the importer's `skipped` channel exists for the same reason and reads the same way.
 fn report_unmappable(label: &str, spec: &RequestSpec, skipped: &mut Vec<String>) {
+    // **Announced, not silently degraded.** Postman keeps sockets in a separate "WebSocket
+    // Request" item that the v2.1 collection schema does not describe, so there is nothing
+    // honest to write — and what `body_for` produces instead is an ordinary GET to the same
+    // URL, which *runs* and does the wrong thing. That is worse than an omission, so it has to
+    // be said out loud. This sentence existed as a comment claiming it was handled before it
+    // was true, which is the failure this file's own Lessons entry is about.
+    if spec.kind.is_session() {
+        skipped.push(format!(
+            "{label}: exported as a plain GET — Postman's collection format has no WebSocket              request, so the subprotocols and saved messages are not carried. Use a Zuno bundle              to move it between Zunos"
+        ));
+    }
     if spec.settings != crate::request::RequestSettings::default() {
         skipped.push(format!(
             "{label}: per-request settings (timeout, TLS, redirects, cookies) — Postman has no \
@@ -207,6 +218,11 @@ fn url_for(spec: &RequestSpec) -> Value {
 fn body_for(spec: &RequestSpec) -> Option<Value> {
     let http = match &spec.kind {
         RequestKind::Http(http) => http,
+        // Postman keeps sockets in a separate "WebSocket Request" item that the v2.1
+        // collection schema does not describe — there is no body to write here, and inventing
+        // an HTTP GET in its place would export something that runs and does the wrong thing.
+        // `report_unmappable` is where this gets announced.
+        RequestKind::WebSocket(_) => return None,
         // Postman models GraphQL as a body *mode* on an HTTP request, which is exactly what the
         // importer reads back into a `GraphQl` kind. `variables` is a string of JSON on both
         // sides, so it travels verbatim.
@@ -278,6 +294,37 @@ fn language_for(kind: crate::request::RawKind) -> &'static str {
         RawKind::Xml => "xml",
         RawKind::Html => "html",
         RawKind::Text => "text",
+    }
+}
+
+#[cfg(test)]
+mod websocket_tests {
+    use super::*;
+    use crate::request::{RequestKind, RequestSpec, WebSocketRequest};
+
+    /// **A socket exports as a plain GET, and the report has to say so.**
+    ///
+    /// Postman's v2.1 collection schema has no WebSocket item, so `body_for` produces nothing —
+    /// which leaves an ordinary GET to the same URL. That *runs*, and does the wrong thing,
+    /// which is worse than an omission. Silence here was shipped once behind a comment claiming
+    /// `report_unmappable` handled it.
+    #[test]
+    fn a_socket_is_reported_rather_than_quietly_degraded() {
+        let mut spec = RequestSpec::default();
+        spec.name = "prices".to_string();
+        spec.url = "wss://api.test/ws".to_string();
+        spec.kind = RequestKind::WebSocket(WebSocketRequest {
+            subprotocols: vec!["graphql-transport-ws".to_string()],
+            messages: Vec::new(),
+        });
+
+        let mut skipped = Vec::new();
+        report_unmappable("prices", &spec, &mut skipped);
+
+        assert!(
+            skipped.iter().any(|line| line.contains("WebSocket")),
+            "the export has to name what it could not carry, got {skipped:?}"
+        );
     }
 }
 

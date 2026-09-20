@@ -236,7 +236,9 @@ pub struct RequestSpec {            // the spine — true for every protocol
 
 pub enum RequestKind {
     Http(HttpRequest),
-    // Grpc, Mqtt, GraphQl … each a compile error until someone decides
+    GraphQl(GraphQlRequest),
+    WebSocket(WebSocketRequest),
+    // Grpc, Mqtt … each a compile error until someone decides
 }
 
 pub struct HttpRequest {
@@ -3499,6 +3501,7 @@ UI work, not engine work.
 | ~~Multipart bodies~~ | **Reachable.** `Ctrl+Shift+M` adds a part, `Ctrl+Shift+O` attaches a file to the focused one. reqwest's `multipart` feature is enabled, and `build_body` reduces parts to bytes so `PreparedBody` keeps its derives |
 | ~~Response history~~ | **Reachable.** `Ctrl+H` lists every retained run; choosing one shows it and re-indexes its body. Until then the retention was *write-only* — nothing read it, not even the diff |
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
+| **Binary, ping and pong frames — sending one** | **Not reachable.** `Frame` has all four variants and the engine sends whichever it is given; a received binary, ping or pong is labelled and shown in the transcript. But `RequestView::send_frame` only ever builds `Frame::Text`, because the composer is a text editor — so there is no way to *send* anything else. A ping in particular is worth reaching: it is how you find out whether a quiet socket is still alive |
 
 **Nothing remains** *of the items this table ever listed.* `Ctrl+,` closed five, the method picker
 a sixth, `Ctrl+H` a seventh, and body authoring took form, binary, and multipart — the last of

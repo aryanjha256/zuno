@@ -60,6 +60,15 @@ pub fn render(
         .border_l_1()
         .border_color(theme.focus_border(focused));
 
+    // **A session outranks everything, including its own in-flight state.** Once the socket is
+    // open there is no "response" coming and never will be — the transcript *is* the answer —
+    // so falling through to the in-flight pane would leave a connected socket showing
+    // "Waiting for response…" for as long as it stayed up. A failed handshake still has no
+    // transcript, so it lands on the error arm below exactly as any other request does.
+    if let Some(session) = &view.session {
+        return pane.child(transcript(view, session, theme, window, cx));
+    }
+
     // Order matters: an in-flight request outranks the previous response, and an error
     // outranks a stale success.
     if let Some(inflight) = &view.inflight {
@@ -2183,4 +2192,379 @@ fn diff_text(
             },
         )
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Transcript — the session's answer to a response body
+// ---------------------------------------------------------------------------
+
+/// What one frame shows on its row.
+///
+/// **One line, always.** A transcript's job is to let you follow a conversation, and a row
+/// that grows to fit a 4KB subscription payload turns the list into a wall — `uniform_list`
+/// also requires every row to be the same height, so this is a constraint as well as a choice.
+/// The full payload is what the row *holds*; this is what it shows.
+fn frame_preview(frame: &zuno_core::Frame) -> (SharedString, bool) {
+    match frame {
+        zuno_core::Frame::Text(text) => {
+            let line = text.lines().next().unwrap_or_default();
+            let elided = zuno_core::request::elide(line, 200);
+            (
+                SharedString::from(elided.into_owned()),
+                text.lines().count() > 1,
+            )
+        }
+        // Binary has no reading. Its size is the useful fact, and the hex view is where you go
+        // when it is not — the same split the response body already makes.
+        zuno_core::Frame::Binary(bytes) => (
+            SharedString::from(format!("{} bytes of binary", bytes.len())),
+            false,
+        ),
+        // Shown rather than hidden: a silent heartbeat is exactly the thing you are looking for
+        // when a connection drops for no visible reason.
+        zuno_core::Frame::Ping(_) => (SharedString::from("ping"), false),
+        zuno_core::Frame::Pong(_) => (SharedString::from("pong"), false),
+    }
+}
+
+/// The strip above the transcript: what was negotiated, and whether it is still open.
+fn session_line(
+    view: &RequestView,
+    session: &crate::request_view::Transcript,
+    theme: &Theme,
+) -> Div {
+    let (label, colour) = match &session.closed {
+        None => (SharedString::from("open"), theme.status_success),
+        // No code and no reason: the peer went away without a Close frame, which is an
+        // ordinary ending rather than a fault.
+        Some((None, reason)) if reason.is_empty() => (
+            SharedString::from("closed by the server"),
+            theme.text_muted,
+        ),
+        // No code *with* a reason means the connection failed — `Event::Failed` puts the error
+        // here. Coloured as an error, because it is one and nothing else on screen will say so.
+        Some((None, reason)) => (
+            SharedString::from(format!("failed — {reason}")),
+            theme.status_client_error,
+        ),
+        Some((Some(code), reason)) if reason.is_empty() => {
+            (SharedString::from(format!("closed {code}")), theme.text_muted)
+        }
+        Some((Some(code), reason)) => (
+            SharedString::from(format!("closed {code} — {reason}")),
+            theme.text_muted,
+        ),
+    };
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .flex_none()
+        .px_3()
+        .py_2()
+        .text_xs()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(colour)
+                .child(label),
+        );
+
+    // The handshake's own status line, which `Event::Opened` fills exactly as `Head` does for
+    // a request — so `101 Switching Protocols` appears here without a second code path.
+    if let Some((status, text)) = view.inflight.as_ref().and_then(|f| f.status.clone()) {
+        row = row.child(
+            div()
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!("{status} {text}"))),
+        );
+    }
+
+    if let Some(protocol) = &session.protocol {
+        row = row.child(
+            div()
+                .text_color(theme.text_faint)
+                .child(SharedString::from(protocol.clone())),
+        );
+    }
+
+    row = row.child(
+        div()
+            .flex_1()
+            .text_color(theme.text_faint)
+            .child(SharedString::from(match session.frames.len() {
+                1 => "1 frame".to_string(),
+                n => format!("{n} frames"),
+            })),
+    );
+
+    // **The mouse path for hanging up**, and it belongs here rather than on the send button:
+    // while a socket is open the primary button is for talking, so making it Disconnect would
+    // put the rare destructive verb where the frequent one goes. `text_action` reads the
+    // keystroke from the live keymap, so this control teaches `Escape` rather than repeating it.
+    //
+    // Only while it is open — a closed transcript is a record, and a control that hangs up
+    // something already hung up is a control that does nothing.
+    if session.is_open() {
+        row = row.child(crate::ui::text_action(
+            "session-disconnect",
+            SharedString::from("Disconnect"),
+            "Disconnect",
+            CancelRequest,
+            theme,
+        ));
+    }
+
+    row
+}
+
+fn transcript(
+    view: &RequestView,
+    session: &crate::request_view::Transcript,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<RequestView>,
+) -> Div {
+    let count = session.frames.len();
+
+    if count == 0 {
+        return div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .child(session_line(view, session, theme))
+            .child(centered_note(
+                if session.is_open() {
+                    "connected — nothing has been said yet"
+                } else {
+                    "the socket closed without a single frame"
+                },
+                theme,
+            ));
+    }
+
+    let row_theme = theme.clone();
+    // A `uniform_list` render closure is handed a bare `&mut App`, so `cx.listener` is
+    // unavailable inside it and the entity has to be captured — the same shape the response
+    // body's rows and the collection tree both use.
+    //
+    // **Read through the entity rather than pre-collected**, and that is the whole point of
+    // using a virtualized list here. The first version built a preview for *every* frame into a
+    // `Vec` before handing this closure over — an `elide` and a `SharedString` allocation each,
+    // on every repaint, while `apply` notifies on every arriving frame. A socket at 200
+    // messages a second with 5,000 buffered did five thousand allocations two hundred times a
+    // second on the UI thread: O(n) per frame, O(n²) across a session, and formatting on the
+    // thread invariant 3 exists to keep clear of. Now only the rows about to be painted are
+    // built.
+    let entity = cx.entity().downgrade();
+
+    let list = uniform_list("transcript", count, move |range, _window, cx| {
+        let Some(handle) = entity.upgrade() else {
+            return Vec::new();
+        };
+        let view = handle.read(cx);
+        let Some(session) = view.session.as_ref() else {
+            return Vec::new();
+        };
+        let selected = view.session_selected;
+
+        range
+            .filter_map(|ix| {
+                // The transcript can have shrunk since `count` was read — a reconnect clears
+                // it — and a panicking index would take the window with it.
+                let entry = session.frames.get(ix)?;
+                let (preview, multiline) = frame_preview(&entry.frame);
+                let (at, direction) = (entry.at, entry.direction);
+                let (arrow, arrow_colour) = match direction {
+                    zuno_core::Direction::Sent => ("▲", row_theme.accent),
+                    zuno_core::Direction::Received => ("▼", row_theme.status_success),
+                };
+
+                let picking = entity.clone();
+                let row = div()
+                    .id(("transcript-row", ix))
+                    .debug_selector(move || format!("transcript-row-{ix}"))
+                    .cursor_pointer()
+                    .bg(if selected == Some(ix) {
+                        row_theme.bg_hover
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .hover(|style| style.bg(row_theme.bg_hover))
+                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                        let _ = picking.update(cx, |view, cx| view.select_frame(ix, cx));
+                    })
+                    .flex()
+                    // **Not optional.** A `.flex()` row inside a `uniform_list` sizes to its
+                    // content rather than the list, so without this the row's background and
+                    // any hit area stop at the end of the text — the dead-control bug the
+                    // collection panel's rows already record.
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(ROW_HEIGHT))
+                    .px_3()
+                    // On the row, not on the list: `uniform_list` measures an item *before* its
+                    // own text style applies, so a font set on the list is not the font the row
+                    // is measured with.
+                    .font_family(row_theme.mono.clone())
+                    .text_xs()
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(arrow_colour)
+                            .child(arrow.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(52.))
+                            .text_color(row_theme.text_faint)
+                            .child(SharedString::from(format_duration(at))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            // One line per row — see `frame_preview`. Without this the text
+                            // wraps and a fixed-height row slices the second line in half,
+                            // which reads as a rendering fault rather than as a long payload.
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_color(row_theme.text)
+                            .child(preview),
+                    )
+                    .children(multiline.then(|| {
+                        div()
+                            .flex_none()
+                            .text_color(row_theme.text_faint)
+                            .child("⏎".to_string())
+                    }))
+                    .into_any_element();
+                Some(row)
+            })
+            .collect()
+    })
+    .track_scroll(view.session_scroll.clone())
+    .debug_selector(|| "transcript".to_string())
+    .flex_1();
+
+    // **The frame detail is the response body viewer, unchanged.** `select_frame` indexes the
+    // chosen payload into `body_view`, which is the field `body_region` already reads — so the
+    // JSON outline, folding, `Ctrl+F` and copy all work here with no second implementation.
+    // A socket has no response body of its own, so nothing is competing for that field.
+    let detail = view.session_selected.and_then(|ix| {
+        let entry = session.frames.get(ix)?;
+        Some(
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                // Half the pane, so the conversation stays visible while you read one of it —
+                // which is the whole reason this is a split and not a replacement.
+                .h(relative(0.5))
+                .min_h(px(0.))
+                .border_t_1()
+                .border_color(theme.border)
+                .child(frame_detail_header(ix, entry, theme))
+                .children(view.search.as_ref().map(|search| {
+                    find_bar(
+                        search,
+                        view.body_view.as_ref().is_some_and(BodyView::is_json),
+                        theme,
+                        cx,
+                    )
+                }))
+                // **Rendered here too, and forgetting it made `Ctrl+F` a dead key.** The bar
+                // lives inside the `ResponseView::Body` arm, which this branch returns before
+                // reaching — so the search opened, the state was set, and no input was ever
+                // drawn to type into. Above the rows for the same reason it is there: an
+                // overlay would cover the first matches it is about to scroll to.
+                .child(body_region(view, theme, window, cx)),
+        )
+    });
+
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .min_h(px(0.))
+        .child(session_line(view, session, theme))
+        .child(list)
+        .children(detail)
+}
+
+/// What the detail pane is showing, above it.
+fn frame_detail_header(
+    ix: usize,
+    entry: &crate::request_view::TranscriptFrame,
+    theme: &Theme,
+) -> Div {
+    let (way, colour) = match entry.direction {
+        zuno_core::Direction::Sent => ("sent", theme.accent),
+        zuno_core::Direction::Received => ("received", theme.status_success),
+    };
+    let kind = match &entry.frame {
+        zuno_core::Frame::Text(_) => "text",
+        zuno_core::Frame::Binary(_) => "binary",
+        zuno_core::Frame::Ping(_) => "ping",
+        zuno_core::Frame::Pong(_) => "pong",
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .flex_none()
+        .px_3()
+        .py_1()
+        .text_xs()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .text_color(colour)
+                .child(SharedString::from(format!("frame {}", ix + 1))),
+        )
+        .child(div().text_color(theme.text_muted).child(way.to_string()))
+        .child(div().text_color(theme.text_faint).child(kind.to_string()))
+        .child(
+            div()
+                .flex_1()
+                .text_color(theme.text_faint)
+                .child(SharedString::from(format_bytes(entry.frame.len() as u64))),
+        )
+        // **The mouse paths for reading a frame.** The response pane's own toolbar is not drawn
+        // in a transcript — that branch returns before it — so without these, Find and Copy are
+        // keyboard-only here while being buttons everywhere else. Both tooltips read the
+        // keystroke from the live keymap, so each control teaches its shortcut.
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(icon_button(
+                    "frame-find",
+                    Icon::Search,
+                    "Find in this frame",
+                    FindInResponse,
+                    theme,
+                ))
+                .child(icon_button(
+                    "frame-copy",
+                    Icon::Copy,
+                    "Copy this frame",
+                    CopyResponse,
+                    theme,
+                )),
+        )
 }

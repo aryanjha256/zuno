@@ -52,7 +52,37 @@ reqwest = { version = "0.13", default-features = false, features = [
     # `UnsupportedBody` without it.
     "multipart",
 ] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "net",
+    # `AsyncReadExt`/`AsyncWriteExt` over the upgraded WebSocket stream.
+    "io-util",
+    # `select!`, which is how a session waits on the socket and the user at the same time.
+    "macros",
+] }
+
+# **The WebSocket half of the engine.** Three crates, and the feature list is the whole
+# design decision.
+#
+# `hyper` and `hyper-util` are direct dependencies rather than transitive accidents because
+# reqwest 0.13 exports an `Upgraded` type and no way to reach one: there is no
+# `Response::upgrade()`. The route is `From<Response> for http::Response<Body>` — which
+# preserves `extensions` — then `hyper::upgrade::on`, then `hyper_util::rt::TokioIo` to get
+# tokio's traits back. `tests/websocket_upgrade.rs` pins that this works, because it is
+# three layers of somebody else's internals agreeing with each other.
+#
+# Doing it this way is what lets a WebSocket inherit the user's TLS settings, client
+# certificates, proxy and cookie jar. `tokio-tungstenite`'s own `connect_async` would open
+# its own socket and silently ignore every one of them.
+#
+# Hence `default-features = false`: `connect` is exactly the part we must not use. Only
+# `handshake` is kept, for `generate_key` and `derive_accept_key` — writing those by hand
+# would mean a sha1 and base64 dependency to reimplement four lines the crate already has.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 url = "2"
 # Runtime-agnostic channel: written from tokio tasks, awaited on gpui's smol executor.
 async-channel = "2"

@@ -15,7 +15,7 @@ use reqwest::{Client, Request, Url};
 use crate::engine::error::EngineError;
 use crate::request::{
     Body, FormField, GraphQlRequest, HttpRequest, Method, MultipartValue, RequestKind,
-    RequestSpec,
+    RequestSpec, WebSocketRequest,
 };
 
 /// A body that has been reduced to bytes, plus the Content-Type it implies.
@@ -224,6 +224,8 @@ pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
         // also decides whether it travels as a body at all — a GET sends it in the query
         // string, so "the body" is genuinely nothing here rather than merely empty.
         RequestKind::GraphQl(_) => return Ok(PreparedBody::None),
+        // The handshake carries no body at all — RFC 6455 forbids one on the GET.
+        RequestKind::WebSocket(_) => return Ok(PreparedBody::None),
     };
     match &http.body {
         Body::Empty => Ok(PreparedBody::None),
@@ -313,6 +315,13 @@ pub fn build(client: &Client, spec: &RequestSpec) -> Result<Request, EngineError
     match &spec.kind {
         RequestKind::Http(http) => build_http(client, spec, http),
         RequestKind::GraphQl(graphql) => build_graphql(client, spec, graphql),
+        // **Not built here.** The handshake needs a `Sec-WebSocket-Key` that the *caller*
+        // has to keep in order to check the server's `Sec-WebSocket-Accept` against it, and
+        // a builder that generates one internally would throw away the only thing that
+        // makes the reply verifiable. `session::connect` calls `build_websocket` directly.
+        RequestKind::WebSocket(_) => Err(EngineError::Other {
+            reason: "a WebSocket is opened, not sent".to_string(),
+        }),
     }
 }
 
@@ -939,4 +948,105 @@ mod tests {
     fn graphql_does_not_go_through_the_http_body_path() {
         assert_eq!(build_body(&graphql_spec("{ a }")).unwrap(), PreparedBody::None);
     }
+}
+
+/// The handshake URL: `ws`/`wss` mapped onto the schemes reqwest can actually resolve.
+///
+/// **RFC 6455's own mapping**, and it has to happen here rather than being typed by the user:
+/// `ws://` is the scheme every WebSocket document uses and the one people paste, and reqwest
+/// cannot resolve it at all — it is not an HTTP scheme, so `resolve_url` rejects it outright.
+/// The handshake underneath *is* ordinary HTTP, with the same default ports.
+///
+/// Separate from `resolve_url` rather than a flag on it because a socket has no query table to
+/// merge: `WebSocketRequest` carries no `QueryParam`s, so half of that function would be
+/// answering a question this kind does not ask.
+pub fn websocket_url(spec: &RequestSpec) -> Result<Url, EngineError> {
+    let raw = spec.url.trim();
+    if raw.is_empty() {
+        return Err(EngineError::EmptyUrl);
+    }
+    // Before parsing, for `resolve_url`'s reason: `Url::parse` reads `{{baseUrl}}` as a host.
+    if let Some(name) = find_unresolved_variable(raw) {
+        return Err(EngineError::UnresolvedVariable {
+            name,
+            location: "the URL".to_string(),
+        });
+    }
+
+    let candidate = match raw.split_once("://") {
+        Some(("ws", rest)) => format!("http://{rest}"),
+        Some(("wss", rest)) => format!("https://{rest}"),
+        Some(_) => raw.to_string(),
+        // No scheme typed. `wss` is the default rather than `ws` for the same reason
+        // `resolve_url` defaults to `https`.
+        None => format!("https://{raw}"),
+    };
+
+    let url = Url::parse(&candidate).map_err(|error| EngineError::InvalidUrl {
+        url: raw.to_string(),
+        reason: error.to_string(),
+    })?;
+
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(EngineError::UnsupportedScheme {
+            scheme: url.scheme().to_string(),
+        });
+    }
+
+    Ok(url)
+}
+
+/// The opening GET, with the six headers that turn it into an upgrade.
+///
+/// `key` is passed in rather than generated here, and that is the whole reason this is not a
+/// `build` arm: the caller has to keep it to check the server's `Sec-WebSocket-Accept` against
+/// it afterwards. A builder that made its own would leave the reply unverifiable.
+pub fn build_websocket(
+    spec: &RequestSpec,
+    socket: &WebSocketRequest,
+    key: &str,
+) -> Result<Request, EngineError> {
+    use http::header::{CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, SEC_WEBSOCKET_VERSION, UPGRADE};
+
+    let mut request = Request::new(http::Method::GET, websocket_url(spec)?);
+
+    // The user's own headers first, so the upgrade set below cannot be overwritten by one of
+    // them — a typed `Connection: keep-alive` would otherwise quietly break the handshake.
+    let headers = request.headers_mut();
+    *headers = build_headers(spec)?;
+    headers.insert(CONNECTION, http::HeaderValue::from_static("Upgrade"));
+    headers.insert(UPGRADE, http::HeaderValue::from_static("websocket"));
+    headers.insert(SEC_WEBSOCKET_VERSION, http::HeaderValue::from_static("13"));
+    headers.insert(
+        SEC_WEBSOCKET_KEY,
+        http::HeaderValue::from_str(key).map_err(|_| EngineError::InvalidHeaderValue {
+            name: "sec-websocket-key".to_string(),
+            value: key.to_string(),
+        })?,
+    );
+
+    let offered: Vec<&str> = socket
+        .subprotocols
+        .iter()
+        .map(|protocol| protocol.trim())
+        .filter(|protocol| !protocol.is_empty())
+        .collect();
+    if !offered.is_empty() {
+        let joined = offered.join(", ");
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            http::HeaderValue::from_str(&joined).map_err(|_| EngineError::InvalidHeaderValue {
+                name: "sec-websocket-protocol".to_string(),
+                value: joined.clone(),
+            })?,
+        );
+    }
+
+    // **HTTP/1.1, pinned, not negotiated.** There is no 101 in HTTP/2 — the upgrade mechanism
+    // was replaced by extended CONNECT — so a `wss://` URL whose ALPN happens to settle on h2
+    // would produce a handshake that can never succeed, with nothing on screen saying why.
+    // `tests/websocket_upgrade.rs` pins that the request goes out as 1.1.
+    *request.version_mut() = http::Version::HTTP_11;
+
+    Ok(request)
 }

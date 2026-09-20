@@ -633,6 +633,9 @@ fn url_text(spec: &RequestSpec) -> String {
 fn has_body(spec: &RequestSpec) -> bool {
     let http = match &spec.kind {
         RequestKind::Http(http) => http,
+        // curl can speak ws:// since 7.86, but a socket's payload is not a body — it is a
+        // conversation that starts after the handshake, and there is no flag for that.
+        RequestKind::WebSocket(_) => return false,
         // A GraphQL request carries its envelope as a body unless it is a GET, where it goes
         // in the query string instead — the same split `build_graphql` makes.
         RequestKind::GraphQl(graphql) => {
@@ -656,6 +659,8 @@ fn has_body(spec: &RequestSpec) -> bool {
 fn body_flags(spec: &RequestSpec) -> Vec<String> {
     let http = match &spec.kind {
         RequestKind::Http(http) => http,
+        // See `has_body`: nothing a socket sends is a body.
+        RequestKind::WebSocket(_) => return Vec::new(),
         // Exported as the envelope that actually goes on the wire, not as the two editors it
         // was authored in — a copied command has to be runnable, and `query`/`variables` mean
         // nothing to curl. Built by `graphql_envelope`, so the exported bytes and the sent

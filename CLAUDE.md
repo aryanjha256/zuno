@@ -13,9 +13,10 @@ Three docs, three jobs. Read them in this order:
   building anything.
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
-**M1, M2 and M3 are all complete**, and architecture.md §11 — engine capability with no UI path —
-is empty. The loop, the navigation thesis, and reuse are all built; response search and the
-body/headers tabs landed after. ROADMAP's audit section, not its milestone headings, is where the
+**M1, M2 and M3 are all complete.** architecture.md §11 — engine capability with no UI path — has
+one entry again: the engine sends any WebSocket frame type and the composer can only ask for
+text. The loop, the navigation thesis, and reuse are all built; response search and the
+body/headers tabs landed after, then GraphQL and WebSocket as request kinds of their own. ROADMAP's audit section, not its milestone headings, is where the
 remaining work lives.
 
 ## Layout
@@ -31,12 +32,17 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 958 tests, ~25s
+cargo test --workspace                   # 974 tests, ~25s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
 # Live HTTPS check — #[ignore]d so CI never depends on the network.
 cargo test -p zuno-core --test engine -- --ignored --nocapture
+
+# Live wss:// check. **Not optional after touching the client**: a plaintext `ws://` never
+# negotiates ALPN, so every offline WebSocket test passes against an h2 client that can never
+# receive a 101. ZUNO_WS_URL overrides the endpoint.
+cargo test -p zuno-core --test websocket -- --ignored --nocapture
 
 # Perf floor for the response viewer. Release, or the numbers are meaningless.
 cargo test --release -p zuno-core --test json_perf -- --nocapture

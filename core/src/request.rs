@@ -302,10 +302,44 @@ impl Default for GraphQlRequest {
     }
 }
 
+/// A message kept with the socket, so reconnecting does not mean retyping what you send.
+///
+/// Named, because the useful ones are a handful of fixed payloads — a subscribe envelope, an
+/// auth frame, a heartbeat — and picking one from a list beats scrolling a transcript for the
+/// last time you typed it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedMessage {
+    pub name: String,
+    /// Sent verbatim, `{{vars}}` resolved. Text only: a binary frame you can type is a
+    /// contradiction, and one you can paste is a file picker, which is not this.
+    pub body: String,
+}
+
+/// A WebSocket endpoint and what to say to it.
+///
+/// **No method, and that is the point of the kind split.** The handshake is a GET and nothing
+/// else is legal, so there is no verb to choose; `HttpRequest::method` would be a field with one
+/// value. What is here instead is what only a socket has: the subprotocols to offer, and a
+/// library of messages, because a socket is a conversation rather than one exchange.
+///
+/// Every field carries `#[serde(default)]`, unlike `GraphQlRequest`. A collection file has no
+/// version to migrate on (invariant 11), so the only way a *third* field can be added later
+/// without orphaning every socket written before it is for absence to already mean something.
+/// Nothing is lost by starting that way; it is a promise that costs nothing until it is needed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSocketRequest {
+    /// `Sec-WebSocket-Protocol` offers, in preference order. The server picks at most one.
+    #[serde(default)]
+    pub subprotocols: Vec<String>,
+    #[serde(default)]
+    pub messages: Vec<SavedMessage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RequestKind {
     Http(HttpRequest),
     GraphQl(GraphQlRequest),
+    WebSocket(WebSocketRequest),
 }
 
 impl RequestKind {
@@ -318,7 +352,20 @@ impl RequestKind {
         match self {
             RequestKind::Http(_) => None,
             RequestKind::GraphQl(_) => Some("GQL"),
+            RequestKind::WebSocket(_) => Some("WS"),
         }
+    }
+
+    /// Whether sending this opens a connection that stays open.
+    ///
+    /// **Not the whole answer, deliberately.** This is what the *request* can promise before
+    /// anything has left the machine, and only a socket can promise it. An ordinary HTTP
+    /// request becomes a session whenever the server answers `text/event-stream`, and a
+    /// GraphQL subscription becomes one whenever the server speaks graphql-sse — neither is
+    /// knowable from here. So the response side has the final say and this is the hint that
+    /// lets the UI show Connect instead of Send *before* it can possibly know.
+    pub fn is_session(&self) -> bool {
+        matches!(self, RequestKind::WebSocket(_))
     }
 
     /// What this kind is called in the UI.
@@ -326,6 +373,7 @@ impl RequestKind {
         match self {
             RequestKind::Http(_) => "HTTP",
             RequestKind::GraphQl(_) => "GraphQL",
+            RequestKind::WebSocket(_) => "WebSocket",
         }
     }
 }
@@ -499,6 +547,8 @@ impl Serialize for RequestSpec {
             // it, which is correct and unavoidable; what matters is that it cannot be *confused*
             // for something else, and a file with `kind` and no `method` is refused outright.
             RequestKind::GraphQl(_) => (None, None, None, Some(&self.kind)),
+            // Same reasoning, and the same absence of a flat shape to imitate.
+            RequestKind::WebSocket(_) => (None, None, None, Some(&self.kind)),
         };
 
         StoredSpecRef {
@@ -573,14 +623,14 @@ impl RequestSpec {
     pub fn http(&self) -> Option<&HttpRequest> {
         match &self.kind {
             RequestKind::Http(http) => Some(http),
-            RequestKind::GraphQl(_) => None,
+            RequestKind::GraphQl(_) | RequestKind::WebSocket(_) => None,
         }
     }
 
     pub fn http_mut(&mut self) -> Option<&mut HttpRequest> {
         match &mut self.kind {
             RequestKind::Http(http) => Some(http),
-            RequestKind::GraphQl(_) => None,
+            RequestKind::GraphQl(_) | RequestKind::WebSocket(_) => None,
         }
     }
 
@@ -588,14 +638,29 @@ impl RequestSpec {
     pub fn graphql(&self) -> Option<&GraphQlRequest> {
         match &self.kind {
             RequestKind::GraphQl(graphql) => Some(graphql),
-            RequestKind::Http(_) => None,
+            RequestKind::Http(_) | RequestKind::WebSocket(_) => None,
         }
     }
 
     pub fn graphql_mut(&mut self) -> Option<&mut GraphQlRequest> {
         match &mut self.kind {
             RequestKind::GraphQl(graphql) => Some(graphql),
-            RequestKind::Http(_) => None,
+            RequestKind::Http(_) | RequestKind::WebSocket(_) => None,
+        }
+    }
+
+    /// The WebSocket half, when this is a WebSocket request.
+    pub fn websocket(&self) -> Option<&WebSocketRequest> {
+        match &self.kind {
+            RequestKind::WebSocket(socket) => Some(socket),
+            RequestKind::Http(_) | RequestKind::GraphQl(_) => None,
+        }
+    }
+
+    pub fn websocket_mut(&mut self) -> Option<&mut WebSocketRequest> {
+        match &mut self.kind {
+            RequestKind::WebSocket(socket) => Some(socket),
+            RequestKind::Http(_) | RequestKind::GraphQl(_) => None,
         }
     }
 
@@ -609,6 +674,9 @@ impl RequestSpec {
             // GraphQL rides HTTP, so it has one and it is variable: POST normally, GET when
             // the query should be cacheable.
             RequestKind::GraphQl(graphql) => Some(&graphql.method),
+            // The handshake is a GET and nothing else is legal, so there is no choice to
+            // show. Reporting one would put a control on screen that cannot be changed.
+            RequestKind::WebSocket(_) => None,
         }
     }
 
@@ -1177,5 +1245,70 @@ mod tests {
         };
         assert_eq!(spec.method(), Some(&Method::Post));
         assert!(spec.http().is_none(), "a GraphQL request has no HTTP body table");
+    }
+
+    /// **A socket survives the round trip with every field it was given.**
+    ///
+    /// Invariant 11's territory rather than a formality: a collection file carries no version
+    /// to migrate on, so the only protection a new kind has is that what is written comes back.
+    /// Asserted on the whole `RequestSpec` for `bundle`'s reason — a field-by-field check
+    /// passes while a field added later goes quietly missing.
+    #[test]
+    fn a_websocket_request_is_written_as_a_kind_and_round_trips() {
+        let spec = RequestSpec {
+            url: "wss://api.test/subscribe".to_string(),
+            kind: RequestKind::WebSocket(WebSocketRequest {
+                subprotocols: vec!["graphql-transport-ws".to_string()],
+                messages: vec![SavedMessage {
+                    name: "subscribe".to_string(),
+                    body: r#"{"type":"connection_init"}"#.to_string(),
+                }],
+            }),
+            ..RequestSpec::default()
+        };
+
+        let written = serde_json::to_string(&spec).expect("serialize");
+        assert!(written.contains(r#""kind""#), "a socket must carry its kind");
+        assert!(
+            !written.contains(r#""method""#),
+            "and must not carry the flat HTTP shape, which would be ambiguous: {written}"
+        );
+
+        let back: RequestSpec = serde_json::from_str(&written).expect("deserialize");
+        assert_eq!(spec, back);
+    }
+
+    /// The handshake is a GET and there is no choice to show, so nothing asks for one.
+    #[test]
+    fn a_websocket_request_reports_no_method() {
+        let spec = RequestSpec {
+            kind: RequestKind::WebSocket(WebSocketRequest::default()),
+            ..RequestSpec::default()
+        };
+        assert_eq!(spec.method(), None);
+        assert!(spec.http().is_none());
+        assert_eq!(spec.kind.badge(), Some("WS"));
+        assert!(spec.kind.is_session());
+    }
+
+    /// A field added to `WebSocketRequest` later must not orphan every socket written today.
+    ///
+    /// The `#[serde(default)]` on each field is what makes that possible, and a default is
+    /// exactly the kind of attribute that gets dropped in a refactor without anything noticing
+    /// — so this reads the *older* shape back rather than trusting the attribute is still there.
+    #[test]
+    fn a_socket_written_with_fewer_fields_still_opens() {
+        let older = r#"{
+            "id": 0,
+            "name": "sub",
+            "url": "wss://api.test/ws",
+            "headers": [],
+            "settings": {},
+            "kind": { "WebSocket": {} }
+        }"#;
+
+        let spec: RequestSpec = serde_json::from_str(older).expect("an older socket must open");
+        let socket = spec.websocket().expect("still a socket");
+        assert!(socket.subprotocols.is_empty() && socket.messages.is_empty());
     }
 }

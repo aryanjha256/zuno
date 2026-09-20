@@ -13050,3 +13050,392 @@ async fn an_empty_header_cell_offers_the_whole_table(cx: &mut TestAppContext) {
     assert_eq!(items.len(), zuno_core::headers::COMMON.len());
 }
 
+
+/// **On an open socket, `Ctrl+Enter` sends a message — it does not reconnect.**
+///
+/// The bug this exists for is invisible and expensive: if the send path treated a connected
+/// socket like any other buffer it would tear the connection down and open a new one, losing
+/// the conversation, on the keystroke people press most. Nothing else would notice — a
+/// reconnect produces a perfectly healthy socket and an empty transcript, which looks like a
+/// server that said nothing.
+///
+/// Asserted on **the job id staying the same** as well as on the frame arriving, because a
+/// reconnect that happened to echo would satisfy the frame assertion on its own.
+#[gpui::test]
+async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut TestAppContext) {
+    use std::net::TcpListener;
+    use tokio_tungstenite::tungstenite;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut ws = tungstenite::accept(stream).expect("handshake");
+        while let Ok(message) = ws.read() {
+            if message.is_close() {
+                break;
+            }
+            if let Ok(text) = message.to_text()
+                && ws
+                    .send(tungstenite::Message::Text(format!("re:{text}").into()))
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
+
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the socket to open", |cx| {
+        cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
+    });
+
+    let job = cx
+        .update(|_, cx| view.read(cx).session.as_ref().map(|session| session.job))
+        .expect("an open session");
+
+    // Type into the composer through the real editor, not by writing the field.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let composer = view
+                .kind
+                .as_websocket()
+                .expect("a socket")
+                .compose
+                .clone();
+            window.focus(&gpui::Focusable::focus_handle(composer.read(cx), cx));
+        })
+    });
+    cx.simulate_input("ping");
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let echoed = wait_for(&mut cx, "the server's reply", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx).session.as_ref().and_then(|session| {
+                session.frames.iter().find_map(|entry| match &entry.frame {
+                    zuno_core::Frame::Text(text) if text.starts_with("re:") => Some(text.clone()),
+                    _ => None,
+                })
+            })
+        })
+    });
+    assert_eq!(echoed, "re:ping", "the server must have received what was typed");
+
+    let still = cx
+        .update(|_, cx| view.read(cx).session.as_ref().map(|session| session.job))
+        .expect("still a session");
+    assert_eq!(
+        still, job,
+        "Ctrl+Enter on an open socket must send down it, not open a second one"
+    );
+
+    // The composer empties, which is what makes it a composer rather than a buffer.
+    let left = cx.update(|_, cx| {
+        view.read(cx)
+            .kind
+            .as_websocket()
+            .expect("a socket")
+            .compose
+            .read(cx)
+            .text()
+            .to_string()
+    });
+    assert!(left.is_empty(), "the composer must clear on send, got {left:?}");
+
+    // **Clicking a frame opens it in the body viewer**, which is the whole reuse: the detail
+    // pane is `body_region` reading `body_view`, so a frame gets the JSON outline, folding and
+    // Ctrl+F with no second implementation. Asserted through a real click on the row's painted
+    // bounds, because a row that renders and cannot be clicked is the dead-hitbox bug the
+    // collection panel already records.
+    let row = cx
+        .debug_bounds("transcript-row-0")
+        .expect("a transcript row to click");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    let rows = wait_for(&mut cx, "the frame to be indexed", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .body_view
+                .as_ref()
+                .map(crate::body_view::BodyView::row_count)
+        })
+    });
+    assert!(rows > 0, "the selected frame must reach the body viewer");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).session_selected),
+        Some(0),
+        "and the row must be marked as the selected one"
+    );
+
+    // **Ctrl+F must reach a real input**, and asserting on the *typing* is the only way to
+    // know. The find bar lived only in the response pane's Body arm, which the transcript
+    // branch returns before reaching — so the search opened, `open_search` focused a handle
+    // whose element was never painted, and every keystroke vanished. Checking that
+    // `view.search` is `Some` would have passed against exactly that bug.
+    cx.simulate_keystrokes("ctrl-f");
+    cx.simulate_input("re:");
+    let typed = cx.update(|_, cx| {
+        view.read(cx)
+            .search
+            .as_ref()
+            .map(|search| search.query.read(cx).text().to_string())
+    });
+    assert_eq!(
+        typed.as_deref(),
+        Some("re:"),
+        "typing after Ctrl+F must land in the find bar, not nowhere"
+    );
+    cx.simulate_keystrokes("escape");
+
+    // **Copy reads the frame, not `displayed()`.** A session has no response, so the handler
+    // used to fall straight through to "No response to copy yet" on every socket.
+    cx.update(|window, cx| window.dispatch_action(Box::new(crate::actions::CopyResponse), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+            .as_deref(),
+        // Row 0 is the frame this side *sent*; the echo is row 1. Asserting on the sent one is
+        // the stronger check — it can only be right if the copy followed the selection rather
+        // than reaching for the newest frame or the whole transcript.
+        Some("ping"),
+        "copying in a transcript must copy the selected frame"
+    );
+
+    // Escape closes politely, and the transcript survives it — a closed conversation is still
+    // the result of the run.
+    cx.simulate_keystrokes("escape");
+    wait_for(&mut cx, "the close", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .session
+                .as_ref()
+                .map(|session| session.closed.is_some())
+        })
+        .filter(|closed| *closed)
+        .map(|_| ())
+    });
+    let kept = cx.update(|_, cx| {
+        view.read(cx)
+            .session
+            .as_ref()
+            .map(|session| session.frames.len())
+            .unwrap_or(0)
+    });
+    assert!(kept >= 2, "the transcript must outlive the socket, saw {kept} frames");
+
+    server.join().expect("server thread");
+}
+
+/// **A socket shows no Capture or Assert tab.**
+///
+/// Both are defined against one finished response and run off `Event::Done`, which a session
+/// never emits — so before `KindEditor::checks_a_response` they were two tabs that opened,
+/// accepted rows, and silently did nothing with them. A dead control is invisible in exactly
+/// the way this suite exists to catch: it draws, it clicks, it just has no effect.
+#[gpui::test]
+async fn a_socket_has_no_capture_or_assert_tabs(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    let tabs = |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            crate::request_view::RequestTab::for_kind(&view.read(cx).kind)
+                .into_iter()
+                .map(|tab| format!("{tab:?}"))
+                .collect::<Vec<_>>()
+        })
+    };
+
+    let http = tabs(&view, &mut cx);
+    assert!(
+        http.iter().any(|tab| tab.contains("Capture"))
+            && http.iter().any(|tab| tab.contains("Assert")),
+        "an HTTP request keeps both: {http:?}"
+    );
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+
+    let socket = tabs(&view, &mut cx);
+    assert!(
+        !socket.iter().any(|tab| tab.contains("Capture"))
+            && !socket.iter().any(|tab| tab.contains("Assert")),
+        "a socket must not offer tabs that cannot do anything: {socket:?}"
+    );
+    assert!(
+        socket.iter().any(|tab| tab.contains("Headers")),
+        "and must keep the ones that can: {socket:?}"
+    );
+}
+
+/// **A saved message reaches the spec**, which is what makes it reach the file.
+///
+/// `RequestView` derives its spec from the editors rather than storing one, and the corollary
+/// bites: anything the editors cannot represent is *destroyed* at the next save. Asserted
+/// through `spec()` rather than on the editor's own field, because the field being right while
+/// the derivation drops it is exactly the failure that emptied form bodies once.
+#[gpui::test]
+async fn saving_a_message_keeps_it_in_the_request(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let composer = view.kind.as_websocket().expect("a socket").compose.clone();
+            window.focus(&gpui::Focusable::focus_handle(composer.read(cx), cx));
+        })
+    });
+    cx.simulate_input(r#"{"type":"subscribe","id":"1"}"#);
+    // Dispatched rather than driven through the palette: `commands`' own drift test already
+    // guarantees the row exists, and what is being checked here is the handler and the
+    // derivation behind it.
+    cx.update(|window, cx| window.dispatch_action(Box::new(crate::actions::SaveMessage), cx));
+    cx.run_until_parked();
+
+    let saved = cx.update(|_, cx| {
+        view.read(cx)
+            .spec(cx)
+            .websocket()
+            .expect("still a socket")
+            .messages
+            .clone()
+    });
+    assert_eq!(saved.len(), 1, "the message must survive the derivation");
+    assert_eq!(
+        saved[0].name, "subscribe",
+        "and be named by its own `type`, which is why saving needs no prompt"
+    );
+    assert_eq!(saved[0].body, r#"{"type":"subscribe","id":"1"}"#);
+}
+
+/// **A kind with no verb shows no method chip, and no route opens the picker.**
+///
+/// The chip used to render unconditionally with an empty label, so a WebSocket carried a strip
+/// of nothing beside the URL that lit up on hover and dispatched `OpenMethod` — invisible,
+/// clickable, and unable to change anything if you did find it. `Ctrl+M` and the palette row
+/// reached the same picker without going past the chip at all, and `set_method` is a no-op on a
+/// socket, so a chosen verb silently did nothing.
+///
+/// Asserted at the guard rather than on the chip's absence: `debug_bounds` reads the last
+/// rendered frame and keeps a removed element's entry, so `is_none()` proves nothing (the
+/// context-menu tests learned this the expensive way). The picker staying shut is the half a
+/// person would notice.
+#[gpui::test]
+async fn a_kind_without_a_method_offers_no_method_picker(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    // HTTP first, so the refusal below is about the kind and not about the action being broken.
+    cx.update(|window, cx| window.dispatch_action(Box::new(crate::actions::OpenMethod), cx));
+    cx.run_until_parked();
+    assert!(
+        picker_is_open(&window, &mut cx),
+        "an HTTP request must still get its method picker"
+    );
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    assert!(
+        cx.update(|_, cx| view.read(cx).method().is_none()),
+        "a socket has no verb to offer — the handshake is a GET and nothing else is legal"
+    );
+
+    cx.update(|window, cx| window.dispatch_action(Box::new(crate::actions::OpenMethod), cx));
+    cx.run_until_parked();
+    assert!(
+        !picker_is_open(&window, &mut cx),
+        "a socket must not get a method picker from the keystroke or the palette row"
+    );
+}
+
+/// **A socket that fails stops calling itself open.**
+///
+/// `Event::Failed` cleared `inflight` and left `Transcript::closed` as `None`, and the response
+/// pane returns the transcript *before* it reaches the error arm — so a connection killed by a
+/// protocol error or a dropped network drew a status strip reading "open", offered a live
+/// Disconnect, and showed the error nowhere at all. The transcript is the only surface a session
+/// has; if it lies there is nothing else to check.
+///
+/// The server here completes a real handshake and then writes invalid framing straight onto the
+/// socket, which is a protocol error rather than a close — the case that produced the lie.
+#[gpui::test]
+async fn a_socket_that_fails_stops_reporting_itself_as_open(cx: &mut TestAppContext) {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use tokio_tungstenite::tungstenite;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        let mut ws = tungstenite::accept(stream).expect("handshake");
+        // Past the handshake, so the client has already reported `Opened`. `0xFF` is not a
+        // legal opcode, so this is a framing error and not a close.
+        let _ = ws.get_mut().write_all(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let _ = ws.get_mut().flush();
+    });
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let reason = wait_for(&mut cx, "the failure to land", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .session
+                .as_ref()
+                .and_then(|session| session.closed.clone())
+        })
+        .map(|(_, reason)| reason)
+    });
+
+    assert!(
+        !reason.is_empty(),
+        "the failure has to reach the transcript as a reason, or nothing on screen says why"
+    );
+    assert!(
+        !cx.update(|_, cx| view.read(cx).is_connected()),
+        "a failed socket must not still read as connected"
+    );
+
+    server.join().expect("server thread");
+}
