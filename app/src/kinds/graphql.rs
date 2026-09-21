@@ -6,7 +6,7 @@
 //! existing at all.
 
 use gpui::{App, AppContext, Context, Entity, Focusable, Window};
-use zuno_core::{GraphQlRequest, Method};
+use zuno_core::{GraphQlRequest, GraphQlTransport, Method};
 
 use crate::input::{Editor, TextInput};
 use crate::request_view::RequestView;
@@ -25,6 +25,12 @@ pub struct GraphQlEditor {
     /// `operationName` — only meaningful when the document holds more than one named
     /// operation, which is why it is a single line beside the editors rather than a tab.
     pub operation: Entity<TextInput>,
+    /// How the operation reaches the server.
+    ///
+    /// **Plain data, not an editor entity**, for `WebSocketEditor::messages`' reason: nothing
+    /// types into it, it is picked — so a live input would be state for something only ever
+    /// read.
+    pub transport: GraphQlTransport,
 }
 
 impl GraphQlEditor {
@@ -45,6 +51,7 @@ impl GraphQlEditor {
                     cx,
                 )
             }),
+            transport: graphql.transport,
         }
     }
 
@@ -55,6 +62,9 @@ impl GraphQlEditor {
         !self.query.read(cx).text().trim().is_empty()
             || !self.variables.read(cx).text().trim().is_empty()
             || !self.operation.read(cx).text().trim().is_empty()
+            // A transport that was chosen rather than defaulted is a decision, and a kind
+            // switch would throw it away as surely as it throws away the document.
+            || self.transport != GraphQlTransport::default()
     }
 
     /// What `spec()` reads back out. The mirror of `from_spec`, and the reason a GraphQL
@@ -68,6 +78,7 @@ impl GraphQlEditor {
             // Blank means "this document has one operation, work it out" — an empty string
             // would be sent as `operationName: ""`, which several servers reject.
             operation: (!operation.is_empty()).then_some(operation),
+            transport: self.transport,
         }
     }
 
@@ -82,6 +93,7 @@ impl GraphQlEditor {
             query,
             variables,
             operation,
+            transport,
         } = base;
 
         let typed = self.operation.read(cx).text().trim().to_string();
@@ -91,6 +103,16 @@ impl GraphQlEditor {
             || self.query.read(cx).text() != query
             || self.variables.read(cx).text() != variables
             || typed.as_deref() != operation.as_deref()
+            || self.transport != *transport
+    }
+
+    /// Whether this will open a socket, as the engine will decide it.
+    ///
+    /// Asked of `to_spec` rather than reimplemented, so the label on screen and the route the
+    /// request actually takes cannot disagree — which they would the first time someone
+    /// adjusted one of them.
+    pub fn uses_websocket(&self, cx: &App) -> bool {
+        self.to_spec(cx).uses_websocket()
     }
 
     /// The document editor — this kind's main text surface, which is what `Ctrl+F` and the

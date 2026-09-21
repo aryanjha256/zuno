@@ -1066,6 +1066,7 @@ fn a_graphql_request_sends_its_envelope_as_json() {
         query: "query Me { me { id } }".to_string(),
         variables: r#"{"n": 50}"#.to_string(),
         operation: Some("Me".to_string()),
+        transport: Default::default(),
     });
 
     let (_, events) = engine.send(spec);
@@ -1099,6 +1100,7 @@ fn a_get_graphql_request_sends_no_body() {
         query: "{ me { id } }".to_string(),
         variables: String::new(),
         operation: None,
+        transport: Default::default(),
     });
 
     let (_, events) = engine.send(spec);

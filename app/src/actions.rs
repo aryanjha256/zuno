@@ -172,6 +172,7 @@ actions!(
         AddHeader,
         AddQuery,
         SaveMessage,
+        OpenGraphQlTransport,
         ToggleRow,
         RemoveRow,
         OpenBodyType,

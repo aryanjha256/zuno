@@ -298,3 +298,127 @@ fn a_real_wss_endpoint_opens() {
     assert_eq!(echoed, "hello");
     println!("wss:// works — saw {seen:?}");
 }
+
+/// **A GraphQL subscription opens a socket and speaks graphql-transport-ws**, with nothing
+/// configured — `Auto` reads the document, sees `subscription`, and routes it.
+///
+/// The server here plays the protocol properly: it checks the subprotocol offer, answers
+/// `connection_init` with `connection_ack`, waits for `subscribe`, and only then sends data.
+/// A client that pipelined the subscribe, offered the wrong subprotocol string, or handed the
+/// raw envelopes to the transcript would all fail different assertions here.
+#[test]
+fn a_graphql_subscription_rides_a_socket_and_unwraps_its_payloads() {
+    use std::sync::mpsc;
+    use zuno_core::{GraphQlRequest, GraphQlTransport, RequestKind};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (offered_tx, offered_rx) = mpsc::channel();
+    let (subscribed_tx, subscribed_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+
+        let mut ws = tungstenite::accept_hdr(
+            stream,
+            |request: &tungstenite::handshake::server::Request, mut response: tungstenite::handshake::server::Response| {
+                let offered = request
+                    .headers()
+                    .get("sec-websocket-protocol")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = offered_tx.send(offered);
+                response.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    "graphql-transport-ws".parse().expect("header"),
+                );
+                Ok(response)
+            },
+        )
+        .expect("handshake");
+
+        // `connection_init` must arrive before anything else.
+        let init = ws.read().expect("connection_init");
+        assert!(
+            init.to_text().unwrap_or_default().contains("connection_init"),
+            "the client must open with connection_init, got {init:?}"
+        );
+        ws.send(tungstenite::Message::Text(
+            r#"{"type":"connection_ack"}"#.into(),
+        ))
+        .expect("ack");
+
+        let subscribe = ws.read().expect("subscribe");
+        let _ = subscribed_tx.send(subscribe.to_text().unwrap_or_default().to_string());
+
+        for n in 0..2 {
+            ws.send(tungstenite::Message::Text(
+                format!(r#"{{"id":"1","type":"next","payload":{{"data":{{"n":{n}}}}}}}"#).into(),
+            ))
+            .expect("next");
+        }
+        ws.send(tungstenite::Message::Text(
+            r#"{"id":"1","type":"complete"}"#.into(),
+        ))
+        .expect("complete");
+        while ws.read().is_ok() {}
+    });
+
+    let mut spec = RequestSpec::default();
+    spec.url = format!("ws://127.0.0.1:{port}/graphql");
+    spec.kind = RequestKind::GraphQl(GraphQlRequest {
+        query: "subscription { greetings }".to_string(),
+        transport: GraphQlTransport::Auto,
+        ..GraphQlRequest::default()
+    });
+
+    assert!(
+        spec.kind.is_session(),
+        "Auto has to route a subscription to a socket before anything is sent"
+    );
+
+    let engine = Engine::new().expect("engine");
+    let (_job, events) = engine.send(spec);
+
+    let mut seen = Vec::new();
+    wait_for(&events, &mut seen, "the socket to open", |event| match event {
+        Event::Opened { .. } => Some(()),
+        Event::Failed { error, .. } => panic!("the handshake failed: {error}"),
+        _ => None,
+    });
+
+    let first = wait_for(&events, &mut seen, "the first payload", |event| match event {
+        Event::Frame {
+            frame: Frame::Text(text),
+            ..
+        } => Some(text.clone()),
+        Event::Failed { error, .. } => panic!("the subscription failed: {error}"),
+        _ => None,
+    });
+    assert_eq!(
+        first, r#"{"data":{"n":0}}"#,
+        "the transcript gets the payload, not the envelope around it"
+    );
+
+    wait_for(&events, &mut seen, "the complete", |event| match event {
+        Event::Closed { .. } => Some(()),
+        _ => None,
+    });
+
+    let offered = offered_rx.recv_timeout(DEADLINE).expect("the offer");
+    assert!(
+        offered.contains("graphql-transport-ws"),
+        "the modern subprotocol must be offered — `graphql-ws` is the deprecated one. Got {offered:?}"
+    );
+    let subscribe = subscribed_rx.recv_timeout(DEADLINE).expect("the subscribe");
+    assert!(
+        subscribe.contains("subscription { greetings }"),
+        "the document has to reach the server: {subscribe}"
+    );
+
+    server.join().expect("server thread");
+}

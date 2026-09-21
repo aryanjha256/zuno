@@ -1040,27 +1040,20 @@ Reasons recorded so a future session can judge them, not commitments.
     `build_websocket` uses `insert`, not `append`. Defensible (the field is the specific answer,
     the header is the general one) but undocumented in the UI, so someone will hit it once.
 
-  - **Nothing caps the transcript, and one frame can be 64 MiB.** `Transcript::frames` grows
-    without bound — `history` has `HISTORY_LIMIT`, this has nothing — and
-    `WebSocketStream::from_raw_socket` is handed a `None` config, so tungstenite's default
-    maximum message size applies. A chatty subscription grows memory until the process dies; a
-    hostile server does it faster. **The shape it should take**, decided and not yet built:
+  - **The transcript cap — done.** A ring bounded by 16 MiB of retained payload and 10,000
+    frames, whichever binds first, dropping oldest and saying how many it dropped. A `VecDeque`,
+    because evicting from the front of a `Vec` is a memmove of everything behind it — the same
+    quiet O(n²) the render already paid for once. `WebSocketConfig::max_message_size` is 8 MiB
+    rather than tungstenite's 64, so no single frame can be four times the whole budget.
 
-    - **Two caps, whichever is hit first dropping oldest.** ~16 MiB of retained payload, which
-      is the one that actually prevents the OOM because a single frame can be large; and
-      ~10,000 frames, so the list and its scroll stay sane when every frame is twenty bytes.
-    - **A ring buffer, not "stop recording at N".** The recent frames are the ones being
-      debugged; dropping the newest would make the cap worse than useless.
-    - **Announced.** A `1,204 earlier frames dropped` marker at the head of the list. Silently
-      losing the start of a conversation is worse than the memory it saved — someone would
-      debug a subscription and never learn the beginning was gone.
-    - **Separately, lower `max_message_size` to ~8 MiB** through `WebSocketConfig`. Not a
-      transcript concern: at the default, one frame is four times the whole budget, and a
-      larger one should fail the connection loudly rather than quietly consume memory.
+    **The part worth remembering is not the arithmetic.** `session_selected` is a position in
+    `frames`, so every eviction moves it: without the reindex, the detail pane keeps its
+    highlight and silently shows a *different* frame, and when the selected one falls off the
+    front there is nothing honest left to show. `push` returns the number evicted for exactly
+    that reason. Break-tested by removing the reindex.
 
-    Worth knowing when it is built: it pairs with the render fix in this same slice. Now that
-    only visible rows are formatted, a large transcript costs nothing to *draw* — so the cap is
-    purely about memory and the numbers can be generous.
+    It pairs with the lazy render from the same slice: only visible rows are formatted, so a long
+    transcript costs nothing to draw and the cap is about memory alone.
 
   From the audit of the slice, kept rather than fixed. Each is real; none is a lie on screen,
   which is where the line was drawn:
@@ -1087,12 +1080,125 @@ Reasons recorded so a future session can judge them, not commitments.
     socket development is overwhelmingly plaintext, so `localhost:8080/ws` fails a TLS handshake
     against a plaintext server.
 
-- **SSE.** Now a content-type check rather than a feature. The session machinery is built, and
-  `Event::Head` already fires at TTFB with the response headers — which is exactly where
-  `text/event-stream` is knowable. The design constraint that makes this cheap was decided when
-  the kind split landed: **lifecycle is not part of the kind**, because with SSE the *server*
-  decides. `RequestKind::is_session` is only what the request can promise before anything leaves
-  the machine; the response side has the final say.
+  From the line-by-line audit of the streaming work, kept rather than fixed. The fourteen that
+  *were* fixed are not listed — they are in the code. These are the rest, in full, so that
+  "deferred" means written down rather than remembered:
+
+  - **`uses_websocket(cx)` clones the whole document per repaint.** `graphql_query_header` calls
+    it to label the transport; it goes through `to_spec`, which copies the query text, then runs
+    the sniffer. Every frame the Query tab is visible.
+  - **`Parser::push` drains the pending buffer inside its line loop**, so a chunk holding many
+    lines is quadratic in lines. Bounded by chunk size, which is why it is here and not fixed.
+  - **`is_session()` is called twice per send** in `drive`, and for GraphQL that is two document
+    scans for one decision.
+  - **`disconnecting_a_stream_actually_stops_it`'s doc still overstates its own assertion.** The
+    load-bearing check is the `Closed` event, not the server-side one the comment names. The
+    assertion itself was tightened when the unbounded loop was fixed; the comment was not.
+  - **No timeout on the graphql-transport-ws handshake.** A server that accepts the socket and
+    never sends `connection_ack` leaves the transcript reading open forever. A protocol-layer
+    auth rejection looks exactly like this.
+  - **The same subscription yields different frame types on different transports** —
+    `Frame::Event` over SSE, carrying the event name, and `Frame::Text` over WebSocket. Compare
+    the two transports of one operation and the transcript looks different for no visible reason.
+    `a_graphql_subscription_rides_a_socket_and_unwraps_its_payloads` asserts the current shape,
+    so fixing this means changing that test too.
+  - **`step()` ignores the envelope `id`.** One subscription per socket today, so a `complete`
+    for an id we never opened would still close the session. It matters the moment anything
+    multiplexes.
+  - **Notice rows carry `cursor_pointer`, hover and a click handler** that `select_frame`
+    rejects. Clicking one does nothing.
+  - **A reconnect notice does not scroll into view.** The follow logic lives in the frame arm
+    only, so the most important row in the transcript is the one that does not scroll to.
+  - **The SSE parser does not strip a leading BOM**, which the spec asks for. A server sending
+    one turns the first field name into `\u{feff}event` and it is silently ignored.
+  - **`stream_events` carries `#[allow(clippy::too_many_arguments)]`** rather than grouping the
+    four handshake parameters that travel together.
+  - **`Save the composed message` and `Choose the GraphQL transport` are unconditional palette
+    rows.** On an HTTP request both appear; the second sets a status, the first returns in
+    silence. `active_http`'s convention says the guard is the fix, and one guard says nothing.
+  - **`build::build` runs outside the head deadline.** For a binary body it reads the file from
+    disk, so a request whose body sits on a stalled mount blocks with no timeout and no event
+    after `Started`. Not a regression — nothing covered it before either.
+  - **`Transcript::frame_count`'s decrement has no test.** The increment is exercised by the ring
+    test; nothing checks the count after an eviction. A drift shows a wrong number on the strip.
+
+- **SSE — done**, and it cost a content-type check plus one change of meaning.
+
+  A response whose head says `text/event-stream` becomes a session instead of a body: the same
+  `Opened` / `Frame` / `Closed` events a socket emits, so the transcript, the frame detail with
+  its JSON viewer, copy and find all work with nothing added. `Frame::Event` carries the name and
+  id, because an SSE stream routes on `event:` and flattening it to the payload would throw away
+  the half you filter on. This is the payoff for **lifecycle not being part of the kind** — a
+  plain GET, a GraphQL subscription and a socket now all arrive at the same surface, and only the
+  socket could have promised it in advance.
+
+  **The expensive half was the timeout, and it changed meaning.** It used to be reqwest's
+  deadline on the whole exchange, body included, which a stream cannot meet by definition — an
+  event stream answered by an HTTP request died at whatever the setting said. (Only `build_http`
+  ever set one; `build_graphql` never has, so graphql-sse was never killed this way.) It now
+  means *answer within N, and do not go
+  silent for N*: `run::execute` deadlines the response head, and `ClientKey::read_timeout`
+  deadlines each read. Two consequences worth knowing. A slow but progressing download is no
+  longer aborted — it is still capped by `MAX_BODY_BYTES`. And `timeout` now **fragments the
+  client cache**, because `read_timeout` is a `ClientBuilder` setting rather than a per-request
+  one. `a_timeout_is_a_client_property_and_fragments_the_cache` asserts that, and was renamed
+  from `client_keys_ignore_settings_that_are_per_request` — which had been reversed in place and
+  left asserting the opposite of its own name.
+
+  The transcript names its transport and keeps the handshake. `Event::Opened` carries a
+  `Transport`, reported by the engine rather than guessed from the kind — the guess is right
+  today only because nothing but a socket opens a session, and the whole point of the lifecycle
+  split is that it will not stay that way. The status line and the response headers now live on
+  the `Transcript` rather than on `inflight`, which is cleared at the close: a finished stream
+  used to keep its frames and silently lose everything about the response that carried them.
+  A session's tab strip offers Frames and Headers and not Timing or Diff, which have nothing to
+  draw for a stream.
+
+  **graphql-transport-ws — done**, which is what makes GraphQL subscriptions work against real
+  servers rather than only against the one demo endpoint that also speaks graphql-sse. Apollo
+  Server, Hasura and graphql-yoga all default to the socket; before this, a subscription was
+  POSTed and the failure said nothing about the transport being the problem.
+
+  `GraphQlRequest::transport` is `Auto` / `Http` / `WebSocket`, and **`Auto` reads the document**
+  — `core/src/graphql.rs` finds the operation `operationName` selects, or the only one there is,
+  and a `subscription` opens a socket. It is a sniff, not a parser: anything it cannot make sense
+  of answers `None` and the request goes the way it always did, because a guess must never be the
+  reason a working request stops working. The query header shows what Auto resolved to (`auto ·
+  websocket`), since a route decided for you and never shown is a route you cannot debug.
+
+  This is the **one place the "lifecycle is the server's decision" rule bends**, and deliberately:
+  a socket handshake and a POST are different requests, so the client cannot wait to be told. It
+  is also the first time a *subprotocol* gets first-class treatment, which is the precedent MQTT
+  over WebSocket and STOMP would inherit.
+
+  Two details worth keeping. The subprotocol offered is `graphql-transport-ws`; the string
+  `graphql-ws` belongs to the **deprecated** `subscriptions-transport-ws`, and the modern library
+  called `graphql-ws` announces itself as the former — one name, two things. And the transcript
+  gets `next` payloads unwrapped, not envelopes: the envelope is addressed to the client, the
+  data is addressed to the person.
+
+  **Reconnection — done, and only where it can be lossless.** SSE picks itself up: the stream
+  drops, the transcript shows a notice where the gap is, and the retry goes out with
+  `Last-Event-ID` so a server that honours it replays what was missed. The server's own `retry:`
+  sets the delay, backed off by attempt and capped at 30s, giving up after six consecutive
+  failures — a connection that delivers anything resets the count, so a long feed that blips
+  never exhausts it. `204 No Content` ends it for good, which is the only way SSE can say "do
+  not come back"; without honouring it, a client retries forever against a server politely
+  saying stop.
+
+  **Sockets get a Reconnect control instead, deliberately.** Neither WebSocket nor
+  graphql-transport-ws can resume, so an automatic retry there loses every message in the gap
+  while looking like it worked. It dispatches `SendRequest`, because a reconnect with no resume
+  *is* a new conversation.
+
+  The notice lives in the transcript rather than in a counter on the strip: a stream that dropped
+  at 12.4s and came back at 15.9s is missing whatever happened between, and a count says that it
+  happened without saying when — which is the only part you need in order to read what is gone.
+  `TranscriptRow` carries a `TranscriptKind` for that reason; not everything in a conversation is
+  a message. SSE defines `retry:` and replay from `Last-Event-ID`, the parser reads
+  both, and nothing acts on them — a dropped stream stays dropped until you send again. And the
+  transcript cap above applies here too, more sharply: a subscription is the likeliest thing in
+  the app to run for hours.
 - **macOS and Windows builds.** Keybindings assume `ctrl`; `session.rs` assumes XDG paths. Both
   are marked in code.
 

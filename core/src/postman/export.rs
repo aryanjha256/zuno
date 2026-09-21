@@ -381,6 +381,7 @@ mod tests {
             query: "query Me { me { id } }".into(),
             variables: r#"{"n": 1}"#.into(),
             operation: None,
+            transport: Default::default(),
         });
         write(&root.join("me.json"), &gql).expect("write");
 

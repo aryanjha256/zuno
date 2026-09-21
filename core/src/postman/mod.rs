@@ -596,6 +596,7 @@ fn graphql_from(body: &Value, method: Option<Method>) -> GraphQlRequest {
         query: field("query"),
         variables: field("variables"),
         operation: (!operation.trim().is_empty()).then_some(operation),
+        transport: Default::default(),
     }
 }
 

@@ -1505,6 +1505,7 @@ mod tests {
                 query: query.to_string(),
                 variables: variables.to_string(),
                 operation: None,
+                transport: Default::default(),
             }),
             ..RequestSpec::default()
         }

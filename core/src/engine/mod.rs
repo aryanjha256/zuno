@@ -40,6 +40,29 @@ use bytes::Bytes;
 use crate::request::{Header, RequestSettings, RequestSpec};
 use crate::response::{HttpVersion, ResponseData};
 
+/// What is carrying a session.
+///
+/// **Reported rather than inferred.** The app could guess from the request's kind today, since
+/// only a WebSocket buffer produces a socket — but that guess is wrong the moment anything else
+/// opens one, and the whole point of the lifecycle split is that the *response* decides. So the
+/// response says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    WebSocket,
+    /// A `text/event-stream` response, whatever asked for it — a plain HTTP request or a
+    /// GraphQL subscription over graphql-sse.
+    EventStream,
+}
+
+impl Transport {
+    pub fn label(self) -> &'static str {
+        match self {
+            Transport::WebSocket => "websocket",
+            Transport::EventStream => "sse",
+        }
+    }
+}
+
 /// Which way one frame of a session travelled.
 ///
 /// A transcript is the only response shape where this question exists — an HTTP response has
@@ -66,6 +89,21 @@ pub enum Frame {
     Binary(Bytes),
     Ping(Bytes),
     Pong(Bytes),
+    /// One server-sent event.
+    ///
+    /// **Its own variant rather than `Text`, because the name is how SSE is routed.** A stream
+    /// that sends `event: added` and `event: removed` says which is which in a field, not in
+    /// the payload, so flattening it to the data would throw away the half you filter on.
+    /// Receive-only by nature: nothing composes one.
+    Event {
+        /// The `event:` field. `None` when the stream did not name one, which the spec calls
+        /// `message` — kept absent rather than filled in, so a transcript can show the
+        /// difference between a stream that names its events and one that does not.
+        name: Option<String>,
+        /// The last `id:` the stream sent, which persists until it sends another.
+        id: Option<String>,
+        data: String,
+    },
 }
 
 impl Frame {
@@ -73,6 +111,7 @@ impl Frame {
     pub fn len(&self) -> usize {
         match self {
             Frame::Text(text) => text.len(),
+            Frame::Event { data, .. } => data.len(),
             Frame::Binary(bytes) | Frame::Ping(bytes) | Frame::Pong(bytes) => bytes.len(),
         }
     }
@@ -257,6 +296,7 @@ pub enum Event {
     /// the one thing about a socket you cannot see by watching it.
     Opened {
         job: JobId,
+        transport: Transport,
         status: u16,
         /// `Switching Protocols`. Carried for the same reason `Head` carries it: the pane
         /// prints the reason phrase beside the code, and deriving it here would be a second
@@ -273,6 +313,19 @@ pub enum Event {
         at: Duration,
         direction: Direction,
         frame: Frame,
+    },
+    /// A dropped stream is being picked up again.
+    ///
+    /// **Only SSE emits this**, because only SSE can resume: the protocol defines `retry:` and
+    /// replay from `Last-Event-ID`, so a reconnect loses nothing. A socket has no such
+    /// mechanism, and reconnecting one silently would drop every message in the gap while
+    /// looking like it had worked.
+    Reconnecting {
+        job: JobId,
+        /// 1 for the first retry. Shown, because a server flapping every three seconds should
+        /// look like a problem rather than like a stream that works.
+        attempt: u32,
+        delay: Duration,
     },
     /// The socket closed. `code` is absent when the peer vanished without a Close frame,
     /// which is a real and common ending rather than an error.
@@ -293,6 +346,7 @@ impl Event {
             | Event::Failed { job, .. }
             | Event::Opened { job, .. }
             | Event::Frame { job, .. }
+            | Event::Reconnecting { job, .. }
             | Event::Closed { job, .. } => *job,
         }
     }
@@ -332,8 +386,12 @@ enum Command {
 /// A running job, and the way in if it has one.
 struct Job {
     handle: tokio::task::JoinHandle<()>,
-    /// `Some` only for a session. Held here rather than in the task so the engine loop can
-    /// route a frame to it without the task having to be awake to receive one.
+    /// Held here rather than in the task so the engine loop can route a frame to it without the
+    /// task having to be awake to receive one.
+    ///
+    /// Present for **every** job, including a plain HTTP request that may never become a
+    /// session — because whether it does is the server's decision, made after the job has
+    /// already been spawned.
     outbound: Option<mpsc::UnboundedSender<Outbound>>,
 }
 
@@ -487,32 +545,38 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                     // HTTP/2 — see `ClientKey::http1_only`. Its own cache entry, so ordinary
                     // requests keep negotiating h2 as they always did.
                     //
-                    // The timeout needs no such handling: it is applied per *request* in
-                    // `build.rs`, and `build_websocket` never sets one, so a socket already
-                    // outlives it.
+                    // The timeout needs no such handling *here*: `build` sets no per-request
+                    // deadline any more, and `ClientKey::read_timeout` — which does — is already
+                    // part of the key below.
                     match clients.get(&spec.settings, &proxy, &tls, spec.kind.is_session()) {
                         Ok(client) => {
-                            let entry = if spec.kind.is_session() {
-                                let (sender, receiver) = mpsc::unbounded_channel();
-                                Job {
-                                    handle: tokio::spawn(session::connect(
-                                        job, client, *spec, events, receiver,
-                                    )),
-                                    outbound: Some(sender),
-                                }
+                            // **Every job gets a way in, not just the ones that promise a
+                            // session.** An HTTP request becomes one the moment the server
+                            // answers `text/event-stream`, and it cannot be handed a channel
+                            // afterwards — so a job spawned without one had a Disconnect that
+                            // routed into nothing: the status bar said "Disconnecting" and the
+                            // stream carried on. The receiver is simply never read by a
+                            // request that stays a request.
+                            let (sender, receiver) = mpsc::unbounded_channel();
+                            let handle = if spec.kind.is_session() {
+                                tokio::spawn(session::connect(job, client, *spec, events, receiver))
                             } else {
-                                Job {
-                                    handle: tokio::spawn(run::execute(
-                                        job,
-                                        client,
-                                        *spec,
-                                        events,
-                                        run::MAX_BODY_BYTES,
-                                    )),
-                                    outbound: None,
-                                }
+                                tokio::spawn(run::execute(
+                                    job,
+                                    client,
+                                    *spec,
+                                    events,
+                                    run::MAX_BODY_BYTES,
+                                    receiver,
+                                ))
                             };
-                            jobs.insert(job, entry);
+                            jobs.insert(
+                                job,
+                                Job {
+                                    handle,
+                                    outbound: Some(sender),
+                                },
+                            );
                         }
                         Err(error) => {
                             let _ = events.try_send(Event::Failed { job, error });
@@ -578,6 +642,19 @@ struct ClientKey {
     /// In the key rather than applied per-request, because it is a property of the *connection*
     /// — a pooled h2 connection cannot be talked out of being h2 afterwards.
     http1_only: bool,
+    /// How long a response may go **silent** before it is abandoned.
+    ///
+    /// **This is half of what `settings.timeout` now means**, and the half that made streaming
+    /// possible. It used to be `RequestBuilder::timeout`, a deadline on the whole exchange
+    /// including the body — which a stream cannot meet by definition, so an event stream
+    /// answered by an HTTP request was killed at whatever the setting said. The other half,
+    /// "answer within N", is enforced
+    /// on the response head in `run::execute`.
+    ///
+    /// It has to be in the key because `read_timeout` is a `ClientBuilder` setting: two
+    /// requests with different timeouts genuinely need different clients now, where before the
+    /// cache could pool them. The cost is real and small — most workspaces use one timeout.
+    read_timeout: Option<Duration>,
 }
 
 impl ClientKey {
@@ -596,6 +673,7 @@ impl ClientKey {
             proxy: proxy.clone(),
             tls: tls.clone(),
             http1_only,
+            read_timeout: settings.timeout,
         }
     }
 }
@@ -663,6 +741,11 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
     // `wss://` handshake silently becomes a plain GET over h2.
     if key.http1_only {
         builder = builder.http1_only();
+    }
+
+    // Per read, not per request. See `ClientKey::read_timeout`.
+    if let Some(idle) = key.read_timeout {
+        builder = builder.read_timeout(idle);
     }
 
     let builder = match &key.proxy {
@@ -734,20 +817,25 @@ mod tests {
     }
 
     #[test]
-    fn client_keys_ignore_settings_that_are_per_request() {
+    fn a_timeout_is_a_client_property_and_fragments_the_cache() {
         let mut a = RequestSettings::default();
         let mut b = RequestSettings::default();
         a.timeout = Some(Duration::from_secs(1));
         b.timeout = Some(Duration::from_secs(600));
 
-        // Timeout is applied per request, so it must not fragment the client cache
-        // (and with it, the connection pool).
+        // **Timeout now *does* fragment the cache**, and this assertion was reversed when it
+        // did. It used to be a per-request deadline, which a shared client could ignore; it is
+        // now `read_timeout`, a `ClientBuilder` setting, because a deadline on the whole
+        // exchange cannot be met by a stream. Two timeouts, two clients, two connection pools —
+        // a real cost, paid because SSE does not work otherwise.
         let system = ProxyMode::System;
-        assert_eq!(
+        assert_ne!(
             ClientKey::new(&a, &system, &TlsFiles::default(), false),
-            ClientKey::new(&b, &system, &TlsFiles::default(), false)
+            ClientKey::new(&b, &system, &TlsFiles::default(), false),
+            "an idle timeout is a client property, so it has to be part of the key"
         );
 
+        b.timeout = a.timeout;
         b.verify_tls = false;
         assert_ne!(
             ClientKey::new(&a, &system, &TlsFiles::default(), false),

@@ -99,6 +99,8 @@ pub enum Target {
     Action(Box<dyn gpui::Action>),
     /// Set the active request's method.
     Method(zuno_core::Method),
+    /// How a GraphQL operation reaches the server.
+    GraphQlTransport(zuno_core::GraphQlTransport),
     /// Change what kind of request this is — HTTP, GraphQL, and later gRPC or MQTT.
     RequestKind(crate::kinds::KindChoice),
     /// The same, past the "this discards your body" prompt. A separate variant rather than a
@@ -147,6 +149,7 @@ impl Clone for Target {
             Self::File(path) => Self::File(path.clone()),
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Method(method) => Self::Method(method.clone()),
+            Self::GraphQlTransport(transport) => Self::GraphQlTransport(*transport),
             Self::RequestKind(choice) => Self::RequestKind(*choice),
             Self::RequestKindConfirmed(choice) => Self::RequestKindConfirmed(*choice),
             Self::Dismiss => Self::Dismiss,

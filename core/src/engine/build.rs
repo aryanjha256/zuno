@@ -479,9 +479,17 @@ fn build_http(
         }
         PreparedBody::None => {}
     }
-    if let Some(timeout) = spec.settings.timeout {
-        builder = builder.timeout(timeout);
-    }
+    // **No `builder.timeout` here, deliberately.** reqwest's request timeout is a deadline on
+    // the *whole* exchange, body included, which a stream can never meet — a `text/event-stream`
+    // answered by an HTTP request died at whatever the setting said, with no close and nothing
+    // on screen explaining it.
+    //
+    // **Only this builder ever set one**, which is worth saying because the symptom looked
+    // wider than it was: `build_graphql` has never carried a timeout, so a graphql-sse
+    // subscription was never killed this way and whatever ended one early had another cause.
+    // `timeout` now means "answer within N, and do not go silent for N": `run::execute` puts
+    // the first half on the response head itself, and `ClientKey::read_timeout` puts the second
+    // half on each read. See `ClientKey`.
 
     builder.build().map_err(|error| EngineError::Build {
         reason: error.to_string(),

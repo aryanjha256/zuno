@@ -81,7 +81,7 @@ pub fn render(
                 )
                 .child(body_region(view, theme, body_focused, window, cx)),
             (KindEditor::GraphQl(graphql), 0) => pane
-                .child(graphql_query_header(graphql, theme))
+                .child(graphql_query_header(graphql, theme, cx))
                 .children(
                     view.body_search
                         .as_ref()
@@ -1429,7 +1429,20 @@ fn body_region(
 fn graphql_query_header(
     graphql: &GraphQlEditor,
     theme: &Theme,
+    cx: &gpui::App,
 ) -> impl IntoElement + use<> {
+    // **Says what Auto resolved to, not just that it is Auto.** The whole point of the default
+    // is that nobody has to answer a question about their own server — but a route decided for
+    // you and never shown is a route you cannot debug when it is wrong. `uses_websocket` is the
+    // same call the engine makes, so this cannot drift from what actually happens.
+    let transport = graphql.transport;
+    let label = match transport {
+        zuno_core::GraphQlTransport::Auto if graphql.uses_websocket(cx) => "auto · websocket",
+        zuno_core::GraphQlTransport::Auto => "auto · post",
+        zuno_core::GraphQlTransport::Http => "post",
+        zuno_core::GraphQlTransport::WebSocket => "websocket",
+    };
+
     div()
         .flex()
         .items_center()
@@ -1443,6 +1456,13 @@ fn graphql_query_header(
         .text_color(theme.text_muted)
         .child(div().flex_none().child("Query"))
         .child(div().flex_1().min_w(px(0.)))
+        .child(crate::ui::text_action(
+            "graphql-transport",
+            SharedString::from(label),
+            "Choose the GraphQL transport",
+            crate::actions::OpenGraphQlTransport,
+            theme,
+        ))
         .child(
             div()
                 .flex_none()

@@ -30,6 +30,20 @@ use super::run::collect_headers;
 use super::{Direction, Event, Frame, JobId, Outbound};
 use crate::request::RequestSpec;
 
+/// The subprotocol every current GraphQL-over-WebSocket server speaks.
+///
+/// **Not `graphql-ws`**, which is the string the *deprecated* `subscriptions-transport-ws`
+/// library uses — the modern library is named `graphql-ws` and announces itself as this. Two
+/// different things share one name, and offering the wrong one gets a socket that opens and then
+/// ignores everything sent down it.
+const GRAPHQL_SUBPROTOCOL: &str = "graphql-transport-ws";
+
+/// The largest single frame that will be accepted.
+///
+/// Half the transcript's whole byte budget, deliberately: one frame that could evict every
+/// other one is a frame worth refusing.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// Open the socket and pump it until either side closes.
 pub async fn connect(
     job: JobId,
@@ -38,16 +52,30 @@ pub async fn connect(
     events: Sender<Event>,
     mut outbound: mpsc::UnboundedReceiver<Outbound>,
 ) {
-    let Some(socket) = spec.websocket().cloned() else {
-        let _ = events
-            .send(Event::Failed {
-                job,
-                error: EngineError::Other {
-                    reason: "not a WebSocket request".to_string(),
-                },
-            })
-            .await;
-        return;
+    // A GraphQL subscription borrows the WebSocket path: same handshake, same framing, with
+    // `graphql-transport-ws` offered and a protocol spoken on top. Modelling it as a synthetic
+    // `WebSocketRequest` rather than branching the handshake keeps one code path for the part
+    // that is genuinely identical.
+    let (socket, graphql) = match &spec.kind {
+        crate::request::RequestKind::WebSocket(socket) => (socket.clone(), None),
+        crate::request::RequestKind::GraphQl(graphql) => (
+            crate::request::WebSocketRequest {
+                subprotocols: vec![GRAPHQL_SUBPROTOCOL.to_string()],
+                messages: Vec::new(),
+            },
+            Some(graphql.clone()),
+        ),
+        crate::request::RequestKind::Http(_) => {
+            let _ = events
+                .send(Event::Failed {
+                    job,
+                    error: EngineError::Other {
+                        reason: "not a WebSocket request".to_string(),
+                    },
+                })
+                .await;
+            return;
+        }
     };
 
     let started = Instant::now();
@@ -146,18 +174,24 @@ pub async fn connect(
         }
     };
 
-    // `None` config: tungstenite's defaults cap a message at 64 MiB, which is far past
-    // anything a person reads in a transcript and well short of letting a server exhaust us.
+    // **8 MiB, not tungstenite's 64.** The default is four times the whole transcript budget,
+    // so a single frame could evict every other one and still not fit — and a server that sends
+    // one is either broken or hostile. A message past this fails the connection loudly, which
+    // is the behaviour worth having: quietly consuming memory is how the process dies with no
+    // explanation.
+    let config = tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES));
     let mut stream = WebSocketStream::from_raw_socket(
         hyper_util::rt::TokioIo::new(upgraded),
         Role::Client,
-        None,
+        Some(config),
     )
     .await;
 
     if events
         .send(Event::Opened {
             job,
+            transport: super::Transport::WebSocket,
             status,
             status_text,
             headers,
@@ -167,6 +201,26 @@ pub async fn connect(
         .await
         .is_err()
     {
+        return;
+    }
+
+    // **`connection_init` first, and nothing may be sent before the ack.** The protocol is
+    // explicit that a client which subscribes early gets the connection closed, so the
+    // subscribe below waits for `connection_ack` rather than pipelining.
+    if graphql.is_some()
+        && stream
+            .send(Message::Text(r#"{"type":"connection_init"}"#.into()))
+            .await
+            .is_err()
+    {
+        let _ = events
+            .send(Event::Failed {
+                job,
+                error: EngineError::Other {
+                    reason: "the socket closed before the GraphQL handshake".to_string(),
+                },
+            })
+            .await;
         return;
     }
 
@@ -190,6 +244,89 @@ pub async fn connect(
                         }
                         // `Frame` is only produced by the raw-frame API, which this never uses.
                         Message::Frame(_) => {}
+                        // A GraphQL socket carries envelopes, not payloads: what the person
+                        // wants in the transcript is the `next` data, and the init/ack
+                        // handshake is plumbing they did not ask for and cannot act on.
+                        Message::Text(text) if graphql.is_some() => {
+                            match step(&text) {
+                                Step::Subscribe => {
+                                    let envelope = graphql
+                                        .as_ref()
+                                        .map(super::build::graphql_envelope)
+                                        .transpose();
+                                    let payload = match envelope {
+                                        Ok(Some(payload)) => payload,
+                                        Ok(None) | Err(_) => {
+                                            let _ = events.send(Event::Failed {
+                                                job,
+                                                error: EngineError::Other {
+                                                    reason: "the GraphQL operation could not be built".to_string(),
+                                                },
+                                            }).await;
+                                            return;
+                                        }
+                                    };
+                                    let subscribe = serde_json::json!({
+                                        "id": "1",
+                                        "type": "subscribe",
+                                        "payload": payload,
+                                    });
+                                    if stream
+                                        .send(Message::Text(subscribe.to_string().into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        let _ = events.send(Event::Closed {
+                                            job,
+                                            code: None,
+                                            reason: String::new(),
+                                        }).await;
+                                        return;
+                                    }
+                                }
+                                // The server's own keep-alive, which is not tungstenite's — it
+                                // is a JSON envelope and has to be answered in kind.
+                                Step::Pong => {
+                                    if stream
+                                        .send(Message::Text(r#"{"type":"pong"}"#.into()))
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Step::Data(data) => {
+                                    if events
+                                        .send(Event::Frame {
+                                            job,
+                                            at: started.elapsed(),
+                                            direction: Direction::Received,
+                                            frame: Frame::Text(data),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Step::Done => {
+                                    let _ = events.send(Event::Closed {
+                                        job,
+                                        code: None,
+                                        reason: String::new(),
+                                    }).await;
+                                    return;
+                                }
+                                Step::Failed(reason) => {
+                                    let _ = events.send(Event::Failed {
+                                        job,
+                                        error: EngineError::Other { reason },
+                                    }).await;
+                                    return;
+                                }
+                                Step::Ignore => {}
+                            }
+                        }
                         other => {
                             if let Some(frame) = into_frame(other)
                                 && events
@@ -272,6 +409,46 @@ pub async fn connect(
     }
 }
 
+/// What one graphql-transport-ws envelope asks of the client.
+enum Step {
+    Subscribe,
+    Pong,
+    Data(String),
+    Done,
+    Failed(String),
+    Ignore,
+}
+
+/// Read a server envelope.
+///
+/// Unknown types are ignored rather than refused: the protocol has grown types before and a
+/// client that dies on one it has not heard of is a client that breaks when the server upgrades.
+fn step(text: &str) -> Step {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Step::Ignore;
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("connection_ack") => Step::Subscribe,
+        Some("ping") => Step::Pong,
+        // The payload alone — `{"data": …}` — because the envelope is addressed to the client
+        // and the data is addressed to the person.
+        Some("next") => match value.get("payload") {
+            Some(payload) => Step::Data(
+                serde_json::to_string(payload).unwrap_or_else(|_| payload.to_string()),
+            ),
+            None => Step::Ignore,
+        },
+        Some("complete") => Step::Done,
+        Some("error") => Step::Failed(
+            value
+                .get("payload")
+                .map(|payload| payload.to_string())
+                .unwrap_or_else(|| "the server rejected the operation".to_string()),
+        ),
+        _ => Step::Ignore,
+    }
+}
+
 fn into_frame(message: Message) -> Option<Frame> {
     match message {
         Message::Text(text) => Some(Frame::Text(text.to_string())),
@@ -288,5 +465,10 @@ fn into_message(frame: Frame) -> Message {
         Frame::Binary(bytes) => Message::Binary(bytes),
         Frame::Ping(bytes) => Message::Ping(bytes),
         Frame::Pong(bytes) => Message::Pong(bytes),
+        // Not reachable from the composer, which builds `Text`, and an SSE stream is
+        // receive-only so nothing else produces one here. Mapped to its data rather than
+        // refused so this stays total and a future "send this frame again" has an obvious
+        // meaning, rather than a variant that silently cannot be resent.
+        Frame::Event { data, .. } => Message::Text(data.into()),
     }
 }

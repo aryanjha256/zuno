@@ -22,6 +22,7 @@ pub mod engine;
 pub mod environment;
 pub mod flow;
 pub mod fuzzy;
+pub mod graphql;
 pub mod highlight;
 pub mod hex;
 pub mod html;
@@ -34,6 +35,7 @@ pub mod request;
 pub mod runner;
 pub mod response;
 pub mod search;
+pub mod sse;
 pub mod headers;
 pub mod version;
 
@@ -43,14 +45,16 @@ pub use import::{Import, ImportError, Imported};
 pub use curl::{CurlError, CurlImport};
 pub use body_diff::{BodyDiff, DiffLine, LineKind};
 pub use diff::ResponseDiff;
-pub use engine::{Direction, Engine, EngineError, Event, Frame, JobId, ProxyMode, TlsFiles};
+pub use engine::{
+    Direction, Engine, EngineError, Event, Frame, JobId, ProxyMode, TlsFiles, Transport,
+};
 pub use highlight::{Token, TokenKind};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;
 pub use request::{
     Body, FormField, GraphQlRequest, Header, HttpRequest, Method, MultipartField, MultipartValue,
-    QueryParam, RawKind, RequestId, RequestKind, RequestSettings, RequestSpec, SavedMessage,
-    WebSocketRequest, label_for,
+    GraphQlTransport, QueryParam, RawKind, RequestId, RequestKind, RequestSettings, RequestSpec,
+    SavedMessage, WebSocketRequest, label_for,
 };
 pub use response::{
     Connection, HttpVersion, Phase, PhaseKind, ResponseData, SizeInfo, StatusClass, Timing,

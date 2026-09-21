@@ -32,7 +32,13 @@ A cargo workspace with two members:
 
 ```bash
 cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
-cargo test --workspace                   # 974 tests, ~25s
+# **And this one before saying it compiles.** `--all-targets` builds the dev-dependencies, which
+# turns on gpui's `test-support` feature for the whole graph — so a `#[cfg(feature =
+# "test-support")]` API resolves in the check and is *absent* from the binary the user runs.
+# Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
+# `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
+cargo check -p zuno                      # what `cargo run` actually compiles
+cargo test --workspace                   # 999 tests, ~35s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -159,6 +165,7 @@ they don't exist.
 | Trap | What to do |
 |---|---|
 `.id()` returns `Stateful<Div>`, not `Div` | Return `impl IntoElement` from render helpers. This bit three separate milestones. |
+Half of `UniformListScrollHandle` is `#[cfg(any(test, feature = "test-support"))]` | `logical_scroll_top_index` is test-only, and so are pieces of other handles. **`cargo check --all-targets` and `cargo test` both enable that feature** through the dev-dependency, so such a call compiles in every check this file recommends and then fails `cargo run` — the one build a green suite says nothing about. The underlying value is usually reachable ungated: `handle.0` is `pub`, `UniformListScrollState`'s fields are `pub`, and `ScrollHandle::logical_scroll_top` is not gated, which is exactly what the test-only helper calls. Read the `#[cfg]` above any gpui method before building on it, and run `cargo check -p zuno` before claiming it compiles. |
 Key context predicates match **only the leaf** context (`contexts.last()`) | Put both identifiers in one string: `"TextInput UrlBar"`. Nesting a `key_context` div does **not** work. |
 A focus handle needs explicit `.tab_stop(true)` | Otherwise `focus_next()` skips it silently. |
 No `cx.background_spawn` in 0.2.2 | Use `cx.background_executor().spawn(fut)`. |

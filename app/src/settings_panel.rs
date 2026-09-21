@@ -110,7 +110,7 @@ impl Row {
             Row::FollowRedirects => "off returns the 3xx itself",
             Row::MaxRedirects => "guards against redirect loops",
             Row::AcceptEncodings => "gzip, brotli, deflate, zstd",
-            Row::Timeout => "how long to wait for a response",
+            Row::Timeout => "how long to wait for a response, or between stream events",
             Row::ClearCookies => "ends the session for every request",
         }
     }

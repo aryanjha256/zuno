@@ -348,6 +348,20 @@ impl KindEditor {
         }
     }
 
+    pub fn as_graphql(&self) -> Option<&GraphQlEditor> {
+        match self {
+            KindEditor::GraphQl(graphql) => Some(graphql),
+            KindEditor::Http(_) | KindEditor::WebSocket(_) => None,
+        }
+    }
+
+    pub fn as_graphql_mut(&mut self) -> Option<&mut GraphQlEditor> {
+        match self {
+            KindEditor::GraphQl(graphql) => Some(graphql),
+            KindEditor::Http(_) | KindEditor::WebSocket(_) => None,
+        }
+    }
+
     pub fn as_websocket(&self) -> Option<&WebSocketEditor> {
         match self {
             KindEditor::WebSocket(socket) => Some(socket),

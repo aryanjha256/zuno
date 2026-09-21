@@ -451,6 +451,40 @@ fn sample_with_body(body: zuno_core::Body) -> RequestSpec {
     spec
 }
 
+/// Accept one connection, or give up.
+///
+/// **A bare `listener.accept()` in a test server thread does not fail a test — it hangs it.**
+/// Every server here is joined, so a client that never arrives blocks the join forever and the
+/// whole suite sits there with no output saying which test is stuck. That happened: the SSE
+/// transcript test waited on a reconnect that a fix had just made correct not to send, and it
+/// presented as the suite freezing rather than as an assertion. `core/tests/sse.rs` carries the
+/// same helper for the same reason.
+fn accept_before(
+    listener: &std::net::TcpListener,
+    within: Duration,
+) -> Option<std::net::TcpStream> {
+    listener.set_nonblocking(true).expect("nonblocking");
+    let deadline = std::time::Instant::now() + within;
+
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break Some(stream),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break None,
+        }
+    }?;
+
+    listener.set_nonblocking(false).expect("blocking");
+    stream.set_nonblocking(false).expect("blocking");
+    stream.set_read_timeout(Some(within)).expect("read timeout");
+    Some(stream)
+}
+
 /// The engine runs on its own OS thread, so its events arrive asynchronously from
 /// gpui's point of view. `run_until_parked` alone returns while the consuming task is
 /// still awaiting the channel, so poll it against a deadline.
@@ -3257,8 +3291,7 @@ async fn a_graphql_request_survives_being_loaded_and_read_back(cx: &mut TestAppC
             query: "query Repos($n: Int!) {\n  viewer { repositories(first: $n) { id } }\n}"
                 .to_string(),
             variables: "{\n  \"n\": 50\n}".to_string(),
-            operation: Some("Repos".to_string()),
-        }),
+            operation: Some("Repos".to_string()), transport: Default::default() }),
         ..RequestSpec::default()
     };
 
@@ -13070,10 +13103,8 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
     let port = listener.local_addr().expect("addr").port();
 
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
+        let stream =
+            accept_before(&listener, Duration::from_secs(10)).expect("a connection");
         let mut ws = tungstenite::accept(stream).expect("handshake");
         while let Ok(message) = ws.read() {
             if message.is_close() {
@@ -13126,8 +13157,10 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
     let echoed = wait_for(&mut cx, "the server's reply", |cx| {
         cx.update(|_, cx| {
             view.read(cx).session.as_ref().and_then(|session| {
-                session.frames.iter().find_map(|entry| match &entry.frame {
-                    zuno_core::Frame::Text(text) if text.starts_with("re:") => Some(text.clone()),
+                session.rows.iter().find_map(|row| match row.kind.frame() {
+                    Some(zuno_core::Frame::Text(text)) if text.starts_with("re:") => {
+                        Some(text.clone())
+                    }
                     _ => None,
                 })
             })
@@ -13231,7 +13264,7 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
         view.read(cx)
             .session
             .as_ref()
-            .map(|session| session.frames.len())
+            .map(|session| session.frames())
             .unwrap_or(0)
     });
     assert!(kept >= 2, "the transcript must outlive the socket, saw {kept} frames");
@@ -13397,10 +13430,8 @@ async fn a_socket_that_fails_stops_reporting_itself_as_open(cx: &mut TestAppCont
     let port = listener.local_addr().expect("addr").port();
 
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
+        let stream =
+            accept_before(&listener, Duration::from_secs(10)).expect("a connection");
         let mut ws = tungstenite::accept(stream).expect("handshake");
         // Past the handshake, so the client has already reported `Opened`. `0xFF` is not a
         // legal opcode, so this is a framing error and not a close.
@@ -13435,6 +13466,227 @@ async fn a_socket_that_fails_stops_reporting_itself_as_open(cx: &mut TestAppCont
     assert!(
         !cx.update(|_, cx| view.read(cx).is_connected()),
         "a failed socket must not still read as connected"
+    );
+
+    server.join().expect("server thread");
+}
+
+/// **An ordinary HTTP request turns into a session when the server says so.**
+///
+/// This is the payoff for keeping lifecycle off the kind. Nothing about the request promises a
+/// stream — it is a plain GET with no special kind, no setting and no flag — and the decision
+/// is made by the *response*, at the one moment it can be: the content type on the head. A
+/// design where the request declared its own lifecycle could not express this at all, because
+/// only the server knows.
+///
+/// Asserted on the transcript existing rather than on the frames, because the frames are the
+/// same path WebSocket already covers; what is new here is which surface the pane chose.
+#[gpui::test]
+async fn an_sse_response_becomes_a_transcript_rather_than_a_body(cx: &mut TestAppContext) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    // **One connection, and closing it is the end.** A clean EOF finishes an SSE stream rather
+    // than dropping it, so nothing reconnects and there is deliberately no second `accept`
+    // below. `core/tests/sse.rs` covers the other two endings — a mid-stream break that resumes,
+    // and a `204` answering a retry.
+    let server = std::thread::spawn(move || {
+        let read_head = |stream: &mut std::net::TcpStream| {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            String::from_utf8_lossy(&seen).into_owned()
+        };
+
+        let mut first =
+            accept_before(&listener, Duration::from_secs(10)).expect("a connection");
+        read_head(&mut first);
+        let _ = first.write_all(
+            b"HTTP/1.1 200 OK\r\n\
+              Content-Type: text/event-stream\r\n\
+              Connection: close\r\n\r\n\
+              id: 7\nevent: greeting\ndata: hi\n\n",
+        );
+        let _ = first.flush();
+        // Closing is how an SSE stream ends, and the client must treat it as the end. There is
+        // deliberately no second `accept` here: a blocking one waiting for a reconnect that
+        // never comes does not fail the test, it **hangs** it — which is the whole reason a test
+        // server must never wait unboundedly.
+    });
+
+    let (view, mut cx) = open_workspace(cx);
+    type_url(&mut cx, &format!("http://127.0.0.1:{port}/events"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let named = wait_for(&mut cx, "the event to arrive", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx).session.as_ref().and_then(|session| {
+                session.rows.iter().find_map(|row| match row.kind.frame() {
+                    Some(zuno_core::Frame::Event { name, data, .. }) => {
+                        Some((name.clone(), data.clone()))
+                    }
+                    _ => None,
+                })
+            })
+        })
+    });
+    assert_eq!(named.0.as_deref(), Some("greeting"));
+    assert_eq!(named.1, "hi");
+
+    // And no response body was built for it — the pane shows a transcript, not a payload.
+    assert!(
+        cx.update(|_, cx| view.read(cx).response.is_none()),
+        "an event stream must not also be buffered as a response"
+    );
+
+    // **The handshake survives the close**, which is the half that reads from the wrong place
+    // if anyone moves it back. `inflight` is cleared when a session ends, so a transcript that
+    // sourced its status and headers from there kept the frames and silently lost everything
+    // about the response that carried them — and a stream's headers are exactly where you check
+    // `content-type`, `cache-control` and the CORS and auth answers.
+    let closed = wait_for(&mut cx, "the stream to close", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .session
+                .as_ref()
+                .map(|session| session.closed.is_some())
+        })
+        .filter(|closed| *closed)
+    });
+    assert!(closed);
+    assert!(
+        cx.update(|_, cx| view.read(cx).inflight.is_none()),
+        "the job is over, so nothing should still be in flight"
+    );
+
+    let (transport, status, headers) = cx.update(|_, cx| {
+        let view = view.read(cx);
+        let session = view.session.as_ref().expect("the transcript outlives the stream");
+        (
+            session.transport,
+            session.status.clone(),
+            session.headers.clone(),
+        )
+    });
+    assert_eq!(
+        transport,
+        zuno_core::Transport::EventStream,
+        "the engine has to report what carried it, not leave the app to guess from the kind"
+    );
+    assert_eq!(status.map(|(code, _)| code), Some(200));
+    assert!(
+        headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-type")),
+        "the response headers must still be readable after the stream ends, got {headers:?}"
+    );
+
+    // Resuming a *broken* stream is covered by `core/tests/sse.rs`, over a real socket where a
+    // connection can actually be broken. Here the server closed cleanly, which is the end.
+    server.join().expect("server thread");
+}
+
+/// **The transcript is a ring, and the selection rides it.**
+///
+/// A subscription is the likeliest thing in the app to run for hours and nothing bounded it, so
+/// the process would eventually die with no explanation. The cap itself is arithmetic; what is
+/// genuinely invisible is what it does to the *indices*. `session_selected` is a position in
+/// `frames`, and every eviction from the front moves it — so a detail pane left alone silently
+/// starts showing a different frame than the one whose row is highlighted, which is a wrong
+/// answer rather than a missing one.
+///
+/// `MAX_TRANSCRIPT_FRAMES` is 6 under test so a real socket can reach the ring.
+#[gpui::test]
+async fn the_transcript_drops_the_oldest_frames_and_moves_the_selection(cx: &mut TestAppContext) {
+    use std::net::TcpListener;
+    use tokio_tungstenite::tungstenite;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let stream =
+            accept_before(&listener, Duration::from_secs(10)).expect("a connection");
+        let mut ws = tungstenite::accept(stream).expect("handshake");
+        // Two to select from, then a flood that must evict them.
+        for n in 0..2 {
+            let _ = ws.send(tungstenite::Message::Text(format!("early {n}").into()));
+        }
+        while ws.read().is_ok_and(|message| !message.is_close()) {
+            for n in 0..12 {
+                if ws
+                    .send(tungstenite::Message::Text(format!("flood {n}").into()))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            return;
+        }
+    });
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
+    cx.simulate_keystrokes("ctrl-enter");
+
+    wait_for(&mut cx, "the first frames", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .session
+                .as_ref()
+                .map(|session| session.frames() >= 2)
+        })
+        .filter(|ready| *ready)
+    });
+
+    // Pin the detail pane to the oldest frame, which the flood is about to evict.
+    cx.update(|_, cx| view.update(cx, |view, cx| view.select_frame(0, cx)));
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).session_selected), Some(0));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let composer = view.kind.as_websocket().expect("a socket").compose.clone();
+            window.focus(&gpui::Focusable::focus_handle(composer.read(cx), cx));
+        })
+    });
+    cx.simulate_input("go");
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let (kept, dropped) = wait_for(&mut cx, "the ring to evict", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .session
+                .as_ref()
+                .map(|session| (session.rows.len(), session.dropped))
+        })
+        .filter(|(_, dropped)| *dropped > 0)
+    });
+
+    assert!(
+        kept <= 6,
+        "the transcript must stay inside its budget, held {kept}"
+    );
+    assert!(dropped >= 2, "the two early frames should be gone, dropped {dropped}");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).session_selected),
+        None,
+        "the selected frame fell off the front, so the detail pane must close rather than \
+         silently show a different frame"
     );
 
     server.join().expect("server thread");

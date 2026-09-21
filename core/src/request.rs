@@ -200,6 +200,12 @@ pub enum MultipartValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestSettings {
+    /// **Two deadlines, not one**: how long the response head may take, and how long the
+    /// response may then go silent. It is deliberately *not* a deadline on the whole exchange,
+    /// which is what it used to be — a `text/event-stream` can never meet one, so a stream
+    /// answered by an HTTP request was killed at whatever this said, with no close and nothing
+    /// explaining it.
+    /// `run::execute` enforces the first half; `ClientKey::read_timeout` enforces the second.
     pub timeout: Option<Duration>,
     pub follow_redirects: bool,
     pub max_redirects: u8,
@@ -287,6 +293,68 @@ pub struct GraphQlRequest {
     pub variables: String,
     /// Which operation to run, when the document holds several.
     pub operation: Option<String>,
+    /// How the operation reaches the server.
+    ///
+    /// **A choice, with a default that is usually right.** Almost every GraphQL server serves
+    /// subscriptions over WebSocket and queries over POST, so `Auto` reads the document and
+    /// picks — which means nobody has to answer a question about their own backend they may not
+    /// know the answer to. The other two exist because "almost every" is not "every", and
+    /// because a tool doing something one way is not a reason to have no opinion of your own.
+    ///
+    /// `#[serde(default)]` is load-bearing: every GraphQL request written before this field
+    /// existed has no `transport` key, and invariant 11 means those files must keep opening.
+    ///
+    /// `skip_serializing_if` is the other half of the same invariant, and is *not* optional.
+    /// Writing `"transport": "Auto"` unconditionally would mean the first save after an upgrade
+    /// produces a diff touching every GraphQL file in the collection and saying nothing — the
+    /// churn the additive format exists to avoid. Only a transport somebody chose reaches disk.
+    #[serde(default, skip_serializing_if = "GraphQlTransport::is_default")]
+    pub transport: GraphQlTransport,
+}
+
+/// How a GraphQL operation reaches the server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphQlTransport {
+    /// Read the document: a subscription opens a socket, everything else posts.
+    #[default]
+    Auto,
+    /// Always POST. A subscription sent this way still streams if the server answers
+    /// `text/event-stream` — which is graphql-sse, and needs nothing from this field.
+    Http,
+    /// Always open a socket and speak `graphql-transport-ws`.
+    WebSocket,
+}
+
+impl GraphQlTransport {
+    /// Whether this is the value a file with no `transport` key reads back as.
+    ///
+    /// Takes `&self` because that is the shape `skip_serializing_if` wants.
+    fn is_default(&self) -> bool {
+        *self == GraphQlTransport::Auto
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GraphQlTransport::Auto => "Auto",
+            GraphQlTransport::Http => "HTTP",
+            GraphQlTransport::WebSocket => "WebSocket",
+        }
+    }
+
+    /// What picking it gets you, for the picker's dimmed column.
+    pub fn detail(self) -> &'static str {
+        match self {
+            GraphQlTransport::Auto => "subscriptions over a socket, the rest over POST",
+            GraphQlTransport::Http => "POST always; streams only if the server sends events",
+            GraphQlTransport::WebSocket => "graphql-transport-ws, even for a query",
+        }
+    }
+
+    pub const ALL: [GraphQlTransport; 3] = [
+        GraphQlTransport::Auto,
+        GraphQlTransport::Http,
+        GraphQlTransport::WebSocket,
+    ];
 }
 
 impl Default for GraphQlRequest {
@@ -298,6 +366,24 @@ impl Default for GraphQlRequest {
             query: String::new(),
             variables: String::new(),
             operation: None,
+            transport: GraphQlTransport::default(),
+        }
+    }
+}
+
+impl GraphQlRequest {
+    /// Whether this will open a socket rather than post.
+    ///
+    /// The one place the decision is made, so the engine's routing, the UI's label and the
+    /// handshake all agree — three readings of the same document would eventually disagree.
+    pub fn uses_websocket(&self) -> bool {
+        match self.transport {
+            GraphQlTransport::WebSocket => true,
+            GraphQlTransport::Http => false,
+            GraphQlTransport::Auto => {
+                crate::graphql::operation_kind(&self.query, self.operation.as_deref())
+                    == Some(crate::graphql::OperationKind::Subscription)
+            }
         }
     }
 }
@@ -365,7 +451,15 @@ impl RequestKind {
     /// knowable from here. So the response side has the final say and this is the hint that
     /// lets the UI show Connect instead of Send *before* it can possibly know.
     pub fn is_session(&self) -> bool {
-        matches!(self, RequestKind::WebSocket(_))
+        match self {
+            RequestKind::WebSocket(_) => true,
+            // **A GraphQL subscription is a session before it leaves**, unlike an SSE stream,
+            // and that is the one place the "the server decides" rule bends. It has to: a
+            // socket handshake and a POST are different requests, so the client cannot wait to
+            // be told. `uses_websocket` reads the document to decide.
+            RequestKind::GraphQl(graphql) => graphql.uses_websocket(),
+            RequestKind::Http(_) => false,
+        }
     }
 
     /// What this kind is called in the UI.
@@ -1217,6 +1311,7 @@ mod tests {
                 query: "query R($n: Int!) { repos(first: $n) { id } }".to_string(),
                 variables: r#"{"n": 50}"#.to_string(),
                 operation: Some("R".to_string()),
+                transport: Default::default(),
             }),
             ..RequestSpec::default()
         };
@@ -1276,6 +1371,36 @@ mod tests {
 
         let back: RequestSpec = serde_json::from_str(&written).expect("deserialize");
         assert_eq!(spec, back);
+    }
+
+    /// **A default transport writes nothing**, so upgrading does not rewrite every GraphQL file.
+    ///
+    /// Invariant 11's second clause: a collection is committed and reviewed, so re-saving a
+    /// request must not change its bytes for a field nobody set. Asserted on the serialized
+    /// text rather than a round trip, because a round trip agrees with itself either way.
+    #[test]
+    fn a_default_graphql_transport_is_not_written() {
+        let mut spec = RequestSpec::default();
+        spec.url = "https://api.test/graphql".to_string();
+        spec.kind = RequestKind::GraphQl(GraphQlRequest::default());
+
+        let written = serde_json::to_string(&spec).expect("serialize");
+        assert!(
+            !written.contains("transport"),
+            "an untouched transport must leave no trace in the file: {written}"
+        );
+
+        spec.kind = RequestKind::GraphQl(GraphQlRequest {
+            transport: GraphQlTransport::WebSocket,
+            ..GraphQlRequest::default()
+        });
+        let chosen = serde_json::to_string(&spec).expect("serialize");
+        assert!(
+            chosen.contains("WebSocket"),
+            "one that was chosen has to survive the trip: {chosen}"
+        );
+        let back: RequestSpec = serde_json::from_str(&chosen).expect("deserialize");
+        assert_eq!(back, spec);
     }
 
     /// The handshake is a GET and there is no choice to show, so nothing asks for one.

@@ -90,13 +90,40 @@ pub struct InFlight {
     _task: Task<()>,
 }
 
-/// One message in a conversation, with when it happened and which way it went.
-pub struct TranscriptFrame {
-    /// Since the connect, so the gaps between frames are readable without a wall clock on
-    /// every row — which is what you actually want to see in a heartbeat or a subscription.
+/// One line of a conversation.
+pub struct TranscriptRow {
+    /// Since the connect, so the gaps are readable without a wall clock on every row — which is
+    /// what you actually want to see in a heartbeat or a subscription.
     pub at: Duration,
-    pub direction: Direction,
-    pub frame: Frame,
+    pub kind: TranscriptKind,
+}
+
+/// What a transcript row is.
+///
+/// **Not everything in a conversation is a message.** A stream dropping and being picked up
+/// again is the most important thing that can happen to it, and it belongs *in the timeline*
+/// where the gap is — a counter in the status strip would say it happened without saying when,
+/// which is the one thing you need in order to read what is missing.
+pub enum TranscriptKind {
+    Frame { direction: Direction, frame: Frame },
+    /// A break: a drop, a reconnect, a give-up.
+    Notice(SharedString),
+}
+
+impl TranscriptKind {
+    fn weight(&self) -> usize {
+        match self {
+            TranscriptKind::Frame { frame, .. } => frame.len(),
+            TranscriptKind::Notice(text) => text.len(),
+        }
+    }
+
+    pub fn frame(&self) -> Option<&Frame> {
+        match self {
+            TranscriptKind::Frame { frame, .. } => Some(frame),
+            TranscriptKind::Notice(_) => None,
+        }
+    }
 }
 
 /// A conversation, live or finished.
@@ -110,10 +137,45 @@ pub struct TranscriptFrame {
 /// view, and does not survive a restart, because nothing serializes it.
 pub struct Transcript {
     pub job: JobId,
+    /// What is carrying this — a socket, or an event stream. Reported by the engine rather than
+    /// guessed from the kind, because an ordinary HTTP request becomes a session whenever the
+    /// server answers `text/event-stream`.
+    pub transport: zuno_core::Transport,
     /// Whichever subprotocol the server picked from the offers. The one thing about an open
     /// socket you cannot learn by watching it.
     pub protocol: Option<String>,
-    pub frames: Vec<TranscriptFrame>,
+    /// The handshake's status line and headers.
+    ///
+    /// **Held here rather than read off `inflight`**, which is cleared at the close — so a
+    /// finished transcript kept the frames and silently lost the `101 Switching Protocols` and
+    /// every response header that came with it. A stream's headers are where `content-type`,
+    /// `cache-control` and the CORS and auth answers live, and they are worth exactly as much
+    /// after it ends.
+    pub status: Option<(u16, String)>,
+    pub headers: Vec<Header>,
+    /// **A ring, not a log.** Bounded by `MAX_TRANSCRIPT_BYTES` and `MAX_TRANSCRIPT_FRAMES`,
+    /// whichever binds first, dropping from the front. A subscription is the likeliest thing in
+    /// the app to run for hours, and nothing else here has a ceiling: `history` has one, this
+    /// had none, and the process would eventually die with no explanation.
+    ///
+    /// Oldest-first because the recent frames are the ones being read — dropping the newest
+    /// would make the cap worse than no cap.
+    ///
+    /// A `VecDeque` rather than a `Vec`: evicting from the front of a `Vec` is a memmove of
+    /// everything behind it, which at ten thousand frames and a few hundred a second is the
+    /// kind of quiet O(n²) this codebase has already paid for once in the render.
+    pub rows: std::collections::VecDeque<TranscriptRow>,
+    /// How many have been evicted, so the transcript can say so rather than silently losing
+    /// the beginning of a conversation someone is debugging.
+    pub dropped: usize,
+    /// Bytes of payload currently held in `rows`.
+    retained: usize,
+    /// How many of `rows` are messages rather than notices.
+    ///
+    /// Maintained rather than counted, because the strip asks for it and the strip redraws on
+    /// every arriving frame — a scan there is the O(n)-per-repaint shape this feature already
+    /// paid for once in the row previews.
+    frame_count: usize,
     /// `Some` once the socket has closed, carrying the close code and reason. A `None` code
     /// inside means the peer vanished without a Close frame, which is an ordinary ending.
     pub closed: Option<(Option<u16>, String)>,
@@ -123,7 +185,58 @@ impl Transcript {
     pub fn is_open(&self) -> bool {
         self.closed.is_none()
     }
+
+    /// Record a row, evicting from the front until both budgets hold.
+    ///
+    /// Returns how many were evicted, because every index into `rows` — the selected one, most
+    /// of all — shifts by exactly that much. Returning it is what stops the detail pane quietly
+    /// switching to a different frame under the reader; see `reindex_selection`.
+    fn push(&mut self, row: TranscriptRow) -> usize {
+        self.retained += row.kind.weight();
+        if matches!(row.kind, TranscriptKind::Frame { .. }) {
+            self.frame_count += 1;
+        }
+        self.rows.push_back(row);
+
+        let mut dropped = 0;
+        while self.rows.len() > MAX_TRANSCRIPT_FRAMES
+            || (self.retained > MAX_TRANSCRIPT_BYTES && self.rows.len() > 1)
+        {
+            match self.rows.pop_front() {
+                Some(gone) => {
+                    self.retained = self.retained.saturating_sub(gone.kind.weight());
+                    if matches!(gone.kind, TranscriptKind::Frame { .. }) {
+                        self.frame_count = self.frame_count.saturating_sub(1);
+                    }
+                    dropped += 1;
+                }
+                None => break,
+            }
+        }
+
+        self.dropped += dropped;
+        dropped
+    }
+
+    /// How many rows are messages rather than notices, for the count on the strip.
+    pub fn frames(&self) -> usize {
+        self.frame_count
+    }
 }
+
+/// The transcript's byte budget. Generous on purpose: now that only visible rows are formatted,
+/// a long transcript costs nothing to *draw*, so this is about memory alone.
+const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024 * 1024;
+/// And a count, for the streams whose frames are twenty bytes each — sixteen megabytes of those
+/// is millions of rows, which the list would survive and a person would not.
+#[cfg(not(test))]
+const MAX_TRANSCRIPT_FRAMES: usize = 10_000;
+/// **Small under test**, so a real socket reaches the ring in a handful of frames. What is worth
+/// testing is the eviction arithmetic and the index shift behind it, and ten thousand frames
+/// would exercise the same three lines more slowly. The production value is a number, not
+/// behaviour.
+#[cfg(test)]
+const MAX_TRANSCRIPT_FRAMES: usize = 6;
 
 /// One part of a multipart body: a key-value row plus whether its value is a file path.
 ///
@@ -1195,6 +1308,7 @@ impl RequestView {
 
         match event {
             Event::Opened {
+                transport,
                 status,
                 status_text,
                 headers,
@@ -1206,14 +1320,20 @@ impl RequestView {
                 // line already reads — the pane shows `101 Switching Protocols` and the server's
                 // headers without a second code path for them.
                 if let Some(inflight) = self.inflight.as_mut() {
-                    inflight.status = Some((status, status_text));
-                    inflight.headers = headers;
+                    inflight.status = Some((status, status_text.clone()));
+                    inflight.headers = headers.clone();
                     inflight.ttfb = Some(elapsed);
                 }
                 self.session = Some(Transcript {
                     job: current,
+                    transport,
                     protocol,
-                    frames: Vec::new(),
+                    status: Some((status, status_text)),
+                    headers,
+                    rows: std::collections::VecDeque::new(),
+                    dropped: 0,
+                    retained: 0,
+                    frame_count: 0,
                     closed: None,
                 });
                 cx.notify();
@@ -1225,22 +1345,60 @@ impl RequestView {
                 frame,
                 ..
             } => {
+                // Asked **before** the push, so "were you at the end" is not made false by the
+                // row that is arriving.
+                let following = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| self.at_transcript_end(session.rows.len()));
+
+                let mut evicted = 0;
                 if let Some(session) = self.session.as_mut() {
-                    session.frames.push(TranscriptFrame {
+                    evicted = session.push(TranscriptRow {
                         at,
-                        direction,
-                        frame,
+                        kind: TranscriptKind::Frame { direction, frame },
                     });
-                    // Follow the conversation. Unconditional on purpose for now: a socket you
-                    // are watching should not need scrolling, and the "don't yank the view
-                    // while I read scrollback" refinement needs a notion of *being* scrolled
-                    // back that `UniformListScrollHandle` cannot answer at this point in the
-                    // frame — its offset is written during prepaint and so reads a frame behind.
-                    self.session_scroll.scroll_to_item(
-                        session.frames.len().saturating_sub(1),
-                        gpui::ScrollStrategy::Top,
-                    );
+                    let last = session.rows.len().saturating_sub(1);
+                    // Follow only while the person is already at the end. Scroll up and the
+                    // stream carries on filling underneath; scroll back down and it resumes
+                    // following, with no control to find and nothing to remember.
+                    if following {
+                        self.session_scroll
+                            .scroll_to_item(last, gpui::ScrollStrategy::Top);
+                    }
                 }
+
+                self.reindex_selection(evicted);
+                cx.notify();
+                true
+            }
+            // **In the timeline, not in a counter.** A stream that dropped at 12.4s and came
+            // back at 15.9s is missing whatever happened in between, and the only way to read
+            // that is to see the gap where it is.
+            Event::Reconnecting { attempt, delay, .. } => {
+                let notice = if attempt == 1 {
+                    format!("disconnected · reconnecting in {:.0}s", delay.as_secs_f32())
+                } else {
+                    format!(
+                        "still disconnected · retrying in {:.0}s (attempt {attempt})",
+                        delay.as_secs_f32()
+                    )
+                };
+                let mut evicted = 0;
+                if let Some(session) = self.session.as_mut() {
+                    evicted = session.push(TranscriptRow {
+                        at: session
+                            .rows
+                            .back()
+                            .map(|row| row.at)
+                            .unwrap_or_default(),
+                        kind: TranscriptKind::Notice(SharedString::from(notice)),
+                    });
+                }
+                // **A notice evicts like anything else.** Discarding the count here left the
+                // detail pane pointing at whatever slid into the selected index — the same bug
+                // the frame arm has a test for, in the arm that did not.
+                self.reindex_selection(evicted);
                 cx.notify();
                 true
             }
@@ -1358,6 +1516,68 @@ impl RequestView {
         self.inflight.is_some()
     }
 
+    /// Slide the selected row down by however many fell off the front.
+    ///
+    /// **Every index into `rows` moves by exactly the eviction count**, and the selection is the
+    /// one that matters: without this the detail pane keeps its highlight and silently shows a
+    /// different frame, which is a wrong answer rather than a missing one. When the selected row
+    /// is the one that went, there is nothing honest left to show and the pane closes.
+    ///
+    /// One method rather than the arithmetic written out per arm, because it *was* written out
+    /// per arm and the second arm forgot it.
+    fn reindex_selection(&mut self, evicted: usize) {
+        if evicted == 0 {
+            return;
+        }
+        match self.session_selected.map(|ix| ix.checked_sub(evicted)) {
+            Some(Some(moved)) => self.session_selected = Some(moved),
+            Some(None) => {
+                self.session_selected = None;
+                self.body_view = None;
+                self.body_task = None;
+            }
+            None => {}
+        }
+    }
+
+    /// Whether the transcript is parked at its newest row.
+    ///
+    /// **This is what makes a fast stream readable.** The reveal used to be unconditional, and
+    /// against something like Wikimedia's recent-changes feed — several events a second — it
+    /// dragged the view back to the bottom before a person could finish reading a row, which
+    /// presents as "scrolling is broken" rather than as a following list.
+    ///
+    /// Reading the handle here is deliberately a frame behind, and that is the right answer
+    /// rather than a limitation: the question is whether the person was looking at the end *as
+    /// it was last painted*, which is exactly what the last prepaint recorded.
+    fn at_transcript_end(&self, total: usize) -> bool {
+        if total == 0 {
+            return true;
+        }
+        // **Read off the state rather than through `logical_scroll_top_index`**, which is
+        // `#[cfg(any(test, feature = "test-support"))]` — it compiles under `cargo test` and
+        // vanishes from the shipping binary. `ScrollHandle::logical_scroll_top` is not gated
+        // and is what that helper calls; the deferred check in front of it matters because a
+        // reveal requested this frame has not been applied yet.
+        let state = self.session_scroll.0.borrow();
+        let Some(size) = state.last_item_size else {
+            // Never painted, so there is no scrollback to protect yet.
+            return true;
+        };
+        let row = f32::from(size.item.height);
+        if row <= 0. {
+            return true;
+        }
+        let visible = (f32::from(size.contents.height) / row).ceil() as usize;
+        let top = state
+            .deferred_scroll_to_item
+            .as_ref()
+            .map(|deferred| deferred.item_index)
+            .unwrap_or_else(|| state.base_handle.logical_scroll_top().0);
+
+        top + visible >= total
+    }
+
     /// Show one frame in full, through the response body's own viewer.
     ///
     /// **The frame is indexed into `body_view`, the same field a response uses**, and that
@@ -1371,16 +1591,22 @@ impl RequestView {
     /// push a megabyte down a socket, and `JsonOutline::parse` on the UI thread would drop
     /// frames on a click.
     pub fn select_frame(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // A notice is a break in the conversation, not a message — there is nothing to open.
         let Some(frame) = self
             .session
             .as_ref()
-            .and_then(|session| session.frames.get(ix))
+            .and_then(|session| session.rows.get(ix))
+            .and_then(|row| row.kind.frame())
         else {
             return;
         };
 
-        let body: bytes::Bytes = match &frame.frame {
+        let body: bytes::Bytes = match frame {
             zuno_core::Frame::Text(text) => bytes::Bytes::from(text.clone().into_bytes()),
+            // The payload alone. The name and id are on the row and in the detail header,
+            // where they are metadata about the event rather than part of it — putting them
+            // in the viewer would break the JSON that is usually inside.
+            zuno_core::Frame::Event { data, .. } => bytes::Bytes::from(data.clone().into_bytes()),
             zuno_core::Frame::Binary(bytes)
             | zuno_core::Frame::Ping(bytes)
             | zuno_core::Frame::Pong(bytes) => bytes.clone(),
@@ -1465,9 +1691,12 @@ impl RequestView {
     /// response body already makes.
     pub fn selected_frame_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
-        let frame = session.frames.get(self.session_selected?)?;
-        match &frame.frame {
+        let frame = session.rows.get(self.session_selected?)?.kind.frame()?;
+        match frame {
             zuno_core::Frame::Text(text) => Some(text.clone()),
+            // Same as the viewer: what you paste into a fixture is the payload, not the
+            // envelope that delivered it.
+            zuno_core::Frame::Event { data, .. } => Some(data.clone()),
             zuno_core::Frame::Binary(_) | zuno_core::Frame::Ping(_) | zuno_core::Frame::Pong(_) => {
                 None
             }

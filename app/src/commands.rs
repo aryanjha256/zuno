@@ -69,6 +69,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
             SendRequest,
         ),
         command("Save the composed message", SaveMessage),
+        command("Choose the GraphQL transport", OpenGraphQlTransport),
         command(
             if session { "Disconnect" } else { "Cancel request" },
             CancelRequest,

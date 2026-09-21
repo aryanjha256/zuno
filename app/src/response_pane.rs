@@ -2214,6 +2214,20 @@ fn frame_preview(frame: &zuno_core::Frame) -> (SharedString, bool) {
                 text.lines().count() > 1,
             )
         }
+        // **The name leads.** An SSE stream routes on `event:`, so a transcript of one is
+        // mostly scanned by name — `added`, `removed`, `next` — and burying it behind the
+        // payload would make the column useless for the thing it is used for. Unnamed events
+        // show their data alone rather than the spec's implicit `message`, which would be a
+        // word the stream never sent.
+        zuno_core::Frame::Event { name, data, .. } => {
+            let line = data.lines().next().unwrap_or_default();
+            let elided = zuno_core::request::elide(line, 200);
+            let text = match name {
+                Some(name) => format!("{name}  {elided}"),
+                None => elided.into_owned(),
+            };
+            (SharedString::from(text), data.lines().count() > 1)
+        }
         // Binary has no reading. Its size is the useful fact, and the hex view is where you go
         // when it is not — the same split the response body already makes.
         zuno_core::Frame::Binary(bytes) => (
@@ -2228,11 +2242,7 @@ fn frame_preview(frame: &zuno_core::Frame) -> (SharedString, bool) {
 }
 
 /// The strip above the transcript: what was negotiated, and whether it is still open.
-fn session_line(
-    view: &RequestView,
-    session: &crate::request_view::Transcript,
-    theme: &Theme,
-) -> Div {
+fn session_line(session: &crate::request_view::Transcript, theme: &Theme) -> Div {
     let (label, colour) = match &session.closed {
         None => (SharedString::from("open"), theme.status_success),
         // No code and no reason: the peer went away without a Close frame, which is an
@@ -2256,17 +2266,32 @@ fn session_line(
         ),
     };
 
-    let mut row = div()
+    // **It wraps.** The strip grew from `open · 3 frames` to a status line, a transport, a
+    // negotiated subprotocol, a count and a control, which does not fit a narrow pane on one
+    // line — so the chips that do not fit go to a second line and nothing is cut.
+    //
+    // Nothing shrinks and nothing clips, which is the part that was got wrong twice. Letting
+    // one child shrink makes *it* the thing that disappears rather than the row giving way, and
+    // since the status label is first, the strip then reads as cut off at the **start** — the
+    // hardest overflow to recognise as overflow. Every child here is a short whole chip, so the
+    // unit that moves is a chip, not a character.
+    //
+    // `gap_3` sets `gap.height` as well as `gap.width` (`gpui-macros/styles.rs`), so a second
+    // line is spaced without a second declaration, and `flex_none` stops the column squashing a
+    // taller strip.
+    //
+    // **The control is a sibling of the whole group, not one more chip**, which is what lets
+    // `justify_between` mean "facts left, control right" rather than spreading all five items
+    // evenly across the strip — `justify_between` distributes between *children*, so the group
+    // has to be one child. It also means only the group ever wraps: the control cannot be
+    // carried to a second line by a chip it has nothing to do with.
+    let mut chips = div()
         .flex()
         .flex_row()
+        .flex_wrap()
         .items_center()
         .gap_3()
-        .flex_none()
-        .px_3()
-        .py_2()
-        .text_xs()
-        .border_b_1()
-        .border_color(theme.border)
+        .min_w(px(0.))
         .child(
             div()
                 .font_weight(FontWeight::MEDIUM)
@@ -2274,32 +2299,75 @@ fn session_line(
                 .child(label),
         );
 
-    // The handshake's own status line, which `Event::Opened` fills exactly as `Head` does for
-    // a request — so `101 Switching Protocols` appears here without a second code path.
-    if let Some((status, text)) = view.inflight.as_ref().and_then(|f| f.status.clone()) {
-        row = row.child(
+    // **Read off the transcript, not off `inflight`**, which is cleared at the close — so a
+    // finished session used to lose its status line while keeping its frames.
+    if let Some((status, text)) = &session.status {
+        chips = chips.child(
             div()
+                .flex_none()
+                .whitespace_nowrap()
                 .text_color(theme.text_muted)
                 .child(SharedString::from(format!("{status} {text}"))),
         );
     }
 
-    if let Some(protocol) = &session.protocol {
-        row = row.child(
-            div()
-                .text_color(theme.text_faint)
-                .child(SharedString::from(protocol.clone())),
-        );
-    }
-
-    row = row.child(
+    chips = chips.child(
         div()
-            .flex_1()
+            .flex_none()
+            .whitespace_nowrap()
             .text_color(theme.text_faint)
-            .child(SharedString::from(match session.frames.len() {
-                1 => "1 frame".to_string(),
-                n => format!("{n} frames"),
+            .child(SharedString::from(match (session.frames(), session.dropped) {
+                // **Said out loud.** Losing the beginning of a conversation silently is worse
+                // than the memory it saved — someone debugging a subscription would never learn
+                // the start was gone, and would read the transcript as the whole of it.
+                (n, dropped) if dropped > 0 => {
+                    format!("{n} frames · {dropped} earlier dropped")
+                }
+                (1, _) => "1 frame".to_string(),
+                (n, _) => format!("{n} frames"),
             })),
+    );
+
+    // **The handshake facts, collapsed behind one chip.**
+    //
+    // Transport and subprotocol are read once — when you open a session you want to know what
+    // is carrying it, and after that the answer never changes and never matters again. They are
+    // also the two longest chips (`graphql-transport-ws` alone is 20 characters), so they were
+    // most of what made the strip overflow while being the least of what it is read for.
+    //
+    // **Collapsed at every width, not past a threshold.** A width-dependent rule would need the
+    // rendered width of each chip, which gpui only knows a frame late, so it would come down to
+    // guessing pixels from character counts — and the strip would change height as you dragged
+    // the splitter. This is the deal instead: the strip is always the same shape, and the two
+    // facts that would be hidden on a narrow pane are hidden on a wide one too.
+    //
+    // A tooltip and not a popover because `ui::Tooltip` already floats free of every clipping
+    // ancestor and already takes several lines — one per fact, so neither is cut.
+    let mut detail = vec![SharedString::from(format!(
+        "Transport · {}",
+        session.transport.label()
+    ))];
+    if let Some(protocol) = &session.protocol {
+        detail.push(SharedString::from(format!("Subprotocol · {protocol}")));
+    }
+    chips = chips.child(
+        div()
+            // `.id()` first: `tooltip` is on `StatefulInteractiveElement`.
+            .id("session-detail")
+            // The glyph reads its hover colour from this group; an `svg()` inherits neither a
+            // `text_color` nor a `hover` from its parent.
+            .group(crate::ui::ICON_GROUP)
+            .flex_none()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .tooltip(move |_, cx| crate::ui::Tooltip::lines(detail.clone(), cx))
+            .child(crate::ui::glyph(
+                crate::ui::Icon::ChevronsRight,
+                theme.text_faint,
+                theme.text,
+                14.,
+            )),
     );
 
     // **The mouse path for hanging up**, and it belongs here rather than on the send button:
@@ -2309,17 +2377,49 @@ fn session_line(
     //
     // Only while it is open — a closed transcript is a record, and a control that hangs up
     // something already hung up is a control that does nothing.
-    if session.is_open() {
-        row = row.child(crate::ui::text_action(
+    // `into_any_element` because the two arms are different types — `text_action` is generic
+    // over the action it dispatches, so `CancelRequest` and `SendRequest` produce two `impl
+    // IntoElement`s that no `if` can unify.
+    let control = if session.is_open() {
+        crate::ui::text_action(
             "session-disconnect",
             SharedString::from("Disconnect"),
             "Disconnect",
             CancelRequest,
             theme,
-        ));
-    }
+        )
+        .into_any_element()
+    } else {
+        // **Manual, and only here.** SSE picks itself up because the protocol can resume from
+        // `Last-Event-ID`; a socket has no such mechanism, so reconnecting one silently would
+        // lose every message in the gap while looking like it had worked. It dispatches
+        // `SendRequest` rather than a verb of its own — a reconnect *is* a new conversation, and
+        // the transcript is replaced exactly as it is on any other send.
+        crate::ui::text_action(
+            "session-reconnect",
+            SharedString::from("Reconnect"),
+            "Reconnect",
+            SendRequest,
+            theme,
+        )
+        .into_any_element()
+    };
 
-    row
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .flex_none()
+        .w_full()
+        .px_3()
+        .py_2()
+        .text_xs()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(chips)
+        .child(control)
 }
 
 fn transcript(
@@ -2329,19 +2429,36 @@ fn transcript(
     window: &Window,
     cx: &mut Context<RequestView>,
 ) -> Div {
-    let count = session.frames.len();
+    let count = session.rows.len();
+
+    // The headers tab is the same table a response uses, over the handshake's headers. Reached
+    // by `Ctrl+Shift+H` and its tab exactly as a response's are, because for a stream this is
+    // where `content-type`, `cache-control` and the CORS and auth answers live — and until now
+    // the transcript returned before the pane ever drew a tab strip, so they were unreachable.
+    if view.response_view == ResponseView::Headers {
+        return div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .min_h(px(0.))
+            .child(session_line(session, theme))
+            .child(session_tabs(view, session.headers.len(), theme, cx))
+            .child(headers_region(&session.headers, &view.headers_scroll, theme));
+    }
 
     if count == 0 {
         return div()
             .flex_1()
             .flex()
             .flex_col()
-            .child(session_line(view, session, theme))
+            .min_h(px(0.))
+            .child(session_line(session, theme))
+            .child(session_tabs(view, session.headers.len(), theme, cx))
             .child(centered_note(
                 if session.is_open() {
                     "connected — nothing has been said yet"
                 } else {
-                    "the socket closed without a single frame"
+                    "it closed without a single frame"
                 },
                 theme,
             ));
@@ -2374,14 +2491,30 @@ fn transcript(
 
         range
             .filter_map(|ix| {
-                // The transcript can have shrunk since `count` was read — a reconnect clears
-                // it — and a panicking index would take the window with it.
-                let entry = session.frames.get(ix)?;
-                let (preview, multiline) = frame_preview(&entry.frame);
-                let (at, direction) = (entry.at, entry.direction);
+                // The transcript can have shrunk since `count` was read — the ring evicts from
+                // the front — and a panicking index would take the window with it.
+                let entry = session.rows.get(ix)?;
+                let at = entry.at;
+                let (direction, preview, multiline) = match &entry.kind {
+                    crate::request_view::TranscriptKind::Frame { direction, frame } => {
+                        let (preview, multiline) = frame_preview(frame);
+                        (Some(*direction), preview, multiline)
+                    }
+                    // A notice is the stream itself speaking, so it has no direction and
+                    // nothing to open — it reads as a rule across the conversation.
+                    crate::request_view::TranscriptKind::Notice(text) => {
+                        (None, text.clone(), false)
+                    }
+                };
                 let (arrow, arrow_colour) = match direction {
-                    zuno_core::Direction::Sent => ("▲", row_theme.accent),
-                    zuno_core::Direction::Received => ("▼", row_theme.status_success),
+                    Some(zuno_core::Direction::Sent) => ("▲", row_theme.accent),
+                    Some(zuno_core::Direction::Received) => ("▼", row_theme.status_success),
+                    None => ("·", row_theme.text_faint),
+                };
+                let text_colour = if direction.is_some() {
+                    row_theme.text
+                } else {
+                    row_theme.text_faint
                 };
 
                 let picking = entity.clone();
@@ -2436,7 +2569,7 @@ fn transcript(
                             // which reads as a rendering fault rather than as a long payload.
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .text_color(row_theme.text)
+                            .text_color(text_colour)
                             .child(preview),
                     )
                     .children(multiline.then(|| {
@@ -2459,7 +2592,11 @@ fn transcript(
     // JSON outline, folding, `Ctrl+F` and copy all work here with no second implementation.
     // A socket has no response body of its own, so nothing is competing for that field.
     let detail = view.session_selected.and_then(|ix| {
-        let entry = session.frames.get(ix)?;
+        let entry = session.rows.get(ix)?;
+        let (direction, frame) = match &entry.kind {
+            crate::request_view::TranscriptKind::Frame { direction, frame } => (*direction, frame),
+            crate::request_view::TranscriptKind::Notice(_) => return None,
+        };
         Some(
             div()
                 .flex_none()
@@ -2471,7 +2608,7 @@ fn transcript(
                 .min_h(px(0.))
                 .border_t_1()
                 .border_color(theme.border)
-                .child(frame_detail_header(ix, entry, theme))
+                .child(frame_detail_header(ix, direction, frame, theme))
                 .children(view.search.as_ref().map(|search| {
                     find_bar(
                         search,
@@ -2494,23 +2631,71 @@ fn transcript(
         .flex()
         .flex_col()
         .min_h(px(0.))
-        .child(session_line(view, session, theme))
+        .child(session_line(session, theme))
+        .child(session_tabs(view, session.headers.len(), theme, cx))
         .child(list)
         .children(detail)
+}
+
+/// A session's own tab strip: the transcript, and the handshake's headers.
+///
+/// **Two tabs, not four.** `view_tabs` also offers Timing and Diff, and neither means anything
+/// here — a stream has no phase breakdown to draw and nothing to compare against, so both would
+/// be controls that open an empty pane. Same reasoning as `KindEditor::checks_a_response` on the
+/// request side, one axis over.
+///
+/// It reuses `ShowResponseBody` and `ShowResponseHeaders`, so `Ctrl+Shift+H` works here for the
+/// reason it works on a response, with no second binding to learn or keep in step.
+fn session_tabs(
+    view: &RequestView,
+    header_count: usize,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> Div {
+    let headers = view.response_view == ResponseView::Headers;
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_2()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(view_tab(
+            "session-tab-frames",
+            "Frames".to_string(),
+            !headers,
+            ShowResponseBody,
+            theme,
+            cx,
+        ))
+        .child(view_tab(
+            "session-tab-headers",
+            format!("Headers {header_count}"),
+            headers,
+            ShowResponseHeaders,
+            theme,
+            cx,
+        ))
 }
 
 /// What the detail pane is showing, above it.
 fn frame_detail_header(
     ix: usize,
-    entry: &crate::request_view::TranscriptFrame,
+    direction: zuno_core::Direction,
+    frame: &zuno_core::Frame,
     theme: &Theme,
 ) -> Div {
-    let (way, colour) = match entry.direction {
+    let (way, colour) = match direction {
         zuno_core::Direction::Sent => ("sent", theme.accent),
         zuno_core::Direction::Received => ("received", theme.status_success),
     };
-    let kind = match &entry.frame {
+    let kind = match frame {
         zuno_core::Frame::Text(_) => "text",
+        zuno_core::Frame::Event { .. } => "event",
         zuno_core::Frame::Binary(_) => "binary",
         zuno_core::Frame::Ping(_) => "ping",
         zuno_core::Frame::Pong(_) => "pong",
@@ -2535,11 +2720,22 @@ fn frame_detail_header(
         )
         .child(div().text_color(theme.text_muted).child(way.to_string()))
         .child(div().text_color(theme.text_faint).child(kind.to_string()))
+        // **The id, where a WebSocket frame has nothing to put.** It is what a reconnect would
+        // replay from, so it is the one piece of an event's envelope worth carrying into the
+        // detail header rather than leaving on the row.
+        .children(match frame {
+            zuno_core::Frame::Event { id: Some(id), .. } => Some(
+                div()
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!("id {id}"))),
+            ),
+            _ => None,
+        })
         .child(
             div()
                 .flex_1()
                 .text_color(theme.text_faint)
-                .child(SharedString::from(format_bytes(entry.frame.len() as u64))),
+                .child(SharedString::from(format_bytes(frame.len() as u64))),
         )
         // **The mouse paths for reading a frame.** The response pane's own toolbar is not drawn
         // in a transcript — that branch returns before it — so without these, Find and Copy are

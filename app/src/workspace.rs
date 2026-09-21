@@ -26,7 +26,7 @@ use zuno_core::{
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
-    SaveMessage,
+    OpenGraphQlTransport, SaveMessage,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -3765,6 +3765,16 @@ impl Workspace {
             picker::Target::RequestKindConfirmed(choice) => {
                 self.switch_request_kind(choice, true, window, cx);
             }
+            picker::Target::GraphQlTransport(transport) => {
+                if let Some(view) = self.active() {
+                    view.update(cx, |view, cx| {
+                        if let Some(graphql) = view.kind.as_graphql_mut() {
+                            graphql.transport = transport;
+                        }
+                        cx.notify();
+                    });
+                }
+            }
             picker::Target::Method(method) => {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| {
@@ -6413,6 +6423,52 @@ impl Workspace {
 
     /// Keep the composed message with the socket.
     ///
+    /// Choose how a GraphQL operation reaches the server.
+    ///
+    /// Guarded on the kind for `open_method`'s reason: off a GraphQL buffer there is nothing to
+    /// choose, and a picker that opens and cannot change anything is the shape this codebase
+    /// keeps finding and fixing.
+    fn open_graphql_transport(
+        &mut self,
+        _: &OpenGraphQlTransport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+        let Some(current) = view
+            .read(cx)
+            .kind
+            .as_graphql()
+            .map(|graphql| graphql.transport)
+        else {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a GraphQL request chooses a transport, not {kind}"), cx);
+            return;
+        };
+
+        let items = zuno_core::GraphQlTransport::ALL
+            .into_iter()
+            .map(|transport| picker::Item {
+                label: SharedString::from(transport.label()),
+                // The current one says so; the rest say what picking them would do, because
+                // "Auto" and "HTTP" mean nothing on their own to someone meeting them here.
+                detail: SharedString::from(if transport == current {
+                    "current"
+                } else {
+                    transport.detail()
+                }),
+                target: picker::Target::GraphQlTransport(transport),
+            })
+            .collect();
+
+        self.show_picker(items, "No transports", window, cx);
+    }
+
+    /// Keep the composed message with the socket.
+    ///
     /// A no-op off a WebSocket buffer rather than reaching for `active_http`'s twin: there is
     /// nothing to reveal first, so the guard would only be stating what the setter already does.
     fn save_message(&mut self, _: &SaveMessage, _: &mut Window, cx: &mut Context<Self>) {
@@ -6710,6 +6766,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
             .on_action(cx.listener(Self::save_message))
+            .on_action(cx.listener(Self::open_graphql_transport))
             .on_action(cx.listener(Self::next_request_tab))
             .on_action(cx.listener(Self::prev_request_tab))
             .on_action(cx.listener(Self::show_headers_tab))
