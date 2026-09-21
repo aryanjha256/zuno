@@ -54,7 +54,10 @@ pub struct PreparedPart {
 /// Deliberately *not* applied to the body: `{{` can occur legitimately inside JSON
 /// strings, and a false positive that blocks sending is worse than a literal
 /// placeholder in a payload the user can see.
-fn find_unresolved_variable(text: &str) -> Option<String> {
+///
+/// **A WebSocket frame is a body by that reasoning**, so `send_frame` warns rather than
+/// refuses — see its comment. That is what this is `pub` for.
+pub fn find_unresolved_variable(text: &str) -> Option<String> {
     let start = text.find("{{")?;
     let rest = &text[start + 2..];
     let end = rest.find("}}")?;

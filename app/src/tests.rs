@@ -13691,3 +13691,153 @@ async fn the_transcript_drops_the_oldest_frames_and_moves_the_selection(cx: &mut
 
     server.join().expect("server thread");
 }
+
+/// **A frame carrying an unresolved `{{var}}` says so, and still goes.**
+///
+/// `build.rs` *refuses* an unresolved variable in a URL or a header and deliberately does not
+/// check a body — `{{` is legal inside JSON, and a false positive that blocks a send is worse
+/// than a placeholder you can see. A frame is a body by that reasoning, so refusing one would
+/// contradict a decision already made, and refusing mid-conversation is worse still.
+///
+/// But sending `{"token":"{{apiKey}}"}` literally with nothing on screen saying so is the bug
+/// that once put `search={{q}}` on a real server. So the assertion is on **both halves**: the
+/// notice appears *and* the server receives the literal text. A test for only the notice would
+/// pass against a version that refused to send.
+#[gpui::test]
+async fn an_unresolved_variable_in_a_frame_is_announced_rather_than_blocked(
+    cx: &mut TestAppContext,
+) {
+    use std::net::TcpListener;
+    use tokio_tungstenite::tungstenite;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let stream = accept_before(&listener, Duration::from_secs(10)).expect("a connection");
+        let mut ws = tungstenite::accept(stream).expect("handshake");
+        while let Ok(message) = ws.read() {
+            if message.is_close() {
+                break;
+            }
+            if let Ok(text) = message.to_text() {
+                let _ = seen_tx.send(text.to_string());
+                let _ = ws.send(tungstenite::Message::Text(format!("re:{text}").into()));
+            }
+        }
+    });
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the socket to open", |cx| {
+        cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
+    });
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let composer = view.kind.as_websocket().expect("a socket").compose.clone();
+            window.focus(&gpui::Focusable::focus_handle(composer.read(cx), cx));
+        })
+    });
+    cx.simulate_input("{{apiKey}}");
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let notice = wait_for(&mut cx, "the unresolved-variable notice", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx).session.as_ref().and_then(|session| {
+                session.rows.iter().find_map(|row| match &row.kind {
+                    crate::request_view::TranscriptKind::Notice(text)
+                        if text.contains("unresolved") =>
+                    {
+                        Some(text.to_string())
+                    }
+                    _ => None,
+                })
+            })
+        })
+    });
+    assert!(
+        notice.contains("apiKey"),
+        "the notice has to name the variable, or it cannot be acted on: {notice}"
+    );
+
+    // The other half: it was *sent*, not swallowed.
+    let received = seen_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the server must still receive the frame");
+    assert_eq!(received, "{{apiKey}}");
+
+    // And the echo clears the outstanding send, so no "not delivered" notice follows.
+    wait_for(&mut cx, "the frame to be acknowledged", |cx| {
+        cx.update(|_, cx| view.read(cx).pending_send.is_none()).then_some(())
+    });
+
+    server.join().expect("server thread");
+}
+
+/// **A ping is reachable from the mouse**, which is the whole of architecture.md §11's last entry.
+///
+/// The engine has always sent whichever `Frame` variant it was handed; `send_frame` only ever
+/// built `Frame::Text`, because the composer is a text editor. So "ask whether this quiet socket
+/// is still there" was capability with no path to it.
+///
+/// Asserted on **what the server received**, not on a transcript row: a row proves the app built
+/// a Ping, and the thing worth knowing is that a Ping reached the wire as a Ping rather than as
+/// text that happened to say so. Driven by clicking the button rather than dispatching the
+/// action, because the button is the half that was missing.
+#[gpui::test]
+async fn the_ping_button_sends_a_real_ping_frame(cx: &mut TestAppContext) {
+    use std::net::TcpListener;
+    use tokio_tungstenite::tungstenite;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (pinged_tx, pinged_rx) = std::sync::mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let stream = accept_before(&listener, Duration::from_secs(10)).expect("a connection");
+        let mut ws = tungstenite::accept(stream).expect("handshake");
+        while let Ok(message) = ws.read() {
+            match message {
+                tungstenite::Message::Ping(_) => {
+                    let _ = pinged_tx.send(());
+                    // tungstenite queues the Pong itself; this read loop flushes it.
+                }
+                tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
+    cx.simulate_keystrokes("ctrl-enter");
+    wait_for(&mut cx, "the socket to open", |cx| {
+        cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
+    });
+
+    let button = wait_for(&mut cx, "the ping button to be painted", |cx| {
+        cx.debug_bounds("send-ping")
+    });
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+
+    pinged_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the server must receive a Ping frame");
+
+    server.join().expect("server thread");
+}

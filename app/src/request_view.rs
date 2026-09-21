@@ -651,6 +651,11 @@ pub struct RequestView {
     pub session_scroll: gpui::UniformListScrollHandle,
     /// Which frame the detail pane is showing, as an index into `Transcript::frames`.
     pub session_selected: Option<usize>,
+    /// A frame handed to the engine that has not been echoed back as `Sent` yet.
+    ///
+    /// The engine's send is fire-and-forget, so this is the only record that something was
+    /// asked for; a session that ends while it is `Some` swallowed a message, and says so.
+    pub(crate) pending_send: Option<String>,
     pub error: Option<EngineError>,
     pub status: Option<SharedString>,
 
@@ -661,6 +666,7 @@ impl RequestView {
     pub fn new(spec: RequestSpec, cx: &mut Context<Self>) -> Self {
         let mut view = Self {
             id: spec.id,
+            pending_send: None,
             name: String::new(),
             baseline: RequestSpec::default(),
             path: None,
@@ -1345,6 +1351,16 @@ impl RequestView {
                 frame,
                 ..
             } => {
+                // **The write is acknowledged.** Matched on content rather than cleared on any
+                // `Sent` frame, so a Ping — which the composer never produced — cannot mark a
+                // typed message as delivered.
+                if direction == Direction::Sent
+                    && let Frame::Text(text) = &frame
+                    && self.pending_send.as_deref() == Some(text.as_str())
+                {
+                    self.pending_send = None;
+                }
+
                 // Asked **before** the push, so "were you at the end" is not made false by the
                 // row that is arriving.
                 let following = self
@@ -1384,25 +1400,16 @@ impl RequestView {
                         delay.as_secs_f32()
                     )
                 };
-                let mut evicted = 0;
-                if let Some(session) = self.session.as_mut() {
-                    evicted = session.push(TranscriptRow {
-                        at: session
-                            .rows
-                            .back()
-                            .map(|row| row.at)
-                            .unwrap_or_default(),
-                        kind: TranscriptKind::Notice(SharedString::from(notice)),
-                    });
-                }
-                // **A notice evicts like anything else.** Discarding the count here left the
-                // detail pane pointing at whatever slid into the selected index — the same bug
-                // the frame arm has a test for, in the arm that did not.
-                self.reindex_selection(evicted);
+                self.push_notice(notice);
                 cx.notify();
                 true
             }
             Event::Closed { code, reason, .. } => {
+                // **Named before the close row, because it happened first.** A frame handed to
+                // the engine after the job was already gone is dropped without a word, so this
+                // is the only place the loss can surface — and showing the text is what makes
+                // it recoverable, since the composer was cleared when it was sent.
+                self.report_undelivered();
                 if let Some(session) = self.session.as_mut() {
                     session.closed = Some((code, reason));
                 }
@@ -1447,6 +1454,7 @@ impl RequestView {
                 false
             }
             Event::Failed { error, .. } => {
+                self.report_undelivered();
                 // **A failed session is a closed one.** Without this the transcript kept
                 // `closed: None` while `inflight` went away, so a socket killed by a network
                 // drop or a protocol error drew a strip reading "open" with a live Disconnect
@@ -1716,6 +1724,63 @@ impl RequestView {
     /// still holding it.
     ///
     /// `{{vars}}` are resolved here, so a saved message can carry `{{token}}` and mean it.
+    /// Add a row that is not a frame — a reconnect, or a warning about what just went out.
+    ///
+    /// **One implementation on purpose.** A notice evicts from the ring like any other row, and
+    /// forgetting to reindex the selection after an eviction leaves the detail pane showing a
+    /// different frame than the one highlighted — a bug this file has already had once, in the
+    /// arm that had been written second.
+    fn push_notice(&mut self, text: impl Into<SharedString>) {
+        let mut evicted = 0;
+        if let Some(session) = self.session.as_mut() {
+            evicted = session.push(TranscriptRow {
+                at: session.rows.back().map(|row| row.at).unwrap_or_default(),
+                kind: TranscriptKind::Notice(text.into()),
+            });
+        }
+        self.reindex_selection(evicted);
+    }
+
+    /// Send a Ping frame down the open socket.
+    ///
+    /// **No `pending_send`.** That exists so typed text is not lost when a send is swallowed,
+    /// and a ping is not typed — an undelivered one needs no recovery, and claiming a message
+    /// was lost when none was written would be worse than saying nothing.
+    pub fn send_ping(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) {
+        let Some(job) = self
+            .session
+            .as_ref()
+            .filter(|session| session.is_open())
+            .map(|session| session.job)
+        else {
+            return;
+        };
+        // Empty payload: RFC 6455 allows up to 125 bytes and the peer must echo them back, but
+        // there is nothing here worth correlating — one ping at a time, from a button.
+        engine.send_frame(job, Frame::Ping(bytes::Bytes::new()));
+        cx.notify();
+    }
+
+    /// Say so if a frame was handed to the engine and never acknowledged.
+    ///
+    /// The first line only, elided: a transcript row is one line, and the point is to identify
+    /// which message was lost rather than to reproduce it in the margin.
+    fn report_undelivered(&mut self) {
+        let Some(text) = self.pending_send.take() else {
+            return;
+        };
+        let first = text.lines().next().unwrap_or_default();
+        let notice = if first.is_empty() {
+            "a frame was not delivered — the socket had already closed".to_string()
+        } else {
+            format!(
+                "not delivered — the socket had already closed: {}",
+                zuno_core::request::elide(first, 120)
+            )
+        };
+        self.push_notice(notice);
+    }
+
     pub fn send_frame(
         &mut self,
         engine: &Arc<Engine>,
@@ -1741,7 +1806,40 @@ impl RequestView {
             return;
         }
 
-        engine.send_frame(job, Frame::Text(resolver.resolve(&text).into_owned()));
+        let resolved = resolver.resolve(&text).into_owned();
+
+        // **Warned about, not refused**, and the distinction is deliberate. `build.rs` refuses
+        // an unresolved `{{var}}` in a URL or a header and explicitly does *not* check a body:
+        // `{{` is legal inside JSON, and a false positive that blocks a send is worse than a
+        // placeholder you can see. A frame is a body by that reasoning, so refusing one would
+        // contradict a decision already made — and a frame goes out mid-conversation, where
+        // being told "no" is worse still.
+        //
+        // But sending `{"token":"{{apiKey}}"}` literally with nothing on screen saying so is
+        // the bug that once put `search={{q}}` on a real server. A notice in the transcript
+        // says it happened without taking the choice away.
+        if let Some(name) = zuno_core::engine::build::find_unresolved_variable(&resolved) {
+            self.push_notice(format!("sent with an unresolved variable: {name}"));
+        }
+
+        engine.send_frame(job, Frame::Text(resolved.clone()));
+
+        // **Held until the echo confirms it.** `Engine::send_frame` is fire-and-forget and the
+        // engine drops the command when the job is already gone, so a socket that closes
+        // between `is_open()` above and the write simply swallows the message: you typed,
+        // pressed send, and nothing appeared anywhere.
+        //
+        // `Event::Frame { direction: Sent }` is emitted only *after* the socket accepted the
+        // write, which makes it the acknowledgement. Clearing this on the echo and reporting it
+        // when the session ends without one is what turns a silent loss into a visible one.
+        //
+        // The composer itself is still cleared here rather than on the echo, because mutating
+        // it needs a `Window` and the event loop runs on an `AsyncApp` that has none — and the
+        // editor deliberately exposes no window-free setter, since a second way to mutate the
+        // buffer is a second place to forget undo and the line index. The text is not lost: an
+        // undelivered frame is named in the transcript.
+        self.pending_send = Some(resolved);
+
         composer.update(cx, |editor, cx| {
             let end = editor.text().len();
             editor.replace_range(0..end, "", window, cx);

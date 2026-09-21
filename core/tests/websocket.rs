@@ -422,3 +422,132 @@ fn a_graphql_subscription_rides_a_socket_and_unwraps_its_payloads() {
 
     server.join().expect("server thread");
 }
+
+/// **A peer that never answers the Close still ends the session.**
+///
+/// RFC 6455 makes closing an exchange, so the loop goes on reading after `stream.close(None)` —
+/// dropping the socket there would reach the server as a reset. But "go on reading" was
+/// unbounded: a server that neither answers the Close nor drops the connection left the task
+/// alive and the strip reading `open` for the life of the process. There is no protocol event
+/// that ends this; only a deadline does.
+///
+/// The server here is deliberately rude in the one way that reproduces it — it completes the
+/// handshake and then never reads again, so tungstenite never gets the chance to auto-reply to
+/// the Close. Reported as `Closed` rather than `Failed`: we asked to hang up and we have.
+#[test]
+fn a_close_the_peer_ignores_still_ends_the_session() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+        let ws = tungstenite::accept(stream).expect("handshake");
+        // **Never read again.** `read` is what makes tungstenite answer a Close, so calling it
+        // even once would defeat the test. Hold the socket open instead, well past the grace.
+        std::thread::sleep(DEADLINE);
+        drop(ws);
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (job, events) = engine.send(socket_spec(
+        format!("ws://127.0.0.1:{port}/"),
+        WebSocketRequest::default(),
+    ));
+
+    let mut seen = Vec::new();
+    wait_for(&events, &mut seen, "the socket to open", |event| {
+        matches!(event, Event::Opened { .. }).then_some(())
+    });
+
+    engine.close(job);
+
+    let started = Instant::now();
+    wait_for(&events, &mut seen, "the close to give up", |event| match event {
+        Event::Closed { .. } => Some(()),
+        Event::Failed { error, .. } => {
+            panic!("asking to close is not a failure: {error}")
+        }
+        _ => None,
+    });
+
+    // The grace is five seconds; anything under the file's whole deadline proves a bound
+    // exists, and pinning the exact number here would make tuning it a test edit.
+    assert!(
+        started.elapsed() < DEADLINE,
+        "the close must give up on its own, not wait for the peer forever"
+    );
+
+    server.join().expect("server thread");
+}
+
+/// **A graphql-transport-ws server that never acknowledges is a timeout, not an open session.**
+///
+/// The protocol says the client sends `connection_init` and may send nothing else until
+/// `connection_ack` comes back. Nothing bounded that wait, so a server that accepts the socket
+/// and then says nothing left the transcript reading `open` forever — and a protocol-layer auth
+/// rejection, where the server holds the socket instead of closing it, looks exactly like this.
+///
+/// `settings.timeout` is the deadline rather than a constant of its own: it now means "answer
+/// within N", and an ack is the answer.
+#[test]
+fn a_graphql_socket_that_never_acknowledges_times_out() {
+    use zuno_core::{GraphQlRequest, GraphQlTransport, RequestKind};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+        let mut ws = tungstenite::accept_hdr(
+            stream,
+            |_: &tungstenite::handshake::server::Request,
+             mut response: tungstenite::handshake::server::Response| {
+                response.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    "graphql-transport-ws".parse().expect("header"),
+                );
+                Ok(response)
+            },
+        )
+        .expect("handshake");
+        // Read the `connection_init` and answer nothing — the case the deadline is for.
+        let _ = ws.read();
+        std::thread::sleep(Duration::from_secs(2));
+    });
+
+    let mut spec = RequestSpec::default();
+    spec.url = format!("ws://127.0.0.1:{port}/graphql");
+    spec.settings.timeout = Some(Duration::from_millis(300));
+    spec.kind = RequestKind::GraphQl(GraphQlRequest {
+        query: "subscription Greetings { greetings }".to_string(),
+        transport: GraphQlTransport::WebSocket,
+        ..GraphQlRequest::default()
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_job, events) = engine.send(spec);
+
+    let mut seen = Vec::new();
+    wait_for(&events, &mut seen, "the handshake to time out", |event| {
+        match event {
+            Event::Failed { error, .. } => {
+                assert!(
+                    error.to_string().to_lowercase().contains("timed out")
+                        || error.to_string().to_lowercase().contains("timeout"),
+                    "an unacknowledged handshake must report as a timeout, not as {error}"
+                );
+                Some(())
+            }
+            Event::Frame { .. } => panic!("nothing may arrive before the ack"),
+            _ => None,
+        }
+    });
+
+    server.join().expect("server thread");
+}

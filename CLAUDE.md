@@ -14,8 +14,8 @@ Three docs, three jobs. Read them in this order:
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
 **M1, M2 and M3 are all complete.** architecture.md §11 — engine capability with no UI path — has
-one entry again: the engine sends any WebSocket frame type and the composer can only ask for
-text. The loop, the navigation thesis, and reuse are all built; response search and the
+one entry: the engine sends any WebSocket frame type and nothing authors a **binary** one. Ping
+is reachable now; text always was. The loop, the navigation thesis, and reuse are all built; response search and the
 body/headers tabs landed after, then GraphQL and WebSocket as request kinds of their own. ROADMAP's audit section, not its milestone headings, is where the
 remaining work lives.
 
@@ -38,7 +38,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 999 tests, ~35s
+cargo test --workspace                   # 1003 tests, ~45s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 

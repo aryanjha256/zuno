@@ -44,6 +44,16 @@ const GRAPHQL_SUBPROTOCOL: &str = "graphql-transport-ws";
 /// other one is a frame worth refusing.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+/// How long to wait for the peer's answering Close before dropping the connection.
+///
+/// **RFC 6455 says to wait a reasonable time and then close the socket**, and nothing did — the
+/// loop went on reading after `stream.close(None)`, so a server that neither answers the Close
+/// nor drops the TCP connection left the task alive and the strip reading `open` forever. A
+/// fixed few seconds rather than `settings.timeout`, because this is the wait *after* you press
+/// Disconnect: a 30-second request timeout is a reasonable deadline for an answer and an
+/// unreasonable one for a goodbye.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Open the socket and pump it until either side closes.
 pub async fn connect(
     job: JobId,
@@ -228,7 +238,25 @@ pub async fn connect(
     // afterwards rather than returning: RFC 6455's close is an exchange, and dropping the
     // stream on the outgoing Close would deny the server the chance to answer — which is the
     // difference between a clean close and a reset that shows up in the server's logs.
+    //
+    // **But the wait is bounded.** Reading on after the Close is only correct while the peer
+    // might still answer; a peer that never does used to keep this task and the socket alive
+    // for the life of the process. `close_by` is the deadline, armed at the moment we ask.
     let mut closing = false;
+    let mut close_by = tokio::time::Instant::now();
+
+    // **The ack deadline, and the reason it is `settings.timeout`.** A graphql-transport-ws
+    // server that accepts the socket and never answers `connection_init` is indistinguishable
+    // from a slow one, and a protocol-layer auth rejection looks exactly like it — so without
+    // this the transcript reads `open` forever against a server that has already refused.
+    // `timeout` now means "answer within N", and an ack is the answer; a second number here
+    // would be one more thing to explain and to get wrong.
+    //
+    // Starts `true` for a plain socket, which never sends `connection_init` and so must never
+    // arm the branch.
+    let ack_limit = spec.settings.timeout;
+    let ack_by = tokio::time::Instant::now() + ack_limit.unwrap_or_default();
+    let mut acked = graphql.is_none();
 
     loop {
         tokio::select! {
@@ -250,6 +278,7 @@ pub async fn connect(
                         Message::Text(text) if graphql.is_some() => {
                             match step(&text) {
                                 Step::Subscribe => {
+                                    acked = true;
                                     let envelope = graphql
                                         .as_ref()
                                         .map(super::build::graphql_envelope)
@@ -399,12 +428,34 @@ pub async fn connect(
                 // still gets its Close frame.
                 Some(Outbound::Close) | None => {
                     closing = true;
+                    close_by = tokio::time::Instant::now() + CLOSE_GRACE;
                     if stream.close(None).await.is_err() {
                         let _ = events.send(Event::Closed { job, code: None, reason: String::new() }).await;
                         return;
                     }
                 }
             },
+
+            // **The peer had its chance to answer and did not take it.** Reported as an
+            // ordinary close, not a failure: we asked to hang up and we have hung up, which is
+            // exactly what was wanted — the peer's silence is its problem, not an error to put
+            // a red pane over. `sleep_until` and not `sleep` because the branch is rebuilt on
+            // every pass of the loop, so a relative delay would restart on each frame that
+            // arrived during the wait and never fire.
+            _ = tokio::time::sleep_until(close_by), if closing => {
+                let _ = events.send(Event::Closed { job, code: None, reason: String::new() }).await;
+                return;
+            }
+
+            _ = tokio::time::sleep_until(ack_by), if !acked && ack_limit.is_some() => {
+                let _ = events.send(Event::Failed {
+                    job,
+                    // The same error a request that never answered reports, because it is the
+                    // same thing: the socket opened, the question went out, nothing came back.
+                    error: EngineError::Timeout { after: ack_limit.unwrap_or_default() },
+                }).await;
+                return;
+            }
         }
     }
 }

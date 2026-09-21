@@ -1055,22 +1055,21 @@ Reasons recorded so a future session can judge them, not commitments.
     It pairs with the lazy render from the same slice: only visible rows are formatted, so a long
     transcript costs nothing to draw and the cap is about memory alone.
 
+  **Four of these were later closed as a slice of their own**, chosen because they shared one
+  shape: the app said something false. A close the peer ignores now gives up after a grace rather
+  than leaving the task alive and the strip reading `open`; a graphql-transport-ws handshake that
+  is never acknowledged times out against `settings.timeout`, which is what a protocol-layer auth
+  rejection looks like from the outside; a frame the engine swallowed is named in the transcript
+  instead of vanishing; and an unresolved `{{var}}` in a frame is *announced* rather than blocked
+  — refusing would contradict `build.rs`'s deliberate choice not to check bodies, where `{{` is
+  legal JSON. §11's ping came with them, since "is this quiet socket alive" is the same question
+  the first two are about.
+
+  What is left is below, and the rest of the list is unchanged.
+
   From the audit of the slice, kept rather than fixed. Each is real; none is a lie on screen,
   which is where the line was drawn:
 
-  - **An unresolved `{{var}}` in a frame reaches the server literally.** `send_frame` resolves
-    and does not check, while the URL, the query params and the headers all call
-    `find_unresolved_variable` and refuse. It is the same shape as the bug that once sent
-    `search={{q}}` to a real server, and the fix is one call — it is here rather than done
-    because a *frame* is not a request and refusing to send one mid-conversation may be worse
-    than sending it; that is a decision, not an oversight.
-  - **A close the peer ignores never ends.** After `stream.close(None)` the loop waits on
-    `stream.next()` forever, so a server that neither answers the Close nor drops the connection
-    leaves the task alive and the strip reading open. RFC 6455 says wait a reasonable time and
-    then drop; nothing here does.
-  - **A frame sent to a socket that just closed vanishes silently.** `Engine::send_frame` is
-    fire-and-forget and the engine drops it when the job is gone. True of the race and false of
-    the experience: you typed, pressed send, and nothing appeared.
   - **The transcript never shows the Pong we send.** tungstenite answers a Ping itself
     (`protocol/mod.rs:672`) outside our `send` path, so the record shows an inbound Ping and no
     reply — which reads as ignoring it. A transcript's job is being a faithful record.
@@ -1094,9 +1093,6 @@ Reasons recorded so a future session can judge them, not commitments.
   - **`disconnecting_a_stream_actually_stops_it`'s doc still overstates its own assertion.** The
     load-bearing check is the `Closed` event, not the server-side one the comment names. The
     assertion itself was tightened when the unbounded loop was fixed; the comment was not.
-  - **No timeout on the graphql-transport-ws handshake.** A server that accepts the socket and
-    never sends `connection_ack` leaves the transcript reading open forever. A protocol-layer
-    auth rejection looks exactly like this.
   - **The same subscription yields different frame types on different transports** —
     `Frame::Event` over SSE, carrying the event name, and `Frame::Text` over WebSocket. Compare
     the two transports of one operation and the transcript looks different for no visible reason.

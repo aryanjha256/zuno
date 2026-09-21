@@ -14,11 +14,10 @@ use gpui::{
 };
 
 use crate::actions::{
-    SaveMessage,
-    AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext, BodyFindPrev,
-    CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl, OpenBodyType,
-    AddAssertion, AddCapture, OpenSettings, ReplaceAll, ReplaceNext, SaveRequest, SendRequest,
-    ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
+    AddAssertion, AddCapture, AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext,
+    BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl,
+    OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
+    SendRequest, ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
 };
 use crate::ui::{Icon, icon_button};
 use crate::kinds::{GraphQlEditor, KindEditor};
@@ -1676,6 +1675,20 @@ fn message_header(saved: usize, theme: &Theme) -> Div {
                             n => format!("{n} saved"),
                         }),
                 )
+                // **The mouse path for §11's last unreachable capability.** The engine has
+                // always sent whichever frame type it was given; the composer only ever built
+                // `Text`, so a Ping — the one way to find out whether a quiet socket is still
+                // there — had no way in. Beside Save rather than in the strip, because it acts
+                // on the socket you are composing for.
+                .child(crate::ui::icon_text_action(
+                    "send-ping",
+                    Icon::Activity,
+                    "Ping".into(),
+                    "Ask the server whether the socket is still alive",
+                    SendPing,
+                    theme.text_muted,
+                    theme,
+                ))
                 .child(crate::ui::icon_text_action(
                     "save-message",
                     Icon::Plus,

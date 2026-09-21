@@ -26,7 +26,7 @@ use zuno_core::{
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
-    OpenGraphQlTransport, SaveMessage,
+    OpenGraphQlTransport, SaveMessage, SendPing,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -6476,6 +6476,28 @@ impl Workspace {
         view.update(cx, |view, cx| view.save_message(cx));
     }
 
+    /// **Is this socket still there?**
+    ///
+    /// A WebSocket that has gone quiet is indistinguishable from one the network dropped, and a
+    /// ping is the protocol's own answer: the peer must reply with a Pong, and the transcript
+    /// records both. Until now the engine could send any frame type and the composer could only
+    /// build `Frame::Text`, which left this — architecture.md §11's last remaining entry — as
+    /// capability with no way to reach it.
+    ///
+    /// **Says so when there is nothing to ping**, rather than no-op'ing. A verb that only makes
+    /// sense for one kind and quietly does nothing off it is the shape `AddQuery` and four
+    /// others shipped in, and every one of them has a palette row that can be chosen anywhere.
+    fn send_ping(&mut self, _: &SendPing, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let Some(engine) = cx.engine() else { return };
+
+        if !view.read(cx).is_connected() {
+            self.set_status("No open session to ping", cx);
+            return;
+        }
+        view.update(cx, |view, cx| view.send_ping(&engine, cx));
+    }
+
     fn cancel_request(&mut self, _: &CancelRequest, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
         let Some(engine) = cx.engine() else { return };
@@ -6766,6 +6788,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
             .on_action(cx.listener(Self::save_message))
+            .on_action(cx.listener(Self::send_ping))
             .on_action(cx.listener(Self::open_graphql_transport))
             .on_action(cx.listener(Self::next_request_tab))
             .on_action(cx.listener(Self::prev_request_tab))
