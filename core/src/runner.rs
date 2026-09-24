@@ -266,12 +266,8 @@ pub fn steps_in_folder(collection_root: &std::path::Path, folder: &std::path::Pa
         .into_iter()
         .map(|entry| Step {
             // Relative to the *collection*, not to the folder, so a report row names the same
-            // path the panel does.
-            label: entry
-                .path
-                .strip_prefix(collection_root)
-                .map(|path| path.display().to_string())
-                .unwrap_or(entry.relative),
+            // path the panel does — and spelt with `/`, as a flow stores it.
+            label: crate::collection::relative_label(collection_root, &entry.path),
             spec: Some(entry.spec),
         })
         .collect()

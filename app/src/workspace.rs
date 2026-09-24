@@ -2025,14 +2025,7 @@ impl Workspace {
     fn selected_relative(&self, cx: &App) -> Option<String> {
         let path = self.selected_node()?.path.clone();
         let root = crate::collections::root(cx)?;
-        Some(
-            path.strip_prefix(root)
-                .unwrap_or(&path)
-                .components()
-                .map(|part| part.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/"),
-        )
+        Some(zuno_core::collection::relative_label(root, &path))
     }
 
     /// Hand the file to the desktop's file manager, selecting it.
@@ -5020,8 +5013,12 @@ impl Workspace {
             return;
         };
         let Some(node) = self.selected_node() else { return };
-        let Ok(relative) = node.path.strip_prefix(&root) else { return };
-        let relative = relative.display().to_string();
+        if node.path.strip_prefix(&root).is_err() {
+            return;
+        }
+        // **`/`, never the platform's separator** — this string is written into a committed flow
+        // file. See `collection::relative_label`.
+        let relative = zuno_core::collection::relative_label(&root, &node.path);
 
         let mut flow = match zuno_core::flow::read(&root, name) {
             Ok(flow) => flow,

@@ -293,8 +293,14 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, skipped: &m
     }
 }
 
-/// The path as shown in the picker, always with `/` separators.
-fn relative_label(root: &Path, path: &Path) -> String {
+/// A collection-relative path, **always with `/` separators, on every platform.**
+///
+/// Shown in the picker, and — the part that makes it more than display — *stored*: a flow names
+/// its steps this way, in a file that is committed and cloned. `Path::display` spells the
+/// separator as the platform does, so a flow built on Windows recorded `users\02-create.json`,
+/// which on Linux or macOS is a single filename with a backslash in it and a step that is always
+/// missing. `/` reads back on all three, since Windows accepts it in a path.
+pub fn relative_label(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .components()
@@ -779,6 +785,17 @@ fn flatten_branch(branch: &Branch<'_>, parent: &Path, depth: u16, out: &mut Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A stored path is spelt with `/` on every platform.** The path is built with `join`, so
+    /// on Windows it carries `\` — which is exactly what a flow step used to be written as, and
+    /// what a teammate on Linux or macOS then could not find. Only discriminating on Windows;
+    /// the portability CI run is where it bites.
+    #[test]
+    fn a_relative_path_is_spelt_with_forward_slashes() {
+        let root = Path::new("collection");
+        let nested = root.join("users").join("02-create.json");
+        assert_eq!(relative_label(root, &nested), "users/02-create.json");
+    }
 
     /// A scratch directory under the system temp dir, unique per test and process.
     fn scratch(name: &str) -> PathBuf {

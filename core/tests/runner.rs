@@ -63,6 +63,12 @@ fn accept_before(listener: &TcpListener, within: Duration) -> Option<TcpStream> 
         }
     }?;
     listener.set_nonblocking(false).expect("blocking");
+    // **The stream too, not only the listener.** On Windows an accepted socket inherits the
+    // listener's non-blocking mode, so `read_head` got `WouldBlock` at once, recorded an empty
+    // request and wrote the response into a socket that could cut it short — steps failed at
+    // random. Linux does not inherit it, which is why this copy of the helper, alone among the
+    // five, went without the line and passed everywhere else.
+    stream.set_nonblocking(false).expect("blocking");
     stream.set_read_timeout(Some(within)).expect("timeout");
     Some(stream)
 }

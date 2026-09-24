@@ -37,6 +37,9 @@ jobs:
       - name: Check the binary
         run: cargo check -p zuno
 
+      # `--no-fail-fast`, so one failing test binary does not hide every one after it — each
+      # Windows run used to stop at the first crate, and the next crate's failures cost another
+      # round trip to discover.
       - name: Run tests
         timeout-minutes: 20
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
