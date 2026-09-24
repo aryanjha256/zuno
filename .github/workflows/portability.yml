@@ -1,0 +1,42 @@
+name: Portability
+
+# **A discovery run for macOS and Windows, not yet a gate.** Zuno has only ever been built on
+# Linux, so the first runs here are expected to fail — and a failure is the point: it is the
+# portability audit, one compile error at a time, from machines nobody on the project has to
+# own. Manual so that `main` does not go red on every push while the ports are underway. Once
+# both jobs pass, they move into `rust.yml` as a matrix and this file goes.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # **No `-D warnings` here, unlike `rust.yml`, on purpose.** Code unused under one `cfg` is a
+  # warning on a new platform, and as an error it would stop the build at the first crate —
+  # hiding every problem behind it. This run exists to show all of them. It comes back when this
+  # moves into `rust.yml`.
+
+jobs:
+  build:
+    strategy:
+      # One OS failing must not cancel the other's report.
+      fail-fast: false
+      matrix:
+        # `macos-14` is Apple Silicon.
+        os: [macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    # Longer than `rust.yml`'s 20: a cold gpui build on these runners is slower than on Linux,
+    # and a first run has no cache. Still bounded, for that file's reason — a hang should cost
+    # minutes, not the six-hour ceiling.
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # What `cargo run` compiles — the build `--all-targets` and the test suite say nothing
+      # about, per CLAUDE.md.
+      - name: Check the binary
+        run: cargo check -p zuno
+
+      - name: Run tests
+        timeout-minutes: 20
+        run: cargo test --workspace
