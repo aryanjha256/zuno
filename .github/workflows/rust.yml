@@ -15,16 +15,25 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      # One OS failing must not cancel the others' reports.
+      fail-fast: false
+      matrix:
+        # macOS and Windows joined after a manual portability run passed on both with no
+        # failures and no warnings. `macos-14` is Apple Silicon.
+        os: [ubuntu-latest, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
     # A hung test used to run until GitHub's 6-hour ceiling killed the job. The whole
-    # workspace builds and tests in a couple of minutes cold, so anything past this is a
-    # hang, not slowness — and a hang should cost minutes of budget, not a whole afternoon.
-    timeout-minutes: 20
+    # workspace builds and tests in a couple of minutes cold on Linux, so anything past 20 is a
+    # hang, not slowness — and a hang should cost minutes of budget, not a whole afternoon. A
+    # cold gpui build on the macOS and Windows runners is slower, hence their 45.
+    timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 20 || 45 }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -38,5 +47,5 @@ jobs:
       - name: Run tests
         # Its own, tighter limit: the step that hangs is nearly always this one, and a
         # step-level timeout says *which* phase stalled rather than just "the job did".
-        timeout-minutes: 10
+        timeout-minutes: ${{ matrix.os == 'ubuntu-latest' && 10 || 20 }}
         run: cargo test --verbose
