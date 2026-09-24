@@ -17,6 +17,7 @@
 //! gpui's executor. Unbounded, so a busy UI can never stall the network.
 
 pub mod build;
+pub mod cookies;
 pub mod error;
 pub(crate) mod grpc;
 mod probe;
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use url::Url;
 
+pub use cookies::StoredCookie;
 pub use error::EngineError;
 
 use bytes::Bytes;
@@ -403,8 +405,6 @@ enum Command {
         job: JobId,
         outbound: Outbound,
     },
-    /// Throw away every cached client, and with them every cookie jar.
-    ClearCookies,
     /// Change where requests are routed. Future clients are built with it.
     SetProxy(ProxyMode),
     /// Change which certificates future clients are built with.
@@ -441,21 +441,37 @@ struct Job {
 pub struct Engine {
     commands: mpsc::UnboundedSender<Command>,
     next_job: AtomicU64,
+    /// Held here as well as by every client, so the viewer can read it without a round trip
+    /// through the engine thread — it is a mutex, not state the thread owns.
+    jar: cookies::Jar,
 }
 
 impl Engine {
     /// Spawn the engine thread and its runtime.
     pub fn new() -> std::io::Result<Self> {
         let (commands, receiver) = mpsc::unbounded_channel();
+        let jar = cookies::new_jar();
 
+        let shared = jar.clone();
         std::thread::Builder::new()
             .name("zuno-http".to_string())
-            .spawn(move || drive(receiver))?;
+            .spawn(move || drive(receiver, shared))?;
 
         Ok(Self {
             commands,
             next_job: AtomicU64::new(1),
+            jar,
         })
+    }
+
+    /// Every cookie a response has set and a later request would send.
+    pub fn cookies(&self) -> Vec<StoredCookie> {
+        cookies::snapshot(&self.jar)
+    }
+
+    /// Forget one cookie; `false` if it was already gone.
+    pub fn remove_cookie(&self, cookie: &StoredCookie) -> bool {
+        cookies::remove(&self.jar, cookie)
     }
 
     /// Submit a request. Returns immediately with the job's id and its event stream.
@@ -523,19 +539,18 @@ impl Engine {
 
     /// Forget every stored cookie.
     ///
-    /// **Why this has to exist for the cookie toggle to make sense.** `cookie_store` is
-    /// part of `ClientKey`, so turning it off doesn't empty a jar — it routes the request
-    /// through a *different* cached client. Turning it back on returns you to the original
-    /// client with every previous cookie intact, so without this you could switch cookies
-    /// off, back on, and still be silently logged in. A toggle alone would create the
-    /// confusion it was added to remove.
+    /// **Why this has to exist for the cookie toggle to make sense.** Turning `cookie_store`
+    /// off doesn't empty the jar — it routes the request through a client that has none.
+    /// Turning it back on returns you to the jar with every previous cookie intact, so without
+    /// this you could switch cookies off, back on, and still be silently logged in. A toggle
+    /// alone would create the confusion it was added to remove.
     ///
-    /// Implemented by dropping the cached clients rather than reaching into a jar: reqwest
-    /// owns the store behind `cookie_store(true)` and exposes no way to clear it, and the
-    /// next request rebuilds a client with an empty one. The cost is the connection pool,
-    /// which is why this is an explicit action and not something a toggle does implicitly.
+    /// **Emptied in place**, now that the jar is Zuno's. It used to be reqwest's private one,
+    /// which could only be cleared by dropping every cached client — and every pooled
+    /// connection with them. A response already in flight can still set a cookie after this;
+    /// that is a response that arrived, not one this undid.
     pub fn clear_cookies(&self) {
-        let _ = self.commands.send(Command::ClearCookies);
+        cookies::clear(&self.jar);
     }
 
     /// Route future requests through `mode`.
@@ -582,7 +597,7 @@ impl Engine {
 }
 
 /// The engine thread's main loop.
-fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
+fn drive(mut commands: mpsc::UnboundedReceiver<Command>, jar: cookies::Jar) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -599,7 +614,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
     };
 
     runtime.block_on(async move {
-        let mut clients = ClientCache::default();
+        let mut clients = ClientCache::new(jar);
         let mut jobs: HashMap<JobId, Job> = HashMap::new();
         let mut proxy = ProxyMode::default();
         let mut tls = TlsFiles::default();
@@ -683,11 +698,6 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                         job.handle.abort();
                     }
                 }
-                // In-flight jobs hold their own `Client` clone, so they finish against the
-                // old jar. Only later requests see the fresh one — which is the behaviour
-                // you want: clearing cookies shouldn't sabotage a response you're waiting
-                // on.
-                Command::ClearCookies => clients.clear(),
                 // No `clear()` needed: the mode is part of `ClientKey`, so a changed proxy
                 // simply misses the cache rather than relying on anyone remembering to evict.
                 Command::SetProxy(mode) => proxy = mode,
@@ -837,15 +847,19 @@ impl Alpn {
 /// Building a client per request would be simpler but would throw away connection
 /// pooling — and pooling is exactly what makes hitting Send twice in a row feel
 /// instant, which is the whole point of the milestone.
-#[derive(Default)]
+///
+/// Every client it builds with cookies on shares its one `jar` — see `cookies`.
 struct ClientCache {
     clients: HashMap<ClientKey, Client>,
+    jar: cookies::Jar,
 }
 
 impl ClientCache {
-    /// Drop every client, so the next request builds a fresh one with an empty jar.
-    fn clear(&mut self) {
-        self.clients.clear();
+    fn new(jar: cookies::Jar) -> Self {
+        Self {
+            clients: HashMap::new(),
+            jar,
+        }
     }
 
     fn get(
@@ -861,13 +875,13 @@ impl ClientCache {
             return Ok(client.clone());
         }
 
-        let client = build_client(&key)?;
+        let client = build_client(&key, &self.jar)?;
         self.clients.insert(key.clone(), client.clone());
         Ok(client)
     }
 }
 
-fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
+fn build_client(key: &ClientKey, jar: &cookies::Jar) -> Result<Client, EngineError> {
     let redirect = if key.follow_redirects {
         reqwest::redirect::Policy::limited(key.max_redirects as usize)
     } else {
@@ -888,8 +902,13 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         .gzip(key.accept_encodings)
         .brotli(key.accept_encodings)
         .deflate(key.accept_encodings)
-        .zstd(key.accept_encodings)
-        .cookie_store(key.cookie_store);
+        .zstd(key.accept_encodings);
+
+    // The shared jar rather than `cookie_store(true)`, which would give this client a private
+    // one — see `cookies` for what that broke.
+    if key.cookie_store {
+        builder = builder.cookie_provider(jar.clone());
+    }
 
     // See `Alpn`. Both non-default arms exist because a silent version mismatch is invisible:
     // a `wss://` handshake that settled on h2 came back as a plain 200, and a gRPC call that
@@ -1135,7 +1154,8 @@ mod tests {
             },
             Alpn::Negotiate,
         );
-        let error = build_client(&missing).expect_err("a missing certificate must fail");
+        let error = build_client(&missing, &cookies::new_jar())
+            .expect_err("a missing certificate must fail");
         assert!(
             matches!(&error, EngineError::Build { reason } if reason.contains("not/here.pem")),
             "{error:?}"
@@ -1152,7 +1172,10 @@ mod tests {
             },
             Alpn::Negotiate,
         );
-        assert!(build_client(&ok).is_ok(), "a valid PEM identity should build");
+        assert!(
+            build_client(&ok, &cookies::new_jar()).is_ok(),
+            "a valid PEM identity should build"
+        );
     }
 
     #[test]

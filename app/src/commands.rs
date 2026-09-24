@@ -168,6 +168,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Fold or unfold the selected row", ToggleFold),
         // Settings.
         command("Request settings", OpenSettings),
+        command("Show stored cookies", OpenCookies),
         command("Clear stored cookies", ClearCookies),
         // Application.
         command("Toggle theme", ToggleTheme),
@@ -332,6 +333,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::CertsConfirm", "only valid inside the certificates panel"),
     ("zuno::CertsRemove", "only valid inside the certificates panel"),
     ("zuno::CertsDismiss", "only valid inside the certificates panel"),
+    ("zuno::CookiesNext", "only valid inside the cookie viewer"),
+    ("zuno::CookiesPrev", "only valid inside the cookie viewer"),
+    ("zuno::CookiesRemove", "only valid inside the cookie viewer"),
+    ("zuno::CookiesDismiss", "only valid inside the cookie viewer"),
     ("zuno::MenuNext", "only valid inside the row menu"),
     ("zuno::MenuPrev", "only valid inside the row menu"),
     ("zuno::MenuConfirm", "only valid inside the row menu"),

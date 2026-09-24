@@ -100,6 +100,16 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # trailers; `BodyExt::collect` is what walks them. Proven end to end before anything was built
 # on it — see `core/tests/grpc_trailers.rs`.
 http-body-util = "0.1"
+# **A cookie jar Zuno owns, so it can be shown.** reqwest's `cookie_store(true)` keeps its jar
+# private — "Clear stored cookies" had to drop every cached client to empty it — and gives each
+# client its own, so requests with different settings did not share cookies at all. One
+# `CookieStoreMutex`, handed to every client through `cookie_provider`, is both readable and
+# shared. `cookie_store` 0.22 is already in the tree through reqwest's `cookies` feature; this
+# adds only the adapter between the two.
+reqwest_cookie_store = "0.10"
+# Named directly only to read a stored cookie's domain and expiry, whose types it defines. The
+# same 0.22 reqwest already builds, default features and all, so nothing new is compiled.
+cookie_store = "0.22"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 url = "2"
 # Runtime-agnostic channel: written from tokio tasks, awaited on gpui's smol executor.

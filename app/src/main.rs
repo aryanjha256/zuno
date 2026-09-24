@@ -11,6 +11,7 @@ mod actions;
 mod body_view;
 mod cert_panel;
 mod chrome;
+mod cookie_panel;
 mod app_state;
 mod close_panel;
 mod collection_panel;
@@ -55,6 +56,7 @@ use crate::actions::{
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
+    ClearCookies, CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCode, CopyRowPath, CopyRowValue,
     FindInBody, FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
@@ -454,6 +456,13 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("down", CertsNext, Some("CertPanel")),
         KeyBinding::new("up", CertsPrev, Some("CertPanel")),
         KeyBinding::new("delete", CertsRemove, Some("CertPanel")),
+        // After the global `escape`, for the tie-break the header-name dropdown's note below
+        // explains. `shift-delete` is the whole jar, one modifier away from the one cookie.
+        KeyBinding::new("escape", CookiesDismiss, Some("CookiePanel")),
+        KeyBinding::new("down", CookiesNext, Some("CookiePanel")),
+        KeyBinding::new("up", CookiesPrev, Some("CookiePanel")),
+        KeyBinding::new("delete", CookiesRemove, Some("CookiePanel")),
+        KeyBinding::new("shift-delete", ClearCookies, Some("CookiePanel")),
         // The header-name dropdown. Scoped to `HeaderCell`, and **after** the global `escape`
         // above — a leaf-matching predicate ties with a context-less one and the tie goes to
         // later registration, which is what makes these win while a header name has focus.

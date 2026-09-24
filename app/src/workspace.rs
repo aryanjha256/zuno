@@ -47,6 +47,7 @@ use crate::actions::{
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
+    CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
     CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     ShowResponseTrailers,
@@ -176,6 +177,7 @@ pub struct Workspace {
     /// Held for the same reason `workspace_prompt` is: dropping the task cancels the dialog.
     cert_prompt: Option<Task<()>>,
     certs: Option<crate::cert_panel::CertPanel>,
+    cookie_viewer: Option<crate::cookie_panel::CookiePanel>,
     tab_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     system_proxy: Option<String>,
     pub(crate) tab_scroll: ScrollHandle,
@@ -439,6 +441,7 @@ impl Workspace {
             panel_scroll: UniformListScrollHandle::new(),
             cert_prompt: None,
             certs: None,
+            cookie_viewer: None,
             tab_menu_anchor: None,
             system_proxy: [
                 "HTTP_PROXY",
@@ -624,6 +627,7 @@ impl Workspace {
             || self.import.is_some()
             || self.close_confirm.is_some()
             || self.certs.is_some()
+            || self.cookie_viewer.is_some()
             || self.new_workspace_panel.is_some()
             || self.environment_panel.is_some()
             || self.run.is_some()
@@ -788,6 +792,12 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn certs_open(&self) -> bool {
         self.certs.is_some()
+    }
+
+    /// `certs_open`'s twin, for the same reason: `debug_bounds(..).is_none()` proves nothing.
+    #[cfg(test)]
+    pub(crate) fn cookie_viewer_open(&self) -> bool {
+        self.cookie_viewer.is_some()
     }
 
     #[cfg(test)]
@@ -3999,7 +4009,83 @@ impl Workspace {
             return;
         };
         engine.clear_cookies();
+        if let Some(viewer) = self.cookie_viewer.as_mut() {
+            viewer.clamp(0);
+        }
         self.set_status("Cleared stored cookies", cx);
+        cx.notify();
+    }
+
+    /// Open the cookie viewer.
+    ///
+    /// **The jar is engine-wide, so this does not ask which request is active.** A cookie belongs
+    /// to a domain, not to a buffer, and every request that stores cookies shares one jar — see
+    /// `zuno_core::engine::cookies`.
+    fn open_cookies(&mut self, _: &OpenCookies, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let restore = Some(window.focused(cx).unwrap_or_else(|| self.focus_handle.clone()));
+        let panel = crate::cookie_panel::CookiePanel::new(restore, cx);
+        let focus = panel.focus_handle.clone();
+        self.cookie_viewer = Some(panel);
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn cookies_dismiss(&mut self, _: &CookiesDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = self.cookie_viewer.take() else { return };
+        if let Some(focus) = panel.restore_focus {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    fn cookies_next(&mut self, _: &CookiesNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_cookies(1, cx);
+    }
+
+    fn cookies_prev(&mut self, _: &CookiesPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_cookies(-1, cx);
+    }
+
+    fn step_cookies(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let len = cx.engine().map_or(0, |engine| engine.cookies().len());
+        if let Some(panel) = self.cookie_viewer.as_mut() {
+            panel.step(delta, len);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_cookie_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(panel) = self.cookie_viewer.as_mut() {
+            panel.selected = ix;
+            cx.notify();
+        }
+    }
+
+    /// Forget the selected cookie.
+    ///
+    /// Read from a fresh snapshot rather than from what was drawn: a response may have set or
+    /// replaced a cookie since, and removing by the row's *identity* — domain, path and name —
+    /// is what keeps a shifted list from deleting its neighbour.
+    fn cookies_remove(&mut self, _: &CookiesRemove, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(engine) = cx.engine() else { return };
+        let Some(selected) = self.cookie_viewer.as_ref().map(|panel| panel.selected) else {
+            return;
+        };
+        let cookies = engine.cookies();
+        let Some(cookie) = cookies.get(selected) else { return };
+
+        let removed = engine.remove_cookie(cookie);
+        let left = engine.cookies().len();
+        if let Some(panel) = self.cookie_viewer.as_mut() {
+            panel.clamp(left);
+        }
+        if removed {
+            self.set_status(&format!("Forgot {} for {}", cookie.name, cookie.domain), cx);
+        }
+        cx.notify();
     }
 
     /// Whether the active request will store and replay cookies.
@@ -7030,6 +7116,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::setting_confirm))
             .on_action(cx.listener(Self::settings_dismiss))
             .on_action(cx.listener(Self::clear_cookies))
+            .on_action(cx.listener(Self::open_cookies))
+            .on_action(cx.listener(Self::cookies_dismiss))
+            .on_action(cx.listener(Self::cookies_next))
+            .on_action(cx.listener(Self::cookies_prev))
+            .on_action(cx.listener(Self::cookies_remove))
             .on_action(cx.listener(Self::picker_next))
             .on_action(cx.listener(Self::picker_prev))
             .on_action(cx.listener(Self::picker_confirm))
@@ -7230,6 +7321,10 @@ impl Render for Workspace {
             )
             .children(self.certs.as_ref().map(|panel| {
                 crate::cert_panel::render(panel, &cert_files, &theme, cx)
+            }))
+            .children(self.cookie_viewer.as_ref().map(|panel| {
+                let cookies = cx.engine().map(|engine| engine.cookies()).unwrap_or_default();
+                crate::cookie_panel::render(panel, &cookies, &theme, cx)
             }))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
@@ -8213,6 +8308,9 @@ fn status_bar(
                 ))
                 .children(cookies.then(|| {
                     div()
+                        .id("cookies-badge")
+                        .debug_selector(|| "cookies-badge".to_string())
+                        .group(crate::ui::ICON_GROUP)
                         .flex()
                         .flex_row()
                         .items_center()
@@ -8222,6 +8320,24 @@ fn status_bar(
                         .rounded_sm()
                         .bg(theme.bg_elevated)
                         .text_color(theme.accent)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme.bg_hover))
+                        .tooltip(|window, cx| {
+                            crate::ui::Tooltip::for_action(
+                                "Show stored cookies",
+                                &OpenCookies,
+                                window,
+                                cx,
+                            )
+                        })
+                        // **The badge that says cookies are on is where you ask which ones**, the
+                        // way the proxy and environment badges beside it open what they name.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            |_: &MouseDownEvent, window, cx| {
+                                window.dispatch_action(Box::new(OpenCookies), cx);
+                            },
+                        )
                         // `GLYPH_INLINE`, not `GLYPH`: beside a word the larger size is 25%
                         // taller than the text.
                         .child(crate::ui::glyph(

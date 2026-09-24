@@ -696,6 +696,66 @@ fn clearing_cookies_stops_them_being_replayed() {
     );
 }
 
+/// **A session survives a request with different settings.** Clients are cached per settings,
+/// and each used to carry a private jar — so a login at the defaults followed by a request with a
+/// timeout of its own went out without the cookie the login had just set. No browser behaves that
+/// way, and nothing on screen said why the second request was logged out.
+#[test]
+fn a_cookie_is_shared_by_requests_with_different_settings() {
+    let engine = Engine::new().expect("engine");
+    let (base, server) = serve_twice_setting_a_cookie();
+
+    let (_, first) = engine.send(spec_for(format!("{base}/login")));
+    drain(&first);
+
+    // A different timeout is a different `ClientKey`, and so a different client.
+    let mut other = spec_for(format!("{base}/me"));
+    other.settings.timeout = Some(Duration::from_secs(7));
+    let (_, second) = engine.send(other);
+    drain(&second);
+
+    let seen = server.join().expect("server thread");
+    assert!(
+        seen[1].to_lowercase().contains("cookie: session=abc123"),
+        "a request with its own timeout must still carry the session:\n{}",
+        seen[1]
+    );
+}
+
+/// **The jar can be read, and one cookie forgotten** — what the cookie viewer is built on, and
+/// what the private jar it replaced could not do at all.
+#[test]
+fn stored_cookies_are_listed_and_one_can_be_removed() {
+    let engine = Engine::new().expect("engine");
+    let (base, server) = serve_twice_setting_a_cookie();
+
+    assert!(engine.cookies().is_empty(), "nothing is stored before a response sets it");
+    let (_, first) = engine.send(spec_for(format!("{base}/login")));
+    drain(&first);
+
+    let stored = engine.cookies();
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let session = &stored[0];
+    assert_eq!((session.name.as_str(), session.value.as_str()), ("session", "abc123"));
+    assert_eq!(session.domain, "127.0.0.1");
+    assert_eq!(session.path, "/");
+    assert!(session.host_only, "set with no Domain attribute");
+    assert_eq!(session.expires, None, "no Max-Age or Expires: a session cookie");
+
+    assert!(engine.remove_cookie(session), "it was there to remove");
+    assert!(!engine.remove_cookie(session), "and is not there twice");
+    assert!(engine.cookies().is_empty());
+
+    let (_, second) = engine.send(spec_for(format!("{base}/me")));
+    drain(&second);
+    let seen = server.join().expect("server thread");
+    assert!(
+        !seen[1].to_lowercase().contains("cookie:"),
+        "a removed cookie must not be sent:\n{}",
+        seen[1]
+    );
+}
+
 #[test]
 fn a_multipart_body_goes_out_with_a_boundary_and_both_part_kinds() {
     // The framing is what could silently be wrong: a boundary that doesn't match the header,

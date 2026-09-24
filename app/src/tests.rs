@@ -5655,6 +5655,71 @@ async fn reflection_answers_the_tab_that_asked(cx: &mut TestAppContext) {
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// **The cookie viewer shows the jar, forgets one cookie, and clears the rest** — reached
+/// through the `cookies on` badge, which is the mouse path, and driven by the keys the footer
+/// advertises.
+///
+/// Asserted on the engine's jar rather than on the rows: the rows are drawn from it, and a
+/// panel that looked right while the jar was untouched is exactly the failure a viewer can have.
+#[gpui::test]
+async fn the_cookie_viewer_shows_the_jar_and_forgets_cookies(cx: &mut TestAppContext) {
+    use crate::engine::ActiveEngine as _;
+
+    let (window, view, mut cx) = boot(cx, None, None);
+    let url = serve_once(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Set-Cookie: session=abc123; Path=/\r\n\
+         Set-Cookie: theme=dark; Path=/; Max-Age=3600\r\n\
+         Content-Length: 2\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+    );
+    type_url(&mut cx, &url);
+    send_and_wait(&mut cx, &view, 200);
+
+    let names = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            cx.engine()
+                .expect("engine")
+                .cookies()
+                .into_iter()
+                .map(|cookie| cookie.name)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(names(&mut cx), vec!["session", "theme"], "sorted by name within a domain");
+
+    let badge = cx.debug_bounds("cookies-badge").expect("the cookies-on badge");
+    cx.simulate_click(badge.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.cookie_viewer_open())
+            .expect("window"),
+        "the badge must open the viewer"
+    );
+    assert!(cx.debug_bounds("cookie-row-1").is_some(), "both cookies are listed");
+
+    // `down` then `delete`: the second row, so this also proves the selection is what is removed.
+    cx.simulate_keystrokes("down delete");
+    cx.run_until_parked();
+    assert_eq!(names(&mut cx), vec!["session"], "delete forgets the selected cookie only");
+
+    cx.simulate_keystrokes("shift-delete");
+    cx.run_until_parked();
+    assert!(names(&mut cx).is_empty(), "shift-delete clears the jar");
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(
+        !window
+            .update(&mut cx, |workspace, _, _| workspace.cookie_viewer_open())
+            .expect("window")
+    );
+}
+
 #[gpui::test]
 async fn clicking_the_headers_tab_switches_the_response_view(cx: &mut TestAppContext) {
     // **This test could not discriminate until the third tab arrived, and now it can.** With

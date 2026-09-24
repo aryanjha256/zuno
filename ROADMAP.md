@@ -716,6 +716,16 @@ cursors stayed separate, because a match and where you are standing are differen
   *not* the same shape — one identity at a time because a handshake presents one certificate,
   but any number of trusted issuers at once because trust is additive. See architecture.md §6j.
 
+- **Cookie viewer — done, and it fixed the jar underneath it.** Click the `cookies on` badge, or
+  *Show stored cookies* in the palette: every live cookie, grouped by domain, with its path,
+  expiry and flags; `delete` forgets one, `shift-delete` clears the jar. It could not be built on
+  what was there — reqwest's `cookie_store(true)` keeps a private jar per client, so nothing could
+  list it, "clear" had to drop every cached client and its connection pool, and **clients are
+  cached per settings, so requests with different settings did not share cookies at all**: a login
+  at the defaults followed by a request with its own timeout was sent logged out. One engine-owned
+  jar (`engine::cookies`, through `cookie_provider`) is readable, clears in place, and is shared by
+  every request that stores cookies. Cookies still live only as long as Zuno runs.
+
 - **Tab context menu — done.** Right-click a tab for Close / Close others / Close to the right /
   Close all / Copy as curl. It also closed the last data-loss shape in `Ctrl+W`'s family: closing
   a batch now asks **once** about every unsaved buffer rather than per tab. See §12.
