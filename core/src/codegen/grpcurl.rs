@@ -121,15 +121,32 @@ mod tests {
         spec
     }
 
+    /// The platform's own spelling of a collection path, for the expected strings below.
+    ///
+    /// **Built with `join`, as the code under test builds it**, because the separator is the
+    /// platform's: `/work/api` joined with `protos` is `/work/api\protos` on Windows. Literal
+    /// `'/work/api/protos'` passed on Linux and macOS and failed the first Windows CI run.
+    fn shown(root: &str, parts: &[&str]) -> String {
+        parts
+            .iter()
+            .fold(Path::new(root).to_path_buf(), |path, part| path.join(part))
+            .display()
+            .to_string()
+    }
+
     #[test]
     fn a_call_names_its_schema_address_and_method() {
         let out = render(&spec("localhost:50051", "greeter.proto"), Some(Path::new("/work/api")))
             .expect("a gRPC call renders");
         assert_eq!(
             out,
-            "grpcurl \\\n  -plaintext \\\n  -import-path '/work/api/protos' \\\n  \
-             -proto 'greeter.proto' \\\n  -H 'authorization: Bearer {{token}}' \\\n  \
-             -d '{\"name\": \"zuno\"}' \\\n  'localhost:50051' \\\n  'helloworld.Greeter/SayHello'"
+            format!(
+                "grpcurl \\\n  -plaintext \\\n  -import-path '{}' \\\n  \
+                 -proto 'greeter.proto' \\\n  -H 'authorization: Bearer {{{{token}}}}' \\\n  \
+                 -d '{{\"name\": \"zuno\"}}' \\\n  'localhost:50051' \\\n  \
+                 'helloworld.Greeter/SayHello'",
+                shown("/work/api", &["protos"])
+            )
         );
     }
 
@@ -139,7 +156,8 @@ mod tests {
     fn a_descriptor_set_or_no_schema_is_said_the_way_grpcurl_reads_it() {
         let out = render(&spec("https://api.test", "api.test.desc"), Some(Path::new("/w")))
             .expect("renders");
-        assert!(out.contains("-protoset '/w/protos/api.test.desc'"), "{out}");
+        let protoset = format!("-protoset '{}'", shown("/w", &["protos", "api.test.desc"]));
+        assert!(out.contains(&protoset), "{out}");
         assert!(out.contains("'api.test:443'") && !out.contains("-plaintext"), "{out}");
 
         let out = render(&spec("https://api.test", ""), None).expect("renders");
