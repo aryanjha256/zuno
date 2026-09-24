@@ -2042,7 +2042,10 @@ async fn the_in_flight_hint_names_a_key_that_actually_cancels(cx: &mut TestAppCo
         "the pane has to be able to name a key at all"
     );
 
-    cx.simulate_keystrokes(&advertised);
+    // The binding the hint was drawn from, pressed in gpui's syntax: the hint itself is the
+    // platform's display form, `⎋` on macOS, which `simulate_keystrokes` cannot parse.
+    let keys = binding_syntax(&crate::actions::CancelRequest, &window, &mut cx);
+    cx.simulate_keystrokes(&keys);
     cx.run_until_parked();
 
     assert!(
@@ -2076,6 +2079,36 @@ fn advertised_actions() -> Vec<Box<dyn gpui::Action>> {
     ]
 }
 
+/// An action's first binding in gpui's own syntax — `ctrl-shift-h` — however the platform
+/// displays it.
+///
+/// **The display form is not the syntax.** `keybinding_hint` renders through `Display`, which on
+/// macOS is `^⇧h` and `⎋`: right on screen, and neither parseable by `simulate_keystrokes` nor
+/// comparable with a binding as the keymap writes it. Three tests used the one as the other and
+/// passed on Linux, where the two happen to coincide; the first macOS CI run failed all three.
+fn binding_syntax(
+    action: &dyn gpui::Action,
+    window: &gpui::WindowHandle<Workspace>,
+    cx: &mut VisualTestContext,
+) -> String {
+    window
+        .update(cx, |_, window, _| {
+            window
+                .bindings_for_action(action)
+                .first()
+                .map(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(|keystroke| keystroke.unparse())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .unwrap_or_default()
+        })
+        .expect("window")
+}
+
 #[gpui::test]
 async fn keybinding_label_matches_the_keymap(cx: &mut TestAppContext) {
     // Ten pieces of UI copy used to write their own keystroke as a literal — "Ctrl+Shift+H to
@@ -2091,14 +2124,14 @@ async fn keybinding_label_matches_the_keymap(cx: &mut TestAppContext) {
     let (window, _view, mut cx) = boot(cx, None, None);
 
     for action in advertised_actions() {
-        let (label, hint) = window
+        let label = window
             .update(&mut cx, |_, window, _| {
-                (
-                    crate::workspace::keybinding_label(action.as_ref(), window),
-                    crate::workspace::keybinding_hint(action.as_ref(), window),
-                )
+                crate::workspace::keybinding_label(action.as_ref(), window)
             })
             .expect("window");
+        // Against the binding's *syntax*, not `keybinding_hint`'s display form — see
+        // `binding_syntax`.
+        let hint = binding_syntax(action.as_ref(), &window, &mut cx);
 
         assert!(
             !label.is_empty(),
@@ -4365,7 +4398,15 @@ async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
         .iter()
         .find(|row| row.starts_with("Send request"))
         .expect("Send request should be listed");
-    assert!(send.contains("ctrl-enter"), "missing its keybinding: {send:?}");
+    // As the platform displays it — `ctrl-enter` on Linux, `^enter` on macOS — so the check is
+    // that the row carries the live binding, not one spelling of it.
+    let shown = window
+        .update(&mut cx, |_, window, _| {
+            crate::workspace::keybinding_hint(&crate::actions::SendRequest, window)
+        })
+        .expect("window");
+    assert!(!shown.is_empty(), "Send request must be bound");
+    assert!(send.contains(&shown), "missing its keybinding {shown:?}: {send:?}");
 
     // Text-editing actions are keystrokes, not commands, and must never appear.
     for row in &rows {
