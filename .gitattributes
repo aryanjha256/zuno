@@ -1,0 +1,4 @@
+# Keep shell scripts out of GitHub's language statistics. They are packaging and release tooling,
+# not the product — which is Rust. `linguist-detectable=false` only drops them from the language
+# bar; unlike `linguist-vendored` they stay highlighted, searchable and shown in diffs.
+*.sh linguist-detectable=false
