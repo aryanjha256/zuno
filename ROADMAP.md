@@ -602,6 +602,21 @@ cursors stayed separate, because a match and where you are standing are differen
 
   A test caught a real bug on the way, and not in the export: the "withheld a secret" notice
   scanned disabled rows too, so a fresh buffer announced a redaction for a header it never sent.
+
+  **Then copy as code — curl, fetch, Python, HTTPie, Go, Java, Ruby, C#, PHP, and grpcurl for a
+  gRPC call.** `Ctrl+Shift+X` opens a picker of the targets that can express the request, curl
+  first. Every target renders one wire description (`codegen::Wire`) built from the engine's own
+  functions rather than reading the spec, and that choice is what running the output found out:
+  **curl had been exporting two different requests from the one Zuno sent.** A JSON body with no
+  typed `Content-Type` went out with none, which curl sends as a form, because the engine
+  *derives* that header and the exporter never did; and a binary body was labelled a form the
+  same way, fixed with curl's own `-H 'Content-Type:'`. Both passed every exact-text test,
+  because the tests agreed with the exporter. `core/tests/codegen.rs` now runs each snippet with
+  its real toolchain against a local server and compares what arrived with what Zuno sent — 42
+  pairs, one known difference named and asserted (Ruby's `Net::HTTP` labels any typeless body a
+  form, and nothing public turns that off). The same run corrected curl *import*: `-H 'Name:'`
+  removes a header in curl, measured, and `Name;` is the empty value — the reverse of what a test
+  had pinned.
 - **Row selection and row-level copy — done.** `up`/`down` or a click place a cursor in the
   response body; `Ctrl+C` copies that row's value (a JSON string arrives *decoded*, a container
   arrives as its own source text) and `Alt+C` copies its JSONPath. This was the last item on the

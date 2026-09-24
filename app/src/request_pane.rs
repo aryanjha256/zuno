@@ -16,7 +16,7 @@ use gpui::{
 use crate::actions::{
     AddAssertion, AddCapture, AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext,
     ChooseProtoFile, OpenGrpcMethod, ReflectSchema,
-    BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl,
+    BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCode, ImportCurl,
     OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
     SendRequest, ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
 };
@@ -443,10 +443,10 @@ fn request_actions(theme: &Theme) -> Div {
             theme,
         ))
         .child(icon_button(
-            "action-copy-curl",
+            "action-copy-code",
             Icon::Terminal,
-            "Copy request as a curl command",
-            CopyAsCurl,
+            "Copy request as code",
+            CopyAsCode,
             theme,
         ))
         .child(icon_button(

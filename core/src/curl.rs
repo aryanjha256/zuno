@@ -23,10 +23,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::engine::build;
 use crate::request::{
-    Body, Header, HttpRequest, Method, MultipartField, MultipartValue, RawKind, RequestKind,
-    RequestSettings, RequestSpec,
+    Body, Header, Method, MultipartField, MultipartValue, RawKind, RequestSettings, RequestSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -347,13 +345,22 @@ fn parse_method(raw: &str) -> Method {
 
 /// `Name: value`. A header with no colon is not a header; `Name:` is a legitimate
 /// empty value.
+/// curl's three header forms, as curl reads them.
+///
+/// `Name: value` sends it. **`Name:` with nothing after the colon *removes* a header curl would
+/// add itself** — it was read here as "send it empty", so re-importing one of the exporter's own
+/// commands would have sent an empty `Content-Type` where curl sends none. And `Name;` is curl's
+/// spelling for an empty value, which used to be dropped for having no colon.
 fn parse_header(raw: &str) -> Option<Header> {
-    let (name, value) = raw.split_once(':')?;
-    let name = name.trim();
-    if name.is_empty() {
-        return None;
+    if let Some((name, value)) = raw.split_once(':') {
+        let name = name.trim();
+        if name.is_empty() || value.trim().is_empty() {
+            return None;
+        }
+        return Some(Header::new(name, value.trim()));
     }
-    Some(Header::new(name, value.trim()))
+    let name = raw.trim().strip_suffix(';')?.trim();
+    (!name.is_empty() && !name.contains(char::is_whitespace)).then(|| Header::new(name, ""))
 }
 
 /// `name=value`, or `name=@path` / `name=<path` for a file part.
@@ -512,228 +519,24 @@ fn tokenize(input: &str) -> Result<Vec<String>, CurlError> {
     Ok(tokens)
 }
 
-/// Standard base64. Written out rather than pulling a dependency for ~15 lines, and shared with
-/// `postman.rs`, which lowers Postman's basic auth into the same header this parses.
 // ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
 
 /// Render a request as a runnable `curl` command.
 ///
-/// The inverse of `parse`, and the answer to "here's the repro" — import existed from M1.5 while
-/// export didn't, which made the pair asymmetric in the direction that matters least.
-///
-/// **The spec is expected to be pre-resolved by the caller**, and the caller is expected to use
-/// `Resolver::without_secrets` — so `{{baseUrl}}` becomes your dev host while `{{token}}` stays a
-/// placeholder. That split is not this function's business, but it is why this function never
-/// touches variables itself: a redaction pass here would be a second set of substitution rules to
-/// keep in step with `Resolver::apply`.
-///
-/// Multi-line with `\` continuations, one flag per line, which is what devtools emits and what
-/// reads as a repro in an issue.
+/// The inverse of `parse`. The rendering lives in `codegen` beside every other target, all of
+/// them drawn from one wire description; it is reachable under this name because this module's
+/// round-trip tests are what hold the two directions together. The spec is expected to be
+/// pre-resolved through `Resolver::without_secrets` — see `codegen`.
 pub fn to_command(spec: &RequestSpec) -> String {
-    let mut parts: Vec<String> = vec![format!("curl {}", quote(&url_text(spec)))];
-
-    // curl infers POST from a body, so `-X` is redundant for a plain POST — but emitting it
-    // always is what makes the round trip exact, and it is how devtools writes it. The one case
-    // it is load-bearing rather than decorative is a GET *with* a body, where omitting it would
-    // silently turn the request into a POST.
-    if spec.method() != Some(&Method::Get) || has_body(spec) {
-        if let Some(method) = spec.method() {
-            parts.push(format!("-X {}", method.as_str()));
-        }
-    }
-
-    for header in spec.enabled_headers() {
-        if header.name.trim().is_empty() {
-            continue;
-        }
-        parts.push(format!(
-            "-H {}",
-            quote(&format!("{}: {}", header.name.trim(), header.value))
-        ));
-    }
-
-    // Only flags that are **wire-observable and differ from curl's own default**, which is the
-    // same line `parse` draws in the other direction (architecture.md §10, M1.5).
-    //
-    // Deliberately absent, each for a recorded reason:
-    // - `--max-redirs`: `parse` already decided this isn't worth faithfulness, and emitting a flag
-    //   the importer doesn't read would make every exported command report an ignored flag on the
-    //   way back in.
-    // - the cookie jar: `cookie_store` is an in-process jar shared per client config. curl's `-b`
-    //   and `-c` are *files*. There is no flag that means "the jar this app happens to hold", and
-    //   inventing one would export a request that behaves differently.
-    if spec.settings.follow_redirects {
-        parts.push("-L".to_string());
-    }
-    if spec.settings.accept_encodings {
-        parts.push("--compressed".to_string());
-    }
-    if !spec.settings.verify_tls {
-        parts.push("-k".to_string());
-    }
-    // Emitted only when it is not Zuno's default. curl has no timeout at all, so a faithful export
-    // would carry `--max-time 30` on every command for a local guard nobody set — noise. A value
-    // someone *chose* is information, and `parse` reads it back.
-    if let Some(timeout) = spec.settings.timeout {
-        if timeout != RequestSettings::default().timeout.unwrap_or(timeout) {
-            parts.push(format!("--max-time {}", timeout.as_secs()));
-        }
-    }
-
-    parts.extend(body_flags(spec));
-    parts.join(" \\\n  ")
+    crate::codegen::Target::Curl
+        .render(spec, None)
+        .unwrap_or_default()
 }
 
-/// The URL as it will appear on the wire, query rows included.
-///
-/// Goes through `build::resolve_url` rather than concatenating, so the exported URL is the one the
-/// engine would actually request — percent-encoding and all — from one implementation instead of a
-/// second that can drift.
-///
-/// It fails for a request that can't be sent, and that is a **normal** outcome here rather than an
-/// error: withholding a secret leaves `{{token}}` in the URL, which `resolve_url` rejects by
-/// design. The fallback appends the rows unencoded, which is the best that can be said about a
-/// command the recipient has to finish editing anyway.
-fn url_text(spec: &RequestSpec) -> String {
-    // A GET GraphQL request carries its envelope in the query string, so the exported URL has
-    // to be built the same way the sent one is — see `build::graphql_url`.
-    if let RequestKind::GraphQl(graphql) = &spec.kind
-        && let Ok(url) = build::graphql_url(spec, graphql)
-    {
-        return url.to_string();
-    }
-
-    if let Ok(url) = build::resolve_url(spec) {
-        return url.to_string();
-    }
-
-    let mut text = spec.url.trim().to_string();
-    let pairs: Vec<String> = spec
-        .http()
-        .into_iter()
-        .flat_map(HttpRequest::enabled_query)
-        .filter(|param| !param.name.trim().is_empty())
-        .map(|param| format!("{}={}", param.name.trim(), param.value))
-        .collect();
-
-    if !pairs.is_empty() {
-        text.push(if text.contains('?') { '&' } else { '?' });
-        text.push_str(&pairs.join("&"));
-    }
-    text
-}
-
-/// Whether anything would actually be sent as a body.
-///
-/// Matches `build_body`'s rules, including the ones that produce nothing: whitespace-only raw text,
-/// a form or multipart body whose every field is disabled or unnamed. Getting this wrong would put
-/// a bare `-X GET` on a command that needs none.
-fn has_body(spec: &RequestSpec) -> bool {
-    let http = match &spec.kind {
-        RequestKind::Http(http) => http,
-        // curl can speak ws:// since 7.86, but a socket's payload is not a body — it is a
-        // conversation that starts after the handshake, and there is no flag for that.
-        RequestKind::WebSocket(_) => return false,
-        // curl cannot make a gRPC call at all: it would need HTTP/2 framing around a protobuf
-        // message it has no schema to encode. There is no body because there is no command.
-        RequestKind::Grpc(_) => return false,
-        // A GraphQL request carries its envelope as a body unless it is a GET, where it goes
-        // in the query string instead — the same split `build_graphql` makes.
-        RequestKind::GraphQl(graphql) => {
-            return !graphql.query.trim().is_empty()
-                && !matches!(graphql.method, Method::Get | Method::Head);
-        }
-    };
-    match &http.body {
-        Body::Empty => false,
-        Body::Raw { text, .. } => !text.trim().is_empty(),
-        Body::Form(fields) => !build::encode_form(fields).is_empty(),
-        Body::Binary(_) => true,
-        Body::Multipart(fields) => fields
-            .iter()
-            .any(|field| field.enabled && !field.name.trim().is_empty()),
-    }
-}
-
-/// The body flags. Exhaustive with no catch-all, for the reason `Resolver::apply` is: a new `Body`
-/// variant must fail the build until someone decides how curl expresses it.
-fn body_flags(spec: &RequestSpec) -> Vec<String> {
-    let http = match &spec.kind {
-        RequestKind::Http(http) => http,
-        // See `has_body`: nothing a socket sends is a body.
-        RequestKind::WebSocket(_) => return Vec::new(),
-        // See `has_body`: curl has no way to make this call, so it has no flags for it.
-        RequestKind::Grpc(_) => return Vec::new(),
-        // Exported as the envelope that actually goes on the wire, not as the two editors it
-        // was authored in — a copied command has to be runnable, and `query`/`variables` mean
-        // nothing to curl. Built by `graphql_envelope`, so the exported bytes and the sent
-        // bytes cannot drift; a query that will not build exports no body rather than a
-        // half-formed one.
-        RequestKind::GraphQl(graphql) => {
-            if matches!(graphql.method, Method::Get | Method::Head) {
-                return Vec::new();
-            }
-            return match build::graphql_envelope(graphql) {
-                Ok(envelope) => vec![format!("--data-raw {}", quote(&envelope.to_string()))],
-                Err(_) => Vec::new(),
-            };
-        }
-    };
-    match &http.body {
-        Body::Empty => Vec::new(),
-
-        Body::Raw { text, .. } => {
-            if text.trim().is_empty() {
-                return Vec::new();
-            }
-            // `--data-raw`, never `-d`: `-d` strips newlines and treats a leading `@` as a
-            // filename, so a JSON body starting with `@` or spanning lines would be mangled.
-            vec![format!("--data-raw {}", quote(text))]
-        }
-
-        // One `--data-raw` carrying the already-encoded form, rather than a `--data-urlencode` per
-        // field. Byte-exact with what Zuno sends, via the same `encode_form`; letting curl do the
-        // encoding would differ for a field whose *name* needs escaping.
-        Body::Form(fields) => {
-            let encoded = build::encode_form(fields);
-            if encoded.is_empty() {
-                return Vec::new();
-            }
-            vec![format!("--data-raw {}", quote(&encoded))]
-        }
-
-        Body::Multipart(fields) => fields
-            .iter()
-            .filter(|field| field.enabled && !field.name.trim().is_empty())
-            .map(|field| {
-                let name = field.name.trim();
-                match &field.value {
-                    MultipartValue::Text(text) => format!("-F {}", quote(&format!("{name}={text}"))),
-                    // `@` is curl's own file syntax, and it derives the filename from the path
-                    // exactly as `build_body` does — so the part arrives with the same name.
-                    MultipartValue::File(path) => {
-                        format!("-F {}", quote(&format!("{name}=@{}", path.display())))
-                    }
-                }
-            })
-            .collect(),
-
-        // `--data-binary`, because `-d`/`--data` would strip newlines out of a binary file.
-        Body::Binary(path) => vec![format!("--data-binary {}", quote(&format!("@{}", path.display())))],
-    }
-}
-
-/// Wrap in single quotes for a POSIX shell.
-///
-/// Single quotes make every other metacharacter literal, so the only thing needing care is a single
-/// quote itself: close, emit an escaped one, reopen. Getting this wrong is a shell-injection bug in
-/// a string the user is about to paste into a terminal, which is why it is one function with its
-/// own tests rather than an inline `format!`.
-fn quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
-}
+/// Standard base64. Written out rather than pulling a dependency for ~15 lines, and shared with
+/// `postman.rs`, which lowers Postman's basic auth into the same header this parses.
 
 pub(crate) fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -767,7 +570,7 @@ pub(crate) fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::request::{FormField, GraphQlRequest, QueryParam};
+    use crate::request::{FormField, GraphQlRequest, QueryParam, RequestKind};
 
     fn import(input: &str) -> CurlImport {
         parse(input).expect("should parse")
@@ -1059,8 +862,14 @@ mod tests {
 
     #[test]
     fn an_empty_header_value_is_legitimate() {
-        let spec = import("curl https://x.test/a -H 'X-Empty:'").spec;
+        // **Spelt `Name;` in curl, and `Name:` means something else.** Measured against curl
+        // 8.18: `-H 'X-Semi;'` sends `X-Semi:` with an empty value, while `-H 'X-Colon:'` sends
+        // nothing at all — it removes a header, which is how `-H 'User-Agent:'` drops curl's own.
+        // This test used to assert the colon form imported as an empty header, which gave the
+        // request a header the command it came from never sent.
+        let spec = import("curl https://x.test/a -H 'X-Empty;' -H 'X-Gone:'").spec;
         assert_eq!(header_of(&spec, "x-empty"), Some(""));
+        assert_eq!(header_of(&spec, "x-gone"), None, "a removal is not a header");
     }
 
     #[test]
@@ -1269,6 +1078,28 @@ mod tests {
             to_command(&spec).contains(&format!("--data-raw '{wire}'")),
             "the exported form body must be byte-identical to what is sent"
         );
+    }
+
+    /// **A JSON body with no `Content-Type` typed still exports one.** The engine derives it, so
+    /// Zuno sends `application/json`; curl, given `--data-raw` and no header, sends
+    /// `application/x-www-form-urlencoded`. The command looked right and was a different request
+    /// — the exporter read the spec directly and never learnt about the derivation.
+    #[test]
+    fn a_body_exports_the_content_type_the_engine_derives() {
+        let mut spec = plain("https://x.test/items");
+        spec.http_mut().unwrap().method = Method::Post;
+        spec.http_mut().unwrap().body = Body::Raw {
+            text: r#"{"a":1}"#.to_string(),
+            kind: RawKind::Json,
+        };
+
+        let command = to_command(&spec);
+        assert!(
+            command.contains("-H 'Content-Type: application/json'"),
+            "curl would send this JSON as a form: {command}"
+        );
+        let back = parse(&command).expect("re-import");
+        assert_eq!(header_of(&back.spec, "Content-Type"), Some("application/json"));
     }
 
     #[test]

@@ -233,7 +233,7 @@ actions!(
         MenuDismiss,
         CopyResponse,
         SaveResponse,
-        CopyAsCurl,
+        CopyAsCode,
         // Header name suggestions
         SuggestNext,
         SuggestPrev,

@@ -20,8 +20,7 @@ use gpui::{
     div, point, px,
 };
 use zuno_core::{
-    Environment, ProxyMode, RawKind, RequestId, RequestSpec, Resolver, collection, curl,
-    environment,
+    Environment, ProxyMode, RawKind, RequestId, RequestSpec, Resolver, collection, environment,
 };
 use zuno_core::collection::{Node, NodeKind};
 
@@ -44,7 +43,7 @@ use crate::actions::{
     ExportCollection, OpenBodyType, PrevRequestTab, OpenMethod, OpenRequestKind, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss,
     OpenAppMenu, PickerNext, PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest,
     SettingConfirm, SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss,
-    BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, FindInBody,
+    BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCode, FindInBody,
     FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
@@ -1189,7 +1188,7 @@ impl Workspace {
             items.into_iter().map(Into::into).collect();
         rows.push(context_menu::MenuRow::Separator);
         rows.push(
-            context_menu::MenuItem::new("Copy as curl", CopyAsCurl, &focus, window).into(),
+            context_menu::MenuItem::new("Copy as code…", CopyAsCode, &focus, window).into(),
         );
 
         self.show_menu(rows, at, Some(focus), window, cx);
@@ -3767,6 +3766,7 @@ impl Workspace {
             picker::Target::RequestKindConfirmed(choice) => {
                 self.switch_request_kind(choice, true, window, cx);
             }
+            picker::Target::CopyAs(target) => self.copy_as(target, cx),
             picker::Target::GrpcMethod(method) => {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| {
@@ -6304,33 +6304,73 @@ impl Workspace {
         }));
     }
 
-    /// Copy the active request to the clipboard as a runnable curl command.
+    /// Offer the languages this request can be copied as.
+    ///
+    /// **Only the ones that can express it** — `codegen::Target::offered_for` — so a gRPC call is
+    /// offered grpcurl and nothing that would send it as a plain POST, and a WebSocket is offered
+    /// nothing at all rather than its handshake as a GET. curl leads, so what `Ctrl+Shift+X` used
+    /// to do directly is now one `enter` away.
+    fn copy_as_code(&mut self, _: &CopyAsCode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+
+        let offered = zuno_core::codegen::Target::offered_for(&view.read(cx).kind.to_spec(cx));
+        if offered.is_empty() {
+            self.set_status(
+                "A WebSocket has no code to copy — it is a conversation, not a request",
+                cx,
+            );
+            return;
+        }
+
+        let items = offered
+            .into_iter()
+            .map(|target| picker::Item {
+                label: SharedString::from(target.label()),
+                detail: SharedString::from(target.hint()),
+                target: picker::Target::CopyAs(target),
+            })
+            .collect();
+        self.show_picker(items, "Nothing to copy as", window, cx);
+    }
+
+    /// Copy the active request to the clipboard as `target`.
     ///
     /// **Variables are resolved, except the secret ones.** `Resolver::without_secrets` substitutes
-    /// `dev.json` values and leaves `dev.local.json` ones as `{{token}}`, so the command runs
+    /// `dev.json` values and leaves `dev.local.json` ones as `{{token}}`, so the snippet runs
     /// against your dev box while a credential never reaches the clipboard — and therefore never
-    /// reaches the issue or the chat message the command is being pasted into. That split is the
-    /// same one invariant 10 protects in the collection files; the point of it being a *file*
-    /// distinction rather than a per-variable flag is that this gets it right for free.
+    /// reaches the issue or the chat message it is being pasted into. That split is the same one
+    /// invariant 10 protects in the collection files; the point of it being a *file* distinction
+    /// rather than a per-variable flag is that this gets it right for free.
     ///
-    /// Nothing here can fail: a request too incomplete to send still exports, because "here's what
-    /// I have" is exactly when you reach for this. `to_command` falls back to the raw URL when the
-    /// engine's URL resolution refuses it.
-    fn copy_as_curl(&mut self, _: &CopyAsCurl, _: &mut Window, cx: &mut Context<Self>) {
+    /// A request too incomplete to send still exports, because "here's what I have" is exactly
+    /// when you reach for this — the URL falls back to the text as typed. The one thing that
+    /// cannot be exported is a gRPC call with no method, which has no command to write.
+    fn copy_as(&mut self, target: zuno_core::codegen::Target, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
 
         let spec = view.read(cx).spec(cx);
         let resolver = self.resolver(cx).without_secrets();
-        let command = curl::to_command(&resolver.apply(&spec));
+        let collection = crate::collections::root(cx).map(Path::to_path_buf);
+        let Some(code) = target.render(&resolver.apply(&spec), collection.as_deref()) else {
+            self.set_status(
+                &format!("Nothing to copy as {} yet — choose a method first", target.label()),
+                cx,
+            );
+            return;
+        };
 
         let withheld = resolver.withheld_in(&spec);
-        cx.write_to_clipboard(ClipboardItem::new_string(command));
+        cx.write_to_clipboard(ClipboardItem::new_string(code));
 
-        // Say when a placeholder was left in, or the command looks broken rather than careful.
+        // Say when a placeholder was left in, or the snippet looks broken rather than careful.
+        let label = target.label();
         let message = match withheld.as_slice() {
-            [] => "Copied as a curl command".to_string(),
-            [one] => format!("Copied as curl — {{{{{one}}}}} left for you to fill in"),
-            many => format!("Copied as curl — {} secrets left as placeholders", many.len()),
+            [] => format!("Copied as {label}"),
+            [one] => format!("Copied as {label} — {{{{{one}}}}} left for you to fill in"),
+            many => format!("Copied as {label} — {} secrets left as placeholders", many.len()),
         };
         self.set_status(&message, cx);
     }
@@ -7068,7 +7108,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::copy_row_path))
             .on_action(cx.listener(Self::copy_response))
             .on_action(cx.listener(Self::save_response))
-            .on_action(cx.listener(Self::copy_as_curl))
+            .on_action(cx.listener(Self::copy_as_code))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))

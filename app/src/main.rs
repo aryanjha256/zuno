@@ -56,7 +56,7 @@ use crate::actions::{
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
-    BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCurl, CopyRowPath, CopyRowValue,
+    BodyFindNext, BodyFindPrev, CloseBodyFind, CloseFind, CopyAsCode, CopyRowPath, CopyRowValue,
     FindInBody, FindInResponse, FindNext, FindPrev, ReplaceAll, ReplaceNext,
     MenuConfirm, MenuDismiss, MenuNext, MenuPrev, ResponseRowNext, ResponseRowPrev, ScrollLeft,
     ScrollRight, ScrollStart, ToggleFold,
@@ -309,8 +309,9 @@ fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-shift-c", CopyResponse, None),
         KeyBinding::new("ctrl-shift-s", SaveResponse, None),
         // Export, mirroring `ctrl-shift-v`'s import. `ctrl-shift-c` is already the response body,
-        // so the request-as-curl gets its own key rather than overloading one.
-        KeyBinding::new("ctrl-shift-x", CopyAsCurl, None),
+        // so the request gets its own key rather than overloading one. It opens the language
+        // picker, curl first, so the old muscle memory is one `enter` longer.
+        KeyBinding::new("ctrl-shift-x", CopyAsCode, None),
         // --- Request lifecycle ---
         KeyBinding::new("ctrl-s", SaveRequest, None),
         KeyBinding::new("ctrl-enter", SendRequest, None),

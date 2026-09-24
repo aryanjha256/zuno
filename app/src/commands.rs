@@ -144,7 +144,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         // The response viewer.
         command("Copy response body", CopyResponse),
         command("Save response body to a file", SaveResponse),
-        command("Copy request as a curl command", CopyAsCurl),
+        command("Copy request as code — curl, fetch, Python…", CopyAsCode),
         // Offered whether or not an update is pending: it is also how someone shares the
         // install command with a colleague, and it is the one always-available path to the
         // feature — the chip itself is conditional, because a badge that is always there

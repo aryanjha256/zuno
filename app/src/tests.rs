@@ -6315,7 +6315,7 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("action-history", "zuno::ShowHistory"),
         ("action-save-request", "zuno::SaveRequest"),
         ("action-import-curl", "zuno::ImportCurl"),
-        ("action-copy-curl", "zuno::CopyAsCurl"),
+        ("action-copy-code", "zuno::CopyAsCode"),
         ("action-settings", "zuno::OpenSettings"),
         ("action-new-tab", "zuno::NewTab"),
         ("collection-new-request", "zuno::NewRequest"),
@@ -6413,13 +6413,15 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
         "the find icon must open the find bar"
     );
 
-    // Copy as curl: fills the clipboard.
-    let curl = cx.debug_bounds("action-copy-curl").expect("curl button");
-    cx.simulate_click(curl.center(), gpui::Modifiers::default());
+    // Copy as code: opens the language picker, and its first row is curl.
+    let copy = cx.debug_bounds("action-copy-code").expect("copy-as-code button");
+    cx.simulate_click(copy.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert!(
         clipboard_text(&mut cx).unwrap_or_default().starts_with("curl "),
-        "the terminal icon must copy a curl command"
+        "the terminal icon must offer curl first, and copy it"
     );
 
     // Fold all: was calling the view directly instead of dispatching, so this is the regression
@@ -6534,7 +6536,8 @@ async fn ctrl_shift_x_copies_the_request_as_curl(cx: &mut TestAppContext) {
 
     cx.simulate_keystrokes("ctrl-l ctrl-a");
     cx.simulate_input("https://api.example.com/things");
-    cx.simulate_keystrokes("ctrl-shift-x");
+    // The picker opens on curl, so `enter` is what copying as curl now is.
+    cx.simulate_keystrokes("ctrl-shift-x enter");
     cx.run_until_parked();
 
     let command = clipboard_text(&mut cx).unwrap_or_default();
@@ -6565,7 +6568,8 @@ async fn copy_as_curl_resolves_variables_but_withholds_secrets(cx: &mut TestAppC
     cx.simulate_keystrokes("tab");
     cx.simulate_input("Bearer {{token}}");
 
-    cx.simulate_keystrokes("ctrl-shift-x");
+    // The picker opens on curl, so `enter` is what copying as curl now is.
+    cx.simulate_keystrokes("ctrl-shift-x enter");
     cx.run_until_parked();
     let command = clipboard_text(&mut cx).unwrap_or_default();
 
@@ -6604,7 +6608,8 @@ async fn copy_as_curl_says_when_it_withheld_something(cx: &mut TestAppContext) {
     // No secret referenced yet: the status must not claim one was held back.
     cx.simulate_keystrokes("ctrl-l ctrl-a");
     cx.simulate_input("https://{{host}}/a");
-    cx.simulate_keystrokes("ctrl-shift-x");
+    // The picker opens on curl, so `enter` is what copying as curl now is.
+    cx.simulate_keystrokes("ctrl-shift-x enter");
     cx.run_until_parked();
     let quiet = buffer_status(&active_view(&window, &mut cx), &mut cx);
     assert!(
@@ -6617,7 +6622,8 @@ async fn copy_as_curl_says_when_it_withheld_something(cx: &mut TestAppContext) {
     cx.simulate_input("Authorization");
     cx.simulate_keystrokes("tab");
     cx.simulate_input("Bearer {{token}}");
-    cx.simulate_keystrokes("ctrl-shift-x");
+    // The picker opens on curl, so `enter` is what copying as curl now is.
+    cx.simulate_keystrokes("ctrl-shift-x enter");
     cx.run_until_parked();
 
     let told = buffer_status(&active_view(&window, &mut cx), &mut cx);
@@ -6644,7 +6650,8 @@ async fn copy_as_curl_exports_the_request_on_screen_including_its_body(cx: &mut 
     clear_body(&mut cx);
     cx.simulate_input("{\"name\":\"ada\"}");
 
-    cx.simulate_keystrokes("ctrl-shift-x");
+    // The picker opens on curl, so `enter` is what copying as curl now is.
+    cx.simulate_keystrokes("ctrl-shift-x enter");
     cx.run_until_parked();
 
     let command = clipboard_text(&mut cx).unwrap_or_default();
@@ -6653,6 +6660,67 @@ async fn copy_as_curl_exports_the_request_on_screen_including_its_body(cx: &mut 
         command.contains(r#"--data-raw '{"name":"ada"}'"#),
         "the body as typed must be in the command: {command}"
     );
+}
+
+/// **Each kind is offered what can express it, and the row chosen is the language copied.**
+///
+/// The picker is the whole mouse and keyboard path to nine languages, so a row wired to the
+/// wrong target would be a control that copies something other than what it says. Asserted
+/// through a row other than curl, since curl is also where a miswired picker would land by
+/// default.
+#[gpui::test]
+async fn copy_as_code_offers_what_each_kind_can_express(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+    type_url(&mut cx, "https://x.test/things");
+
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+    let rows = picker_rows(&window, &mut cx);
+    assert!(rows.first().is_some_and(|row| row.starts_with("curl")), "curl leads: {rows:?}");
+    assert!(!rows.iter().any(|row| row.contains("grpcurl")), "{rows:?}");
+    cx.simulate_input("python");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let copied = clipboard_text(&mut cx).unwrap_or_default();
+    assert!(copied.starts_with("import requests"), "the chosen row is what is copied: {copied}");
+
+    // gRPC: grpcurl alone — nothing that would send the call as a plain POST.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+            if let Some(grpc) = view.kind.as_grpc_mut() {
+                grpc.service = "helloworld.Greeter".into();
+                grpc.method = "SayHello".into();
+            }
+        })
+    });
+    type_url(&mut cx, "localhost:50051");
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+    let rows = picker_rows(&window, &mut cx);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].starts_with("grpcurl"), "{rows:?}");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    let copied = clipboard_text(&mut cx).unwrap_or_default();
+    assert!(
+        copied.starts_with("grpcurl") && copied.contains("helloworld.Greeter/SayHello"),
+        "{copied}"
+    );
+
+    // WebSocket: nothing, and it says why rather than opening an empty picker.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.run_until_parked();
+    assert!(!picker_is_open(&window, &mut cx), "no picker with nothing in it");
+    let status = buffer_status(&view, &mut cx);
+    assert!(status.contains("WebSocket"), "{status:?}");
 }
 
 #[gpui::test]
@@ -6669,7 +6737,8 @@ async fn a_copied_command_imports_back_into_an_equivalent_request(cx: &mut TestA
     cx.simulate_keystrokes("tab");
     cx.simulate_input("abc123");
 
-    cx.simulate_keystrokes("ctrl-shift-x");
+    // The picker opens on curl, so `enter` is what copying as curl now is.
+    cx.simulate_keystrokes("ctrl-shift-x enter");
     cx.run_until_parked();
 
     // Ctrl+Shift+V imports from the clipboard into a *new* buffer, so the original is untouched.

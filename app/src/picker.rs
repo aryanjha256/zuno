@@ -103,6 +103,8 @@ pub enum Target {
     GraphQlTransport(zuno_core::GraphQlTransport),
     /// Which method a gRPC call makes.
     GrpcMethod(zuno_core::grpc::Method),
+    /// Copy the active request as code in this language.
+    CopyAs(zuno_core::codegen::Target),
     /// Change what kind of request this is — HTTP, GraphQL, and later gRPC or MQTT.
     RequestKind(crate::kinds::KindChoice),
     /// The same, past the "this discards your body" prompt. A separate variant rather than a
@@ -153,6 +155,7 @@ impl Clone for Target {
             Self::Method(method) => Self::Method(method.clone()),
             Self::GraphQlTransport(transport) => Self::GraphQlTransport(*transport),
             Self::GrpcMethod(method) => Self::GrpcMethod(method.clone()),
+            Self::CopyAs(target) => Self::CopyAs(*target),
             Self::RequestKind(choice) => Self::RequestKind(*choice),
             Self::RequestKindConfirmed(choice) => Self::RequestKindConfirmed(*choice),
             Self::Dismiss => Self::Dismiss,
