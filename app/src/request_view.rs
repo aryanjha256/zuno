@@ -1890,9 +1890,16 @@ impl RequestView {
         // only offers it while the *client* half is streaming — a server-streaming call sends
         // one request and then listens, so a live composer there would be a control the
         // protocol has no way to deliver.
-        let composer = match (self.kind.as_websocket(), self.kind.as_grpc()) {
-            (Some(socket), _) => socket.compose.clone(),
-            (_, Some(grpc)) if grpc.sends_more() => grpc.message.clone(),
+        //
+        // **Only a socket's composer is cleared after sending, because only it is a draft.** A
+        // WebSocket's `compose` is never saved — `to_spec` leaves it out on purpose — so emptying
+        // it is what makes it a composer. A gRPC call's message editor *is* the request's saved
+        // message: clearing it after each streaming send quietly emptied the request, and
+        // `Ctrl+S` then wrote the emptiness to disk. It keeps its text, as the initial Send
+        // always has, and as Postman and Bruno do; sending again sends it again.
+        let (composer, clears) = match (self.kind.as_websocket(), self.kind.as_grpc()) {
+            (Some(socket), _) => (socket.compose.clone(), true),
+            (_, Some(grpc)) if grpc.sends_more() => (grpc.message.clone(), false),
             _ => return,
         };
         let text = composer.read(cx).text().to_string();
@@ -1934,10 +1941,12 @@ impl RequestView {
         // undelivered frame is named in the transcript.
         self.pending_send = Some(resolved);
 
-        composer.update(cx, |editor, cx| {
-            let end = editor.text().len();
-            editor.replace_range(0..end, "", window, cx);
-        });
+        if clears {
+            composer.update(cx, |editor, cx| {
+                let end = editor.text().len();
+                editor.replace_range(0..end, "", window, cx);
+            });
+        }
         cx.notify();
     }
 

@@ -14227,10 +14227,8 @@ async fn a_client_streaming_call_sends_repeatedly_and_closes(cx: &mut TestAppCon
             window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
         })
     });
-    // **Select all first.** The initial Send does *not* clear the composer — only `send_frame`
-    // does — so typing straight into it appends to what is still there and produces invalid
-    // JSON. That is a property of the app worth encoding in the test rather than working
-    // around silently.
+    // **Select all first.** A gRPC message editor is never cleared by sending — it is the
+    // request's saved message, not a draft — so typing straight into it would append.
     cx.simulate_keystrokes("ctrl-a");
     cx.simulate_input(r#"{"name":"second"}"#);
     cx.simulate_keystrokes("ctrl-enter");
@@ -14256,6 +14254,22 @@ async fn a_client_streaming_call_sends_repeatedly_and_closes(cx: &mut TestAppCon
         })
     });
     assert_eq!(sent, 2, "each message sent has to appear in the transcript");
+
+    // **Sending must not empty the request.** The message editor is the saved message, and it
+    // used to be cleared after every streaming send — so `Ctrl+S` then wrote an empty message
+    // to disk. Asserted on the spec, which is what a save writes, rather than on the editor.
+    let saved = cx.update(|_, cx| {
+        view.read(cx)
+            .spec(cx)
+            .grpc()
+            .expect("a gRPC request")
+            .message
+            .clone()
+    });
+    assert_eq!(
+        saved, r#"{"name":"second"}"#,
+        "a sent message stays the request's message"
+    );
 
     // **Disconnect is what finishes a client-streaming call** — it half-closes the request, and
     // only then does the server answer.
