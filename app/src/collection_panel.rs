@@ -533,13 +533,14 @@ pub(crate) fn method_label(method: &Method) -> String {
 
 /// The first column of a request row: its verb, or its kind.
 ///
-/// **HTTP keeps its per-verb colour; every other kind gets one neutral colour.** The verb
-/// palette means something — red for DELETE — and mapping `GQL`, `WS` and `gRPC` onto it would
-/// invent a meaning the tag does not have.
+/// **HTTP keeps its per-verb colour; every other kind gets a colour of its own.** Not one
+/// borrowed from the verb palette, which means something — red for DELETE — and would invent a
+/// meaning the tag does not have. Grey, which the kinds used to share, made a column of them
+/// read as disabled rows.
 fn badge_cell(badge: &Badge, theme: &Theme) -> Div {
     let (text, color) = match badge {
         Badge::Method(method) => (method_label(method), theme.method_color(method)),
-        Badge::Kind(tag) => ((*tag).to_string(), theme.text_muted),
+        Badge::Kind(kind) => (kind.label().to_string(), theme.kind_color(*kind)),
     };
     div()
         .flex_none()

@@ -5559,6 +5559,54 @@ async fn trailers_are_reachable_only_where_they_are_drawn(cx: &mut TestAppContex
     assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
 }
 
+/// **The Method tab's two controls are real mouse paths.** The method select is a box whose
+/// whole area opens the picker, so it is clicked at its far edge — where the shape and the
+/// chevron sit — as well as its centre: a hitbox that stopped at the text would pass a centre
+/// click alone. Each click is read through the status it leaves: with no schema the picker
+/// reports it cannot read the file, and with no collection reflection says where it would save.
+#[gpui::test]
+async fn the_grpc_method_tab_controls_dispatch(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    cx.run_until_parked();
+
+    let status = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).status.as_ref().map(|s| s.to_string()))
+            .unwrap_or_default()
+    };
+    let clear = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.update(cx, |view, _| view.status = None))
+    };
+
+    let select = cx.debug_bounds("grpc-choose-method").expect("the method select");
+    let edge = gpui::point(select.right() - gpui::px(3.), select.center().y);
+    for at in [select.center(), edge] {
+        clear(&mut cx);
+        cx.simulate_click(at, gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            status(&mut cx).contains("could not be read"),
+            "a click anywhere on the select must open the picker, got {:?}",
+            status(&mut cx)
+        );
+    }
+
+    let reflect = cx.debug_bounds("grpc-reflect").expect("From server");
+    clear(&mut cx);
+    cx.simulate_click(reflect.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        status(&mut cx).contains("collection"),
+        "From server must ask for the schema, got {:?}",
+        status(&mut cx)
+    );
+}
+
 /// **Reflection answers the tab that asked**, not whichever is active when the answer lands.
 ///
 /// A round trip is long enough to switch tabs in, and the result used to be written into

@@ -490,18 +490,42 @@ pub enum RequestKind {
     Grpc(GrpcRequest),
 }
 
+/// The tag a non-HTTP collection row wears in place of a verb.
+///
+/// **An enum rather than the string it prints**, so the panel's colour for it is an exhaustive
+/// match: a new kind cannot ship a badge that silently falls back to grey because a string it
+/// was matched against was spelt differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindBadge {
+    GraphQl,
+    WebSocket,
+    Grpc,
+}
+
+impl KindBadge {
+    /// Upper case throughout, as the verbs beside it are — a row reads `GET`, `GQL`, `GRPC`,
+    /// and one mixed-case tag in that column looks like a different kind of thing.
+    pub fn label(self) -> &'static str {
+        match self {
+            KindBadge::GraphQl => "GQL",
+            KindBadge::WebSocket => "WS",
+            KindBadge::Grpc => "GRPC",
+        }
+    }
+}
+
 impl RequestKind {
-    /// The short tag a collection row wears: `GQL`, and later `WS`, `gRPC`, `MQTT`.
+    /// The short tag a collection row wears: `GQL`, `WS`, `GRPC`, and later `MQTT`.
     ///
     /// `None` for HTTP, where the *method* is the useful distinction and the row shows that
     /// instead. For every other kind the method is noise — every GraphQL request is a POST —
     /// so the kind is what tells two rows apart.
-    pub fn badge(&self) -> Option<&'static str> {
+    pub fn badge(&self) -> Option<KindBadge> {
         match self {
             RequestKind::Http(_) => None,
-            RequestKind::GraphQl(_) => Some("GQL"),
-            RequestKind::WebSocket(_) => Some("WS"),
-            RequestKind::Grpc(_) => Some("gRPC"),
+            RequestKind::GraphQl(_) => Some(KindBadge::GraphQl),
+            RequestKind::WebSocket(_) => Some(KindBadge::WebSocket),
+            RequestKind::Grpc(_) => Some(KindBadge::Grpc),
         }
     }
 
@@ -1546,7 +1570,7 @@ mod tests {
         };
         assert_eq!(spec.method(), None);
         assert!(spec.http().is_none());
-        assert_eq!(spec.kind.badge(), Some("WS"));
+        assert_eq!(spec.kind.badge(), Some(KindBadge::WebSocket));
         assert!(spec.kind.opens_a_transcript());
         assert!(spec.kind.accepts_more_messages());
         assert!(spec.kind.opens_a_websocket());

@@ -87,12 +87,7 @@ impl Method {
     /// Kept as a method rather than stored, because the two booleans come straight from the
     /// descriptor and a third field would be a second source of truth for the same fact.
     pub fn shape(&self) -> Shape {
-        match (self.client_streaming, self.server_streaming) {
-            (false, false) => Shape::Unary,
-            (false, true) => Shape::ServerStreaming,
-            (true, false) => Shape::ClientStreaming,
-            (true, true) => Shape::BidiStreaming,
-        }
+        Shape::of(self.client_streaming, self.server_streaming)
     }
 }
 
@@ -106,6 +101,17 @@ pub enum Shape {
 }
 
 impl Shape {
+    /// From the two streaming flags — a descriptor's, or the copy a request stores to label
+    /// itself. One mapping, so the picker and the request pane cannot name a shape differently.
+    pub fn of(client_streaming: bool, server_streaming: bool) -> Self {
+        match (client_streaming, server_streaming) {
+            (false, false) => Shape::Unary,
+            (false, true) => Shape::ServerStreaming,
+            (true, false) => Shape::ClientStreaming,
+            (true, true) => Shape::BidiStreaming,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Shape::Unary => "unary",

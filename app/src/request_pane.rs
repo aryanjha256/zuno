@@ -89,15 +89,7 @@ pub fn render(
             // kind the endpoint says what is being called; a gRPC URL is only a host, and the
             // call lives in the schema. So Method is where the schema is chosen and the method
             // picked, and Message is the payload.
-            (KindEditor::Grpc(grpc), 0) => pane
-                .child(editor_header(
-                    "Schema",
-                    "a file in the collection's protos/, or a path to one",
-                    theme,
-                ))
-                .child(grpc_schema_row(grpc, theme, cx))
-                .child(editor_header("Method", "", theme))
-                .child(grpc_method_row(grpc, theme)),
+            (KindEditor::Grpc(grpc), 0) => pane.children(grpc_method_tab(grpc, theme, cx)),
             (KindEditor::Grpc(grpc), _) => pane
                 .child(grpc_message_header(grpc, theme))
                 .children(
@@ -1855,11 +1847,52 @@ fn saved_messages(
     )
 }
 
-/// The `.proto` field, with the folder button that fills it.
+/// The Method tab's label column, wide enough for its longest label so the fields line up.
+const GRPC_LABEL_WIDTH: f32 = 56.;
+
+fn grpc_label(text: &'static str, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .w(px(GRPC_LABEL_WIDTH))
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child(text)
+}
+
+/// The Method tab: which schema, and which method on it.
+///
+/// **One header and a two-row form**, not a header per field. The pane had two header strips
+/// dividing a form two lines tall, which read as two unrelated sections. The header's note says
+/// the chosen call's shape — the one fact that changes what Send does next.
+fn grpc_method_tab(
+    grpc: &crate::kinds::GrpcEditor,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Vec<gpui::AnyElement> {
+    let note = match grpc.chosen() {
+        Some(_) => zuno_core::grpc::Shape::of(grpc.client_streaming, grpc.server_streaming).label(),
+        None => "choose a schema, then a method",
+    };
+    vec![
+        editor_header("Method", note, theme).into_any_element(),
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .child(grpc_schema_row(grpc, theme, cx))
+            .child(grpc_method_row(grpc, theme))
+            .into_any_element(),
+    ]
+}
+
+/// The `.proto` field, with the two ways to fill it: a file, or the server itself.
 ///
 /// **A path you must type is a path you have to already know**, which is why every file field
 /// here pairs an editable input with a dialog that *fills* it rather than acting on selection.
 /// The field stays editable so browsing is a faster way to answer rather than a different verb.
+/// *From server* sits here rather than beside the method, because it answers this row's
+/// question — where the schema comes from — for someone who has no `.proto` at all.
 fn grpc_schema_row(
     grpc: &crate::kinds::GrpcEditor,
     theme: &Theme,
@@ -1870,7 +1903,7 @@ fn grpc_schema_row(
         .flex_row()
         .items_center()
         .gap_2()
-        .p_3()
+        .child(grpc_label("Schema", theme))
         .child(
             div()
                 .flex_1()
@@ -1915,46 +1948,9 @@ fn grpc_schema_row(
                     crate::ui::GLYPH,
                 )),
         )
-}
-
-/// Which method this call makes, and the control that changes it.
-///
-/// **Says "none chosen" rather than drawing nothing.** A gRPC request with no method cannot be
-/// sent at all, and an empty row would read as a rendering gap rather than as the one thing
-/// left to do.
-fn grpc_method_row(grpc: &crate::kinds::GrpcEditor, theme: &Theme) -> Div {
-    let (label, colour) = match grpc.chosen() {
-        Some(chosen) => (SharedString::from(chosen), theme.text),
-        None => (SharedString::from("none chosen"), theme.text_faint),
-    };
-
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .pb_3()
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .whitespace_nowrap()
-                .overflow_hidden()
-                .text_xs()
-                .text_color(colour)
-                .child(label),
-        )
-        .children(grpc.server_streaming.then(|| {
-            div()
-                .flex_none()
-                .text_xs()
-                .text_color(theme.text_faint)
-                .child("streaming")
-        }))
-        // **Offered beside Choose rather than hidden behind the palette**, because it answers
-        // the question someone without a `.proto` is actually stuck on — and that is precisely
-        // the person who cannot discover a keystroke for it.
+        // **Offered on the row rather than hidden behind the palette**, because it answers the
+        // question someone without a `.proto` is actually stuck on — and that is precisely the
+        // person who cannot discover a keystroke for it.
         .child(crate::ui::icon_text_action(
             "grpc-reflect",
             Icon::Download,
@@ -1964,15 +1960,118 @@ fn grpc_method_row(grpc: &crate::kinds::GrpcEditor, theme: &Theme) -> Div {
             theme.text_muted,
             theme,
         ))
-        .child(crate::ui::icon_text_action(
-            "grpc-choose-method",
-            Icon::ChevronsUpDown,
-            "Choose".into(),
-            "Pick a method from the schema",
-            OpenGrpcMethod,
-            theme.accent,
-            theme,
-        ))
+}
+
+/// Which method this call makes, drawn as a select: the whole box opens the picker.
+///
+/// **A select rather than a label with a Choose link beside it**, because choosing is the only
+/// thing to do with it — a line of text and a separate control made the value look read-only.
+/// The name leads and the service follows, dimmed: two methods can share a name across services,
+/// but it is the name a person is looking for. Every shape is named, not only server streaming,
+/// since each one changes what Send does next.
+///
+/// **Says "Choose a method…" rather than drawing nothing.** A gRPC request with no method cannot
+/// be sent at all, and an empty box would read as a rendering gap rather than as the one thing
+/// left to do.
+fn grpc_method_row(grpc: &crate::kinds::GrpcEditor, theme: &Theme) -> Div {
+    let chosen = grpc.chosen().is_some();
+    let shape = zuno_core::grpc::Shape::of(grpc.client_streaming, grpc.server_streaming);
+    let hover = theme.bg_hover;
+
+    let value = if chosen {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(theme.text)
+                    .child(grpc.method.clone()),
+            )
+            // The service gives before the name does: it is the half that distinguishes least.
+            .child(
+                div()
+                    .flex_shrink()
+                    .min_w(px(0.))
+                    .overflow_hidden()
+                    .text_color(theme.text_faint)
+                    .child(grpc.service.clone()),
+            )
+    } else {
+        div()
+            .text_color(theme.text_faint)
+            .child("Choose a method…")
+    };
+
+    let select = div()
+        .id("grpc-choose-method")
+        .debug_selector(|| "grpc-choose-method".to_string())
+        .group(crate::ui::ICON_GROUP)
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .bg(theme.bg)
+        .border_1()
+        .border_color(theme.border)
+        .text_xs()
+        .whitespace_nowrap()
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .tooltip(|window, cx| {
+            crate::ui::Tooltip::for_action(
+                "Pick a method from the schema",
+                &OpenGrpcMethod,
+                window,
+                cx,
+            )
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            |_: &MouseDownEvent, window, cx| {
+                // Bubble phase: without this the pane's `track_focus` takes the click as well.
+                cx.stop_propagation();
+                window.dispatch_action(Box::new(OpenGrpcMethod), cx);
+            },
+        )
+        // **The value shrinks; the shape and the chevron do not.** They are what says what
+        // this is and that it opens — `flex_none` on the value would push both off the row.
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(value),
+        )
+        .children(chosen.then(|| {
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(shape.label())
+        }))
+        .child(
+            div().flex_none().child(crate::ui::glyph(
+                Icon::ChevronsUpDown,
+                theme.text_muted,
+                theme.accent,
+                crate::ui::GLYPH_INLINE,
+            )),
+        );
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .child(grpc_label("Method", theme))
+        .child(select)
 }
 
 /// The header above the request message.

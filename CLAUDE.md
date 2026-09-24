@@ -40,7 +40,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 1040 tests, ~50s
+cargo test --workspace                   # 1041 tests, ~50s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 

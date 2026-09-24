@@ -63,6 +63,13 @@ pub struct Theme {
     pub method_delete: Hsla,
     pub method_other: Hsla,
 
+    // Request kinds, for the badge a non-HTTP row wears in place of a verb. **Their own hues**
+    // — pink, cyan, teal — rather than borrowed verb colours, which mean something: a GRPC row
+    // painted DELETE-red would read as destructive.
+    pub kind_graphql: Hsla,
+    pub kind_websocket: Hsla,
+    pub kind_grpc: Hsla,
+
     // Status classes
     pub status_info: Hsla,
     pub status_success: Hsla,
@@ -173,6 +180,10 @@ impl Theme {
             method_delete: rgb(0xe06c6c).into(),
             method_other: rgb(0x8b8b94).into(),
 
+            kind_graphql: rgb(0xe57ab8).into(),
+            kind_websocket: rgb(0x4cc3d6).into(),
+            kind_grpc: rgb(0x3dbd9f).into(),
+
             status_info: rgb(0x8b8b94).into(),
             status_success: rgb(0x6bbf59).into(),
             status_redirect: rgb(0x4ea8de).into(),
@@ -235,6 +246,10 @@ impl Theme {
             method_delete: rgb(0xb32d2d).into(),
             method_other: rgb(0x6b6b74).into(),
 
+            kind_graphql: rgb(0xa3306f).into(),
+            kind_websocket: rgb(0x0e7085).into(),
+            kind_grpc: rgb(0x147560).into(),
+
             status_info: rgb(0x6b6b74).into(),
             status_success: rgb(0x2f7a24).into(),
             status_redirect: rgb(0x1f6f9e).into(),
@@ -285,6 +300,15 @@ impl Theme {
             Method::Patch => self.method_patch,
             Method::Delete => self.method_delete,
             Method::Head | Method::Options | Method::Other(_) => self.method_other,
+        }
+    }
+
+    pub fn kind_color(&self, badge: zuno_core::request::KindBadge) -> Hsla {
+        use zuno_core::request::KindBadge;
+        match badge {
+            KindBadge::GraphQl => self.kind_graphql,
+            KindBadge::WebSocket => self.kind_websocket,
+            KindBadge::Grpc => self.kind_grpc,
         }
     }
 

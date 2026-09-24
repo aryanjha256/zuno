@@ -679,8 +679,8 @@ pub struct Node {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Badge {
     Method(Method),
-    /// `GQL`, and later `WS`, `gRPC`, `MQTT`.
-    Kind(&'static str),
+    /// `GQL`, `WS`, `GRPC`, and later `MQTT`.
+    Kind(crate::request::KindBadge),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -822,7 +822,7 @@ mod tests {
         assert_eq!(badges[0], &Badge::Method(Method::Delete), "HTTP keeps its verb");
         assert_eq!(
             badges[1],
-            &Badge::Kind("GQL"),
+            &Badge::Kind(crate::request::KindBadge::GraphQl),
             "a GraphQL row must not be labelled POST like every other GraphQL row"
         );
 
