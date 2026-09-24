@@ -262,7 +262,10 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, skipped: &m
             // listing happens to come out the same, because an environment doesn't
             // deserialize as a `RequestSpec` — but a file in there that did would be offered
             // as a request, and the log would be noise either way.
-            if name == crate::environment::DIRECTORY || name == crate::flow::DIRECTORY {
+            if name == crate::environment::DIRECTORY
+                || name == crate::flow::DIRECTORY
+                || name == crate::grpc::DIRECTORY
+            {
                 continue;
             }
             walk(root, &path, depth + 1, out, skipped);
@@ -586,6 +589,7 @@ fn collect_folders(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>)
         if name.starts_with('.')
             || name == crate::environment::DIRECTORY
             || name == crate::flow::DIRECTORY
+            || name == crate::grpc::DIRECTORY
         {
             continue;
         }

@@ -81,7 +81,25 @@ tokio = { version = "1", features = [
 # `handshake` is kept, for `generate_key` and `derive_accept_key` — writing those by hand
 # would mean a sha1 and base64 dependency to reimplement four lines the crate already has.
 hyper = { version = "1", features = ["client", "http1"] }
+# gRPC schema. **No `protoc` binary**: `protox` is a protobuf compiler written in Rust, so a
+# `.proto` compiles inside Zuno with nothing installed — which is what makes this shippable in a
+# `.deb` at all. `prost-reflect` is the other half: a descriptor pool plus `DynamicMessage`, so a
+# message can be encoded against a schema learned at runtime rather than generated at build time.
+# `serde` on it is what lets a person type JSON and have it become protobuf.
+#
+# Deliberately **not `tonic`**: it would bring its own client, codegen and connection handling,
+# and the transport is already proven on reqwest — see `core/tests/grpc_trailers.rs`. gRPC's wire
+# framing is a compression byte and a length prefix, which is not worth a dependency.
+protox = "0.9"
+prost-reflect = { version = "0.16", features = ["serde"] }
+prost = "0.14"
+
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Reading HTTP/2 **trailers**, which is where gRPC puts its status and which reqwest names
+# nowhere. `reqwest::Body` implements `http_body::Body`, whose frames are either data or
+# trailers; `BodyExt::collect` is what walks them. Proven end to end before anything was built
+# on it — see `core/tests/grpc_trailers.rs`.
+http-body-util = "0.1"
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 url = "2"
 # Runtime-agnostic channel: written from tokio tasks, awaited on gpui's smol executor.

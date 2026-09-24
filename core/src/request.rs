@@ -312,6 +312,67 @@ pub struct GraphQlRequest {
     pub transport: GraphQlTransport,
 }
 
+/// A gRPC call: which schema, which method on it, and the request message as JSON.
+///
+/// **The schema is named, not embedded.** A `.proto` is shared between requests — a dozen calls
+/// against one service all describe themselves with the same file — so it lives on disk and this
+/// holds a reference to it, the way a flow holds collection-relative paths rather than copies of
+/// the requests it runs.
+///
+/// `proto` is resolved two ways, and the split is the point. A bare filename means the reserved
+/// `protos/` directory inside the collection, which is what keeps a **committed collection file
+/// portable**: an absolute path to someone's home directory is broken for every teammate who
+/// clones it, the same failure invariant 10 exists to prevent for secrets. Anything with a
+/// separator in it is used as a path, so a scratch tab can still point at a file anywhere before
+/// it has been saved into a collection — the field stays editable and the folder icon fills it,
+/// which is the convention every other path field here follows.
+///
+/// **The two streaming flags are stored rather than derived**, which is the one place this type
+/// breaks the "derive, don't mirror" rule, and it needs the exception it gets. The honest source
+/// is the descriptor — but reading it means compiling a `.proto` off disk, and the answer is
+/// wanted on the UI thread while deciding whether the button says Send or Connect. Invariant 3
+/// forbids that outright. They are written when a method is picked and rewritten whenever one is
+/// picked again; a `.proto` edited or re-fetched underneath them can leave them stale.
+///
+/// **So the engine never reads them.** It compiles the schema on every send and takes the shape
+/// from the descriptor; these are the UI's copy and nothing else. That rule was once only a
+/// claim in this comment while `engine::grpc` read the stored flags for the request body and the
+/// descriptor for the reply — and a stale copy built a streaming body for a unary method that
+/// hung until the read timeout. A stale copy can now mislabel the button and nothing more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrpcRequest {
+    /// A bare filename inside the collection's `protos/`, or a path to a `.proto` anywhere.
+    pub proto: String,
+    /// The fully-qualified service, `helloworld.Greeter`.
+    pub service: String,
+    /// The bare method name, `SayHello`.
+    pub method: String,
+    /// The request message as JSON *text*, for the reason `GraphQlRequest::variables` is text:
+    /// a half-typed message is invalid on most keystrokes, and a model that refuses to hold
+    /// invalid text cannot back an editor.
+    pub message: String,
+    /// Whether the chosen method streams its *requests* — see the type's note on why the
+    /// shape is stored at all.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub client_streaming: bool,
+    /// Whether it streams its replies.
+    ///
+    /// **Two bools rather than one shape, and unlike `Alpn` that is the right model here**:
+    /// gRPC has exactly four call shapes and every combination of these two is one of them, so
+    /// there is no state to make unrepresentable. They are also what the descriptor reports,
+    /// which keeps `choose` a copy rather than a translation.
+    ///
+    /// `#[serde(default)]` and `skip_serializing_if` for invariant 11's reason: a unary call is
+    /// the overwhelming majority, and writing `"server_streaming": false` into every file would
+    /// be diff churn that says nothing.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_streaming: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// How a GraphQL operation reaches the server.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GraphQlTransport {
@@ -426,6 +487,7 @@ pub enum RequestKind {
     Http(HttpRequest),
     GraphQl(GraphQlRequest),
     WebSocket(WebSocketRequest),
+    Grpc(GrpcRequest),
 }
 
 impl RequestKind {
@@ -439,18 +501,28 @@ impl RequestKind {
             RequestKind::Http(_) => None,
             RequestKind::GraphQl(_) => Some("GQL"),
             RequestKind::WebSocket(_) => Some("WS"),
+            RequestKind::Grpc(_) => Some("gRPC"),
         }
     }
 
-    /// Whether sending this opens a connection that stays open.
+    /// Whether sending this produces a **transcript** rather than a single response.
     ///
     /// **Not the whole answer, deliberately.** This is what the *request* can promise before
-    /// anything has left the machine, and only a socket can promise it. An ordinary HTTP
-    /// request becomes a session whenever the server answers `text/event-stream`, and a
-    /// GraphQL subscription becomes one whenever the server speaks graphql-sse — neither is
-    /// knowable from here. So the response side has the final say and this is the hint that
-    /// lets the UI show Connect instead of Send *before* it can possibly know.
-    pub fn is_session(&self) -> bool {
+    /// anything has left the machine. An ordinary HTTP request becomes a stream whenever the
+    /// server answers `text/event-stream`, and a GraphQL subscription whenever the server
+    /// speaks graphql-sse — neither is knowable from here. So the response side has the final
+    /// say and this is the hint that lets the UI show Connect instead of Send *before* it can
+    /// possibly know.
+    ///
+    /// **This used to be one predicate called `is_session`, and that was the bug.** Four
+    /// separate questions were reading it — which HTTP version to offer, which engine path to
+    /// take, whether the reply streams, and whether more may be sent — and for WebSocket and
+    /// SSE all four have the same answer, so one boolean served them all and looked right.
+    /// gRPC splits them: a client-streaming call keeps its *request* open and answers exactly
+    /// once. Each of those questions got the wrong answer in turn, four times, each silently.
+    /// They are separate predicates now so that a new kind cannot answer the wrong one — there
+    /// is no general one left to reach for.
+    pub fn opens_a_transcript(&self) -> bool {
         match self {
             RequestKind::WebSocket(_) => true,
             // **A GraphQL subscription is a session before it leaves**, unlike an SSE stream,
@@ -458,7 +530,46 @@ impl RequestKind {
             // socket handshake and a POST are different requests, so the client cannot wait to
             // be told. `uses_websocket` reads the document to decide.
             RequestKind::GraphQl(graphql) => graphql.uses_websocket(),
+            // **The one kind that genuinely knows.** A `.proto` states the shape of every
+            // method, so unlike SSE — where the server decides — and unlike GraphQL, where the
+            // document has to be read, this is a fact the schema already told us.
+            //
+            // Either direction qualifies: a client-streaming call answers once, but everything
+            // you send on the way there belongs on screen, and a transcript is where sent
+            // messages live.
+            RequestKind::Grpc(grpc) => grpc.client_streaming || grpc.server_streaming,
             RequestKind::Http(_) => false,
+        }
+    }
+
+    /// Whether more messages may be sent once the connection is open.
+    ///
+    /// **The half `opens_a_transcript` cannot answer.** A server-streaming gRPC call produces a
+    /// transcript and accepts nothing more; a client-streaming one does both. Offering a live
+    /// composer on the first would be a control the protocol has no way to deliver — the
+    /// dead-control shape this codebase keeps finding.
+    pub fn accepts_more_messages(&self) -> bool {
+        match self {
+            RequestKind::WebSocket(_) => true,
+            // A subscription is one operation. The socket stays open to *receive*; there is
+            // nothing further to say on it.
+            RequestKind::GraphQl(_) => false,
+            RequestKind::Grpc(grpc) => grpc.client_streaming,
+            RequestKind::Http(_) => false,
+        }
+    }
+
+    /// Whether this kind reaches the server through a **WebSocket upgrade**.
+    ///
+    /// Distinct from the two above and not derivable from them: gRPC streams both ways over
+    /// HTTP/2 and never upgrades, so the engine's dispatch and the client's ALPN both need this
+    /// question rather than "is it a session". Answering the latter is what pinned a gRPC call
+    /// to HTTP/1.1 and routed it into the WebSocket handshake.
+    pub fn opens_a_websocket(&self) -> bool {
+        match self {
+            RequestKind::WebSocket(_) => true,
+            RequestKind::GraphQl(graphql) => graphql.uses_websocket(),
+            RequestKind::Http(_) | RequestKind::Grpc(_) => false,
         }
     }
 
@@ -468,6 +579,7 @@ impl RequestKind {
             RequestKind::Http(_) => "HTTP",
             RequestKind::GraphQl(_) => "GraphQL",
             RequestKind::WebSocket(_) => "WebSocket",
+            RequestKind::Grpc(_) => "gRPC",
         }
     }
 }
@@ -643,6 +755,10 @@ impl Serialize for RequestSpec {
             RequestKind::GraphQl(_) => (None, None, None, Some(&self.kind)),
             // Same reasoning, and the same absence of a flat shape to imitate.
             RequestKind::WebSocket(_) => (None, None, None, Some(&self.kind)),
+            // And again. A gRPC request names a `.proto` and a method; there has never been a
+            // flat shape carrying either, so there is nothing for an older build to mistake it
+            // for.
+            RequestKind::Grpc(_) => (None, None, None, Some(&self.kind)),
         };
 
         StoredSpecRef {
@@ -717,14 +833,14 @@ impl RequestSpec {
     pub fn http(&self) -> Option<&HttpRequest> {
         match &self.kind {
             RequestKind::Http(http) => Some(http),
-            RequestKind::GraphQl(_) | RequestKind::WebSocket(_) => None,
+            RequestKind::GraphQl(_) | RequestKind::WebSocket(_) | RequestKind::Grpc(_) => None,
         }
     }
 
     pub fn http_mut(&mut self) -> Option<&mut HttpRequest> {
         match &mut self.kind {
             RequestKind::Http(http) => Some(http),
-            RequestKind::GraphQl(_) | RequestKind::WebSocket(_) => None,
+            RequestKind::GraphQl(_) | RequestKind::WebSocket(_) | RequestKind::Grpc(_) => None,
         }
     }
 
@@ -732,14 +848,14 @@ impl RequestSpec {
     pub fn graphql(&self) -> Option<&GraphQlRequest> {
         match &self.kind {
             RequestKind::GraphQl(graphql) => Some(graphql),
-            RequestKind::Http(_) | RequestKind::WebSocket(_) => None,
+            RequestKind::Http(_) | RequestKind::WebSocket(_) | RequestKind::Grpc(_) => None,
         }
     }
 
     pub fn graphql_mut(&mut self) -> Option<&mut GraphQlRequest> {
         match &mut self.kind {
             RequestKind::GraphQl(graphql) => Some(graphql),
-            RequestKind::Http(_) | RequestKind::WebSocket(_) => None,
+            RequestKind::Http(_) | RequestKind::WebSocket(_) | RequestKind::Grpc(_) => None,
         }
     }
 
@@ -747,14 +863,29 @@ impl RequestSpec {
     pub fn websocket(&self) -> Option<&WebSocketRequest> {
         match &self.kind {
             RequestKind::WebSocket(socket) => Some(socket),
-            RequestKind::Http(_) | RequestKind::GraphQl(_) => None,
+            RequestKind::Http(_) | RequestKind::GraphQl(_) | RequestKind::Grpc(_) => None,
         }
     }
 
     pub fn websocket_mut(&mut self) -> Option<&mut WebSocketRequest> {
         match &mut self.kind {
             RequestKind::WebSocket(socket) => Some(socket),
-            RequestKind::Http(_) | RequestKind::GraphQl(_) => None,
+            RequestKind::Http(_) | RequestKind::GraphQl(_) | RequestKind::Grpc(_) => None,
+        }
+    }
+
+    /// The gRPC half, when this is a gRPC request.
+    pub fn grpc(&self) -> Option<&GrpcRequest> {
+        match &self.kind {
+            RequestKind::Grpc(grpc) => Some(grpc),
+            RequestKind::Http(_) | RequestKind::GraphQl(_) | RequestKind::WebSocket(_) => None,
+        }
+    }
+
+    pub fn grpc_mut(&mut self) -> Option<&mut GrpcRequest> {
+        match &mut self.kind {
+            RequestKind::Grpc(grpc) => Some(grpc),
+            RequestKind::Http(_) | RequestKind::GraphQl(_) | RequestKind::WebSocket(_) => None,
         }
     }
 
@@ -771,6 +902,9 @@ impl RequestSpec {
             // The handshake is a GET and nothing else is legal, so there is no choice to
             // show. Reporting one would put a control on screen that cannot be changed.
             RequestKind::WebSocket(_) => None,
+            // Always POST, by the spec, and never worth a control — which is the case this
+            // method's own doc comment was written about.
+            RequestKind::Grpc(_) => None,
         }
     }
 
@@ -1413,7 +1547,9 @@ mod tests {
         assert_eq!(spec.method(), None);
         assert!(spec.http().is_none());
         assert_eq!(spec.kind.badge(), Some("WS"));
-        assert!(spec.kind.is_session());
+        assert!(spec.kind.opens_a_transcript());
+        assert!(spec.kind.accepts_more_messages());
+        assert!(spec.kind.opens_a_websocket());
     }
 
     /// A field added to `WebSocketRequest` later must not orphan every socket written today.

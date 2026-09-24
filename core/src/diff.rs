@@ -146,6 +146,7 @@ mod tests {
             status_text: "OK".into(),
             version: HttpVersion::Http11,
             headers,
+            trailers: Vec::new(),
             body: Bytes::from_static(body.as_bytes()),
             timing: Timing {
                 // The diff reads only `total`, so how the connection was obtained is

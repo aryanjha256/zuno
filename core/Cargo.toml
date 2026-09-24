@@ -35,3 +35,20 @@ tokio-tungstenite.workspace = true
 similar.workspace = true
 # HTML -> readable text for the response viewer. See the workspace manifest for the choice.
 html2text.workspace = true
+# gRPC. See the workspace manifest for why these and why not `tonic`.
+http-body-util.workspace = true
+protox.workspace = true
+prost-reflect.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+# **A spike, and the reason it is a dev-dependency.** gRPC reports its status in HTTP/2
+# *trailers*, which reqwest names nowhere in its public API — the plan is to reach them through
+# `From<Response> for http::Response<Body>` and `http_body::Body::poll_frame`. Three layers
+# agreeing is not something to take on trust (see `tests/websocket_upgrade.rs` for the last time
+# this mattered), so a real h2 server proves it before any schema work is built on top.
+#
+# `server` + `http2` on hyper, and `http-body-util` for a body that can actually emit a trailers
+# frame. None of this reaches the shipped binary: dev-dependency features do not apply to
+# `cargo build`.
+hyper = { workspace = true, features = ["server", "http2"] }

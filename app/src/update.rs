@@ -138,6 +138,7 @@ mod tests {
             headers: location
                 .map(|value| vec![Header::new("location", value)])
                 .unwrap_or_default(),
+            trailers: Vec::new(),
             body: bytes::Bytes::new(),
             timing: Timing {
                 connection: Connection::Unknown,

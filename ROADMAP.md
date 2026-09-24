@@ -1006,7 +1006,107 @@ Reasons recorded so a future session can judge them, not commitments.
 - **Scripting** (pre-request / post-response). The largest single feature in the original
   original brief, and the one most likely to define the product's ceiling. Needs a language and a
   sandbox decision before anything else.
-- **gRPC.** Shipped WebSocket first, deliberately, and the ordering is the point: both need a
+- **gRPC — all four call shapes, metadata and trailers, and reflection.** The design and its
+  rejected alternatives are architecture.md §6q; this is the order it was built in. A `.proto` is compiled by `protox` (no
+  `protoc` binary, which is what makes it shippable in the `.deb`), `prost-reflect` encodes JSON
+  into a `DynamicMessage`, and the call goes out over the existing reqwest client. Choose a
+  schema, pick a method, type JSON, send.
+
+  **The transport was spiked before anything was built on it**, because two of its assumptions
+  were load-bearing. gRPC reports its status in HTTP/2 *trailers*, which reqwest names nowhere —
+  reachable through `From<Response> for http::Response<Body>` and `http_body::Body`, proven in
+  `core/tests/grpc_trailers.rs`. And plaintext gRPC needs h2 with **prior knowledge**: there is
+  no ALPN on a cleartext socket, so a client that merely prefers h2 sends HTTP/1.1 and the
+  server hangs up. That is the exact mirror of the `wss://` bug, and it is why `ClientKey` now
+  carries an `Alpn` enum rather than an `http1_only` bool.
+
+  **`is_session()` had been standing in for two different questions**, which gRPC exposed. It was
+  passed as "offer only HTTP/1.1" — true of every session that existed when it was written — so a
+  server-streaming gRPC call would have been pinned to the one version gRPC cannot use; and it
+  routed dispatch, so the same call would have opened a WebSocket handshake at a gRPC server.
+  Both silent.
+
+  A `.proto` lives in the collection's reserved `protos/`, named rather than pathed, for the
+  reason invariant 10 exists: an absolute path into one person's home directory is broken for
+  everyone who clones the repo.
+
+  **Server streaming landed with it**, and cost almost nothing: past `Opened` the app cannot tell
+  a gRPC stream from a socket or an SSE stream, which is the fourth time keeping lifecycle off
+  the kind has paid for itself. The one piece that needed writing is `grpc::Reader`, because a
+  length-prefixed message arrives split across HTTP/2 DATA frames however the network felt like
+  splitting it — and it is capped for the reason the SSE parser is.
+
+  It also sharpened why trailers matter: a stream can deliver three messages and *then* fail, all
+  under one 200. A client judging by the status line, or treating the end of the body as success,
+  shows partial data as if it were the whole answer.
+
+  **All four call shapes now work.** Client-streaming needed the one mechanism nothing else in
+  Zuno has: a request body that stays open, fed by the same `Outbound` channel a socket sends
+  down, with a half-close — dropping the body sender — as the thing that lets the server answer
+  at all.
+
+  Three bugs on the way, all one family: **"is this a session" and "does this stream" kept being
+  the same question in the code and different questions in fact.** It picked the wrong ALPN, it
+  routed a gRPC call into the WebSocket handshake, and it read a client-streaming call — which
+  answers exactly once — as a transcript. Each was silent. The fourth of the family is still
+  worth watching for.
+
+  And one that only a repeated run found: a bidirectional call read zero frames about half the
+  time, because **dropping a `oneshot` sender resolves its receiver**, so the feeder task ending
+  after half-close was indistinguishable from someone pressing Disconnect. It presented as a
+  clean close with no data, which is the worst shape — nothing on screen said anything was wrong.
+
+  **Reflection landed last, as planned, and the ordering paid off exactly as argued.** Asking a
+  server to describe itself *is* a bidirectional streaming call, so by the time it was built the
+  transport was proven and what remained was the conversation: `list_services`, then
+  `file_containing_symbol` per service — by *symbol*, which is what makes the answer a complete
+  schema without knowing how the server lays its files out.
+
+  Only the reflection envelope is hand-decoded, about sixty lines. What comes back inside it is a
+  `FileDescriptorProto`, which goes straight to prost-reflect — so the hard parsing stays in a
+  library and the hand-written part is small enough to check against the spec by eye.
+
+  **It is an import, not a live lookup.** The descriptor set is written into the collection's
+  `protos/` and the request points at it like any hand-written schema, which is why reflection
+  needed no new field on `GrpcRequest` at all. See architecture.md §11 for the trade.
+
+  **And then a real server found three bugs the whole test suite had missed**, which is the part
+  worth keeping. Reflection was written, tested nine ways and reported done; the first live
+  attempt failed with a rustls error about a corrupt message.
+
+  - `list_services` sent an **empty** value. The spec says it is ignored; a real server reads it
+    for truthiness, sees "unset", and answers nothing — with `grpc-status: 0`, so silently.
+    `"*"` works everywhere.
+  - The conversation was **one held-open bidi stream**, which is what the service is declared as.
+    A server that buffers the whole request before replying deadlocks against it: measured, first
+    byte at 9.99s of a 10s hold. One call per question, half-closing immediately, works against
+    both kinds.
+  - A scheme-less address defaulted to **TLS**, and gRPC servers are routinely cleartext —
+    including on port 443. Now plaintext on loopback only, because widening it would send
+    credentials out readable; everything else keeps the secure default and gets an error that
+    names the fix.
+
+  All three were invisible to nine passing tests, because every one ran against a fixture written
+  to agree with the client. CLAUDE.md says the live `wss://` check is not optional for exactly
+  this reason and the same test was missing here. It exists now.
+
+  **A line-by-line audit before commit found four more wrong answers**, each proven with a
+  throwaway test before it was fixed. A *Trailers-Only* error — the status in the response head,
+  which grpc-go and grpc-java send for an unknown method — was reported as "not a gRPC endpoint".
+  A typed `Content-Type` metadata entry went out *beside* ours, because reqwest's `header`
+  appends. A bidirectional call against a buffering server deadlocked, because the early-`Opened`
+  fix had been applied to client-streaming alone. And the engine read the shape from the stored
+  copy in one place and the schema in another, so a stale copy hung the call. The same lesson as
+  the reflection bugs, one layer further: every fixture here answered the way the client already
+  expected, and the bidirectional test had been written to send before `Opened` — encoding the
+  deadlock as the test's own ordering requirement.
+
+  That closes gRPC. What is named but not planned: per-call reflection, a hang-up verb for a
+  bidirectional call, copying a chosen `.proto` into the collection rather than storing an
+  unportable absolute path, reflection without a collection open, and the `.proto` route's
+  remaining rough edge — a schema whose imports live outside the file's own directory.
+
+- **gRPC, the original note.** Shipped WebSocket first, deliberately, and the ordering is the point: both need a
   request that stays open and a transcript instead of a response, and WebSocket forces that to
   be built with the simplest possible payload story — you type text and send it. gRPC would have
   meant building the session model *and* a schema pipeline at once, with no way to tell which
@@ -1088,8 +1188,8 @@ Reasons recorded so a future session can judge them, not commitments.
     the sniffer. Every frame the Query tab is visible.
   - **`Parser::push` drains the pending buffer inside its line loop**, so a chunk holding many
     lines is quadratic in lines. Bounded by chunk size, which is why it is here and not fixed.
-  - **`is_session()` is called twice per send** in `drive`, and for GraphQL that is two document
-    scans for one decision.
+  - **The kind is asked about its socket twice per send** in `drive` — `Alpn::for_kind` and
+    `opens_a_websocket` — and for GraphQL that is two document scans for one answer.
   - **`disconnecting_a_stream_actually_stops_it`'s doc still overstates its own assertion.** The
     load-bearing check is the `Closed` event, not the server-side one the comment names. The
     assertion itself was tightened when the unbounded loop was fixed; the comment was not.

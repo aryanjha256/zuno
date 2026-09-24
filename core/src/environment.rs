@@ -293,6 +293,10 @@ impl Resolver {
                 scan(&graphql.query);
                 scan(&graphql.variables);
             }
+            // The request message is the only field here that reaches the wire as *content*.
+            // `proto`, `service` and `method` are schema coordinates — they address the call
+            // rather than carry a value — so a token would not be typed into one.
+            RequestKind::Grpc(grpc) => scan(&grpc.message),
         }
         for header in spec.enabled_headers() {
             scan(&header.name);
@@ -373,6 +377,13 @@ impl Resolver {
                 for message in &mut socket.messages {
                     message.body = self.resolve(&message.body).into_owned();
                 }
+            }
+            // The message goes on the wire, so a `{{token}}` in it must be substituted here.
+            // The schema coordinates are left alone for `mark_secrets`' reason — and `proto`
+            // especially: it is a path resolved against the collection, not a value, and
+            // substituting into it would let an environment redirect which schema is compiled.
+            RequestKind::Grpc(grpc) => {
+                grpc.message = self.resolve(&grpc.message).into_owned();
             }
         }
 

@@ -124,6 +124,11 @@ fn main() {
         if let Some(engine) = crate::engine::ActiveEngine::engine(cx as &gpui::App) {
             engine.set_proxy(app_state::proxy(cx));
             engine.set_tls(app_state::tls(cx));
+            // Same reasoning, and the same ordering problem: `collections::install_at` ran
+            // before the engine existed, so the root it set never reached it.
+            engine.set_collection(
+                crate::collections::root(cx as &gpui::App).map(std::path::Path::to_path_buf),
+            );
         }
         // Without this, closing the last window leaves the process running with nothing
         // on screen — GPUI does not quit on last-window-close by default. Quitting here
@@ -265,10 +270,10 @@ fn bindings() -> Vec<KeyBinding> {
         // --- Response viewer ---
         // Body ⇄ headers. `alt-` rather than `ctrl-`, to sit with the other two viewer
         // bindings; `alt-r` is free where `ctrl-shift-r` already focuses this pane.
-        // `alt-r`/`alt-shift-r` mirrors the request pane's `alt-q`/`alt-shift-q`. The three
+        // `alt-r`/`alt-shift-r` mirrors the request pane's `alt-q`/`alt-shift-q`. The five
         // `ShowResponse*` verbs are deliberately **unbound**, exactly as the request pane's
-        // `Show*Tab` trio is: they exist for the palette and for the tabs' own clicks, and
-        // three more keystrokes would be three more chances at the clash §6e records.
+        // `Show*Tab` verbs are: they exist for the palette and for the tabs' own clicks, and
+        // five more keystrokes would be five more chances at the clash §6e records.
         KeyBinding::new("alt-r", NextResponseTab, None),
         KeyBinding::new("alt-shift-r", PrevResponseTab, None),
         KeyBinding::new("alt-f", FoldAll, None),

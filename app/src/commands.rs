@@ -70,6 +70,9 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         ),
         command("Save the composed message", SaveMessage),
         command("Send a ping frame", SendPing),
+        command("Choose the .proto file", ChooseProtoFile),
+        command("Choose the gRPC method", OpenGrpcMethod),
+        command("Fetch the schema from the server", ReflectSchema),
         command("Choose the GraphQL transport", OpenGraphQlTransport),
         command(
             if session { "Disconnect" } else { "Cancel request" },
@@ -150,6 +153,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Show response history", ShowHistory),
         command("Show response body", ShowResponseBody),
         command("Show response headers", ShowResponseHeaders),
+        command("Show response trailers", ShowResponseTrailers),
         command("Show response timing", ShowResponseTiming),
         command("Show response diff", ShowResponseDiff),
         command("Toggle HTML text / raw", ToggleHtmlView),

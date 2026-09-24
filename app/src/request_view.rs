@@ -413,6 +413,13 @@ pub enum ResponseView {
     #[default]
     Body,
     Headers,
+    /// Metadata sent *after* the body — gRPC's trailing metadata, and where `grpc-status` lives.
+    ///
+    /// Second, beside Headers, because the two are the same kind of thing: a gRPC response has
+    /// two metadata blocks and this is the other one. Only offered for gRPC — HTTP has trailers
+    /// and essentially nobody sends them, so on every other kind this would be a tab that is
+    /// permanently empty.
+    Trailers,
     /// Where the time went, on one time axis. Third, so the two answers you came for keep
     /// their positions — this is the tab you visit when one of them was slow.
     Timing,
@@ -425,9 +432,13 @@ impl ResponseView {
     /// Visual order, which is also cycle order — not most-recently-used, for the reason
     /// `RequestTab::ALL` states: MRU on a fixed strip sends one keystroke somewhere
     /// different each time and throws away the muscle memory the strip gives for free.
-    pub const ALL: [ResponseView; 4] = [
+    ///
+    /// Trailers is in the list although only gRPC draws it; `cycle_response_view` steps over any
+    /// view the kind does not offer, so the order here stays the one visual order.
+    pub const ALL: [ResponseView; 5] = [
         ResponseView::Body,
         ResponseView::Headers,
+        ResponseView::Trailers,
         ResponseView::Timing,
         ResponseView::Diff,
     ];
@@ -741,7 +752,23 @@ impl RequestView {
         // A tab slot valid for the old kind may not exist in the new one.
         self.request_tab = RequestTab::Kind(kind.default_tab());
         self.kind = kind;
+        self.keep_response_view_offered();
         cx.notify();
+    }
+
+    /// Whether this kind's response strip draws `view`.
+    ///
+    /// **One answer for the cycle, the palette verb and the kind switch.** Trailers is drawn only
+    /// for gRPC, and each of those three could otherwise land on it where no tab exists: an empty
+    /// table with nothing highlighted, and `alt-r` stepping as if from Body.
+    pub fn offers_response_view(&self, view: ResponseView) -> bool {
+        view != ResponseView::Trailers || self.kind.as_grpc().is_some()
+    }
+
+    fn keep_response_view_offered(&mut self) {
+        if !self.offers_response_view(self.response_view) {
+            self.response_view = ResponseView::Body;
+        }
     }
 
     /// The HTTP verb, for the kinds that have one.
@@ -800,6 +827,9 @@ impl RequestView {
         self.id = spec.id;
         self.name = spec.name;
         self.kind = kind;
+        // Sticky like `request_tab`, and replaced on the same condition: only when the
+        // incoming kind does not offer it.
+        self.keep_response_view_offered();
         self.url = url;
         self.headers = headers;
         self.captures = spec
@@ -897,7 +927,12 @@ impl RequestView {
     }
 
     pub fn cycle_response_view(&mut self, delta: isize, cx: &mut Context<Self>) {
-        self.response_view = self.response_view.step(delta);
+        let mut next = self.response_view.step(delta);
+        // Terminates: Body is offered by every kind.
+        while !self.offers_response_view(next) {
+            next = next.step(delta);
+        }
+        self.response_view = next;
         cx.notify();
     }
 
@@ -908,11 +943,18 @@ impl RequestView {
     /// Timing while on Body is two steps and a cycling handler lands on Headers instead —
     /// a control that does something other than what its label says. Same correction the
     /// request pane's strip already made.
-    pub fn show_response_view(&mut self, view: ResponseView, cx: &mut Context<Self>) {
+    ///
+    /// Returns whether the view is offered at all, so a caller reached from the palette can say
+    /// why nothing happened.
+    pub fn show_response_view(&mut self, view: ResponseView, cx: &mut Context<Self>) -> bool {
+        if !self.offers_response_view(view) {
+            return false;
+        }
         if self.response_view != view {
             self.response_view = view;
             cx.notify();
         }
+        true
     }
 
     /// The body diff, but only where it describes what is on screen.
@@ -1316,7 +1358,6 @@ impl RequestView {
             Event::Opened {
                 transport,
                 status,
-                status_text,
                 headers,
                 protocol,
                 elapsed,
@@ -1325,8 +1366,12 @@ impl RequestView {
                 // The handshake response is a response, so it fills the same fields the status
                 // line already reads — the pane shows `101 Switching Protocols` and the server's
                 // headers without a second code path for them.
+                //
+                // **`status` may be `None`**, and that is not an absent value: a client-streaming
+                // gRPC call is open for sending before the server has answered at all. `Head`
+                // fills it in when the reply arrives, which is why that arm now writes it too.
                 if let Some(inflight) = self.inflight.as_mut() {
-                    inflight.status = Some((status, status_text.clone()));
+                    inflight.status = status.clone();
                     inflight.headers = headers.clone();
                     inflight.ttfb = Some(elapsed);
                 }
@@ -1334,7 +1379,7 @@ impl RequestView {
                     job: current,
                     transport,
                     protocol,
-                    status: Some((status, status_text)),
+                    status,
                     headers,
                     rows: std::collections::VecDeque::new(),
                     dropped: 0,
@@ -1404,6 +1449,21 @@ impl RequestView {
                 cx.notify();
                 true
             }
+            // **Settled here, not left for `report_undelivered`.** The message is accounted
+            // for — it was refused, with a reason — and reporting it again at close as
+            // "not delivered" would blame the connection for a typo.
+            Event::Rejected { text, reason, .. } => {
+                if self.pending_send.as_deref() == Some(text.as_str()) {
+                    self.pending_send = None;
+                }
+                let first = text.lines().next().unwrap_or_default();
+                self.push_notice(format!(
+                    "not sent — {reason}: {}",
+                    zuno_core::request::elide(first, 120)
+                ));
+                cx.notify();
+                true
+            }
             Event::Closed { code, reason, .. } => {
                 // **Named before the close row, because it happened first.** A frame handed to
                 // the engine after the job was already gone is dropped without a word, so this
@@ -1427,6 +1487,22 @@ impl RequestView {
                     response.size.decoded
                 );
                 self.inflight = None;
+
+                // **A finished session is a closed one**, and this arm is where that was
+                // missing. The `Failed` arm below already does it, for the same reason — but
+                // until client-streaming gRPC existed, *nothing that emitted `Opened` ever
+                // ended with `Done`*. Sessions ended in `Closed`, requests ended in `Done`, and
+                // the two sequences never met.
+                //
+                // Client-streaming is the first: many messages up, one response back. Without
+                // this the transcript stayed `open` after the call had finished, with a live
+                // Disconnect button pointing at a job that no longer existed — pressing it did
+                // nothing, forever.
+                if let Some(session) = self.session.as_mut()
+                    && session.closed.is_none()
+                {
+                    session.closed = Some((None, String::new()));
+                }
 
                 // The run this one replaces is the diff baseline, and then becomes history.
                 let previous = self.response.take();
@@ -1486,9 +1562,22 @@ impl RequestView {
                 ..
             } => {
                 if let Some(inflight) = self.inflight.as_mut() {
-                    inflight.status = Some((status, status_text));
-                    inflight.headers = headers;
+                    inflight.status = Some((status, status_text.clone()));
+                    inflight.headers = headers.clone();
                     inflight.ttfb = Some(ttfb);
+                }
+                // **The transcript's own status, filled in late.** A client-streaming gRPC call
+                // opens its transcript before the server has answered, so the strip has no code
+                // to show until this arrives. Only filled when it is still empty: for every
+                // other kind `Opened` already carried the real one, and overwriting a `101`
+                // with an ordinary `200` would be a downgrade, not an update.
+                if let Some(session) = self.session.as_mut()
+                    && session.status.is_none()
+                {
+                    session.status = Some((status, status_text));
+                    if session.headers.is_empty() {
+                        session.headers = headers;
+                    }
                 }
                 cx.notify();
                 true
@@ -1796,11 +1885,16 @@ impl RequestView {
         else {
             return;
         };
-        let Some(socket) = self.kind.as_websocket() else {
-            return;
+        // **The composer is whichever surface this kind sends from**, and both are the same
+        // verb: type a message, press the key, it goes down the open connection. A gRPC call
+        // only offers it while the *client* half is streaming — a server-streaming call sends
+        // one request and then listens, so a live composer there would be a control the
+        // protocol has no way to deliver.
+        let composer = match (self.kind.as_websocket(), self.kind.as_grpc()) {
+            (Some(socket), _) => socket.compose.clone(),
+            (_, Some(grpc)) if grpc.sends_more() => grpc.message.clone(),
+            _ => return,
         };
-
-        let composer = socket.compose.clone();
         let text = composer.read(cx).text().to_string();
         if text.trim().is_empty() {
             return;

@@ -27,10 +27,12 @@ use crate::input::Editor;
 use crate::request_view::RequestView;
 
 pub mod graphql;
+pub mod grpc;
 pub mod http;
 pub mod websocket;
 
 pub use graphql::GraphQlEditor;
+pub use grpc::GrpcEditor;
 pub use http::HttpEditor;
 pub use websocket::WebSocketEditor;
 
@@ -61,18 +63,24 @@ pub enum KindChoice {
     Http,
     GraphQl,
     WebSocket,
+    Grpc,
 }
 
 impl KindChoice {
     /// What the kind picker offers.
-    pub const ALL: [KindChoice; 3] =
-        [KindChoice::Http, KindChoice::GraphQl, KindChoice::WebSocket];
+    pub const ALL: [KindChoice; 4] = [
+        KindChoice::Http,
+        KindChoice::GraphQl,
+        KindChoice::WebSocket,
+        KindChoice::Grpc,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             KindChoice::Http => "HTTP",
             KindChoice::GraphQl => "GraphQL",
             KindChoice::WebSocket => "WebSocket",
+            KindChoice::Grpc => "gRPC",
         }
     }
 
@@ -83,6 +91,7 @@ impl KindChoice {
             KindChoice::Http => "a verb, params and a body",
             KindChoice::GraphQl => "a query and variables",
             KindChoice::WebSocket => "a connection you send messages down",
+            KindChoice::Grpc => "a .proto, a method and a message",
         }
     }
 }
@@ -92,6 +101,7 @@ pub enum KindEditor {
     Http(HttpEditor),
     GraphQl(GraphQlEditor),
     WebSocket(WebSocketEditor),
+    Grpc(GrpcEditor),
 }
 
 impl KindEditor {
@@ -109,6 +119,7 @@ impl KindEditor {
             RequestKind::WebSocket(socket) => {
                 KindEditor::WebSocket(WebSocketEditor::from_spec(socket, cx))
             }
+            RequestKind::Grpc(grpc) => KindEditor::Grpc(GrpcEditor::from_spec(grpc, cx)),
         }
     }
 
@@ -118,6 +129,7 @@ impl KindEditor {
             KindChoice::Http => KindEditor::Http(HttpEditor::new(cx)),
             KindChoice::GraphQl => KindEditor::GraphQl(GraphQlEditor::new(cx)),
             KindChoice::WebSocket => KindEditor::WebSocket(WebSocketEditor::new(cx)),
+            KindChoice::Grpc => KindEditor::Grpc(GrpcEditor::new(cx)),
         }
     }
 
@@ -126,6 +138,7 @@ impl KindEditor {
             KindEditor::Http(_) => KindChoice::Http,
             KindEditor::GraphQl(_) => KindChoice::GraphQl,
             KindEditor::WebSocket(_) => KindChoice::WebSocket,
+            KindEditor::Grpc(_) => KindChoice::Grpc,
         }
     }
 
@@ -142,6 +155,7 @@ impl KindEditor {
             KindEditor::Http(http) => http.has_content(cx),
             KindEditor::GraphQl(graphql) => graphql.has_content(cx),
             KindEditor::WebSocket(socket) => socket.has_content(cx),
+            KindEditor::Grpc(grpc) => grpc.has_content(cx),
         }
     }
 
@@ -176,6 +190,17 @@ impl KindEditor {
                     parts.push("the operation name");
                 }
             }
+            KindEditor::Grpc(grpc) => {
+                if !grpc.proto.read(cx).text().trim().is_empty() {
+                    parts.push("the schema");
+                }
+                if grpc.chosen().is_some() {
+                    parts.push("the chosen method");
+                }
+                if !grpc.message.read(cx).text().trim().is_empty() {
+                    parts.push("the message");
+                }
+            }
             KindEditor::WebSocket(socket) => {
                 if !socket.compose.read(cx).text().trim().is_empty() {
                     parts.push("the message you are composing");
@@ -201,6 +226,7 @@ impl KindEditor {
             KindEditor::Http(http) => RequestKind::Http(http.to_spec(cx)),
             KindEditor::GraphQl(graphql) => RequestKind::GraphQl(graphql.to_spec(cx)),
             KindEditor::WebSocket(socket) => RequestKind::WebSocket(socket.to_spec(cx)),
+            KindEditor::Grpc(grpc) => RequestKind::Grpc(grpc.to_spec(cx)),
         }
     }
 
@@ -218,6 +244,7 @@ impl KindEditor {
             (KindEditor::WebSocket(editor), RequestKind::WebSocket(base)) => {
                 editor.is_dirty(base, cx)
             }
+            (KindEditor::Grpc(editor), RequestKind::Grpc(base)) => editor.is_dirty(base, cx),
             _ => true,
         }
     }
@@ -232,11 +259,15 @@ impl KindEditor {
         // Handshake first: it is what you set once, and Message is where the time goes — the
         // same reasoning that puts Body second for HTTP and opens on it.
         const WEBSOCKET: [KindTab; 2] = [KindTab::new("Handshake"), KindTab::new("Message")];
+        // Method first for Handshake's reason: the schema and the method are set once, and the
+        // message is where the time goes.
+        const GRPC: [KindTab; 2] = [KindTab::new("Method"), KindTab::new("Message")];
 
         match self {
             KindEditor::Http(_) => &HTTP,
             KindEditor::GraphQl(_) => &GRAPHQL,
             KindEditor::WebSocket(_) => &WEBSOCKET,
+            KindEditor::Grpc(_) => &GRPC,
         }
     }
 
@@ -262,6 +293,15 @@ impl KindEditor {
             // No count: lines are a useful number for a table of rows, not for prose.
             (KindEditor::GraphQl(_), 0) => SharedString::from("Query"),
             (KindEditor::GraphQl(_), _) => SharedString::from("Variables"),
+            // **The method's name, not the word "Method".** A gRPC buffer is identified by
+            // which call it makes, and that is the one thing the URL cannot say — the endpoint
+            // is only a host. Bare name rather than the qualified one: the service is usually
+            // the same across a whole collection, so it is the half that distinguishes nothing.
+            (KindEditor::Grpc(grpc), 0) => match grpc.method.trim() {
+                "" => SharedString::from("Method"),
+                name => SharedString::from(format!("Method {name}")),
+            },
+            (KindEditor::Grpc(_), _) => SharedString::from("Message"),
             (KindEditor::WebSocket(_), 0) => SharedString::from("Handshake"),
             (KindEditor::WebSocket(socket), _) => match socket.messages.len() {
                 0 => SharedString::from("Message"),
@@ -284,6 +324,15 @@ impl KindEditor {
         match self {
             KindEditor::Http(_) | KindEditor::GraphQl(_) => true,
             KindEditor::WebSocket(_) => false,
+            // **Only a unary gRPC call**, and the narrowness is the correction.
+            //
+            // A client-streaming call does produce exactly one response, so by that reading it
+            // should qualify — but the engine delivers that response into the *transcript*,
+            // not as `Event::Done`, and captures and assertions run off `Done`. Offering them
+            // there would put two tabs on screen that can never fire: the dead-control shape
+            // this codebase keeps finding, and the reason the question is asked of the kind
+            // rather than guessed at the render site.
+            KindEditor::Grpc(grpc) => !grpc.client_streaming && !grpc.server_streaming,
         }
     }
 
@@ -296,6 +345,12 @@ impl KindEditor {
             KindEditor::GraphQl(_) => 0,
             // The composer. The handshake is set once and rarely revisited.
             KindEditor::WebSocket(_) => 1,
+            // **Method, not Message**, which is the one kind where the second tab is not the
+            // answer. A socket's composer is useful immediately — you can type a frame before
+            // deciding anything — but a gRPC message has no shape until a method is chosen, so
+            // opening on it shows an editor whose placeholder is a guess and whose content
+            // cannot be encoded. The schema is the first thing to answer, not a setting.
+            KindEditor::Grpc(_) => 0,
         }
     }
 
@@ -308,6 +363,7 @@ impl KindEditor {
             KindEditor::Http(http) => http.primary_editor(),
             KindEditor::GraphQl(graphql) => Some(graphql.primary_editor()),
             KindEditor::WebSocket(socket) => Some(socket.primary_editor()),
+            KindEditor::Grpc(grpc) => Some(grpc.primary_editor()),
         }
     }
 
@@ -320,7 +376,8 @@ impl KindEditor {
             KindEditor::Http(http) => Some(&http.method),
             KindEditor::GraphQl(graphql) => Some(&graphql.method),
             // The handshake is a GET and nothing else is legal, so there is no choice to show.
-            KindEditor::WebSocket(_) => None,
+            // gRPC is always POST, which is the same situation stated by the spec instead.
+            KindEditor::WebSocket(_) | KindEditor::Grpc(_) => None,
         }
     }
 
@@ -330,49 +387,63 @@ impl KindEditor {
             KindEditor::GraphQl(graphql) => graphql.method = method,
             // Nothing to set. Reached only if something dispatches a method change at a kind
             // that reports `None` from `method()`, which the chip does not draw.
-            KindEditor::WebSocket(_) => {}
+            KindEditor::WebSocket(_) | KindEditor::Grpc(_) => {}
         }
     }
 
     pub fn as_http(&self) -> Option<&HttpEditor> {
         match self {
             KindEditor::Http(http) => Some(http),
-            KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
+            KindEditor::GraphQl(_) | KindEditor::WebSocket(_) | KindEditor::Grpc(_) => None,
         }
     }
 
     pub fn as_http_mut(&mut self) -> Option<&mut HttpEditor> {
         match self {
             KindEditor::Http(http) => Some(http),
-            KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
+            KindEditor::GraphQl(_) | KindEditor::WebSocket(_) | KindEditor::Grpc(_) => None,
         }
     }
 
     pub fn as_graphql(&self) -> Option<&GraphQlEditor> {
         match self {
             KindEditor::GraphQl(graphql) => Some(graphql),
-            KindEditor::Http(_) | KindEditor::WebSocket(_) => None,
+            KindEditor::Http(_) | KindEditor::WebSocket(_) | KindEditor::Grpc(_) => None,
         }
     }
 
     pub fn as_graphql_mut(&mut self) -> Option<&mut GraphQlEditor> {
         match self {
             KindEditor::GraphQl(graphql) => Some(graphql),
-            KindEditor::Http(_) | KindEditor::WebSocket(_) => None,
+            KindEditor::Http(_) | KindEditor::WebSocket(_) | KindEditor::Grpc(_) => None,
         }
     }
 
     pub fn as_websocket(&self) -> Option<&WebSocketEditor> {
         match self {
             KindEditor::WebSocket(socket) => Some(socket),
-            KindEditor::Http(_) | KindEditor::GraphQl(_) => None,
+            KindEditor::Http(_) | KindEditor::GraphQl(_) | KindEditor::Grpc(_) => None,
         }
     }
 
     pub fn as_websocket_mut(&mut self) -> Option<&mut WebSocketEditor> {
         match self {
             KindEditor::WebSocket(socket) => Some(socket),
-            KindEditor::Http(_) | KindEditor::GraphQl(_) => None,
+            KindEditor::Http(_) | KindEditor::GraphQl(_) | KindEditor::Grpc(_) => None,
+        }
+    }
+
+    pub fn as_grpc(&self) -> Option<&GrpcEditor> {
+        match self {
+            KindEditor::Grpc(grpc) => Some(grpc),
+            KindEditor::Http(_) | KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
+        }
+    }
+
+    pub fn as_grpc_mut(&mut self) -> Option<&mut GrpcEditor> {
+        match self {
+            KindEditor::Grpc(grpc) => Some(grpc),
+            KindEditor::Http(_) | KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
         }
     }
 
@@ -381,6 +452,7 @@ impl KindEditor {
             KindEditor::Http(http) => http.is_focused(window, cx),
             KindEditor::GraphQl(graphql) => graphql.is_focused(window, cx),
             KindEditor::WebSocket(socket) => socket.is_focused(window, cx),
+            KindEditor::Grpc(grpc) => grpc.is_focused(window, cx),
         }
     }
 }

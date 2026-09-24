@@ -44,6 +44,18 @@ gpui = { workspace = true, features = ["test-support"] }
 # not pass — the same reason `core/tests/websocket.rs` uses it rather than a hand-written fake.
 tokio-tungstenite.workspace = true
 
+# A **real** HTTP/2 server for the gRPC end-to-end test, same reasoning as the socket above:
+# gRPC's status lives in trailers and its body is length-prefixed, and a fake would agree with
+# whatever this code sent. `server` and `http2` on hyper reach `cargo test` only — dev-dependency
+# features do not apply to `cargo build`.
+hyper = { workspace = true, features = ["server", "http2"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+
 [[bin]]
 name = "zuno"
 path = "src/main.rs"

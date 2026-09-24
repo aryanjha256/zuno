@@ -138,11 +138,15 @@ fn an_event_stream_arrives_as_frames_rather_than_a_body() {
 
     let mut seen = Vec::new();
     let status = wait_for(&events, &mut seen, "the stream to open", |event| match event {
-        Event::Opened { status, .. } => Some(*status),
+        Event::Opened { status, .. } => Some(status.clone()),
         Event::Failed { error, .. } => panic!("failed: {error}"),
         _ => None,
     });
-    assert_eq!(status, 200, "an SSE response is an ordinary 200");
+    assert_eq!(
+        status.map(|(code, _)| code),
+        Some(200),
+        "an SSE response is an ordinary 200"
+    );
 
     let named = wait_for(&events, &mut seen, "the named event", |event| match event {
         Event::Frame {

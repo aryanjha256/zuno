@@ -36,6 +36,17 @@ pub(crate) fn default_path() -> Option<PathBuf> {
 /// Two callers, and they are the same idea from opposite ends: `app_state::resolve` sets this
 /// from the active workspace, and the test harness sets it to a scratch directory (invariant 6).
 pub fn install_at(cx: &mut App, path: Option<PathBuf>) {
+    // **The engine is told here rather than by each caller**, because it needs the same answer
+    // and a second place to set it is a second place to forget: a gRPC request naming a bare
+    // `greeter.proto` resolves it against this root, so an engine holding a stale one would
+    // compile the wrong schema — or none — while the method picker, which reads the global
+    // directly, went on showing the right methods.
+    //
+    // At boot the engine does not exist yet and this is a no-op; `main` pushes it once the
+    // engine is up, exactly as it does for the proxy and the certificates.
+    if let Some(engine) = crate::engine::ActiveEngine::engine(cx as &App) {
+        engine.set_collection(path.clone());
+    }
     cx.set_global(CollectionRoot(path));
 }
 

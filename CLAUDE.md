@@ -14,10 +14,12 @@ Three docs, three jobs. Read them in this order:
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
 **M1, M2 and M3 are all complete.** architecture.md §11 — engine capability with no UI path — has
-one entry: the engine sends any WebSocket frame type and nothing authors a **binary** one. Ping
-is reachable now; text always was. The loop, the navigation thesis, and reuse are all built; response search and the
-body/headers tabs landed after, then GraphQL and WebSocket as request kinds of their own. ROADMAP's audit section, not its milestone headings, is where the
-remaining work lives.
+three entries: nothing authors a **binary** WebSocket frame, and two gRPC gaps kept open by
+decision — reflection is a one-time import rather than a per-call lookup, and a bidirectional call
+has no hang-up short of closing the tab. The loop, the navigation thesis, and reuse are all built;
+response search and the body/headers tabs landed after, then GraphQL, WebSocket and gRPC as request
+kinds of their own (gRPC's design is §6q). ROADMAP's audit section, not its milestone headings, is
+where the remaining work lives.
 
 ## Layout
 
@@ -38,7 +40,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 1003 tests, ~45s
+cargo test --workspace                   # 1040 tests, ~50s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -49,6 +51,18 @@ cargo test -p zuno-core --test engine -- --ignored --nocapture
 # negotiates ALPN, so every offline WebSocket test passes against an h2 client that can never
 # receive a 101. ZUNO_WS_URL overrides the endpoint.
 cargo test -p zuno-core --test websocket -- --ignored --nocapture
+
+# gRPC, offline. Both halves are worth knowing about: `grpc_trailers` proves reqwest can reach
+# HTTP/2 trailers at all — where gRPC's status lives and which reqwest names nowhere — and
+# `grpc` drives a whole call against a real h2 server.
+cargo test -p zuno-core --test grpc_trailers --test grpc
+
+# Live gRPC reflection. **Not optional after touching reflection**, for the wss:// check's exact
+# reason: every offline test here runs against a fixture written to agree with the client, and
+# three real bugs survived all of them — an empty `list_services` value a real server ignores, a
+# held-open conversation a real server deadlocks against, and a TLS default against a cleartext
+# endpoint. ZUNO_GRPC_URL overrides it.
+cargo test -p zuno-core --test grpc -- --ignored --nocapture
 
 # Perf floor for the response viewer. Release, or the numbers are meaningless.
 cargo test --release -p zuno-core --test json_perf -- --nocapture

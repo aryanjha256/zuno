@@ -25,7 +25,8 @@ use zuno_core::{
 
 use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
-    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseDiff, ShowResponseTiming, ToggleFold, ToggleHtmlView, UnfoldAll,
+    ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTrailers, ShowResponseDiff,
+    ShowResponseTiming, ToggleFold, ToggleHtmlView, UnfoldAll,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
@@ -111,6 +112,11 @@ pub fn render(
                 ResponseView::Headers => {
                     pane.child(headers_region(&response.headers, &view.headers_scroll, theme))
                 }
+                // The same table: trailers are the same key/value shape as headers, and giving
+                // them a second renderer would be two places for one look to drift.
+                ResponseView::Trailers => {
+                    pane.child(headers_region(&response.trailers, &view.headers_scroll, theme))
+                }
                 ResponseView::Timing => pane.child(timing_region(response.timing, theme)),
                 ResponseView::Diff => pane.child(diff_region(view, theme, window)),
             }
@@ -144,6 +150,14 @@ fn view_tabs(
 ) -> Div {
     let active = view.response_view;
 
+    // **gRPC calls this metadata, and it has two blocks.** Every other kind has one and calls it
+    // headers. Naming them per kind rather than picking one word is the same correction already
+    // made for GraphQL's palette labels: a tool that speaks HTTP at you about a protocol that
+    // does not use the word is a tool you have to translate in your head.
+    let grpc = view.kind.as_grpc().is_some();
+    let headers_label = if grpc { "Metadata" } else { "Headers" };
+    let trailer_count = view.response.as_ref().map_or(0, |r| r.trailers.len());
+
     div()
         .flex()
         .flex_row()
@@ -167,12 +181,25 @@ fn view_tabs(
         // without switching.
         .child(view_tab(
             "response-tab-headers",
-            format!("Headers {header_count}"),
+            format!("{headers_label} {header_count}"),
             active == ResponseView::Headers,
             ShowResponseHeaders,
             theme,
             cx,
         ))
+        // **Only for gRPC.** HTTP has trailers and essentially nobody sends them, so on every
+        // other kind this would be a permanently empty tab — the shape of dead control this
+        // codebase keeps finding, one tab wide.
+        .children(grpc.then(|| {
+            view_tab(
+                "response-tab-trailers",
+                format!("Trailers {trailer_count}"),
+                active == ResponseView::Trailers,
+                ShowResponseTrailers,
+                theme,
+                cx,
+            )
+        }))
         // No number on this one. The equivalent would be the total, which is already in the
         // status line above the strip — repeating it here would be the only tab label that
         // duplicates something two rows up.

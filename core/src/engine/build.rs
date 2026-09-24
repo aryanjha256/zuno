@@ -229,6 +229,10 @@ pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
         RequestKind::GraphQl(_) => return Ok(PreparedBody::None),
         // The handshake carries no body at all — RFC 6455 forbids one on the GET.
         RequestKind::WebSocket(_) => return Ok(PreparedBody::None),
+        // A gRPC body is a framed protobuf message, and producing one needs the compiled
+        // schema — which this function has no way to reach. `build_grpc` takes the encoded
+        // bytes from the caller that does. Genuinely nothing here, not merely empty.
+        RequestKind::Grpc(_) => return Ok(PreparedBody::None),
     };
     match &http.body {
         Body::Empty => Ok(PreparedBody::None),
@@ -324,6 +328,13 @@ pub fn build(client: &Client, spec: &RequestSpec) -> Result<Request, EngineError
         // makes the reply verifiable. `session::connect` calls `build_websocket` directly.
         RequestKind::WebSocket(_) => Err(EngineError::Other {
             reason: "a WebSocket is opened, not sent".to_string(),
+        }),
+        // **Not built here either, and for a sharper reason.** A gRPC body is a protobuf
+        // message, and encoding one needs the compiled `.proto` — which is on disk, is shared
+        // between requests, and is not reachable from a `RequestSpec`. `build_grpc` takes the
+        // already-encoded bytes from the caller that compiled the schema.
+        RequestKind::Grpc(_) => Err(EngineError::Other {
+            reason: "a gRPC call needs its schema, so it is built by the gRPC path".to_string(),
         }),
     }
 }
@@ -503,6 +514,62 @@ fn build_http(
 mod tests {
     use super::*;
     use crate::request::{FormField, Header, MultipartField, QueryParam, RawKind};
+
+    /// **A scheme-less gRPC address is plaintext only on loopback**, and the narrowness is the
+    /// point: the wide version would send credentials out readable.
+    ///
+    /// The failure this prevents is silent in both directions — a TLS client against a plaintext
+    /// server gets rustls complaining about a corrupt message, and a plaintext client against a
+    /// TLS one gets no error naming the version at all.
+    #[test]
+    fn a_scheme_less_grpc_address_is_plaintext_only_on_loopback() {
+        let path = "/pkg.Svc/Method";
+        let url = |raw: &str| grpc_url(&spec_with_url(raw), path).expect("url");
+
+        // Local development, which is essentially never TLS.
+        assert_eq!(url("localhost:50051").scheme(), "http");
+        assert_eq!(url("127.0.0.1:50051").scheme(), "http");
+        assert_eq!(url("[::1]:50051").scheme(), "http");
+        assert_eq!(url("LocalHost:50051").scheme(), "http");
+
+        // Anything else keeps the secure default. A public plaintext server — there are some,
+        // including on 443 — needs `http://` typed, and the connect error now says so.
+        assert_eq!(url("grpc.example.com:443").scheme(), "https");
+        assert_eq!(url("10.0.0.5:50051").scheme(), "https");
+
+        // **A typed scheme is always obeyed**, which is what makes the rule a default rather
+        // than a policy: it must be possible to say plainly what you meant.
+        assert_eq!(url("http://grpc.example.com:443").scheme(), "http");
+        assert_eq!(url("https://localhost:50051").scheme(), "https");
+
+        // And the method's path replaces whatever was typed, since gRPC routes on it alone.
+        assert_eq!(url("localhost:50051/ignored").path(), path);
+    }
+
+    /// **A typed `Content-Type` is replaced, not joined.** gRPC's pane calls headers Metadata,
+    /// which invites exactly this entry, and two content types reach the server as one joined
+    /// value that nothing routes.
+    #[test]
+    fn grpc_metadata_cannot_duplicate_a_protocol_header() {
+        let mut spec = spec_with_url("http://127.0.0.1:1");
+        spec.headers = vec![
+            Header::new("Content-Type", "application/json"),
+            Header::new("TE", "gzip"),
+            Header::new("authorization", "Bearer x"),
+        ];
+
+        let headers = grpc_headers(&spec).expect("headers");
+        let all = |name: &str| {
+            headers
+                .get_all(name)
+                .iter()
+                .map(|value| value.to_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(all("content-type"), vec!["application/grpc+proto"]);
+        assert_eq!(all("te"), vec!["trailers"]);
+        assert_eq!(all("authorization"), vec!["Bearer x"], "the person's own metadata stays");
+    }
 
     fn spec_with_url(url: &str) -> RequestSpec {
         RequestSpec {
@@ -1060,4 +1127,133 @@ pub fn build_websocket(
     *request.version_mut() = http::Version::HTTP_11;
 
     Ok(request)
+}
+
+/// The endpoint a gRPC call is made against, with the method's path replacing whatever the URL
+/// text carried.
+///
+/// **gRPC routes entirely on `:path`**, and that path is `/package.Service/Method` — there is no
+/// query string, no verb and no content negotiation. So the URL a person types is only ever an
+/// *origin*: a host, a port, and a scheme. Anything they left in the path is discarded rather
+/// than joined, because a base of `http://host/v1` plus a method would produce
+/// `/v1/pkg.Service/Method`, which no gRPC server routes.
+pub fn grpc_url(spec: &RequestSpec, path: &str) -> Result<Url, EngineError> {
+    let mut url = resolve_url(spec)?;
+    url.set_path(path);
+    url.set_query(None);
+
+    // **A scheme-less loopback address means plaintext**, and only loopback.
+    //
+    // `resolve_url` fills in `https://`, which is the right default for HTTP — you are usually
+    // calling a public API — and the wrong one for a gRPC server on your own machine, which is
+    // essentially never TLS. Getting it wrong is not a polite failure either: the server's
+    // HTTP/2 preface arrives where rustls expects a TLS record and the error names neither the
+    // cause nor the fix.
+    //
+    // Narrowed to loopback on purpose. Defaulting *everything* to plaintext would be a security
+    // regression — credentials typed into a request would go out readable, and the whole reason
+    // a secure default is right is that the insecure one fails silently in the safe direction.
+    // On loopback there is no path to expose them on. A public plaintext server, such as
+    // `grpc.postman-echo.com`, still needs `http://` typed, which the error now says.
+    if !has_scheme(spec.url.trim()) && is_loopback(url.host_str()) {
+        // Infallible for a known scheme on a URL that already parsed.
+        let _ = url.set_scheme("http");
+    }
+
+    Ok(url)
+}
+
+/// Whether a host is this machine, by name or by address.
+///
+/// Name as well as address because `localhost` is what people type; the numeric forms are what
+/// a container or a compose file tends to produce.
+fn is_loopback(host: Option<&str>) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // **`Url::host_str` keeps the brackets on an IPv6 literal** — `[::1]`, not `::1` — and
+    // `IpAddr` will not parse that, so `::1` read as "not loopback" and a local IPv6 gRPC server
+    // got TLS. Written here first as a comment claiming the opposite; the test caught it.
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+/// Build one gRPC call from an already-encoded message.
+///
+/// **The bytes come in rather than being built here**, because encoding needs the compiled
+/// `.proto` — which lives on disk, is shared between requests, and is not reachable from a
+/// `RequestSpec`. Keeping the schema out of this function is what lets it stay pure and testable
+/// the way every other builder here is.
+pub fn build_grpc(
+    client: &Client,
+    spec: &RequestSpec,
+    grpc: &crate::request::GrpcRequest,
+    message: &[u8],
+) -> Result<Request, EngineError> {
+    build_grpc_body(client, spec, grpc, crate::grpc::frame(message).into())
+}
+
+/// The same, with a body that stays open.
+///
+/// **What client-streaming actually needs.** A unary call's body is a fixed run of bytes; a
+/// client-streaming one is a body that accepts more messages for as long as the person keeps
+/// sending, and ends when they say so. `reqwest::Body::wrap_stream` is what makes that a body at
+/// all, and HTTP/2 is what makes it work — the request headers go out immediately and DATA
+/// frames follow, which is exactly the shape gRPC was designed around.
+pub fn build_grpc_body(
+    client: &Client,
+    spec: &RequestSpec,
+    grpc: &crate::request::GrpcRequest,
+    body: reqwest::Body,
+) -> Result<Request, EngineError> {
+    if grpc.service.trim().is_empty() || grpc.method.trim().is_empty() {
+        return Err(EngineError::Other {
+            reason: "choose a service and a method before sending".to_string(),
+        });
+    }
+
+    let path = format!("/{}/{}", grpc.service.trim(), grpc.method.trim());
+    let url = grpc_url(spec, &path)?;
+
+    client
+        .post(url)
+        .headers(grpc_headers(spec)?)
+        .body(body)
+        .build()
+        .map_err(|error| EngineError::Build {
+            reason: error.to_string(),
+        })
+}
+
+/// The person's metadata plus the three headers the protocol requires.
+///
+/// **`insert`, which replaces, and not `RequestBuilder::header`, which appends.** gRPC calls
+/// these *metadata* and they are ordinary HTTP/2 headers, so someone can type a `content-type`
+/// into them — and appending ours after theirs sent both, which HTTP/2 joins into
+/// `application/json, application/grpc+proto` and no server routes. Shared with reflection so
+/// the two cannot disagree about it.
+pub fn grpc_headers(spec: &RequestSpec) -> Result<HeaderMap, EngineError> {
+    let mut headers = build_headers(spec)?;
+    // `+proto` names the codec. A bare `application/grpc` is legal and means the same, but
+    // being explicit is what makes a proxy's logs readable.
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/grpc+proto"),
+    );
+    // **Required by the spec, and the whole reason trailers arrive at all.** `TE: trailers` is
+    // how a client says it will read them; gRPC puts its status there.
+    headers.insert(http::header::TE, HeaderValue::from_static("trailers"));
+    // Nothing here negotiates message compression, and `unframe` refuses a compressed frame
+    // rather than decoding it as plaintext — so say so instead of letting a server pick
+    // something we would then reject.
+    headers.insert(
+        HeaderName::from_static("grpc-accept-encoding"),
+        HeaderValue::from_static("identity"),
+    );
+    Ok(headers)
 }

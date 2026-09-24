@@ -15,6 +15,7 @@ use gpui::{
 
 use crate::actions::{
     AddAssertion, AddCapture, AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext,
+    ChooseProtoFile, OpenGrpcMethod, ReflectSchema,
     BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCurl, ImportCurl,
     OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
     SendRequest, ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
@@ -60,7 +61,12 @@ pub fn render(
 
     match view.request_tab {
         RequestTab::Headers => pane
-            .child(section_header("Headers", header_detail, RowKind::Header, theme))
+            .child(section_header(
+                metadata_label(view),
+                header_detail,
+                RowKind::Header,
+                theme,
+            ))
             .child(rows_table(&view.headers, RowKind::Header, theme, window, cx)),
         // **The kind's own tabs.** Which content a slot holds is the kind's business, not this
         // match's — that is what keeps adding gRPC to one module instead of to every site that
@@ -79,6 +85,30 @@ pub fn render(
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(body_region(view, theme, body_focused, window, cx)),
+            // **Two tabs, and the first is the half a URL cannot express.** For every other
+            // kind the endpoint says what is being called; a gRPC URL is only a host, and the
+            // call lives in the schema. So Method is where the schema is chosen and the method
+            // picked, and Message is the payload.
+            (KindEditor::Grpc(grpc), 0) => pane
+                .child(editor_header(
+                    "Schema",
+                    "a file in the collection's protos/, or a path to one",
+                    theme,
+                ))
+                .child(grpc_schema_row(grpc, theme, cx))
+                .child(editor_header("Method", "", theme))
+                .child(grpc_method_row(grpc, theme)),
+            (KindEditor::Grpc(grpc), _) => pane
+                .child(grpc_message_header(grpc, theme))
+                .children(
+                    view.body_search
+                        .as_ref()
+                        .map(|search| body_find_bar(search, theme, cx)),
+                )
+                .child(
+                    editor_region(theme, focused_editor(&grpc.message, window, cx))
+                        .child(grpc.message.clone()),
+                ),
             (KindEditor::GraphQl(graphql), 0) => pane
                 .child(graphql_query_header(graphql, theme, cx))
                 .children(
@@ -182,7 +212,7 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
         let (id, label, action): (&'static str, SharedString, Box<dyn gpui::Action>) = match tab {
             RequestTab::Headers => (
                 "request-tab-headers",
-                SharedString::from(count_suffix("Headers", view.headers.len())),
+                SharedString::from(count_suffix(metadata_label(view), view.headers.len())),
                 Box::new(ShowHeadersTab),
             ),
             // **Two slot actions, because no kind has a third tab yet.** A kind that declares
@@ -582,6 +612,20 @@ fn send_button(
                 }),
             )
             .child(if session { "Connect" } else { "Send" }.to_string())
+    }
+}
+
+/// What this kind calls its ordered key/value metadata.
+///
+/// **gRPC says metadata; everything else says headers**, and they are the same thing on the
+/// wire — gRPC rides HTTP/2 and its metadata *is* HTTP/2 headers. Naming it per kind rather
+/// than picking one word is the correction already made for GraphQL's palette labels: a pane
+/// that says "Headers" to someone composing a gRPC call is speaking a vocabulary the protocol,
+/// its spec and every other client have agreed not to use.
+fn metadata_label(view: &RequestView) -> &'static str {
+    match view.kind.as_grpc() {
+        Some(_) => "Metadata",
+        None => "Headers",
     }
 }
 
@@ -1809,4 +1853,135 @@ fn saved_messages(
             )
             .children(rows),
     )
+}
+
+/// The `.proto` field, with the folder button that fills it.
+///
+/// **A path you must type is a path you have to already know**, which is why every file field
+/// here pairs an editable input with a dialog that *fills* it rather than acting on selection.
+/// The field stays editable so browsing is a faster way to answer rather than a different verb.
+fn grpc_schema_row(
+    grpc: &crate::kinds::GrpcEditor,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .p_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .child(crate::ui::field_box(grpc.proto.clone(), theme)),
+        )
+        .child(
+            div()
+                .id("grpc-proto-file")
+                .debug_selector(|| "grpc-proto-file".to_string())
+                .group(crate::ui::ICON_GROUP)
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(22.))
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover))
+                .tooltip(move |window, cx| {
+                    crate::ui::Tooltip::for_action(
+                        "Choose a .proto file",
+                        &ChooseProtoFile,
+                        window,
+                        cx,
+                    )
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, window, cx| {
+                        // See the multipart file button: `Workspace`'s root carries
+                        // `track_focus`, whose focus-on-click is an ordinary bubble listener,
+                        // so without this the click is taken back by the root.
+                        cx.stop_propagation();
+                        window.dispatch_action(Box::new(ChooseProtoFile), cx);
+                    }),
+                )
+                .child(crate::ui::glyph(
+                    crate::ui::Icon::File,
+                    theme.text_muted,
+                    theme.accent,
+                    crate::ui::GLYPH,
+                )),
+        )
+}
+
+/// Which method this call makes, and the control that changes it.
+///
+/// **Says "none chosen" rather than drawing nothing.** A gRPC request with no method cannot be
+/// sent at all, and an empty row would read as a rendering gap rather than as the one thing
+/// left to do.
+fn grpc_method_row(grpc: &crate::kinds::GrpcEditor, theme: &Theme) -> Div {
+    let (label, colour) = match grpc.chosen() {
+        Some(chosen) => (SharedString::from(chosen), theme.text),
+        None => (SharedString::from("none chosen"), theme.text_faint),
+    };
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .pb_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_xs()
+                .text_color(colour)
+                .child(label),
+        )
+        .children(grpc.server_streaming.then(|| {
+            div()
+                .flex_none()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child("streaming")
+        }))
+        // **Offered beside Choose rather than hidden behind the palette**, because it answers
+        // the question someone without a `.proto` is actually stuck on — and that is precisely
+        // the person who cannot discover a keystroke for it.
+        .child(crate::ui::icon_text_action(
+            "grpc-reflect",
+            Icon::Download,
+            "From server".into(),
+            "Ask the server for its schema and save it in the collection",
+            ReflectSchema,
+            theme.text_muted,
+            theme,
+        ))
+        .child(crate::ui::icon_text_action(
+            "grpc-choose-method",
+            Icon::ChevronsUpDown,
+            "Choose".into(),
+            "Pick a method from the schema",
+            OpenGrpcMethod,
+            theme.accent,
+            theme,
+        ))
+}
+
+/// The header above the request message.
+fn grpc_message_header(grpc: &crate::kinds::GrpcEditor, theme: &Theme) -> Div {
+    // The message type is what you are filling in, so it is the useful note — and it is only
+    // knowable once a method has been chosen.
+    let note = match grpc.chosen() {
+        Some(_) => "JSON, encoded as protobuf on the wire",
+        None => "choose a method first",
+    };
+    editor_header("Message", note, theme)
 }

@@ -2986,6 +2986,131 @@ the part, and `set_source` for the import field.
 
 ---
 
+## 6q. gRPC — a schema learned at runtime, on the client that already worked
+
+A REST request can be typed from nothing. A gRPC call cannot be composed at all without the
+service, the method and the request message's shape — so the expensive half is **learning a
+schema at runtime and encoding against it**, and the transport is the cheap half.
+
+**Rejected: `tonic`.** It brings its own client, codegen and connection handling, and the transport
+was already proven on reqwest. gRPC's framing is one compression byte and a four-byte length
+(`grpc::frame`, `grpc::Reader`), which is not worth a dependency. What reqwest does *not* name is
+HTTP/2 **trailers**, where gRPC puts its status; the route is `From<Response> for
+http::Response<Body>` and then `http_body::Body`'s frames, and `core/tests/grpc_trailers.rs` proved
+it against a real h2 server before anything was built on top.
+
+**Rejected: `protoc`.** `protox` is a protobuf compiler in Rust, so a `.proto` compiles with nothing
+installed — the only way this ships in a `.deb`. `prost-reflect` holds the descriptors and gives
+`DynamicMessage`; its serde support is what lets a person type JSON. The encoding is protobuf; only
+what you type and what you read are JSON, because every other body in Zuno is. A `.desc`,
+`.protoset` or `.pb` is read as an already-compiled descriptor set, told apart **by extension** —
+a descriptor set has no magic number, and "does this parse as protobuf" is a question almost any
+file answers yes to. The schema is **compiled on every send**: caching it would make the obvious
+loop, fix the schema and press Send, silently use the old one.
+
+### Where the schema lives
+
+A request *names* its schema. A bare filename resolves inside the collection's reserved `protos/`
+(`grpc::resolve_proto`), which keeps a committed collection portable for invariant 10's reason; a
+path with a separator is used as written, so a scratch tab works before it has a collection.
+`protos/` is skipped by `collection::scan` and the folder list, like `environments/` and `flows/`.
+**Known gap:** a path chosen from outside `protos/` is stored verbatim, which is unportable — copying
+it in would fix that, and is not built.
+
+### One predicate was four questions
+
+`RequestKind::is_session()` answered "which HTTP version", "which engine path", "does the reply
+stream" and "may more be sent" — the same answer for WebSocket and SSE, so it looked right. gRPC
+splits them: a client-streaming call keeps its *request* open and answers once. It got the wrong
+answer to each question in turn, four times, each silently — an h2-requiring call pinned to
+HTTP/1.1, a gRPC call routed into the WebSocket handshake, a single reply read as a transcript, a
+call that never opened. **Rejected: patching call sites.** There are now three predicates —
+`opens_a_transcript`, `accepts_more_messages`, `opens_a_websocket` — and no general one to reach
+for. The version question is its own enum, `Alpn` (`Negotiate`, `Http1Only`,
+`Http2PriorKnowledge`), in `ClientKey` because ALPN is a property of the connection: a pooled h2
+connection cannot be talked out of being h2. Prior knowledge because a cleartext socket has no
+ALPN, so a client that merely *prefers* h2 sends HTTP/1.1 and the server hangs up — the mirror of
+the `wss://` bug. A scheme-less URL is plaintext **on loopback only**; anywhere else keeps the TLS
+default, because widening it sends credentials out readable.
+
+### The shape: the schema decides, the stored copy labels
+
+`GrpcRequest` stores `client_streaming` and `server_streaming` so the button can say Send or
+Connect without compiling on the UI thread. **The engine never reads them.** It takes the shape
+from the descriptor it just compiled. It used to read the copy for the request body and the
+descriptor for the reply, and a copy gone stale after a `.proto` edit built a streaming body for a
+unary method that hung until the read timeout. Re-fetching a schema by reflection re-reads the
+chosen method, so the label follows too.
+
+A streaming request is `reqwest::Body::wrap_stream` fed from the same `Outbound` channel a socket
+sends down. **Dropping the sender is the half-close**, and the only thing that lets the server
+answer. Three details are load-bearing:
+
+- **`Opened` is emitted before sending, for both shapes whose request stays open**, with
+  `status: None` until `Head` fills it in. Many servers answer only once the request ends — so
+  waiting for the response head deadlocks: the app will not send without an open transcript, and
+  Disconnect without one *aborts* rather than half-closing. Emitted before the feeder task is
+  spawned, or a `Sent` row can beat it and be dropped. `stream()` then does not emit a second one,
+  which would restart the transcript.
+- **Dropping a `oneshot` sender resolves its receiver.** The feeder ends after half-closing, and
+  handing it the stop signal made the end of the feeder look like Disconnect — a bidirectional call
+  read zero frames about half the time. `_keep_alive` holds it.
+- **A message that does not encode is refused alone** (`Event::Rejected`), not treated as the end
+  of the conversation. Ending there half-closed the request and the server answered as if the
+  messages before the typo were all of it.
+
+Disconnect on a bidirectional call means *done sending* and keeps reading; §11 records that it has
+no hang-up.
+
+### The verdict
+
+`grpc-status` outranks the HTTP status, always: a failed call is a 200. It is read **from the
+trailers, or from the response head** — a *Trailers-Only* response, which grpc-go and grpc-java
+send for any error raised before a message exists, carries it in HEADERS with no body. Reading
+only trailers called a correct server "not a gRPC endpoint". Absent from both, the reply is not
+gRPC at all. `grpc-message` is percent-encoded and is decoded as bytes.
+
+A success's decoded JSON is the body, because the viewer's value is over a structure. The two
+metadata blocks keep separate tabs — **Metadata** for the head, **Trailers** for what came after,
+verbatim with `grpc-status` included — and the request pane calls its headers Metadata too. The
+person's metadata is merged by `grpc_headers`, which **replaces** `content-type`, `te` and
+`grpc-accept-encoding` rather than appending, since two content types reach the server joined into
+one value nothing routes. A failed call produces `Event::Failed` and carries no response, so
+`grpc-status-details-bin` is the one thing lost.
+
+### Reflection — an import, one call per question
+
+*From server* writes the descriptor set into `protos/` and points the request at it (§11 has the
+trade against a live lookup). Only the envelope is hand-decoded (`grpc::reflection`); what comes
+back inside is a `FileDescriptorProto`, which goes straight to prost-reflect. A real server found
+three things every offline test had missed:
+
+- `list_services` must carry **`"*"`**, not the empty string the spec says is ignored — a server
+  reading it for truthiness answers nothing, with status 0.
+- **Rejected: one held-open bidirectional conversation**, which is what the service is declared as.
+  A server that buffers the request deadlocks against it. One call per question, half-closed at
+  once, works against both kinds.
+- The TLS default against a cleartext endpoint, which the loopback rule and a named error answer.
+
+`v1` is tried before `v1alpha`, and every failure falls through to the other version. A server
+that refuses a symbol says why inside a healthy call, and that reason is what gets reported. The
+descriptor set is loaded and written on the background executor, and the result goes to the tab
+that asked, not the active one.
+
+### What is asserted, and what is not
+
+`core/tests/grpc.rs` drives the engine against a real hyper h2 server that **decodes what it was
+sent**: all four shapes, a failure after delivery, a Trailers-Only error, a stale stored shape, a
+refused message, a port that does not speak HTTP/2, and reflection, including a refused symbol. The
+live `#[ignore]`d reflection test is not optional after touching reflection — every bug in the list
+above passed the offline fixture. **Not asserted:** a bidirectional server that interleaves replies
+with an unfinished request — the fixture reads the whole request first, so it proves the plumbing,
+not the overtaking. And `open_grpc_method` compiles on the UI thread, deliberately: a person asked
+for the schema by name, and a picker that opened empty and filled a frame later reads as a schema
+with no methods.
+
+---
+
 ## 7. Text input — the biggest hidden cost
 
 Be clear-eyed about this: **gpui 0.2.2 does not ship a text editor.** `src/input.rs` contains
@@ -3502,9 +3627,13 @@ UI work, not engine work.
 | ~~Response history~~ | **Reachable.** `Ctrl+H` lists every retained run; choosing one shows it and re-indexes its body. Until then the retention was *write-only* — nothing read it, not even the diff |
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 | ~~**Ping**~~ | **Reachable.** A Ping button beside Save in the message header, plus a *Send a ping frame* palette row. It was the half of this entry worth reaching — a socket that has gone quiet is indistinguishable from one the network dropped, and a Ping is the protocol's own way to ask; the peer must answer with a Pong, and the transcript records both |
+| **Live gRPC reflection** | **Not reachable, and deliberately.** *From server* fetches the schema once and writes it into the collection's `protos/` as a `.desc`; nothing looks it up per call. That buys three things a live lookup does not — the request works offline and against a server with reflection later disabled, the schema is committable so a teammate gets it by cloning, and no send pays for a round trip whose answer almost never changes. Re-fetching is one keystroke. If per-call reflection is ever wanted it is a flag on `GrpcRequest`, not a rewrite |
+| **Hanging up a bidirectional gRPC call** | **Not reachable.** Disconnect on one means *done sending*: it half-closes the request and keeps listening, because stopping the read there truncates whatever the server was still sending — a wrong answer on screen rather than an inconvenience. So there is no hang-up short of closing the tab, which `Engine::cancel` handles. A separate "done sending" verb would let Disconnect mean Disconnect again; it is not worth inventing one until somebody wants it |
 | **Binary frames — sending one** | **Not reachable.** `Frame` has all four variants and the engine sends whichever it is given; a received binary, ping or pong is labelled and shown in the transcript. But `send_frame` builds `Frame::Text` and `send_ping` builds `Frame::Ping`, so a binary frame still has no author. It needs what a binary *body* needed — a file picker and a path held rather than bytes typed — which is why it did not come along with the ping. **Pong is deliberately not listed**: tungstenite answers a received Ping itself, so a hand-sent Pong is a frame with no question behind it |
 
-**Nothing remains** *of the items this table ever listed.* `Ctrl+,` closed five, the method picker
+**Nothing remains** *of the items this table originally listed*; the three rows still open —
+binary frames, and the two gRPC ones, which are open by decision rather than omission (§6q) —
+arrived after. `Ctrl+,` closed five, the method picker
 a sixth, `Ctrl+H` a seventh, and body authoring took form, binary, and multipart — the last of
 which was the only item here that ever needed engine work rather than UI.
 

@@ -326,6 +326,7 @@ mod tests {
             status_text: "OK".into(),
             version: HttpVersion::Http11,
             headers: vec![Header::new("content-type", content_type)],
+            trailers: Vec::new(),
             size: SizeInfo {
                 declared: Some(body.len() as u64),
                 decoded: body.len() as u64,

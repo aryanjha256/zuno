@@ -43,7 +43,7 @@ fn wait_for<T>(
 fn describe(event: &Event) -> String {
     match event {
         Event::Started { .. } => "Started".into(),
-        Event::Opened { status, protocol, .. } => format!("Opened({status}, {protocol:?})"),
+        Event::Opened { status, protocol, .. } => format!("Opened({status:?}, {protocol:?})"),
         Event::Frame { direction, frame, .. } => format!("Frame({direction:?}, {frame:?})"),
         Event::Closed { code, reason, .. } => format!("Closed({code:?}, {reason:?})"),
         Event::Failed { error, .. } => format!("Failed({error})"),
@@ -115,11 +115,11 @@ fn a_socket_opens_carries_frames_both_ways_and_closes() {
     let mut seen = Vec::new();
 
     let status = wait_for(&events, &mut seen, "the socket to open", |event| match event {
-        Event::Opened { status, .. } => Some(*status),
+        Event::Opened { status, .. } => Some(status.clone()),
         Event::Failed { error, .. } => panic!("the handshake failed: {error}"),
         _ => None,
     });
-    assert_eq!(status, 101);
+    assert_eq!(status.map(|(code, _)| code), Some(101));
 
     engine.send_frame(job, Frame::Text("hello".to_string()));
 
@@ -276,11 +276,11 @@ fn a_real_wss_endpoint_opens() {
 
     let mut seen = Vec::new();
     let status = wait_for(&events, &mut seen, "the socket to open", |event| match event {
-        Event::Opened { status, .. } => Some(*status),
+        Event::Opened { status, .. } => Some(status.clone()),
         Event::Failed { error, .. } => panic!("handshake failed: {error}"),
         _ => None,
     });
-    assert_eq!(status, 101);
+    assert_eq!(status.map(|(code, _)| code), Some(101));
 
     engine.send_frame(job, Frame::Text("hello".to_string()));
     // Skipped rather than asserted on: a public echo server is entitled to greet you first,
@@ -377,7 +377,7 @@ fn a_graphql_subscription_rides_a_socket_and_unwraps_its_payloads() {
     });
 
     assert!(
-        spec.kind.is_session(),
+        spec.kind.opens_a_websocket(),
         "Auto has to route a subscription to a socket before anything is sent"
     );
 

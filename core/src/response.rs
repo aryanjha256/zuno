@@ -306,6 +306,25 @@ pub struct ResponseData {
     pub version: HttpVersion,
     /// Ordered, exactly as received — duplicates included.
     pub headers: Vec<Header>,
+    /// Metadata sent *after* the body, which in practice means gRPC.
+    ///
+    /// **A gRPC response carries two metadata blocks, and this is the second.** `headers` is the
+    /// initial metadata that arrives with the response head; trailers arrive at the end and are
+    /// where `grpc-status`, `grpc-message` and any application trailing metadata live. Reading
+    /// only the first is reading half the response — and the half that says whether the call
+    /// actually succeeded is this one.
+    ///
+    /// Carried verbatim, `grpc-status` included. Hiding the keys the engine happens to read
+    /// would make a Trailers tab lie about what the server sent.
+    ///
+    /// **Empty for every other protocol**, and for a gRPC call that *failed*: a non-zero status
+    /// produces `Event::Failed`, which carries no response at all. The status, its name and the
+    /// server's message are in the error text; `grpc-status-details-bin` is the one thing lost,
+    /// and recovering it means reshaping `Event::Failed` to carry a response.
+    ///
+    /// HTTP has trailers too and essentially nobody sends them, which is why nothing but the
+    /// gRPC path fills this in.
+    pub trailers: Vec<Header>,
     pub body: Bytes,
     pub timing: Timing,
     pub size: SizeInfo,
@@ -352,6 +371,7 @@ impl ResponseData {
                 Header::new("x-ratelimit-remaining", "4998"),
                 Header::new("cache-control", "no-cache"),
             ],
+            trailers: Vec::new(),
             body,
             timing: Timing {
                 connection: Connection::Opened {

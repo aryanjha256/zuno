@@ -5503,11 +5503,108 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     }
     seen.sort_by_key(|tab| format!("{tab:?}"));
     seen.dedup();
+    // Every tab *this kind offers* — Trailers is declared for gRPC alone, and an HTTP cycle
+    // that stopped on it would land on a tab the strip does not draw.
+    let offered = cx.update(|_, cx| {
+        ResponseView::ALL
+            .iter()
+            .filter(|tab| view.read(cx).offers_response_view(**tab))
+            .count()
+    });
     assert_eq!(
         seen.len(),
-        ResponseView::ALL.len(),
-        "cycling should reach every declared tab, saw {seen:?}"
+        offered,
+        "cycling should reach every tab this kind offers, saw {seen:?}"
     );
+    assert!(!seen.contains(&ResponseView::Trailers), "HTTP draws no Trailers tab");
+}
+
+/// **Trailers is reachable exactly where it is drawn.**
+///
+/// Three routes could put the pane on it, and each did on a kind with no Trailers tab — `alt-r`
+/// never reached it on gRPC because `ResponseView::ALL` did not list it, the palette verb set it
+/// on HTTP where nothing is drawn, and switching a gRPC tab to HTTP left it there. Each of those
+/// shows an empty table with no tab highlighted, which reads as a rendering fault.
+#[gpui::test]
+async fn trailers_are_reachable_only_where_they_are_drawn(cx: &mut TestAppContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+
+    // HTTP: the palette verb refuses rather than landing on an undrawn tab.
+    cx.dispatch_action(crate::actions::ShowResponseHeaders);
+    cx.dispatch_action(crate::actions::ShowResponseTrailers);
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
+
+    // gRPC: `alt-r` reaches it, between Headers and Timing as drawn, and back again.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    cx.dispatch_action(crate::actions::ShowResponseHeaders);
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Trailers);
+    cx.simulate_keystrokes("alt-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
+    cx.simulate_keystrokes("alt-shift-r");
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Trailers);
+
+    // Switching away from gRPC while on it moves off it.
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Http, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
+}
+
+/// **Reflection answers the tab that asked**, not whichever is active when the answer lands.
+///
+/// A round trip is long enough to switch tabs in, and the result used to be written into
+/// `Workspace::active` — so the error, or the schema's filename, landed in some other request
+/// while the one that asked showed nothing. The server holds each connection open before
+/// dropping it, so the switch below always happens first.
+#[gpui::test]
+async fn reflection_answers_the_tab_that_asked(cx: &mut TestAppContext) {
+    let dir = scratch_dir("reflect-target");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        // Once per reflection version tried — v1, then v1alpha.
+        for _ in 0..2 {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(Duration::from_millis(400));
+            drop(stream);
+        }
+    });
+
+    let (window, asking, mut cx) = boot(cx, None, Some(dir.clone()));
+    cx.update(|_, cx| {
+        asking.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("http://127.0.0.1:{port}"));
+
+    cx.dispatch_action(crate::actions::ReflectSchema);
+    cx.dispatch_action(crate::actions::NewTab);
+    let other = active_view(&window, &mut cx);
+    assert_ne!(other.entity_id(), asking.entity_id(), "a second tab is active");
+
+    wait_for(&mut cx, "the reflection to fail", |cx| {
+        cx.update(|_, cx| asking.read(cx).error.is_some().then_some(()))
+    });
+    assert!(
+        cx.update(|_, cx| other.read(cx).error.is_none()),
+        "the failure belongs to the tab that asked, not the one that happened to be active"
+    );
+
+    drop(server);
+    remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
 #[gpui::test]
@@ -13840,4 +13937,343 @@ async fn the_ping_button_sends_a_real_ping_frame(cx: &mut TestAppContext) {
         .expect("the server must receive a Ping frame");
 
     server.join().expect("server thread");
+}
+
+/// An h2 server that speaks enough gRPC for one unary call.
+///
+/// `hyper`'s own server rather than a hand-written socket, for `core/tests/websocket.rs`'s
+/// reason: a fake agrees with whatever this code happens to send. It decodes the request's
+/// `name` field and answers with it, so the channel it returns is a record of what actually
+/// arrived rather than of what was intended.
+fn grpc_server() -> (u16, std::sync::mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+
+    let handle = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let _ = port_tx.send(listener.local_addr().expect("addr").port());
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+
+            let service = hyper::service::service_fn(
+                move |request: http::Request<hyper::body::Incoming>| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let body = request
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|collected| collected.to_bytes())
+                            .unwrap_or_default();
+
+                        // `[flag][len:4][0x0a][n][name]` — field 1, length-delimited.
+                        let name = zuno_core::grpc::unframe(&body)
+                            .first()
+                            .and_then(|message| {
+                                let rest = message.strip_prefix(&[0x0a])?;
+                                let (len, rest) = rest.split_first()?;
+                                std::str::from_utf8(rest.get(..*len as usize)?)
+                                    .ok()
+                                    .map(str::to_string)
+                            })
+                            .unwrap_or_default();
+                        let _ = seen_tx.send(name.clone());
+
+                        let text = format!("hello {name}");
+                        let mut message = vec![0x0a, text.len() as u8];
+                        message.extend_from_slice(text.as_bytes());
+
+                        let mut trailers = http::HeaderMap::new();
+                        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+
+                        let frames: Vec<Result<hyper::body::Frame<Bytes>, std::convert::Infallible>> = vec![
+                            Ok(hyper::body::Frame::data(Bytes::from(zuno_core::grpc::frame(
+                                &message,
+                            )))),
+                            Ok(hyper::body::Frame::trailers(trailers)),
+                        ];
+
+                        Ok::<_, std::convert::Infallible>(
+                            http::Response::builder()
+                                .status(200)
+                                .header("content-type", "application/grpc")
+                                .body(http_body_util::StreamBody::new(
+                                    futures_util::stream::iter(frames),
+                                ))
+                                .expect("response"),
+                        )
+                    }
+                },
+            );
+
+            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+    });
+
+    let port = port_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the server must bind");
+    (port, seen_rx, handle)
+}
+
+/// **A gRPC call, driven the way a person drives it.**
+///
+/// Picks the kind, types the schema path, chooses a method from the picker, types a message and
+/// sends — so the wiring between six layers is asserted end to end rather than a piece at a time.
+/// The engine side is already covered by `core/tests/grpc.rs`; what is new here is that the
+/// editor, the picker, the kind dispatch and the collection root all agree.
+///
+/// **Asserted on what the server received**, not only on what came back. A client that framed
+/// the body wrongly or sent an empty message would still get a reply from a server that ignored
+/// it, and this is the same reason `core/tests/websocket.rs` reads the request text.
+#[gpui::test]
+async fn a_grpc_request_is_authored_and_sent(cx: &mut TestAppContext) {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("zuno-grpc-app-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let proto = dir.join("greeter.proto");
+    let mut file = std::fs::File::create(&proto).expect("create");
+    file.write_all(
+        br#"
+            syntax = "proto3";
+            package helloworld;
+            message HelloRequest { string name = 1; }
+            message HelloReply { string message = 1; }
+            service Greeter { rpc SayHello (HelloRequest) returns (HelloReply); }
+        "#,
+    )
+    .expect("write");
+
+    let (port, seen, server) = grpc_server();
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("http://127.0.0.1:{port}"));
+
+    // The schema path, typed into the real field through the real input handler.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let field = view.kind.as_grpc().expect("a gRPC buffer").proto.clone();
+            window.focus(&gpui::Focusable::focus_handle(field.read(cx), cx));
+        })
+    });
+    cx.simulate_input(&proto.display().to_string());
+
+    // **Through the picker**, because the picker is what compiles the schema — setting the
+    // fields directly would assert the engine and skip the half most likely to be miswired.
+    cx.dispatch_action(crate::actions::OpenGrpcMethod);
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    let chosen = cx.update(|_, cx| {
+        view.read(cx)
+            .kind
+            .as_grpc()
+            .expect("a gRPC buffer")
+            .chosen()
+    });
+    assert_eq!(
+        chosen.as_deref(),
+        Some("helloworld.Greeter/SayHello"),
+        "picking a method has to write the service and the name back"
+    );
+
+    // **The Message tab has to be shown before its editor can be typed into.** Focusing an
+    // element that is not painted leaves the keystrokes nowhere — the trap that made the first
+    // version of this test see an empty schema field.
+    cx.dispatch_action(crate::actions::ShowBodyTab);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let editor = view.kind.as_grpc().expect("a gRPC buffer").message.clone();
+            window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+        })
+    });
+    cx.simulate_input(r#"{"name": "zuno"}"#);
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let body = wait_for(&mut cx, "the decoded reply", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .response
+                .as_ref()
+                .map(|response| String::from_utf8_lossy(&response.body).into_owned())
+        })
+    });
+
+    assert_eq!(
+        seen.recv_timeout(Duration::from_secs(10))
+            .expect("the server must decode a request"),
+        "zuno",
+        "the message typed into the editor has to reach the wire encoded"
+    );
+    assert!(
+        body.contains("hello zuno"),
+        "the reply has to arrive decoded as JSON: {body}"
+    );
+
+    // **Deliberately not joined.** `serve_connection` returns when the connection closes, and
+    // the engine caches its client for the life of the process — so in an app test, unlike
+    // `core/tests/grpc.rs` where the engine can simply be dropped, there is nothing to wait for
+    // and the join sits on an idle socket. Measured: 90 seconds instead of one.
+    //
+    // Nothing is lost by dropping it. The server's whole contribution is the `name` it decoded,
+    // and `seen.recv_timeout` above already refuses to pass without it.
+    drop(server);
+}
+
+/// **A client-streaming call: send repeatedly, then Disconnect finishes it.**
+///
+/// The shape nothing else in Zuno has — many messages up, one reply back — and the one that
+/// broke in three separate ways, each invisible on its own:
+///
+/// - the transcript never opened, so the composer refused to send and the call could never be
+///   finished; it sat in flight until the read timeout, looking like "connecting" forever
+/// - messages that *were* sent left no row, so a working send looked like a failed one
+/// - the reply arrived as `Done`, which never closed the session — the strip kept reading
+///   `open` with a live Disconnect pointing at a job that had already finished
+///
+/// Every assertion here is one of those three. Driven through the real keymap and the real
+/// composer, because each failure was in the seam between the engine and the pane.
+#[gpui::test]
+async fn a_client_streaming_call_sends_repeatedly_and_closes(cx: &mut TestAppContext) {
+    use std::io::Write;
+
+    let dir = std::env::temp_dir().join(format!("zuno-grpc-cs-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let proto = dir.join("greeter.proto");
+    std::fs::File::create(&proto)
+        .expect("create")
+        .write_all(
+            br#"
+                syntax = "proto3";
+                package helloworld;
+                message HelloRequest { string name = 1; }
+                message HelloReply { string message = 1; }
+                service Greeter { rpc SendHellos (stream HelloRequest) returns (HelloReply); }
+            "#,
+        )
+        .expect("write");
+
+    let (port, _seen, server) = grpc_server();
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+            // Set directly rather than through the picker: the picker is covered by its own
+            // test, and what is under test here is what happens *after* Send.
+            if let Some(grpc) = view.kind.as_grpc_mut() {
+                grpc.service = "helloworld.Greeter".to_string();
+                grpc.method = "SendHellos".to_string();
+                grpc.client_streaming = true;
+            }
+        })
+    });
+    type_url(&mut cx, &format!("http://127.0.0.1:{port}"));
+
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let field = view.kind.as_grpc().expect("a gRPC buffer").proto.clone();
+            window.focus(&gpui::Focusable::focus_handle(field.read(cx), cx));
+        })
+    });
+    cx.simulate_input(&proto.display().to_string());
+
+    cx.dispatch_action(crate::actions::ShowBodyTab);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let editor = view.kind.as_grpc().expect("a gRPC buffer").message.clone();
+            window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+        })
+    });
+    cx.simulate_input(r#"{"name":"first"}"#);
+    cx.simulate_keystrokes("ctrl-enter");
+
+    // **The transcript has to open before the reply**, or nothing below is reachable.
+    wait_for(&mut cx, "the call to open", |cx| {
+        cx.update(|_, cx| view.read(cx).session.is_some()).then_some(())
+    });
+
+    // A second message, typed into the same composer, while the call is open.
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let editor = view.kind.as_grpc().expect("a gRPC buffer").message.clone();
+            window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+        })
+    });
+    // **Select all first.** The initial Send does *not* clear the composer — only `send_frame`
+    // does — so typing straight into it appends to what is still there and produces invalid
+    // JSON. That is a property of the app worth encoding in the test rather than working
+    // around silently.
+    cx.simulate_keystrokes("ctrl-a");
+    cx.simulate_input(r#"{"name":"second"}"#);
+    cx.simulate_keystrokes("ctrl-enter");
+
+    let sent = wait_for(&mut cx, "both sent messages to show", |cx| {
+        cx.update(|_, cx| {
+            let count = view.read(cx).session.as_ref().map_or(0, |session| {
+                session
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.kind,
+                            crate::request_view::TranscriptKind::Frame {
+                                direction: zuno_core::engine::Direction::Sent,
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+            });
+            (count >= 2).then_some(count)
+        })
+    });
+    assert_eq!(sent, 2, "each message sent has to appear in the transcript");
+
+    // **Disconnect is what finishes a client-streaming call** — it half-closes the request, and
+    // only then does the server answer.
+    cx.dispatch_action(crate::actions::CancelRequest);
+
+    let closed = wait_for(&mut cx, "the session to close", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .session
+                .as_ref()
+                .map(|session| session.closed.is_some())
+        })
+        .filter(|closed| *closed)
+    });
+    assert!(
+        closed,
+        "a finished call must close its transcript, or Disconnect stays on screen doing nothing"
+    );
+
+    drop(server);
 }

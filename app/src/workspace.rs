@@ -26,7 +26,8 @@ use zuno_core::{
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
-    OpenGraphQlTransport, SaveMessage, SendPing,
+    ChooseProtoFile, OpenGraphQlTransport, OpenGrpcMethod, ReflectSchema, SaveMessage,
+    SendPing,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -49,6 +50,7 @@ use crate::actions::{
     ChooseRootCa, OpenCertificates,
     CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
+    ShowResponseTrailers,
     ShowResponseTiming, ToggleHtmlView,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
@@ -3765,6 +3767,16 @@ impl Workspace {
             picker::Target::RequestKindConfirmed(choice) => {
                 self.switch_request_kind(choice, true, window, cx);
             }
+            picker::Target::GrpcMethod(method) => {
+                if let Some(view) = self.active() {
+                    view.update(cx, |view, cx| {
+                        if let Some(grpc) = view.kind.as_grpc_mut() {
+                            grpc.choose(&method);
+                        }
+                        cx.notify();
+                    });
+                }
+            }
             picker::Target::GraphQlTransport(transport) => {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| {
@@ -5346,8 +5358,13 @@ impl Workspace {
     }
 
     fn show_response_view(&mut self, view: ResponseView, cx: &mut Context<Self>) {
-        if let Some(active) = self.active() {
-            active.update(cx, |active, cx| active.show_response_view(view, cx));
+        let Some(active) = self.active() else { return };
+        let shown = active.update(cx, |active, cx| active.show_response_view(view, cx));
+        // Reached from the palette, whose rows are not filtered by kind — so say why nothing
+        // moved, the way the other kind-specific verbs do.
+        if !shown {
+            let kind = active.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a gRPC response has trailers, not {kind}"), cx);
         }
     }
 
@@ -5362,6 +5379,15 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.show_response_view(ResponseView::Headers, cx);
+    }
+
+    fn show_response_trailers(
+        &mut self,
+        _: &ShowResponseTrailers,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_response_view(ResponseView::Trailers, cx);
     }
 
     fn show_response_timing(
@@ -6421,8 +6447,6 @@ impl Workspace {
         cx.quit();
     }
 
-    /// Keep the composed message with the socket.
-    ///
     /// Choose how a GraphQL operation reaches the server.
     ///
     /// Guarded on the kind for `open_method`'s reason: off a GraphQL buffer there is nothing to
@@ -6465,6 +6489,267 @@ impl Workspace {
             .collect();
 
         self.show_picker(items, "No transports", window, cx);
+    }
+
+    /// Fill the `.proto` field from the native dialog.
+    ///
+    /// **Fills the field rather than acting on the choice**, which is the convention every file
+    /// path here follows: the field stays editable, so browsing is a faster way to answer the
+    /// same question rather than a second verb with different behaviour.
+    ///
+    /// The path is written back **relative to the collection's `protos/` when it sits there**,
+    /// because that is the spelling that survives being cloned by somebody else — an absolute
+    /// path into one person's home directory is broken for every teammate. Anywhere else is
+    /// written as chosen, since there is nothing portable to shorten it to.
+    fn choose_proto_file(
+        &mut self,
+        _: &ChooseProtoFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        if view.read(cx).kind.as_grpc().is_none() {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a gRPC request has a schema, not {kind}"), cx);
+            return;
+        }
+
+        let protos = crate::collections::root(cx).map(|root| root.join(zuno_core::grpc::DIRECTORY));
+
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose .proto".into()),
+        });
+
+        // The tab that opened the dialog, for `reflect_schema`'s reason: a dialog left open is
+        // time enough to switch tabs, and the answer belongs to the request that asked.
+        let target = view.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+
+            // Shortened only when it really is in `protos/`, and only to its file name —
+            // `resolve_proto` treats anything with a separator as a literal path, so a nested
+            // `protos/a/b.proto` must stay a path rather than become a bare name that would
+            // then resolve to the wrong place.
+            let written = protos
+                .as_deref()
+                .and_then(|protos| path.parent().filter(|parent| *parent == protos))
+                .and_then(|_| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+
+            let _ = target.update_in(cx, |view, window, cx| {
+                if let Some(grpc) = view.kind.as_grpc() {
+                    let field = grpc.proto.clone();
+                    field.update(cx, |input, cx| {
+                        input.select_all_text(cx);
+                        gpui::EntityInputHandler::replace_text_in_range(
+                            input, None, &written, window, cx,
+                        );
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ask the server for its own schema and keep it with the collection.
+    ///
+    /// **Reflection is a one-time import here, not a live lookup**, which is the decision worth
+    /// knowing. `grpcurl` reflects on every call; Zuno writes the descriptor set into the
+    /// collection's `protos/` and points the request at it, which buys three things a live
+    /// lookup does not: the request works offline and against a server with reflection turned
+    /// off afterwards, the schema is committable so a teammate gets it by cloning, and every
+    /// send does not pay for a round trip that almost never changes its answer. Re-running it is
+    /// one keystroke when the schema does change.
+    ///
+    /// It also means nothing new on `GrpcRequest`: a reflected schema is a file in `protos/`
+    /// exactly like a hand-written one, and everything downstream already knows how to read it.
+    fn reflect_schema(&mut self, _: &ReflectSchema, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        if view.read(cx).kind.as_grpc().is_none() {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a gRPC request has a schema, not {kind}"), cx);
+            return;
+        }
+
+        let Some(engine) = cx.engine() else {
+            self.set_status("The HTTP engine failed to start — restart Zuno", cx);
+            return;
+        };
+
+        // **Refused without a collection rather than written somewhere arbitrary.** The whole
+        // point of writing the file is that it lives beside the requests that use it; with
+        // nowhere to put it, silently dropping it in the working directory would be a file
+        // nobody finds and `collection::scan` never sees.
+        let Some(root) = crate::collections::root(cx).map(std::path::Path::to_path_buf) else {
+            self.set_status("Open a collection first — the schema is saved into its protos/", cx);
+            return;
+        };
+
+        let spec = self.resolver(cx).apply(&view.read(cx).spec(cx));
+        if spec.url.trim().is_empty() {
+            self.set_status("Enter the server's address first", cx);
+            return;
+        }
+
+        // Named from the host, so two servers in one collection do not overwrite each other.
+        // `collection::slug` for the reason saving a request uses it: the URL is attacker- and
+        // typo-controlled, and a name derived from it must not become a path.
+        let label = zuno_core::collection::slug(&spec.url);
+        self.set_status("Asking the server for its schema…", cx);
+
+        // **The tab that asked, not whichever is active when the answer lands.** A round trip is
+        // long enough to switch tabs in, and writing the schema into `this.active()` then filled
+        // some other request's field while the status said "Saved". Weak, so a tab closed
+        // meanwhile is simply not written to.
+        let target = view.downgrade();
+        let replies = engine.reflect(spec);
+        cx.spawn_in(window, async move |_, cx| {
+            // **Into the response pane, not the status bar.** A reflection failure says things
+            // like "try http:// instead of https://" — an instruction, and the status bar is one
+            // line nobody reads. Every other failure already lands there.
+            let fail = |reason: String, cx: &mut gpui::AsyncWindowContext| {
+                let _ = target.update(cx, |view, cx| {
+                    view.error = Some(zuno_core::engine::EngineError::Other { reason });
+                    cx.notify();
+                });
+            };
+
+            let bytes = match replies.recv().await {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(error)) => {
+                    let _ = target.update(cx, |view, cx| {
+                        view.error = Some(error);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => return fail("the engine stopped before answering".to_string(), cx),
+            };
+
+            // **Invariant 3: the parse and the write go to the background executor.** A real
+            // server's descriptor set carries its whole schema and every file that schema
+            // imports, which is a great deal more than a hand-written `.proto`. Loaded before it
+            // is written, because a set that does not load is not worth leaving on disk for
+            // someone to find later and wonder about.
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    let schema = zuno_core::grpc::Schema::from_descriptor_set(&bytes)
+                        .map_err(|error| error.to_string())?;
+                    let directory = root.join(zuno_core::grpc::DIRECTORY);
+                    std::fs::create_dir_all(&directory)
+                        .map_err(|error| format!("could not create protos/: {error}"))?;
+                    let name = format!("{label}.desc");
+                    std::fs::write(directory.join(&name), &bytes)
+                        .map_err(|error| format!("could not write {name}: {error}"))?;
+                    Ok::<_, String>((name, schema.methods()))
+                })
+                .await;
+
+            let (name, methods) = match saved {
+                Ok(saved) => saved,
+                Err(reason) => return fail(reason, cx),
+            };
+
+            let _ = target.update_in(cx, |view, window, cx| {
+                let Some(grpc) = view.kind.as_grpc_mut() else {
+                    return;
+                };
+                // The bare filename, which is the portable spelling — see `resolve_proto`.
+                let field = grpc.proto.clone();
+                field.update(cx, |input, cx| {
+                    input.select_all_text(cx);
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        input, None, &name, window, cx,
+                    );
+                });
+                // **The chosen method re-read from the new schema**, so its stored shape cannot
+                // outlive the file it was read from. The engine no longer trusts that copy, but
+                // the button's label still does. A method the new schema lacks is left as it
+                // is: sending then names it as missing, which is the true answer.
+                if let Some(fresh) = methods
+                    .iter()
+                    .find(|method| method.service == grpc.service && method.name == grpc.method)
+                {
+                    grpc.choose(fresh);
+                }
+                view.status = Some(SharedString::from(format!(
+                    "Saved {name} — {} method(s). Choose one to call",
+                    methods.len()
+                )));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Offer every method the schema defines.
+    ///
+    /// **Compiling is the failure people will actually hit**, so its error is reported here
+    /// rather than on send: a missing file, a syntax error, an unresolvable import. Finding out
+    /// at the picker costs one keystroke; finding out at send costs a round trip you then have
+    /// to explain to yourself.
+    ///
+    /// Flat across services rather than grouped, for the request picker's reason: someone
+    /// looking for `SayHello` rarely knows which service it is on.
+    fn open_grpc_method(&mut self, _: &OpenGrpcMethod, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+        let Some(grpc) = view.read(cx).kind.as_grpc() else {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a gRPC request has methods, not {kind}"), cx);
+            return;
+        };
+
+        let spec = grpc.to_spec(cx);
+        let root = crate::collections::root(cx).map(std::path::Path::to_path_buf);
+        let current = grpc.chosen();
+
+        // **Compiled on the UI thread, deliberately and narrowly.** Invariant 3 forbids parsing
+        // here, and this is a parse — but it is one a person just asked for by name, it is
+        // bounded by the size of a `.proto`, and the alternative is a picker that opens empty
+        // and fills in a frame later, which reads as a schema with no methods. Worth revisiting
+        // if a large schema ever makes it felt.
+        let path = zuno_core::grpc::resolve_proto(&spec.proto, root.as_deref());
+        let methods = match zuno_core::grpc::Schema::compile(path) {
+            Ok(schema) => schema.methods(),
+            Err(error) => {
+                self.set_status(&error.to_string(), cx);
+                return;
+            }
+        };
+
+        let items = methods
+            .into_iter()
+            .map(|method| {
+                let chosen = Some(format!("{}/{}", method.service, method.name));
+                picker::Item {
+                    label: SharedString::from(method.name.clone()),
+                    // The service and the shape, because two methods can share a name across
+                    // services and the shape decides whether this is a request or a session.
+                    detail: SharedString::from(if chosen == current {
+                        format!("{} · {} · current", method.service, method.shape().label())
+                    } else {
+                        format!("{} · {}", method.service, method.shape().label())
+                    }),
+                    target: picker::Target::GrpcMethod(method),
+                }
+            })
+            .collect();
+
+        self.show_picker(items, "No methods in this schema", window, cx);
     }
 
     /// Keep the composed message with the socket.
@@ -6744,6 +7029,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_response_tab))
             .on_action(cx.listener(Self::show_response_body))
             .on_action(cx.listener(Self::show_response_headers))
+            .on_action(cx.listener(Self::show_response_trailers))
             .on_action(cx.listener(Self::show_response_timing))
             .on_action(cx.listener(Self::show_response_diff))
             .on_action(cx.listener(Self::toggle_html_view))
@@ -6789,6 +7075,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel_request))
             .on_action(cx.listener(Self::save_message))
             .on_action(cx.listener(Self::send_ping))
+            .on_action(cx.listener(Self::choose_proto_file))
+            .on_action(cx.listener(Self::open_grpc_method))
+            .on_action(cx.listener(Self::reflect_schema))
             .on_action(cx.listener(Self::open_graphql_transport))
             .on_action(cx.listener(Self::next_request_tab))
             .on_action(cx.listener(Self::prev_request_tab))

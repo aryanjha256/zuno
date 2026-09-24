@@ -269,6 +269,7 @@ async fn run(
             status_text: status.canonical_reason().unwrap_or_default().to_string(),
             version,
             headers,
+            trailers: Vec::new(),
             body: Bytes::from(buffer),
             timing: Timing {
                 // Read here rather than at `Head`: a redirect chain opens its sockets across
@@ -338,8 +339,12 @@ async fn stream_events(
     emit(Event::Opened {
         job,
         transport: crate::engine::Transport::EventStream,
-        status: status.as_u16(),
-        status_text: status.canonical_reason().unwrap_or_default().to_string(),
+        // Always known here: a stream is recognised from the response head, so the head has
+        // already arrived by the time this is emitted.
+        status: Some((
+            status.as_u16(),
+            status.canonical_reason().unwrap_or_default().to_string(),
+        )),
         headers,
         // An SSE stream negotiates nothing — the field exists for a WebSocket's subprotocol.
         protocol: None,
@@ -581,7 +586,7 @@ pub(crate) fn collect_headers(headers: &http::HeaderMap) -> Vec<Header> {
     collected
 }
 
-fn http_version(version: reqwest::Version) -> HttpVersion {
+pub(crate) fn http_version(version: reqwest::Version) -> HttpVersion {
     match version {
         reqwest::Version::HTTP_09 => HttpVersion::Http09,
         reqwest::Version::HTTP_10 => HttpVersion::Http10,

@@ -108,6 +108,39 @@ impl EngineError {
     /// reqwest's own `Display` is often a nest of "error sending request for url
     /// (...): error trying to connect: ...", so the useful signal gets buried. This
     /// pulls out the category and the innermost cause.
+    /// `from_reqwest` for a gRPC call, which can say one thing more about an HTTP/2 fault.
+    ///
+    /// **The peer is not speaking HTTP/2**, which h2 reports as a framing fault — "connection
+    /// error detected: frame with invalid size" — and which says nothing about the cause. For a
+    /// gRPC call the cause is almost always the port: `http://host` is port 80, and almost nothing
+    /// serves gRPC there. Measured against a real endpoint, which speaks HTTP/2 on 443 and not
+    /// on 80.
+    ///
+    /// **A separate constructor, not a branch in `from_reqwest`**, because the reading is only
+    /// true of gRPC. An ordinary request that negotiated h2 and hit a genuine protocol fault
+    /// was being told that gRPC requires HTTP/2 and to check its port.
+    pub fn from_reqwest_grpc(error: &reqwest::Error, timeout: Option<Duration>) -> Self {
+        let lower = root_cause(error).to_ascii_lowercase();
+        if !error.is_timeout()
+            && (lower.contains("frame with invalid size")
+                || lower.contains("connection error detected")
+                || lower.contains("settings frame"))
+        {
+            let host = error
+                .url()
+                .and_then(|url| url.host_str().map(str::to_string))
+                .unwrap_or_else(|| "the server".to_string());
+            return EngineError::Other {
+                reason: format!(
+                    "{host} did not answer HTTP/2, which gRPC requires — check the port. A URL \
+                     with no port means 80 for http:// and 443 for https://, and a gRPC server \
+                     is rarely on either"
+                ),
+            };
+        }
+        Self::from_reqwest(error, timeout)
+    }
+
     pub fn from_reqwest(error: &reqwest::Error, timeout: Option<Duration>) -> Self {
         if error.is_timeout() {
             return EngineError::Timeout {
@@ -125,16 +158,32 @@ impl EngineError {
             .unwrap_or_else(|| "the server".to_string());
 
         if error.is_connect() {
+            let lower = reason.to_ascii_lowercase();
+
+            // **A plaintext server on a TLS port, which rustls describes uselessly.** Its words
+            // are "received corrupt message of type InvalidContentType" — what actually happened
+            // is that the first byte back was not a TLS record, because the peer is not speaking
+            // TLS at all. Common enough to name: gRPC servers frequently run cleartext HTTP/2,
+            // including on 443, and the untranslated message sends people to look at their
+            // network. Cost thirty minutes to diagnose once, from the same message.
+            if lower.contains("invalidcontenttype") || lower.contains("corrupt message") {
+                return EngineError::Tls {
+                    reason: format!(
+                        "{host} answered something that is not TLS — it is probably a plaintext \
+                         server. Try http:// instead of https://"
+                    ),
+                };
+            }
+
             // rustls surfaces certificate problems through the connect path, so
             // separate them out — "certificate verify failed" and "connection
             // refused" call for very different fixes.
-            if reason.to_ascii_lowercase().contains("certificate")
-                || reason.to_ascii_lowercase().contains("tls")
-            {
+            if lower.contains("certificate") || lower.contains("tls") {
                 return EngineError::Tls { reason };
             }
             return EngineError::Connect { host, reason };
         }
+
         if error.is_body() || error.is_decode() {
             return EngineError::IncompleteBody { reason };
         }

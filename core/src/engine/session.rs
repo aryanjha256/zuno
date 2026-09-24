@@ -75,7 +75,10 @@ pub async fn connect(
             },
             Some(graphql.clone()),
         ),
-        crate::request::RequestKind::Http(_) => {
+        // **gRPC streams over HTTP/2, not over a WebSocket.** It reaches a transcript by the
+        // same events this file emits, but through `run`'s h2 path — there is no handshake to
+        // share, so routing one here would open a socket nothing on the other end expects.
+        crate::request::RequestKind::Http(_) | crate::request::RequestKind::Grpc(_) => {
             let _ = events
                 .send(Event::Failed {
                     job,
@@ -202,8 +205,8 @@ pub async fn connect(
         .send(Event::Opened {
             job,
             transport: super::Transport::WebSocket,
-            status,
-            status_text,
+            // Always known: the 101 is what opened the socket.
+            status: Some((status, status_text)),
             headers,
             protocol,
             elapsed: started.elapsed(),

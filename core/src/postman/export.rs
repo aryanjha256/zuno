@@ -131,10 +131,27 @@ fn report_unmappable(label: &str, spec: &RequestSpec, skipped: &mut Vec<String>)
     // URL, which *runs* and does the wrong thing. That is worse than an omission, so it has to
     // be said out loud. This sentence existed as a comment claiming it was handled before it
     // was true, which is the failure this file's own Lessons entry is about.
-    if spec.kind.is_session() {
-        skipped.push(format!(
-            "{label}: exported as a plain GET — Postman's collection format has no WebSocket              request, so the subprotocols and saved messages are not carried. Use a Zuno bundle              to move it between Zunos"
-        ));
+    // **Matched on the kind, not on a predicate**, because the question here is "can Postman's
+    // v2.1 format express this at all" and that is not the same as any of the streaming ones.
+    // A *unary* gRPC call streams nothing and is still inexpressible — reading `is_session`
+    // here let one export as a silent plain GET.
+    match &spec.kind {
+        RequestKind::WebSocket(_) => skipped.push(format!(
+            "{label}: exported as a plain GET — Postman's collection format has no WebSocket \
+             request, so the subprotocols and saved messages are not carried. Use a Zuno bundle \
+             to move it between Zunos"
+        )),
+        RequestKind::Grpc(_) => skipped.push(format!(
+            "{label}: exported as a plain GET — Postman's collection format has no gRPC request, \
+             so the schema, the method and the message are not carried. Use a Zuno bundle to \
+             move it between Zunos"
+        )),
+        // A GraphQL subscription over a socket is the same problem wearing GraphQL's clothes.
+        RequestKind::GraphQl(graphql) if graphql.uses_websocket() => skipped.push(format!(
+            "{label}: exported as an HTTP request — Postman has no way to say this subscription \
+             rides a WebSocket, so it will be sent as a POST"
+        )),
+        RequestKind::GraphQl(_) | RequestKind::Http(_) => {}
     }
     if spec.settings != crate::request::RequestSettings::default() {
         skipped.push(format!(
@@ -223,6 +240,10 @@ fn body_for(spec: &RequestSpec) -> Option<Value> {
         // an HTTP GET in its place would export something that runs and does the wrong thing.
         // `report_unmappable` is where this gets announced.
         RequestKind::WebSocket(_) => return None,
+        // Postman's v2.1 collection schema has no gRPC item at all — its own gRPC support
+        // lives outside the export format. Same reasoning as the socket above: an HTTP POST
+        // to the same URL would *run* and do the wrong thing.
+        RequestKind::Grpc(_) => return None,
         // Postman models GraphQL as a body *mode* on an HTTP request, which is exactly what the
         // importer reads back into a `GraphQl` kind. `variables` is a string of JSON on both
         // sides, so it travels verbatim.

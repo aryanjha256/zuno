@@ -18,6 +18,7 @@
 
 pub mod build;
 pub mod error;
+pub(crate) mod grpc;
 mod probe;
 mod run;
 mod session;
@@ -52,6 +53,10 @@ pub enum Transport {
     /// A `text/event-stream` response, whatever asked for it — a plain HTTP request or a
     /// GraphQL subscription over graphql-sse.
     EventStream,
+    /// A streaming gRPC call. Named separately from `EventStream` although both are a series of
+    /// messages over one HTTP response, because what you can do next differs: an SSE stream is
+    /// receive-only for good, while a gRPC call may yet accept messages from this side.
+    Grpc,
 }
 
 impl Transport {
@@ -59,6 +64,7 @@ impl Transport {
         match self {
             Transport::WebSocket => "websocket",
             Transport::EventStream => "sse",
+            Transport::Grpc => "grpc",
         }
     }
 }
@@ -297,11 +303,18 @@ pub enum Event {
     Opened {
         job: JobId,
         transport: Transport,
-        status: u16,
-        /// `Switching Protocols`. Carried for the same reason `Head` carries it: the pane
-        /// prints the reason phrase beside the code, and deriving it here would be a second
-        /// table that can disagree with the server's own words.
-        status_text: String,
+        /// The code and its reason phrase — `101 Switching Protocols` — when the response head
+        /// has arrived.
+        ///
+        /// **`None` when the connection is open for sending before the server has answered**,
+        /// which is a real state and not a missing value: a client-streaming gRPC call may send
+        /// for as long as it likes, and many servers do not send response headers until the
+        /// request ends. Waiting for a status before opening the transcript left that call with
+        /// no transcript, no live composer, and nothing able to end its request body.
+        ///
+        /// Carried rather than derived for `Head`'s reason: the pane prints the server's own
+        /// reason phrase, and a table here could disagree with it.
+        status: Option<(u16, String)>,
         headers: Vec<Header>,
         protocol: Option<String>,
         elapsed: Duration,
@@ -327,6 +340,20 @@ pub enum Event {
         attempt: u32,
         delay: Duration,
     },
+    /// A message handed to an open call was refused before it was sent, and the call carries on.
+    ///
+    /// **gRPC only, and the reason it exists.** A streaming message is encoded against the
+    /// schema at send time, so a typo'd field or half-typed JSON fails *here*, in the engine.
+    /// Ending the stream on it half-closed the request, and the server then answered as if the
+    /// messages before it were the whole conversation — a finished-looking result built on input
+    /// the person never meant to stop at, with nothing on screen saying why. Refusing just that
+    /// one message keeps the call open to send a corrected one.
+    Rejected {
+        job: JobId,
+        /// The text as it was handed over, so the app can name it and settle its pending send.
+        text: String,
+        reason: String,
+    },
     /// The socket closed. `code` is absent when the peer vanished without a Close frame,
     /// which is a real and common ending rather than an error.
     Closed {
@@ -347,6 +374,7 @@ impl Event {
             | Event::Opened { job, .. }
             | Event::Frame { job, .. }
             | Event::Reconnecting { job, .. }
+            | Event::Rejected { job, .. }
             | Event::Closed { job, .. } => *job,
         }
     }
@@ -381,6 +409,21 @@ enum Command {
     SetProxy(ProxyMode),
     /// Change which certificates future clients are built with.
     SetTls(TlsFiles),
+    /// Where the collection lives, so a gRPC request naming a bare `greeter.proto` can be
+    /// resolved against its `protos/` directory. Engine-level rather than on the spec for
+    /// `ProxyMode`'s reason: it is a path on *this* machine, and a machine-specific path in a
+    /// committed collection file is broken for everyone else who clones it.
+    SetCollection(Option<PathBuf>),
+    /// Ask a gRPC server to describe itself.
+    ///
+    /// **Not a `Send`, although it is a real call**, because nothing about it belongs in the
+    /// job table: it produces no transcript, no response to view and nothing to cancel, and a
+    /// `JobId` for it would show up in every count and every reap. It answers once, down its
+    /// own channel.
+    Reflect {
+        spec: Box<RequestSpec>,
+        reply: Sender<Result<Vec<u8>, EngineError>>,
+    },
 }
 
 /// A running job, and the way in if it has one.
@@ -509,6 +552,33 @@ impl Engine {
     pub fn set_tls(&self, files: TlsFiles) {
         let _ = self.commands.send(Command::SetTls(files));
     }
+
+    /// Tell the engine which collection is open, for resolving a gRPC request's `.proto`.
+    pub fn set_collection(&self, root: Option<PathBuf>) {
+        let _ = self.commands.send(Command::SetCollection(root));
+    }
+
+    /// Ask a gRPC server for its own schema, as an encoded `FileDescriptorSet`.
+    ///
+    /// Goes through the engine rather than opening its own client, for the reason the WebSocket
+    /// handshake does: reflection has to honour the same TLS settings, client certificates and
+    /// proxy as the calls it is fetching a schema for, and a second client would quietly not.
+    pub fn reflect(&self, spec: RequestSpec) -> Receiver<Result<Vec<u8>, EngineError>> {
+        let (reply, receiver) = async_channel::bounded(1);
+        if self
+            .commands
+            .send(Command::Reflect {
+                spec: Box::new(spec),
+                reply: reply.clone(),
+            })
+            .is_err()
+        {
+            let _ = reply.try_send(Err(EngineError::Other {
+                reason: "the HTTP engine is not running".to_string(),
+            }));
+        }
+        receiver
+    }
 }
 
 /// The engine thread's main loop.
@@ -533,6 +603,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut jobs: HashMap<JobId, Job> = HashMap::new();
         let mut proxy = ProxyMode::default();
         let mut tls = TlsFiles::default();
+        let mut collection: Option<PathBuf> = None;
 
         while let Some(command) = commands.recv().await {
             // Opportunistic reaping: without this the map grows for the life of the
@@ -541,14 +612,19 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
 
             match command {
                 Command::Send { job, spec, events } => {
-                    // **A session gets an HTTP/1.1-only client**, because there is no 101 in
-                    // HTTP/2 — see `ClientKey::http1_only`. Its own cache entry, so ordinary
-                    // requests keep negotiating h2 as they always did.
+                    // **The kind decides which HTTP versions the client may offer** — see
+                    // `Alpn`. Its own cache entry per answer, so ordinary requests keep
+                    // negotiating h2 as they always did.
+                    //
+                    // This used to pass `is_session()` for "offer only HTTP/1.1", which was
+                    // true of every session there was when it was written. gRPC broke that
+                    // equivalence: a server-streaming call is a session *and* must have h2, so
+                    // the boolean would have pinned it to the one version gRPC cannot use.
                     //
                     // The timeout needs no such handling *here*: `build` sets no per-request
                     // deadline any more, and `ClientKey::read_timeout` — which does — is already
                     // part of the key below.
-                    match clients.get(&spec.settings, &proxy, &tls, spec.kind.is_session()) {
+                    match clients.get(&spec.settings, &proxy, &tls, Alpn::for_kind(&spec.kind)) {
                         Ok(client) => {
                             // **Every job gets a way in, not just the ones that promise a
                             // session.** An HTTP request becomes one the moment the server
@@ -558,7 +634,21 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                             // stream carried on. The receiver is simply never read by a
                             // request that stays a request.
                             let (sender, receiver) = mpsc::unbounded_channel();
-                            let handle = if spec.kind.is_session() {
+                            // **Routed on the kind, then on `opens_a_websocket`** — never on
+                            // "does it stream". A streaming gRPC call produces a transcript and
+                            // `session` speaks WebSocket, which gRPC is not; routing on the
+                            // streaming question once opened a socket a gRPC server never answers.
+                            let handle = if matches!(spec.kind, crate::request::RequestKind::Grpc(_))
+                            {
+                                tokio::spawn(grpc::call(
+                                    job,
+                                    client,
+                                    *spec,
+                                    collection.clone(),
+                                    events,
+                                    receiver,
+                                ))
+                            } else if spec.kind.opens_a_websocket() {
                                 tokio::spawn(session::connect(job, client, *spec, events, receiver))
                             } else {
                                 tokio::spawn(run::execute(
@@ -602,6 +692,23 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>) {
                 // simply misses the cache rather than relying on anyone remembering to evict.
                 Command::SetProxy(mode) => proxy = mode,
                 Command::SetTls(files) => tls = files,
+                Command::SetCollection(root) => collection = root,
+                Command::Reflect { spec, reply } => {
+                    // The same client an ordinary gRPC call would get — h2 with prior
+                    // knowledge — so a schema fetched over mTLS or through a proxy works
+                    // wherever the calls do.
+                    match clients.get(&spec.settings, &proxy, &tls, Alpn::Http2PriorKnowledge) {
+                        Ok(client) => {
+                            let timeout = spec.settings.timeout;
+                            tokio::spawn(async move {
+                                let _ = reply.send(grpc::reflect(client, *spec, timeout).await).await;
+                            });
+                        }
+                        Err(error) => {
+                            let _ = reply.try_send(Err(error));
+                        }
+                    }
+                }
             }
         }
     });
@@ -627,7 +734,7 @@ struct ClientKey {
     /// In the key for the same reason the proxy is: a changed certificate must miss the cache
     /// rather than leave every pooled client presenting the old one.
     tls: TlsFiles,
-    /// **Forces ALPN to offer only `http/1.1`, and a WebSocket does not work without it.**
+    /// **Which HTTP versions this client may offer**, which a WebSocket and gRPC each pin,
     ///
     /// There is no 101 in HTTP/2 — the upgrade mechanism was replaced by extended CONNECT —
     /// and `Connection`/`Upgrade` are illegal headers there, so hyper strips them. A `wss://`
@@ -641,7 +748,7 @@ struct ClientKey {
     ///
     /// In the key rather than applied per-request, because it is a property of the *connection*
     /// — a pooled h2 connection cannot be talked out of being h2 afterwards.
-    http1_only: bool,
+    alpn: Alpn,
     /// How long a response may go **silent** before it is abandoned.
     ///
     /// **This is half of what `settings.timeout` now means**, and the half that made streaming
@@ -662,7 +769,7 @@ impl ClientKey {
         settings: &RequestSettings,
         proxy: &ProxyMode,
         tls: &TlsFiles,
-        http1_only: bool,
+        alpn: Alpn,
     ) -> Self {
         Self {
             verify_tls: settings.verify_tls,
@@ -672,8 +779,55 @@ impl ClientKey {
             cookie_store: settings.cookie_store,
             proxy: proxy.clone(),
             tls: tls.clone(),
-            http1_only,
+            alpn,
             read_timeout: settings.timeout,
+        }
+    }
+}
+
+/// Which HTTP versions a client may offer.
+///
+/// **An enum and not two booleans**, because the third state a pair would allow — offer only
+/// HTTP/1.1 *and* insist on HTTP/2 — has no meaning, and this is a value that has already been
+/// got wrong once in each direction.
+///
+/// Part of `ClientKey`, so each answer gets its own connection pool. That is not tidiness: ALPN
+/// is negotiated by the connector, and a pooled h2 connection cannot be talked out of being h2
+/// afterwards, so this has to be decided before a client exists rather than per request.
+/// Setting `Request::version` does not work and was the first attempt at the WebSocket half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Alpn {
+    /// Offer both and take what the server picks. What every ordinary request wants.
+    Negotiate,
+    /// Offer only `http/1.1`.
+    ///
+    /// **A WebSocket does not work without this.** There is no 101 in HTTP/2 — the upgrade
+    /// mechanism was replaced by extended CONNECT — and `Connection`/`Upgrade` are illegal
+    /// there, so hyper strips them. A `wss://` URL whose TLS handshake settles on h2 reaches
+    /// the server as a *plain GET* and comes back 200 or 404. Nothing errors; it simply is not
+    /// a WebSocket. Offline tests never caught it because plaintext `ws://` negotiates no ALPN.
+    Http1Only,
+    /// Speak HTTP/2 immediately, with no negotiation.
+    ///
+    /// **gRPC is defined over HTTP/2 and nothing else**, and on a cleartext socket there is no
+    /// ALPN to negotiate with — so a client that merely *prefers* h2 sends HTTP/1.1 to a
+    /// plaintext gRPC server, which answers by hanging up. The exact mirror of the arm above.
+    Http2PriorKnowledge,
+}
+
+impl Alpn {
+    /// Exhaustive with no catch-all: a new kind has to say which versions it can live with,
+    /// and both wrong answers here fail silently rather than loudly.
+    fn for_kind(kind: &crate::request::RequestKind) -> Self {
+        use crate::request::RequestKind;
+        match kind {
+            RequestKind::WebSocket(_) => Alpn::Http1Only,
+            // Only when it genuinely opens a socket. A graphql-sse subscription is an ordinary
+            // HTTP request and must keep negotiating h2 like any other.
+            RequestKind::GraphQl(graphql) if graphql.uses_websocket() => Alpn::Http1Only,
+            RequestKind::GraphQl(_) => Alpn::Negotiate,
+            RequestKind::Grpc(_) => Alpn::Http2PriorKnowledge,
+            RequestKind::Http(_) => Alpn::Negotiate,
         }
     }
 }
@@ -699,9 +853,9 @@ impl ClientCache {
         settings: &RequestSettings,
         proxy: &ProxyMode,
         tls: &TlsFiles,
-        http1_only: bool,
+        alpn: Alpn,
     ) -> Result<Client, EngineError> {
-        let key = ClientKey::new(settings, proxy, tls, http1_only);
+        let key = ClientKey::new(settings, proxy, tls, alpn);
 
         if let Some(client) = self.clients.get(&key) {
             return Ok(client.clone());
@@ -737,11 +891,14 @@ fn build_client(key: &ClientKey) -> Result<Client, EngineError> {
         .zstd(key.accept_encodings)
         .cookie_store(key.cookie_store);
 
-    // ALPN offers only `http/1.1` when set. See `ClientKey::http1_only` — without this a
-    // `wss://` handshake silently becomes a plain GET over h2.
-    if key.http1_only {
-        builder = builder.http1_only();
-    }
+    // See `Alpn`. Both non-default arms exist because a silent version mismatch is invisible:
+    // a `wss://` handshake that settled on h2 came back as a plain 200, and a gRPC call that
+    // settled on HTTP/1.1 gets hung up on by the server.
+    builder = match key.alpn {
+        Alpn::Negotiate => builder,
+        Alpn::Http1Only => builder.http1_only(),
+        Alpn::Http2PriorKnowledge => builder.http2_prior_knowledge(),
+    };
 
     // Per read, not per request. See `ClientKey::read_timeout`.
     if let Some(idle) = key.read_timeout {
@@ -816,6 +973,66 @@ mod tests {
         );
     }
 
+    /// **Each kind gets the HTTP versions it can actually work over**, and both wrong answers
+    /// here are silent.
+    ///
+    /// A WebSocket offered h2 comes back as an ordinary 200 with no socket; a gRPC call offered
+    /// HTTP/1.1 gets hung up on. Neither produces an error naming the version, which is why this
+    /// is pinned rather than left to a reading of `build_client`.
+    ///
+    /// The gRPC arm is the one worth the test. This was `is_session()` before gRPC existed —
+    /// true of every session there was — and a server-streaming gRPC call is a session, so the
+    /// old boolean would have pinned the one kind that *requires* h2 to the one version it
+    /// cannot use.
+    #[test]
+    fn each_kind_gets_an_http_version_it_can_work_over() {
+        use crate::request::{
+            GraphQlRequest, GraphQlTransport, GrpcRequest, HttpRequest, RequestKind,
+            WebSocketRequest,
+        };
+
+        assert_eq!(
+            Alpn::for_kind(&RequestKind::Http(HttpRequest::default())),
+            Alpn::Negotiate
+        );
+        assert_eq!(
+            Alpn::for_kind(&RequestKind::WebSocket(WebSocketRequest::default())),
+            Alpn::Http1Only
+        );
+
+        // Streaming or not, gRPC is HTTP/2 only.
+        assert_eq!(
+            Alpn::for_kind(&RequestKind::Grpc(GrpcRequest::default())),
+            Alpn::Http2PriorKnowledge
+        );
+        assert_eq!(
+            Alpn::for_kind(&RequestKind::Grpc(GrpcRequest {
+                server_streaming: true,
+                ..GrpcRequest::default()
+            })),
+            Alpn::Http2PriorKnowledge,
+            "a streaming gRPC call is a session and still must not be pinned to HTTP/1.1"
+        );
+
+        // **GraphQL splits on transport, not on being a subscription.** Over graphql-sse it is
+        // an ordinary HTTP request and must keep negotiating h2; only the socket needs pinning.
+        let subscription = |transport| {
+            RequestKind::GraphQl(GraphQlRequest {
+                query: "subscription S { s }".to_string(),
+                transport,
+                ..GraphQlRequest::default()
+            })
+        };
+        assert_eq!(
+            Alpn::for_kind(&subscription(GraphQlTransport::WebSocket)),
+            Alpn::Http1Only
+        );
+        assert_eq!(
+            Alpn::for_kind(&subscription(GraphQlTransport::Http)),
+            Alpn::Negotiate
+        );
+    }
+
     #[test]
     fn a_timeout_is_a_client_property_and_fragments_the_cache() {
         let mut a = RequestSettings::default();
@@ -830,16 +1047,16 @@ mod tests {
         // a real cost, paid because SSE does not work otherwise.
         let system = ProxyMode::System;
         assert_ne!(
-            ClientKey::new(&a, &system, &TlsFiles::default(), false),
-            ClientKey::new(&b, &system, &TlsFiles::default(), false),
+            ClientKey::new(&a, &system, &TlsFiles::default(), Alpn::Negotiate),
+            ClientKey::new(&b, &system, &TlsFiles::default(), Alpn::Negotiate),
             "an idle timeout is a client property, so it has to be part of the key"
         );
 
         b.timeout = a.timeout;
         b.verify_tls = false;
         assert_ne!(
-            ClientKey::new(&a, &system, &TlsFiles::default(), false),
-            ClientKey::new(&b, &system, &TlsFiles::default(), false)
+            ClientKey::new(&a, &system, &TlsFiles::default(), Alpn::Negotiate),
+            ClientKey::new(&b, &system, &TlsFiles::default(), Alpn::Negotiate)
         );
     }
 
@@ -850,12 +1067,12 @@ mod tests {
         // on screen would say so.
         let settings = RequestSettings::default();
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::System, &TlsFiles::default(), false),
-            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default(), false)
+            ClientKey::new(&settings, &ProxyMode::System, &TlsFiles::default(), Alpn::Negotiate),
+            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default(), Alpn::Negotiate)
         );
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default(), false),
-            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()), &TlsFiles::default(), false)
+            ClientKey::new(&settings, &ProxyMode::Off, &TlsFiles::default(), Alpn::Negotiate),
+            ClientKey::new(&settings, &ProxyMode::Url("http://p:8080".into()), &TlsFiles::default(), Alpn::Negotiate)
         );
     }
 
@@ -897,8 +1114,8 @@ mod tests {
             ..TlsFiles::default()
         };
         assert_ne!(
-            ClientKey::new(&settings, &ProxyMode::System, &none, false),
-            ClientKey::new(&settings, &ProxyMode::System, &with_identity, false)
+            ClientKey::new(&settings, &ProxyMode::System, &none, Alpn::Negotiate),
+            ClientKey::new(&settings, &ProxyMode::System, &with_identity, Alpn::Negotiate)
         );
     }
 
@@ -916,7 +1133,7 @@ mod tests {
                 identity: Some(PathBuf::from("/definitely/not/here.pem")),
                 ..TlsFiles::default()
             },
-            false,
+            Alpn::Negotiate,
         );
         let error = build_client(&missing).expect_err("a missing certificate must fail");
         assert!(
@@ -933,7 +1150,7 @@ mod tests {
                 identity: Some(PathBuf::from(fixture)),
                 ..TlsFiles::default()
             },
-            false,
+            Alpn::Negotiate,
         );
         assert!(build_client(&ok).is_ok(), "a valid PEM identity should build");
     }
