@@ -18,9 +18,15 @@ curl -fsSL https://raw.githubusercontent.com/aryanjha256/zuno/main/scripts/insta
 ```
 
 The same command installs Zuno and updates it — run it again whenever you want the latest.
-It downloads the `.deb` from the latest release, verifies its checksum, and hands it to
-`apt-get`, asking for `sudo` only at that last step. `ZUNO_VERSION=0.2.4` pins a specific
-release if you need to go back.
+It downloads from the latest release and verifies the checksum, then:
+
+- **on Debian, Ubuntu and derivatives** it installs the `.deb` with `apt-get`, asking for
+  `sudo` only at that last step;
+- **everywhere else** — Fedora, openSUSE, Arch — it unpacks the tarball into `~/.local`, with
+  no `sudo` at all.
+
+`ZUNO_VERSION=0.2.4` pins a specific release if you need to go back, and `ZUNO_METHOD=tarball`
+takes the no-`sudo` route on Debian too.
 
 <details>
 <summary>Or install the <code>.deb</code> by hand</summary>
@@ -36,13 +42,36 @@ Use `apt install ./file.deb` rather than `dpkg -i` — apt resolves the runtime 
 
 </details>
 
-**Requirements:** x86-64, and Ubuntu 22.04+ / Debian 12+ or a derivative (Mint, Pop!\_OS,
-elementary). Zuno renders through Vulkan, so on a machine with no GPU driver installed you
-also want `mesa-vulkan-drivers` — apt suggests it, but only installs it if you accept
-recommends.
+<details>
+<summary>Or unpack the tarball by hand</summary>
 
-No other platform is packaged yet. macOS and Windows both need work beyond building:
-keybindings assume `ctrl`, and the config paths assume XDG.
+```bash
+tar -xzf zuno-*-x86_64-linux.tar.gz --strip-components=1 -C ~/.local
+```
+
+It needs `libxkbcommon`, `libxkbcommon-x11` and `libxcb`, which every desktop already has.
+
+</details>
+
+<details>
+<summary>Or run the AppImage — one file, nothing installed</summary>
+
+```bash
+chmod +x Zuno-*-x86_64.AppImage && ./Zuno-*-x86_64.AppImage
+```
+
+It needs FUSE, which desktop systems have; where it is missing, run it with
+`--appimage-extract-and-run`.
+
+</details>
+
+**Requirements:** x86-64 Linux with glibc 2.35+ — Ubuntu 22.04+, Debian 12+, Fedora 36+, or
+anything as recent. Zuno renders through Vulkan, so on a machine with no GPU driver installed
+you also want one: `mesa-vulkan-drivers` on Debian and Fedora — apt suggests it with the
+`.deb`, but only installs it if you accept recommends.
+
+macOS and Windows are not packaged yet. Both build and pass the test suite in CI; what is left
+is platform conventions — keybindings assume `ctrl`, and the config paths assume XDG.
 
 ## Build from source
 

@@ -246,6 +246,24 @@ status, so a successful install reported failure until `cleanup` ended in `retur
 `[ -r /dev/tty ]` passes with no controlling terminal, so a confirmation prompt read its own
 failed `read` as the `[Y/n]` default and **auto-accepted**.
 
+**Three Linux artifacts, one binary.** `release.yml` builds `target/release/zuno` once (on
+`ubuntu-22.04`, so glibc 2.35 is the floor for all of them) and ships it as the `.deb`, a
+**tarball** (`zuno-<v>-x86_64-linux.tar.gz`, laid out as a prefix — `bin/`, `share/` — with a
+`VERSION` file, since there is no package database to ask) and an **AppImage**. There is no
+`.rpm`, deliberately: Fedora and openSUSE name the same library differently, and the tarball
+covers them with nothing to declare. `install.sh` installs the `.deb` where apt exists and the
+tarball into `~/.local` everywhere else, with no sudo; `installer.yml`'s `tarball` job proves that
+path in a `fedora` container against **fake** releases (`.github/scripts/test-tarball-install.sh`,
+`ZUNO_DOWNLOAD_BASE=file://…`), and `release.yml`'s `smoke-tarball`/`smoke-appimage` check the real
+artifacts at tag time. Traps found here:
+
+| Trap | Why |
+|---|---|
+**A tarball declares no dependencies, so `ldd` is its only contract** | The binary links `libxcb`, `libxkbcommon` and `libxkbcommon-x11` beyond glibc (read off `readelf -d`), and the smoke jobs install exactly those three before requiring `ldd` to find everything — so a newly linked library fails the release, not a user. Vulkan and Wayland are `dlopen`ed and stay invisible to `ldd`, as for the `.deb`. |
+**The `.desktop`'s `Exec=zuno` is rewritten to an absolute, quoted path on the tarball install** | A launcher does not always start apps with `~/.local/bin` on `PATH`, so the menu entry could do nothing. Rewritten line by line in `sh`, not with `sed`, whose replacement text would read a `|` or `&` in the path as syntax. |
+**`appimagetool` 1.9 downloads the AppImage runtime while it builds** | An unpinned fetch inside every release. Both it and the runtime (`--runtime-file`) are pinned by version and SHA-256. The type2 runtime is static — no `NEEDED` entries, libfuse built in — so an AppImage needs `fusermount`, **not `libfuse2`**. |
+**Fedora's minimal container has no `su`** | It is in `util-linux`, which the image leaves out; the first tarball job died on `su: command not found`. `tar` is already there. Ask for `curl` only if absent — the image ships `curl-minimal`, and requesting `curl` over it is a conflict. |
+
 `.github/workflows/release.yml` on a `v*` tag → `.deb` on a GitHub Release.
 `workflow_dispatch` runs the same build without publishing. Four things here are
 counter-intuitive enough that the workflow asserts each one rather than trusting it:

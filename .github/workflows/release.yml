@@ -132,6 +132,53 @@ jobs:
           tar -tzvf "target/debian/$name.tar.gz"
           echo "TARBALL_PATH=$PWD/target/debian/$name.tar.gz" >> "$GITHUB_ENV"
 
+      # **One file that runs on most distros without installing** — the same binary again, in an
+      # AppDir. No libraries are bundled, exactly as in the tarball: it uses the system's
+      # libxkbcommon, libxcb and Vulkan, because a bundled Vulkan loader is how GPU apps in
+      # AppImages break the driver the system already has.
+      #
+      # **Both tools pinned by version and hash.** appimagetool 1.9 otherwise *downloads the
+      # AppImage runtime from GitHub while it builds*, which is an unpinned fetch inside every
+      # release; `--runtime-file` hands it one we checked. The runtime is type2's static build —
+      # no NEEDED entries, libfuse compiled in — so the result needs only `fusermount` on the
+      # user's machine, not libfuse2. `--appimage-extract-and-run` because the runner has no FUSE.
+      # Both hashes were verified against the digests GitHub publishes for these assets.
+      - name: Build the AppImage
+        env:
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "zuno") | .version')
+
+          tools=target/appimage-tools
+          mkdir -p "$tools"
+          curl -fsSL --proto '=https' -o "$tools/appimagetool" "$APPIMAGETOOL_URL"
+          curl -fsSL --proto '=https' -o "$tools/runtime-x86_64" "$RUNTIME_URL"
+          echo "$APPIMAGETOOL_SHA256  $tools/appimagetool" | sha256sum -c -
+          echo "$RUNTIME_SHA256  $tools/runtime-x86_64" | sha256sum -c -
+          chmod +x "$tools/appimagetool"
+
+          # The .desktop and icon at the AppDir root are what appimagetool and the runtime read;
+          # the `usr/share` copies are what a desktop integration tool installs from.
+          appdir=target/appimage/Zuno.AppDir
+          rm -rf target/appimage
+          install -Dm755 target/release/zuno "$appdir/usr/bin/zuno"
+          install -Dm644 assets/dev.zuno.Zuno.desktop "$appdir/usr/share/applications/dev.zuno.Zuno.desktop"
+          install -Dm644 assets/icons/zuno.svg "$appdir/usr/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg"
+          cp assets/dev.zuno.Zuno.desktop "$appdir/dev.zuno.Zuno.desktop"
+          cp assets/icons/zuno.svg "$appdir/dev.zuno.Zuno.svg"
+          ln -s dev.zuno.Zuno.svg "$appdir/.DirIcon"
+          ln -s usr/bin/zuno "$appdir/AppRun"
+
+          out="$PWD/target/debian/Zuno-${version}-x86_64.AppImage"
+          ARCH=x86_64 "$tools/appimagetool" --appimage-extract-and-run \
+            --runtime-file "$tools/runtime-x86_64" "$appdir" "$out"
+          ls -lh "$out"
+          echo "APPIMAGE_PATH=$out" >> "$GITHUB_ENV"
+
       # `scripts/install.sh` reads this file for two things, not one: the hash, and the
       # asset's *real* filename. cargo-deb appends a Debian revision the git tag does not
       # carry (`zuno_0.2.5-1_amd64.deb` for tag v0.2.5), so an installer that builds the
@@ -144,7 +191,7 @@ jobs:
           # a worse artifact to read and was the spelling that broke the installer's lookup on
           # the first release to carry this file. The installer tolerates both now; this keeps
           # the published list plain.
-          sha256sum -- *.deb *.tar.gz > sha256sums.txt
+          sha256sum -- *.deb *.tar.gz *.AppImage > sha256sums.txt
           cat sha256sums.txt
           echo "SUMS_PATH=$PWD/sha256sums.txt" >> "$GITHUB_ENV"
 
@@ -176,6 +223,7 @@ jobs:
           path: |
             target/debian/*.deb
             target/debian/*.tar.gz
+            target/debian/*.AppImage
           if-no-files-found: error
 
       # Written to a file rather than piped: `--notes-file` and `--generate-notes` are
@@ -218,6 +266,17 @@ jobs:
             echo
             echo '</details>'
             echo
+            echo '<details><summary>Or run the AppImage — one file, nothing installed</summary>'
+            echo
+            echo '```bash'
+            echo 'chmod +x Zuno-*-x86_64.AppImage && ./Zuno-*-x86_64.AppImage'
+            echo '```'
+            echo
+            echo 'It needs FUSE, which desktop systems have; where it is missing, run it with'
+            echo '`--appimage-extract-and-run`. It uses the same system libraries as the tarball.'
+            echo
+            echo '</details>'
+            echo
             echo 'Requires x86-64 Linux with glibc 2.35+: Ubuntu 22.04+, Debian 12+,'
             echo 'Fedora 36+, or anything as recent.'
             echo
@@ -232,7 +291,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" "$TARBALL_PATH" "$SUMS_PATH" \
+          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" "$TARBALL_PATH" "$APPIMAGE_PATH" "$SUMS_PATH" \
             --title "Zuno $GITHUB_REF_NAME" \
             --notes-file release-notes.md
 
@@ -354,5 +413,49 @@ jobs:
                 *"already the latest"*) echo "ok: re-run is a no-op" ;;
                 *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
               esac
+            '
+
+  # **The published AppImage, opened up on Fedora.** Downloaded and checked against the release's
+  # own `sha256sums.txt`, then extracted rather than run — a container has no FUSE and no display
+  # — so what is proven is the part packaging can break: the AppDir layout the runtime and desktop
+  # tools read, and a binary that finds every library it links on a distro it was not built on.
+  smoke-appimage:
+    needs: deb
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Extract and check the published AppImage in a clean Fedora
+        timeout-minutes: 10
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker run --rm \
+            -e "ZUNO_VERSION=$version" \
+            -e "REPO=$GITHUB_REPOSITORY" \
+            fedora:latest sh -c '
+              set -eux
+              command -v curl || dnf install -y curl
+              # The same three desktop libraries as `smoke-tarball`, for the same reason.
+              dnf install -y libxcb libxkbcommon libxkbcommon-x11
+
+              cd /tmp
+              base="https://github.com/$REPO/releases/download/v$ZUNO_VERSION"
+              file="Zuno-$ZUNO_VERSION-x86_64.AppImage"
+              curl -fsSL -o sha256sums.txt "$base/sha256sums.txt"
+              curl -fsSL -o "$file" "$base/$file"
+              grep " $file\$" sha256sums.txt | sha256sum -c -
+
+              chmod +x "$file"
+              "./$file" --appimage-extract >/dev/null
+              test -e squashfs-root/AppRun
+              test -f squashfs-root/dev.zuno.Zuno.desktop
+              test -f squashfs-root/dev.zuno.Zuno.svg
+              test -x squashfs-root/usr/bin/zuno
+
+              ldd squashfs-root/usr/bin/zuno
+              if ldd squashfs-root/usr/bin/zuno | grep -q "not found"; then
+                echo "::error::the AppImage binary links a library a Fedora desktop may lack"
+                exit 1
+              fi
             '
 
