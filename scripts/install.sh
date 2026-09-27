@@ -7,12 +7,19 @@
 # Deliberately NOT `curl ... | sudo sh`: that would run the download and the version
 # resolution as root too. This runs as you, and calls sudo only for the apt line.
 #
-# There is no install/upgrade branch, because `apt-get install ./file.deb` is already both.
+# **Two ways in, chosen by what the system has.** With apt, the .deb, installed system-wide —
+# `apt-get install ./file.deb` is install and upgrade in one, so there is no branch for either.
+# Anywhere else — Fedora, openSUSE, Arch — the tarball, unpacked into ~/.local with no sudo at
+# all: the same binary, laid out as a prefix. It is an upgrade too, because it overwrites.
 #
 # Knobs:
 #   ZUNO_VERSION=0.2.4    install that version instead of the latest (bisecting a regression)
 #   ZUNO_ASSUME_YES=1     never prompt; required when there is no terminal
 #   ZUNO_FORCE=1          reinstall even when the wanted version is already installed
+#   ZUNO_METHOD=tarball   force a method — `deb` or `tarball` — e.g. a no-sudo install on Ubuntu
+#   ZUNO_PREFIX=~/.local  where the tarball goes (default ~/.local)
+#   ZUNO_DOWNLOAD_BASE=…  fetch the assets from here instead of the release — a mirror, or a
+#                         local server when testing this script before a release exists
 #
 set -eu
 
@@ -37,19 +44,52 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # --- preflight ----------------------------------------------------------------------
 #
 # Each check exists because its failure is otherwise silent or cryptic: a wrong-arch
-# binary dies with "cannot execute", too-old glibc dies inside the loader, and a non-dpkg
-# distro gets "apt-get: not found" rather than being told Zuno has no package for it.
+# binary dies with "cannot execute", too-old glibc dies inside the loader, and a musl system
+# dies with a "not found" that names a file which plainly exists.
 
-require_debian() {
+require_linux() {
     [ "$(uname -s)" = "Linux" ] || die "this installer supports Linux only (found $(uname -s))"
-    if ! have dpkg-query || ! have apt-get; then
-        die "Zuno ships a .deb and this system has no dpkg/apt.
-Download the package or build from source: $RELEASES/latest"
-    fi
+}
+
+# `deb` where apt can install one, `tarball` everywhere else — or whatever ZUNO_METHOD says.
+install_method() {
+    case "${ZUNO_METHOD:-}" in
+        deb)
+            { have dpkg-query && have apt-get; } \
+                || die "ZUNO_METHOD=deb, but this system has no dpkg/apt"
+            printf 'deb'
+            ;;
+        tarball) printf 'tarball' ;;
+        "")
+            if have dpkg-query && have apt-get; then printf 'deb'; else printf 'tarball'; fi
+            ;;
+        *) die "ZUNO_METHOD must be deb or tarball, not ${ZUNO_METHOD}" ;;
+    esac
 }
 
 require_tools() {
-    have curl || die "curl is required. Install it with: sudo apt-get install -y curl"
+    method=$1
+    if ! have curl; then
+        if [ "$method" = "deb" ]; then
+            die "curl is required. Install it with: sudo apt-get install -y curl"
+        fi
+        die "curl is required. Install it with your package manager and re-run."
+    fi
+    if [ "$method" = "tarball" ]; then
+        have tar || die "tar is required to unpack Zuno. Install it and re-run."
+    fi
+}
+
+# A musl system reports a glibc-style `ldd` with no version in it, so the floor check below
+# would wave it through — and the binary, built against glibc, then fails with "not found" on
+# a path that exists. Said plainly instead.
+require_not_musl() {
+    have ldd || return 0
+    if ldd --version 2>&1 | grep -qi musl; then
+        die "this system uses musl (Alpine, Void musl…) and Zuno is built against glibc.
+Build from source: https://github.com/$REPO"
+    fi
+    return 0
 }
 
 detect_arch() {
@@ -62,14 +102,25 @@ Build from source: https://github.com/$REPO" ;;
     esac
 }
 
-# The .deb is built on ubuntu-22.04 so dpkg-shlibdeps emits `libc6 (>= 2.35)`. apt would
-# refuse the install anyway; checking here turns that into a sentence someone can act on.
+# `$1` < `$2`, as version strings.
+#
+# **`sort -V`, because `dpkg --compare-versions` exists only on Debian** — and the tarball path
+# runs everywhere else. Only ever given plain dotted versions (a glibc release, a Zuno tag with
+# its Debian revision stripped), which is where the two agree.
+version_lt() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]
+}
+
+# Everything is built on ubuntu-22.04, so the binary needs glibc 2.35+ — dpkg-shlibdeps writes it
+# into the .deb as `libc6 (>= 2.35)`, and the tarball carries the same binary with nothing to
+# enforce it. apt would refuse the .deb anyway; checking here turns both into a sentence
+# someone can act on.
 require_glibc() {
     have ldd || return 0
     found=$(ldd --version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+$' || true)
     [ -n "$found" ] || return 0
-    if dpkg --compare-versions "$found" lt "2.35"; then
-        die "glibc $found is too old — Zuno needs 2.35+ (Ubuntu 22.04+, Debian 12+)"
+    if version_lt "$found" "2.35"; then
+        die "glibc $found is too old — Zuno needs 2.35+ (Ubuntu 22.04+, Debian 12+, Fedora 36+)"
     fi
     return 0
 }
@@ -177,17 +228,48 @@ sum_for() {
     return 1
 }
 
+# Where one release's assets live — the release itself, or `ZUNO_DOWNLOAD_BASE`.
+download_base() {
+    printf '%s' "${ZUNO_DOWNLOAD_BASE:-$RELEASES/download/v$1}"
+}
+
+# The checksum list, fetched first because it also names the assets. Missing is not an error
+# here: releases published before it existed have none, and `download` says so.
+fetch_sums() {
+    version=$1
+    dir=$2
+    curl -fsSL -o "$dir/sha256sums.txt" "$(download_base "$version")/sha256sums.txt" \
+        2>/dev/null || true
+}
+
+# The tarball's name. **No Debian revision to guess**, unlike the .deb: it is named after the
+# tag, so the constructed name is only a fallback for a list that did not mention it.
+tarball_name() {
+    version=$1
+    sums=$2
+    if [ -s "$sums" ]; then
+        name=$(grep -oE "zuno-[^ ]*-x86_64-linux\.tar\.gz" "$sums" | head -n 1 || true)
+        [ -n "$name" ] && { printf '%s' "$name"; return 0; }
+        # Listed sums with no tarball in them: a release from before tarballs shipped. Named
+        # here, because the 404 the download would otherwise hit says nothing about why.
+        die "Zuno $version was published before the tarball existed, so there is none to install
+here. Install a newer version, or on Debian/Ubuntu use ZUNO_METHOD=deb."
+    fi
+    printf 'zuno-%s-x86_64-linux.tar.gz' "$version"
+}
+
 download() {
     version=$1
-    arch=$2
+    file=$2
     dir=$3
-    base="$RELEASES/download/v${version}"
-
-    curl -fsSL -o "$dir/sha256sums.txt" "$base/sha256sums.txt" 2>/dev/null || true
-    file=$(asset_name "$version" "$arch" "$dir/sha256sums.txt")
+    base=$(download_base "$version")
 
     info "Downloading $file…"
-    curl -fsSL --proto '=https' --tlsv1.2 -o "$dir/$file" "$base/$file" \
+    # HTTPS only — plus `file`, for a `ZUNO_DOWNLOAD_BASE` pointing at a local directory when
+    # testing this script before a release exists. Safe to allow: it applies to the URL as
+    # given, and curl never follows a *redirect* into `file://`, so the default GitHub download
+    # is exactly as strict as `=https` alone.
+    curl -fsSL --proto '=https,file' --tlsv1.2 -o "$dir/$file" "$base/$file" \
         || die "could not download $file.
 Check that version $version exists: $RELEASES"
 
@@ -251,13 +333,9 @@ install_deb() {
     fi
 }
 
-main() {
-    require_debian
-    require_tools
-    require_glibc
-    arch=$(detect_arch)
-
-    wanted=$(resolve_version)
+install_via_deb() {
+    arch=$1
+    wanted=$2
     current=$(installed_version)
     downgrade=0
 
@@ -280,12 +358,131 @@ main() {
     ensure_root
 
     WORKDIR=$(mktemp -d)
-    package=$(download "$wanted" "$arch" "$WORKDIR")
+    fetch_sums "$wanted" "$WORKDIR"
+    file=$(asset_name "$wanted" "$arch" "$WORKDIR/sha256sums.txt")
+    package=$(download "$wanted" "$file" "$WORKDIR")
     install_deb "$package" "$downgrade"
 
     warn_about_vulkan
     info ""
     info "Zuno $wanted is installed. Launch it from your applications menu, or run: zuno"
+}
+
+# --- tarball ------------------------------------------------------------------------
+
+PREFIX="${ZUNO_PREFIX:-$HOME/.local}"
+
+# What an unpacked copy says it is. There is no package database to ask, which is why the
+# tarball carries `VERSION` at all.
+tarball_version() {
+    file="$PREFIX/share/doc/zuno/VERSION"
+    [ -r "$file" ] || return 0
+    head -n 1 "$file" | tr -d '[:space:]'
+}
+
+install_tarball() {
+    archive=$1
+    stage="$WORKDIR/unpacked"
+    mkdir -p "$stage"
+    tar -xzf "$archive" -C "$stage" --strip-components=1 \
+        || die "could not unpack $archive"
+    [ -x "$stage/bin/zuno" ] || die "the archive has no bin/zuno — refusing to install it"
+
+    mkdir -p "$PREFIX/bin" "$PREFIX/share/applications" \
+        "$PREFIX/share/icons/hicolor/scalable/apps" "$PREFIX/share/doc/zuno" \
+        || die "cannot write to $PREFIX. Set ZUNO_PREFIX to a directory you own."
+
+    # **Renamed into place, not copied over.** Writing into an executable that is running fails
+    # with "Text file busy", and updating while Zuno is open is exactly when people run this.
+    # A rename swaps the directory entry and leaves the running copy's inode alone.
+    cp "$stage/bin/zuno" "$PREFIX/bin/.zuno.new"
+    chmod 755 "$PREFIX/bin/.zuno.new"
+    mv -f "$PREFIX/bin/.zuno.new" "$PREFIX/bin/zuno"
+
+    # **`Exec=` rewritten to the absolute path.** A launcher does not always start apps with
+    # ~/.local/bin on PATH, so `Exec=zuno` could be a menu entry that silently does nothing.
+    # Quoted, for a home directory with a space in it. Line by line in sh rather than `sed`,
+    # whose replacement text would read a `|` or `&` in the path as syntax.
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            Exec=zuno) printf 'Exec="%s"\n' "$PREFIX/bin/zuno" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$stage/share/applications/dev.zuno.Zuno.desktop" \
+        > "$PREFIX/share/applications/dev.zuno.Zuno.desktop"
+
+    cp "$stage/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg" \
+        "$PREFIX/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg"
+    cp "$stage/share/doc/zuno/"* "$PREFIX/share/doc/zuno/"
+
+    # So the menu picks the entry up without a logout. Optional: absent on minimal systems,
+    # where the next login does the same.
+    if have update-desktop-database; then
+        update-desktop-database "$PREFIX/share/applications" >/dev/null 2>&1 || true
+    fi
+}
+
+install_via_tarball() {
+    wanted=$1
+    current=$(tarball_version)
+
+    # **Before any question is asked**, so a version that has no tarball is refused up front
+    # rather than after someone has agreed to a downgrade that cannot happen.
+    WORKDIR=$(mktemp -d)
+    fetch_sums "$wanted" "$WORKDIR"
+    file=$(tarball_name "$wanted" "$WORKDIR/sha256sums.txt")
+
+    if [ -n "$current" ]; then
+        if [ "$current" = "$wanted" ] && [ "${ZUNO_FORCE:-0}" != "1" ]; then
+            info "Zuno $current is already the latest. Re-run with ZUNO_FORCE=1 to reinstall."
+            return 0
+        fi
+        if version_lt "$wanted" "$current"; then
+            confirm "Zuno $current is installed. Downgrade to $wanted?" \
+                || die "cancelled."
+        else
+            info "Zuno $current is installed. Updating to $wanted."
+        fi
+    else
+        info "Installing Zuno $wanted into $PREFIX — no sudo needed."
+    fi
+
+    archive=$(download "$wanted" "$file" "$WORKDIR")
+    install_tarball "$archive"
+
+    if have ldconfig && ! ldconfig -p 2>/dev/null | grep -q 'libvulkan\.so\.1'; then
+        info ""
+        info "Note: no Vulkan loader was found, and Zuno renders through Vulkan. If it fails to"
+        info "start, install your distribution's Vulkan loader and driver (on Fedora:"
+        info "vulkan-loader and mesa-vulkan-drivers)."
+    fi
+
+    info ""
+    info "Zuno $wanted is installed in $PREFIX."
+    case ":$PATH:" in
+        *":$PREFIX/bin:"*)
+            info "Launch it from your applications menu, or run: zuno"
+            ;;
+        *)
+            info "Launch it from your applications menu, or run: $PREFIX/bin/zuno"
+            info "($PREFIX/bin is not on your PATH — add it to run plain \`zuno\`.)"
+            ;;
+    esac
+}
+
+main() {
+    require_linux
+    method=$(install_method)
+    require_tools "$method"
+    require_not_musl
+    require_glibc
+    arch=$(detect_arch)
+    wanted=$(resolve_version)
+
+    case "$method" in
+        deb) install_via_deb "$arch" "$wanted" ;;
+        tarball) install_via_tarball "$wanted" ;;
+    esac
 }
 
 main "$@"

@@ -102,6 +102,36 @@ jobs:
           dpkg-deb --contents "$deb"
           echo "DEB_PATH=$deb" >> "$GITHUB_ENV"
 
+      # **The same binary as the .deb, laid out as a prefix** — for every Linux without apt, and
+      # for anyone who unpacks by hand. `bin/` and `share/` mirror `/usr`, so the one archive
+      # installs to `~/.local` without sudo (what `install.sh` does off Debian) or to
+      # `/usr/local` with it: `tar -xzf … --strip-components=1 -C ~/.local`.
+      #
+      # Reused rather than rebuilt: `cargo deb` has just produced `target/release/zuno`, already
+      # stripped by the release profile, so the tarball inherits this runner's glibc 2.35 floor
+      # and the binary the tests above ran against. `VERSION` is how the installer knows what an
+      # unpacked copy is, since there is no package database to ask.
+      - name: Build the tarball
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "zuno") | .version')
+          name="zuno-${version}-x86_64-linux"
+          stage="target/tarball/$name"
+          rm -rf target/tarball
+          install -Dm755 target/release/zuno "$stage/bin/zuno"
+          install -Dm644 assets/dev.zuno.Zuno.desktop "$stage/share/applications/dev.zuno.Zuno.desktop"
+          install -Dm644 assets/icons/zuno.svg "$stage/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg"
+          install -Dm644 README.md "$stage/share/doc/zuno/README.md"
+          install -Dm644 LICENSE "$stage/share/doc/zuno/LICENSE"
+          printf '%s\n' "$version" > "$stage/share/doc/zuno/VERSION"
+          chmod 644 "$stage/share/doc/zuno/VERSION"
+          # Root-owned in the archive, so unpacking as root does not create files owned by the
+          # runner's uid 1001 — and unpacking as a user gives that user ownership either way.
+          tar --owner=0 --group=0 --numeric-owner -C target/tarball \
+            -czf "target/debian/$name.tar.gz" "$name"
+          tar -tzvf "target/debian/$name.tar.gz"
+          echo "TARBALL_PATH=$PWD/target/debian/$name.tar.gz" >> "$GITHUB_ENV"
+
       # `scripts/install.sh` reads this file for two things, not one: the hash, and the
       # asset's *real* filename. cargo-deb appends a Debian revision the git tag does not
       # carry (`zuno_0.2.5-1_amd64.deb` for tag v0.2.5), so an installer that builds the
@@ -114,7 +144,7 @@ jobs:
           # a worse artifact to read and was the spelling that broke the installer's lookup on
           # the first release to carry this file. The installer tolerates both now; this keeps
           # the published list plain.
-          sha256sum -- *.deb > sha256sums.txt
+          sha256sum -- *.deb *.tar.gz > sha256sums.txt
           cat sha256sums.txt
           echo "SUMS_PATH=$PWD/sha256sums.txt" >> "$GITHUB_ENV"
 
@@ -142,8 +172,10 @@ jobs:
       # Always uploaded, so a workflow_dispatch run is downloadable without a release.
       - uses: actions/upload-artifact@v4
         with:
-          name: zuno-deb
-          path: target/debian/*.deb
+          name: zuno-linux
+          path: |
+            target/debian/*.deb
+            target/debian/*.tar.gz
           if-no-files-found: error
 
       # Written to a file rather than piped: `--notes-file` and `--generate-notes` are
@@ -160,7 +192,9 @@ jobs:
             echo '```'
             echo
             echo 'The same command does both — it installs Zuno if you do not have it and'
-            echo 'updates it if you do. It asks for sudo only to run `apt-get install`.'
+            echo 'updates it if you do. On Debian and Ubuntu it installs the .deb and asks'
+            echo 'for sudo only to run `apt-get install`; everywhere else — Fedora, openSUSE,'
+            echo 'Arch — it unpacks the tarball into `~/.local`, with no sudo at all.'
             echo
             echo '<details><summary>Or install the .deb by hand</summary>'
             echo
@@ -173,7 +207,19 @@ jobs:
             echo
             echo '</details>'
             echo
-            echo 'Requires Ubuntu 22.04+, Debian 12+, or a derivative, on x86-64.'
+            echo '<details><summary>Or unpack the tarball by hand</summary>'
+            echo
+            echo '```bash'
+            echo 'tar -xzf zuno-*-x86_64-linux.tar.gz --strip-components=1 -C ~/.local'
+            echo '```'
+            echo
+            echo 'It needs `libxkbcommon`, `libxkbcommon-x11` and `libxcb`, which every'
+            echo 'desktop already has, plus a Vulkan driver.'
+            echo
+            echo '</details>'
+            echo
+            echo 'Requires x86-64 Linux with glibc 2.35+: Ubuntu 22.04+, Debian 12+,'
+            echo 'Fedora 36+, or anything as recent.'
             echo
             echo 'Zuno renders through Vulkan. On a machine with no GPU driver present,'
             echo 'install `mesa-vulkan-drivers` as well.'
@@ -186,7 +232,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" "$SUMS_PATH" \
+          gh release create "$GITHUB_REF_NAME" "$DEB_PATH" "$TARBALL_PATH" "$SUMS_PATH" \
             --title "Zuno $GITHUB_REF_NAME" \
             --notes-file release-notes.md
 
@@ -248,6 +294,60 @@ jobs:
               # The update path: re-running is what an existing user does, and it has to be
               # a clean no-op rather than a reinstall or an error.
               out=$(sh /install.sh 2>&1)
+              printf "%s\n" "$out"
+              case "$out" in
+                *"already the latest"*) echo "ok: re-run is a no-op" ;;
+                *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
+              esac
+            '
+
+  # **The published tarball, on Fedora, as an ordinary user** — the `smoke` job's check for the
+  # path every non-apt Linux takes. `installer.yml`'s `tarball` job proves the script's logic
+  # against a stand-in binary; this is the one that proves the *real* archive installs and that
+  # its binary finds every library it links.
+  smoke-tarball:
+    needs: deb
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the published tarball in a clean Fedora
+        timeout-minutes: 10
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          docker run --rm \
+            -e "ZUNO_VERSION=$version" \
+            -v "$PWD/scripts/install.sh:/install.sh:ro" \
+            fedora:latest sh -c '
+              set -eux
+              dnf install -y tar
+              command -v curl || dnf install -y curl
+              # **The three desktop libraries the binary links**, which every Fedora desktop
+              # already has and a minimal container does not — read off the release binary with
+              # `readelf -d`: libxcb, libxkbcommon and libxkbcommon-x11, beside glibc and
+              # libgcc. The tarball declares no dependencies, so this list is what the `ldd`
+              # check below holds it to. A new NEEDED entry fails the job rather than a
+              # user, which is the point: README says what a tarball install needs.
+              dnf install -y libxcb libxkbcommon libxkbcommon-x11
+              useradd -m tester
+
+              su tester -c "ZUNO_VERSION=$ZUNO_VERSION sh /install.sh"
+
+              bin=/home/tester/.local/bin/zuno
+              test -x "$bin"
+              test -f /home/tester/.local/share/applications/dev.zuno.Zuno.desktop
+              test -f /home/tester/.local/share/icons/hicolor/scalable/apps/dev.zuno.Zuno.svg
+              grep -qx "Exec=\"$bin\"" /home/tester/.local/share/applications/dev.zuno.Zuno.desktop
+
+              ldd "$bin"
+              if ldd "$bin" | grep -q "not found"; then
+                echo "::error::the tarball binary links a library a Fedora desktop may lack"
+                exit 1
+              fi
+
+              out=$(su tester -c "ZUNO_VERSION=$ZUNO_VERSION sh /install.sh" 2>&1)
               printf "%s\n" "$out"
               case "$out" in
                 *"already the latest"*) echo "ok: re-run is a no-op" ;;

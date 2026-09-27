@@ -19,11 +19,13 @@ on:
     branches: ["main"]
     paths:
       - "scripts/install.sh"
+      - ".github/scripts/test-tarball-install.sh"
       - ".github/workflows/installer.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "scripts/install.sh"
+      - ".github/scripts/test-tarball-install.sh"
       - ".github/workflows/installer.yml"
 
 jobs:
@@ -39,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --shell=sh scripts/install.sh
+          shellcheck --shell=sh scripts/install.sh .github/scripts/test-tarball-install.sh
 
       # Ubuntu 22.04 is the floor the .deb claims (`libc6 (>= 2.35)`), so installing there
       # proves the claim rather than trusting it. The container runs as root, which is also
@@ -94,3 +96,30 @@ jobs:
                 *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
               esac
             '
+
+  # **The tarball path, on a distro with no apt** — so `install.sh` has to choose it by itself,
+  # which is the half of the change a Debian runner can never exercise.
+  #
+  # Against fake releases built by the script, because no published release carries a tarball
+  # yet: this tests the installer's logic before a tag exists, and `release.yml`'s
+  # `smoke-tarball` tests the real archive once one does. As an ordinary user, because the
+  # whole point of this path is that it needs no root.
+  tarball:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from a fake release in a clean Fedora
+        timeout-minutes: 8
+        run: |
+          docker run --rm -v "$PWD:/src:ro" fedora:latest sh -c '
+            set -eux
+            # The minimal image has no tar; every Fedora desktop does. curl only if absent: the
+            # image usually ships curl-minimal, and asking for `curl` over it is a conflict.
+            dnf install -y tar
+            command -v curl || dnf install -y curl
+            useradd -m tester
+            su tester -c "sh /src/.github/scripts/test-tarball-install.sh /src"
+          '
