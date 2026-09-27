@@ -322,7 +322,8 @@ jobs:
             -v "$PWD/scripts/install.sh:/install.sh:ro" \
             fedora:latest sh -c '
               set -eux
-              dnf install -y tar
+              # util-linux for `su`, which the minimal image leaves out — see `installer.yml`.
+              dnf install -y tar util-linux
               command -v curl || dnf install -y curl
               # **The three desktop libraries the binary links**, which every Fedora desktop
               # already has and a minimal container does not — read off the release binary with

@@ -116,9 +116,11 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src:ro" fedora:latest sh -c '
             set -eux
-            # The minimal image has no tar; every Fedora desktop does. curl only if absent: the
-            # image usually ships curl-minimal, and asking for `curl` over it is a conflict.
-            dnf install -y tar
+            # tar is what install.sh unpacks with, and `su` — to run as an ordinary user — comes
+            # from util-linux, which the minimal image leaves out: the first run of this job died
+            # on `su: command not found`. curl only if absent: the image ships curl-minimal, and
+            # asking for `curl` over it is a conflict.
+            dnf install -y tar util-linux
             command -v curl || dnf install -y curl
             useradd -m tester
             su tester -c "sh /src/.github/scripts/test-tarball-install.sh /src"
