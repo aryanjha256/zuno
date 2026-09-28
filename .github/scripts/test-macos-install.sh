@@ -40,7 +40,9 @@ make_release 0.0.2
 # An admin-writable folder, as /Applications is for the first account on a Mac: no sudo.
 apps="$work/Applications"
 mkdir -p "$apps"
-out=$(install_version 0.0.1 "$apps" 2>&1)
+# `|| fail "$out"` on every captured run: under `set -e` a bare `out=$(…)` exits the moment the
+# install fails, before anything prints it, so the job died with an exit code and no reason.
+out=$(install_version 0.0.1 "$apps" 2>&1) || fail "the install failed: $out"
 printf '%s\n' "$out"
 case "$out" in
     *"Checksum verified."*) echo "ok: verified with shasum" ;;
@@ -55,7 +57,7 @@ app="$apps/Zuno.app"
 codesign --verify --strict --verbose=2 "$app" || fail "the installed app's signature is broken"
 [ -z "$(find "$app" -name '._*')" ] || fail "AppleDouble files inside the bundle"
 
-out=$(install_version 0.0.1 "$apps" 2>&1)
+out=$(install_version 0.0.1 "$apps" 2>&1) || fail "the re-run failed: $out"
 case "$out" in
     *"already the latest"*) echo "ok: re-run is a no-op" ;;
     *) fail "re-running did not report an up-to-date install: $out" ;;
@@ -73,7 +75,7 @@ locked="$work/Locked"
 sudo mkdir -p "$locked"
 sudo chmod 755 "$locked"
 sudo chown root "$locked"
-out=$(install_version 0.0.2 "$locked" 2>&1)
+out=$(install_version 0.0.2 "$locked" 2>&1) || fail "the sudo install failed: $out"
 printf '%s\n' "$out"
 case "$out" in
     *"sudo will ask"*) echo "ok: fell back to sudo" ;;

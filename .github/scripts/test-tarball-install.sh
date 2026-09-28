@@ -49,7 +49,7 @@ make_release 0.0.1
 make_release 0.0.2
 
 # Fresh install. No ZUNO_METHOD: on a system without apt the tarball is the only way in.
-out=$(install_version 0.0.1 2>&1)
+out=$(install_version 0.0.1 2>&1) || fail "the install failed: $out"
 printf '%s\n' "$out"
 case "$out" in
     *"no sudo needed"*) echo "ok: chose the tarball path on its own" ;;
@@ -67,7 +67,7 @@ grep -qx "Exec=\"$HOME/.local/bin/zuno\"" "$desktop" \
     || fail "Exec= was not rewritten to the absolute path: $(grep '^Exec=' "$desktop")"
 
 # A re-run of the same version is a no-op, as it is for the .deb.
-out=$(install_version 0.0.1 2>&1)
+out=$(install_version 0.0.1 2>&1) || fail "the re-run failed: $out"
 case "$out" in
     *"already the latest"*) echo "ok: re-run is a no-op" ;;
     *) fail "re-running did not report an up-to-date install: $out" ;;

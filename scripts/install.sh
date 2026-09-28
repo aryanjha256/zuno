@@ -500,7 +500,9 @@ APP_DIR="${ZUNO_APP_DIR:-/Applications}"
 # **Asked of the hardware, not of `uname -m`**, which reports x86_64 from a shell running under
 # Rosetta on an Apple Silicon Mac. Intel Macs have no `hw.optional.arm64` at all.
 require_apple_silicon() {
-    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" != "1" ]; then
+    # By full path: `sysctl` is in /usr/sbin, which a stripped-down PATH can leave out, and a
+    # missing command here would read as "this Mac is Intel".
+    if [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || true)" != "1" ]; then
         die "Zuno for macOS is built for Apple Silicon only, and this Mac is Intel.
 Build from source: https://github.com/$REPO"
     fi
