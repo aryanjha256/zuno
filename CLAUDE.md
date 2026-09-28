@@ -264,6 +264,23 @@ artifacts at tag time. Traps found here:
 **`appimagetool` 1.9 downloads the AppImage runtime while it builds** | An unpinned fetch inside every release. Both it and the runtime (`--runtime-file`) are pinned by version and SHA-256. The type2 runtime is static — no `NEEDED` entries, libfuse built in — so an AppImage needs `fusermount`, **not `libfuse2`**. |
 **Fedora's minimal container has no `su`** | It is in `util-linux`, which the image leaves out; the first tarball job died on `su: command not found`. `tar` is already there. Ask for `curl` only if absent — the image ships `curl-minimal`, and requesting `curl` over it is a conflict. |
 
+**macOS: `Zuno.app`, ad-hoc signed, installed over curl.** The `macos` job (`macos-14`, arm64)
+builds and runs `scripts/macos-bundle.sh` — Info.plist, an `.icns` drawn from `zuno.svg`,
+`codesign --sign -` — and uploads `zuno-<v>-aarch64-macos.tar.gz`; one `publish` job then
+releases every artifact together, so a release is never Linux-only. No Developer ID and no
+notarization, **which is why the install is `curl | sh`**: Gatekeeper acts on the quarantine flag
+a *browser* sets, curl sets none, so the app opens where a browser-downloaded copy is blocked.
+`install.sh` puts it in `/Applications` (writable by admin accounts) and falls back to sudo only
+when it isn't. `installer.yml`'s `macos` job proves that path against fake releases
+(`.github/scripts/test-macos-install.sh`, a `cc`-compiled stand-in so the signature is real), and
+`smoke-macos` installs the real one at tag time.
+
+| Trap | Why |
+|---|---|
+**macOS has no `sha256sum`** | It ships `shasum -a 256`. `download()` verified only when `sha256sum` existed, so a Mac install would have skipped verification every time, silently; `sha256_of` tries both, and a published list with no tool to check it is now a refusal. |
+**`COPYFILE_DISABLE=1` on the macOS `tar`** | Otherwise it writes `._` AppleDouble files for extended attributes, which unpack inside the bundle and break the signature's seal. |
+**Sign last, copy with `ditto`** | The signature seals every file in the bundle, so any edit after `codesign` invalidates it; `ditto` is the copy macOS defines as preserving a bundle exactly. Both are checked by `codesign --verify` after the install, not just after the build. |
+
 `.github/workflows/release.yml` on a `v*` tag → `.deb` on a GitHub Release.
 `workflow_dispatch` runs the same build without publishing. Four things here are
 counter-intuitive enough that the workflow asserts each one rather than trusting it:

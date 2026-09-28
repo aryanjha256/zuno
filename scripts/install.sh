@@ -12,12 +12,18 @@
 # Anywhere else — Fedora, openSUSE, Arch — the tarball, unpacked into ~/.local with no sudo at
 # all: the same binary, laid out as a prefix. It is an upgrade too, because it overwrites.
 #
+# **On macOS, Zuno.app into /Applications**, with sudo only when that folder is not writable —
+# it is for an admin account, which the first account on a Mac is. Downloaded by curl, which
+# sets no quarantine flag, so the ad-hoc signed app opens without a Gatekeeper prompt; the same
+# archive fetched by a browser would be blocked. Apple Silicon only.
+#
 # Knobs:
 #   ZUNO_VERSION=0.2.4    install that version instead of the latest (bisecting a regression)
 #   ZUNO_ASSUME_YES=1     never prompt; required when there is no terminal
 #   ZUNO_FORCE=1          reinstall even when the wanted version is already installed
 #   ZUNO_METHOD=tarball   force a method — `deb` or `tarball` — e.g. a no-sudo install on Ubuntu
 #   ZUNO_PREFIX=~/.local  where the tarball goes (default ~/.local)
+#   ZUNO_APP_DIR=…        where Zuno.app goes on macOS (default /Applications)
 #   ZUNO_DOWNLOAD_BASE=…  fetch the assets from here instead of the release — a mirror, or a
 #                         local server when testing this script before a release exists
 #
@@ -47,8 +53,22 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # binary dies with "cannot execute", too-old glibc dies inside the loader, and a musl system
 # dies with a "not found" that names a file which plainly exists.
 
-require_linux() {
-    [ "$(uname -s)" = "Linux" ] || die "this installer supports Linux only (found $(uname -s))"
+require_supported_os() {
+    case "$(uname -s)" in
+        Linux | Darwin) ;;
+        *) die "this installer supports Linux and macOS (found $(uname -s))" ;;
+    esac
+}
+
+# The SHA-256 of a file, or nothing when there is no tool to compute it. **macOS has no
+# `sha256sum`** — it ships `shasum` — and the check below used to skip verification whenever
+# `sha256sum` was missing, so a Mac install would have skipped it every time, silently.
+sha256_of() {
+    if have sha256sum; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif have shasum; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
 }
 
 # `deb` where apt can install one, `tarball` everywhere else — or whatever ZUNO_METHOD says.
@@ -275,10 +295,13 @@ Check that version $version exists: $RELEASES"
 
     # A mismatch is always fatal. A *missing* checksum file is not, or pinning a release
     # published before this installer existed would be impossible.
-    if [ -s "$dir/sha256sums.txt" ] && have sha256sum; then
+    if [ -s "$dir/sha256sums.txt" ]; then
         expected=$(sum_for "$file" "$dir/sha256sums.txt" || true)
-        actual=$(sha256sum "$dir/$file" | cut -d' ' -f1)
+        actual=$(sha256_of "$dir/$file")
         [ -n "$expected" ] || die "$file is not listed in sha256sums.txt — refusing to install"
+        # A published list and no way to check against it is a refusal, not a skip: the skip is
+        # the silent failure `sha256_of` exists to remove.
+        [ -n "$actual" ] || die "no sha256sum or shasum to verify $file with — refusing to install"
         [ "$expected" = "$actual" ] || die "checksum mismatch on $file — refusing to install"
         info "Checksum verified."
     else
@@ -470,8 +493,130 @@ install_via_tarball() {
     esac
 }
 
+# --- macOS --------------------------------------------------------------------------
+
+APP_DIR="${ZUNO_APP_DIR:-/Applications}"
+
+# **Asked of the hardware, not of `uname -m`**, which reports x86_64 from a shell running under
+# Rosetta on an Apple Silicon Mac. Intel Macs have no `hw.optional.arm64` at all.
+require_apple_silicon() {
+    if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" != "1" ]; then
+        die "Zuno for macOS is built for Apple Silicon only, and this Mac is Intel.
+Build from source: https://github.com/$REPO"
+    fi
+}
+
+# What the installed app says it is — its own Info.plist, the macOS counterpart of `VERSION`.
+app_version() {
+    plist="$APP_DIR/Zuno.app/Contents/Info.plist"
+    [ -r "$plist" ] || return 0
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist" 2>/dev/null || true
+}
+
+# The archive's name, read out of the checksum list as the tarball's is.
+app_archive_name() {
+    version=$1
+    sums=$2
+    if [ -s "$sums" ]; then
+        name=$(grep -oE "zuno-[^ ]*-aarch64-macos\.tar\.gz" "$sums" | head -n 1 || true)
+        [ -n "$name" ] && { printf '%s' "$name"; return 0; }
+        die "Zuno $version was published before macOS builds existed, so there is none to install."
+    fi
+    printf 'zuno-%s-aarch64-macos.tar.gz' "$version"
+}
+
+# sudo only when this account cannot write the app or the folder it goes in: a standard
+# (non-admin) account, or a Zuno.app an earlier install left owned by root.
+app_sudo() {
+    SUDO=""
+    if { [ -d "$APP_DIR" ] || mkdir -p "$APP_DIR" 2>/dev/null; } \
+        && [ -w "$APP_DIR" ] \
+        && { [ ! -e "$APP_DIR/Zuno.app" ] || [ -w "$APP_DIR/Zuno.app" ]; }; then
+        return 0
+    fi
+    have sudo || die "$APP_DIR is not writable and sudo is not available.
+Set ZUNO_APP_DIR to a folder you own, e.g. ZUNO_APP_DIR=~/Applications."
+    info "$APP_DIR is not writable by this account — sudo will ask for your password."
+    sudo -v || die "could not get root via sudo.
+Under \`curl | sh\` sudo reads the password from the terminal, so this needs one.
+Or install where you can write: ZUNO_APP_DIR=~/Applications."
+    SUDO="sudo"
+    $SUDO mkdir -p "$APP_DIR"
+}
+
+install_app() {
+    archive=$1
+    stage="$WORKDIR/unpacked"
+    mkdir -p "$stage"
+    tar -xzf "$archive" -C "$stage" || die "could not unpack $archive"
+    [ -x "$stage/Zuno.app/Contents/MacOS/zuno" ] \
+        || die "the archive has no Zuno.app — refusing to install it"
+
+    app_sudo
+
+    # **Swapped in by rename, as the Linux binary is**, so an update while Zuno is open leaves
+    # the running copy alone. `ditto` rather than `cp -R`, because it is the copy macOS defines
+    # as preserving a bundle exactly — the code signature seals every file in it.
+    dest="$APP_DIR/Zuno.app"
+    new="$APP_DIR/.Zuno.app.new"
+    old="$APP_DIR/.Zuno.app.old"
+    $SUDO rm -rf "$new" "$old"
+    $SUDO ditto "$stage/Zuno.app" "$new"
+    if [ -e "$dest" ]; then
+        $SUDO mv "$dest" "$old"
+    fi
+    $SUDO mv "$new" "$dest"
+    $SUDO rm -rf "$old"
+}
+
+install_via_app() {
+    wanted=$1
+    current=$(app_version)
+
+    WORKDIR=$(mktemp -d)
+    fetch_sums "$wanted" "$WORKDIR"
+    file=$(app_archive_name "$wanted" "$WORKDIR/sha256sums.txt")
+
+    if [ -n "$current" ]; then
+        if [ "$current" = "$wanted" ] && [ "${ZUNO_FORCE:-0}" != "1" ]; then
+            info "Zuno $current is already the latest. Re-run with ZUNO_FORCE=1 to reinstall."
+            return 0
+        fi
+        if version_lt "$wanted" "$current"; then
+            confirm "Zuno $current is installed. Downgrade to $wanted?" \
+                || die "cancelled."
+        else
+            info "Zuno $current is installed. Updating to $wanted."
+        fi
+    else
+        info "Installing Zuno $wanted into $APP_DIR."
+    fi
+
+    archive=$(download "$wanted" "$file" "$WORKDIR")
+    install_app "$archive"
+
+    info ""
+    info "Zuno $wanted is installed in $APP_DIR. Open it from Launchpad or Spotlight, or run:"
+    info "  open -a Zuno"
+}
+
+main_macos() {
+    case "${ZUNO_METHOD:-}" in
+        "" | app) ;;
+        *) die "on macOS Zuno installs as an app; ZUNO_METHOD=${ZUNO_METHOD} is for Linux" ;;
+    esac
+    have curl || die "curl is required, and ships with macOS — is it on your PATH?"
+    require_apple_silicon
+    wanted=$(resolve_version)
+    install_via_app "$wanted"
+}
+
 main() {
-    require_linux
+    require_supported_os
+    if [ "$(uname -s)" = "Darwin" ]; then
+        main_macos
+        return 0
+    fi
     method=$(install_method)
     require_tools "$method"
     require_not_musl

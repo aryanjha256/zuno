@@ -20,12 +20,16 @@ on:
     paths:
       - "scripts/install.sh"
       - ".github/scripts/test-tarball-install.sh"
+      - ".github/scripts/test-macos-install.sh"
+      - "scripts/macos-bundle.sh"
       - ".github/workflows/installer.yml"
   pull_request:
     branches: ["main"]
     paths:
       - "scripts/install.sh"
       - ".github/scripts/test-tarball-install.sh"
+      - ".github/scripts/test-macos-install.sh"
+      - "scripts/macos-bundle.sh"
       - ".github/workflows/installer.yml"
 
 jobs:
@@ -41,7 +45,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --shell=sh scripts/install.sh .github/scripts/test-tarball-install.sh
+          shellcheck --shell=sh scripts/install.sh scripts/macos-bundle.sh \
+            .github/scripts/test-tarball-install.sh .github/scripts/test-macos-install.sh
 
       # Ubuntu 22.04 is the floor the .deb claims (`libc6 (>= 2.35)`), so installing there
       # proves the claim rather than trusting it. The container runs as root, which is also
@@ -125,3 +130,18 @@ jobs:
             useradd -m tester
             su tester -c "sh /src/.github/scripts/test-tarball-install.sh /src"
           '
+
+  # **The macOS path, on a real Mac** — the `tarball` job's twin. Fake releases again, packed by
+  # the real `macos-bundle.sh`, so the bundle layout, the ad-hoc signature surviving the archive,
+  # the `shasum` verification and the sudo fallback are all proven before a tag exists;
+  # `release.yml`'s `smoke-macos` checks the real app at tag time.
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from a fake release
+        timeout-minutes: 8
+        run: sh .github/scripts/test-macos-install.sh "$PWD"

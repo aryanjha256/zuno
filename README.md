@@ -23,7 +23,13 @@ It downloads from the latest release and verifies the checksum, then:
 - **on Debian, Ubuntu and derivatives** it installs the `.deb` with `apt-get`, asking for
   `sudo` only at that last step;
 - **everywhere else** — Fedora, openSUSE, Arch — it unpacks the tarball into `~/.local`, with
-  no `sudo` at all.
+  no `sudo` at all;
+- **on a Mac with Apple Silicon** it installs `Zuno.app` into `/Applications`, asking for
+  `sudo` only if your account cannot write there.
+
+On macOS, use the command rather than downloading the archive in a browser. The app is signed
+but not yet notarized, and macOS blocks such an app when a browser downloaded it; installed this
+way it opens normally.
 
 `ZUNO_VERSION=0.2.4` pins a specific release if you need to go back, and `ZUNO_METHOD=tarball`
 takes the no-`sudo` route on Debian too.
@@ -68,10 +74,10 @@ It needs FUSE, which desktop systems have; where it is missing, run it with
 **Requirements:** x86-64 Linux with glibc 2.35+ — Ubuntu 22.04+, Debian 12+, Fedora 36+, or
 anything as recent. Zuno renders through Vulkan, so on a machine with no GPU driver installed
 you also want one: `mesa-vulkan-drivers` on Debian and Fedora — apt suggests it with the
-`.deb`, but only installs it if you accept recommends.
+`.deb`, but only installs it if you accept recommends. On macOS: Apple Silicon, macOS 11 or
+later.
 
-macOS and Windows are not packaged yet. Both build and pass the test suite in CI; what is left
-is platform conventions — keybindings assume `ctrl`, and the config paths assume XDG.
+Windows is not packaged yet. It builds and passes the test suite in CI.
 
 ## Build from source
 
