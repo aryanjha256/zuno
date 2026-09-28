@@ -129,14 +129,7 @@ impl AppState {
 /// location so naming one is enough, and an override for the case that matters, which is a
 /// workspace inside the repo it belongs to.
 pub fn default_new_location() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("share"))
-        })?;
-
-    Some(base.join("zuno").join("workspaces"))
+    Some(crate::paths::data_dir()?.join("workspaces"))
 }
 
 /// A workspace's display name: its directory's own name.
@@ -254,12 +247,7 @@ pub fn set_active(cx: &mut App, id: &str) -> bool {
 }
 
 fn config_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-
-    Some(base.join("zuno"))
+    crate::paths::config_dir()
 }
 
 /// `sessions/<id>.json`, derived from the id rather than recorded in the registry — so an entry
@@ -590,7 +578,7 @@ mod tests {
     fn the_config_dir_sits_under_xdg_config() {
         // Reads the real environment, so assert on shape rather than an exact value.
         if let Some(dir) = config_dir() {
-            assert!(dir.ends_with("zuno"), "{dir:?}");
+            assert!(dir.ends_with(crate::paths::app_dir_name()), "{dir:?}");
             assert!(dir.is_absolute(), "{dir:?}");
         }
     }

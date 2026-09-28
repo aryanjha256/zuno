@@ -20,15 +20,7 @@ pub struct CollectionRoot(Option<PathBuf>);
 impl Global for CollectionRoot {}
 
 pub(crate) fn default_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".local").join("share"))
-        })?;
-
-    Some(base.join("zuno").join("collections"))
+    Some(crate::paths::data_dir()?.join("collections"))
 }
 
 /// Point collections at a specific directory, or disable saving with `None`.
@@ -63,7 +55,8 @@ mod tests {
     fn the_default_path_sits_under_the_xdg_data_dir() {
         // Reads the real environment, so assert on shape rather than an exact value.
         if let Some(path) = default_path() {
-            assert!(path.ends_with("zuno/collections"), "{path:?}");
+            let tail = std::path::Path::new(crate::paths::app_dir_name()).join("collections");
+            assert!(path.ends_with(&tail), "{path:?}");
             assert!(path.is_absolute(), "{path:?}");
             // Collections are documents, not config — mixing them into the config dir is
             // the mistake this asserts against.

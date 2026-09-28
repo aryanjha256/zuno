@@ -349,7 +349,7 @@ fn shellexpand_home(input: &str) -> String {
     let Some(rest) = trimmed.strip_prefix('~') else {
         return trimmed.to_string();
     };
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = crate::paths::home_dir() else {
         return trimmed.to_string();
     };
     format!("{}{rest}", home.to_string_lossy())
@@ -4687,9 +4687,7 @@ impl Workspace {
         // `collection::scan` walks *every* `.json` under the root, so an export saved beside
         // the requests it came from is read back as a request, fails to parse, and reports
         // "is not a valid request" on every scan from then on.
-        let directory = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.clone());
+        let directory = crate::paths::home_dir().unwrap_or_else(|| root.clone());
         let prompt = cx.prompt_for_new_path(&directory, Some(&suggested));
 
         self.export_task = Some(cx.spawn(async move |workspace, cx| {
@@ -6357,9 +6355,7 @@ impl Workspace {
         );
         // `$HOME` rather than the collection root: a saved response is an artefact you're
         // taking elsewhere, not part of the collection you'd commit.
-        let directory = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let directory = crate::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
         let prompt = cx.prompt_for_new_path(&directory, Some(&suggested));
         self.response_save = Some(cx.spawn(async move |workspace, cx| {
@@ -8090,39 +8086,76 @@ pub fn keybinding_label(action: &dyn gpui::Action, window: &Window) -> String {
 
 /// Spell one binding the way UI copy does — `Ctrl+Shift+H`, not gpui's `ctrl-shift-h`.
 fn spell(binding: &gpui::KeyBinding) -> String {
+    let mac = cfg!(target_os = "macos");
     binding
         .keystrokes()
         .iter()
-        .map(|keystroke| {
-            let modifiers = keystroke.modifiers();
-            let mut parts: Vec<String> = Vec::new();
-            if modifiers.control {
-                parts.push("Ctrl".into());
-            }
-            if modifiers.alt {
-                parts.push("Alt".into());
-            }
-            // control, alt, platform, shift — gpui's own order in `display_modifiers`, matched by
-            // inspection of the vendored source.
-            //
-            // **Not covered by a test, and it's worth knowing why.** The round-trip check in
-            // `keybinding_label_matches_the_keymap` lowercases this back into gpui's spelling and
-            // compares, but a swap here is invisible to it: telling the two orders apart needs a
-            // binding with *both* platform and shift, and Zuno has none. Worse, one could never be
-            // compared that way anyway — gpui renders the platform modifier as the glyph `❖` on
-            // Linux, which does not lowercase into `super`. Reordering these lines was tried
-            // deliberately and the suite stayed green.
-            if modifiers.platform {
-                parts.push("Super".into());
-            }
-            if modifiers.shift {
-                parts.push("Shift".into());
-            }
-            parts.push(capitalize(keystroke.key()));
-            parts.join("+")
-        })
+        .map(|keystroke| spell_keystroke(keystroke.modifiers(), keystroke.key(), mac))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// One keystroke as UI copy spells it on the platform.
+///
+/// **On macOS, the way Mac apps write it** — modifier symbols in Apple's order, `⌃⌥⇧⌘`, with no
+/// separators, and symbols for the named keys: `⇧⌘H`, `⌘↩`, `⌥⌫`. Everywhere else, `Ctrl+Shift+H`.
+/// A parameter rather than a `cfg!` inside, so a test on any host can check both spellings.
+pub(crate) fn spell_keystroke(modifiers: &gpui::Modifiers, key: &str, mac: bool) -> String {
+    if mac {
+        let mut out = String::new();
+        if modifiers.control {
+            out.push('⌃');
+        }
+        if modifiers.alt {
+            out.push('⌥');
+        }
+        if modifiers.shift {
+            out.push('⇧');
+        }
+        if modifiers.platform {
+            out.push('⌘');
+        }
+        out.push_str(&match key {
+            "enter" => "↩".to_string(),
+            "backspace" => "⌫".to_string(),
+            "delete" => "⌦".to_string(),
+            "escape" => "⎋".to_string(),
+            "tab" => "⇥".to_string(),
+            "space" => "Space".to_string(),
+            "up" => "↑".to_string(),
+            "down" => "↓".to_string(),
+            "left" => "←".to_string(),
+            "right" => "→".to_string(),
+            other => capitalize(other),
+        });
+        return out;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if modifiers.control {
+        parts.push("Ctrl".into());
+    }
+    if modifiers.alt {
+        parts.push("Alt".into());
+    }
+    // control, alt, platform, shift — gpui's own order in `display_modifiers`, matched by
+    // inspection of the vendored source.
+    //
+    // **Not covered by a test, and it's worth knowing why.** The round-trip check in
+    // `keybinding_label_matches_the_keymap` lowercases this back into gpui's spelling and
+    // compares, but a swap here is invisible to it: telling the two orders apart needs a binding
+    // with *both* platform and shift, and Zuno has none off macOS. Worse, one could never be
+    // compared that way anyway — gpui renders the platform modifier as the glyph `❖` on Linux,
+    // which does not lowercase into `super`. Reordering these lines was tried deliberately and the
+    // suite stayed green.
+    if modifiers.platform {
+        parts.push("Super".into());
+    }
+    if modifiers.shift {
+        parts.push("Shift".into());
+    }
+    parts.push(capitalize(key));
+    parts.join("+")
 }
 
 /// `"No headers — Ctrl+Shift+H to add"`, with every key read from the keymap.

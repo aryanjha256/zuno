@@ -27,6 +27,11 @@ unicode-segmentation.workspace = true
 # adds a name in scope rather than a dependency.
 url.workspace = true
 
+# Where each platform keeps an app's files: XDG on Linux (identical to what Zuno computed by hand
+# before, including ignoring a relative `XDG_*`), `~/Library/Application Support` on macOS, the
+# Known Folder API on Windows — which is the half not worth writing by hand. See `paths.rs`.
+dirs = "7"
+
 # GPUI's headless test platform, which is the only way to drive real keystrokes and
 # focus through the app without a display server. Dev-only, so `cargo build` keeps
 # the default feature set.

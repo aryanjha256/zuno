@@ -40,7 +40,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 1069 tests, ~50s
+cargo test --workspace                   # 1073 tests, ~50s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -306,6 +306,18 @@ missing global and silently falls back to a default. A test that needs one calls
 `app_state::install_at(cx, None, ..)` itself; `None` keeps the write in memory, per invariant 6.
 Costs a debug cycle every time, because the symptom is a setting that reads back as its default
 with no error anywhere.
+
+**Keys are written once, in the Linux spelling, and translated for macOS.** Every binding in
+`main.rs` goes through `bind!(mac, "ctrl-…", …)`, which runs `platform_keys::for_platform` — the
+identity off macOS, so the Linux keymap is exactly what it says; on a Mac `ctrl-` becomes `⌘`,
+`alt-`+letter becomes `⌃`, and text editing follows Mac conventions (the module lists the rules
+and the three exceptions). **Tests press keys with `cx.press("ctrl-enter")`, never
+`simulate_keystrokes`**, so the macOS CI job exercises the Mac bindings through the same
+translation — a raw `simulate_keystrokes("ctrl-enter")` passes on Linux and fails on the Mac
+runner. The one exception is a key read back from the live keymap (`binding_syntax`), which is
+already in the platform's spelling and must not be translated twice.
+`no_two_global_bindings_claim_the_same_keystroke` checks **both** platforms' keymaps from any host,
+which is what caught the translation putting two actions on `⌘⇧M`.
 
 Two patterns worth reusing:
 

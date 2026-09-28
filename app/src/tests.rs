@@ -22,6 +22,25 @@ use crate::request_view::{RequestTab, RequestView, ResponseView};
 use crate::theme::{Appearance, Theme};
 use crate::workspace::Workspace;
 
+/// Press keys, **written in the Linux spelling and translated for the platform** — so
+/// `cx.press("ctrl-enter")` presses `⌘↩` on the macOS CI runner, through exactly the translation
+/// the keymap is registered with (`platform_keys::for_platform`). One spelling in 800 tests rather
+/// than two; the Mac keymap is then exercised by the same suite that exercises Linux's.
+///
+/// **Not for a key read back from the live keymap** (`binding_syntax`), which is already in the
+/// platform's spelling — translating it again would turn a Mac `ctrl-r` into `⌘R`. Those call
+/// `simulate_keystrokes` directly.
+trait Press {
+    fn press(&mut self, keystrokes: &str);
+}
+
+impl Press for VisualTestContext {
+    fn press(&mut self, keystrokes: &str) {
+        let keys = crate::platform_keys::for_platform(keystrokes, cfg!(target_os = "macos"));
+        self.simulate_keystrokes(&keys);
+    }
+}
+
 /// Boot a window the same way `main` does, so the keymap, theme, and engine under test
 /// are the real ones rather than a test-only arrangement.
 fn open_workspace(cx: &mut TestAppContext) -> (gpui::Entity<RequestView>, VisualTestContext) {
@@ -315,7 +334,7 @@ async fn switching_workspace_swaps_the_collection_and_the_buffers(cx: &mut TestA
     );
 
     // Open the request, so the buffer belongs to workspace one and must not survive the switch.
-    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.press("ctrl-shift-e down enter");
     cx.run_until_parked();
     let before = tabs_of(&window, &mut cx).1.url;
     assert_eq!(before, "https://one.test/alpha");
@@ -584,14 +603,14 @@ fn closed_port() -> String {
 /// still true on the first probe depended on how quickly a network call nobody intended
 /// resolved. Under load it lost about one run in three.
 fn type_url(cx: &mut VisualTestContext, url: &str) {
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(url);
 }
 
 /// Focus the body editor and empty it. The sample request ships a body and the editor
 /// opens with the cursor at offset 0, so typing without this prepends.
 fn clear_body(cx: &mut VisualTestContext) {
-    cx.simulate_keystrokes("ctrl-b ctrl-a backspace");
+    cx.press("ctrl-b ctrl-a backspace");
 }
 
 #[gpui::test]
@@ -600,7 +619,7 @@ async fn url_bar_starts_focused_and_accepts_typing(cx: &mut TestAppContext) {
 
     // The sample request seeds a URL; select-all then type replaces it, which is the
     // real editing path (SelectAll action, then a text replacement over a selection).
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input("https://api.zuno.dev/v1/users");
 
     let spec = spec_of(&view, &mut cx);
@@ -611,16 +630,16 @@ async fn url_bar_starts_focused_and_accepts_typing(cx: &mut TestAppContext) {
 async fn typed_text_reaches_the_derived_spec(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input("https://example.test/api");
 
     // Adding a header focuses its name cell, so typing lands there without a click.
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-Trace-Id");
 
     // Tab must reach the value cell. This is the assertion that would have caught
     // TextInput's focus handles missing `tab_stop(true)`.
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("abc-123");
 
     let spec = spec_of(&view, &mut cx);
@@ -636,7 +655,7 @@ async fn typed_text_reaches_the_derived_spec(cx: &mut TestAppContext) {
 async fn ctrl_m_opens_the_method_picker_with_the_current_one_marked(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     assert!(picker_is_open(&window, &mut cx));
 
     let rows = picker_rows(&window, &mut cx);
@@ -916,10 +935,10 @@ async fn http_body_verbs_refuse_on_a_graphql_request(cx: &mut TestAppContext) {
 async fn the_palette_names_tabs_by_the_active_kind(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Show request");
     let http = picker_rows(&window, &mut cx);
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     assert!(
@@ -935,7 +954,7 @@ async fn the_palette_names_tabs_by_the_active_kind(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Show request");
     let gql = picker_rows(&window, &mut cx);
 
@@ -964,7 +983,7 @@ async fn switching_kind_asks_before_discarding_a_body(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     cx.simulate_input("GraphQL");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     // Not switched — a second picker is asking.
@@ -987,7 +1006,7 @@ async fn switching_kind_asks_before_discarding_a_body(cx: &mut TestAppContext) {
 
     // Answering it goes through.
     cx.simulate_input("Switch to GraphQL");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     assert!(
         spec_of(&view, &mut cx).graphql().is_some(),
@@ -1000,9 +1019,9 @@ async fn choosing_a_method_sets_it_on_the_request(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
     assert_eq!(spec_of(&view, &mut cx).http().unwrap().method, Method::Post);
 
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     cx.simulate_input("del");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     assert!(!picker_is_open(&window, &mut cx));
     assert_eq!(spec_of(&view, &mut cx).http().unwrap().method, Method::Delete);
@@ -1021,9 +1040,9 @@ async fn typing_a_proxy_sets_it_and_the_status_bar_says_so(cx: &mut TestAppConte
     // in memory, per invariant 6.
     cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Set proxy");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     // System and Off are always offered; the typed value arrives as the derived row.
@@ -1038,7 +1057,7 @@ async fn typing_a_proxy_sets_it_and_the_status_bar_says_so(cx: &mut TestAppConte
         "a bare host:port should be offered, since that is what people type: {rows:?}"
     );
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -1054,12 +1073,12 @@ async fn typing_a_proxy_sets_it_and_the_status_bar_says_so(cx: &mut TestAppConte
 
     // **Switching away must not throw the URL away.** It used to: the row existed only while
     // that proxy was current, so choosing System deleted it and the only way back was retyping.
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Set proxy");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     cx.simulate_input("System");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -1073,24 +1092,24 @@ async fn typing_a_proxy_sets_it_and_the_status_bar_says_so(cx: &mut TestAppConte
     );
 
     // And it is still offered, so you can go back to it without typing.
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Set proxy");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     let rows = picker_rows(&window, &mut cx);
     assert!(
         rows.iter().any(|row| row.contains("127.0.0.1:8080")),
         "the saved proxy should be a row: {rows:?}"
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     // Removing it is a verb of its own, like Forget workspace.
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Remove a saved proxy");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert!(
@@ -1105,7 +1124,7 @@ async fn typing_an_unknown_verb_offers_it_as_a_custom_method(cx: &mut TestAppCon
     // has tests for it — but nothing in the UI could produce one.
     let (window, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     cx.simulate_input("purge");
 
     let rows = picker_rows(&window, &mut cx);
@@ -1114,7 +1133,7 @@ async fn typing_an_unknown_verb_offers_it_as_a_custom_method(cx: &mut TestAppCon
     assert!(derived.contains("custom method"), "{derived:?}");
 
     // The derived row is last, so this walks to it rather than assuming it's selected.
-    cx.simulate_keystrokes("up enter");
+    cx.press("up enter");
     assert_eq!(
         spec_of(&view, &mut cx).http().unwrap().method,
         Method::Other("PURGE".to_string()),
@@ -1129,7 +1148,7 @@ async fn a_known_verb_typed_in_full_is_not_offered_twice(cx: &mut TestAppContext
     // different value everything downstream compares.
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     cx.simulate_input("get");
 
     let rows = picker_rows(&window, &mut cx);
@@ -1139,10 +1158,10 @@ async fn a_known_verb_typed_in_full_is_not_offered_twice(cx: &mut TestAppContext
 
 /// Put the active buffer's body into a raw text editor with `text` in it.
 fn author_body(cx: &mut VisualTestContext, text: &str) {
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("text");
-    cx.simulate_keystrokes("enter");
-    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.press("enter");
+    cx.press("ctrl-b ctrl-a");
     cx.simulate_input(text);
 }
 
@@ -1162,27 +1181,27 @@ async fn undo_collapses_a_typed_run_and_redo_replays_it(cx: &mut TestAppContext)
     let (_, view, mut cx) = boot(cx, None, None);
 
     let original = spec_of(&view, &mut cx).url.clone();
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://example.test/a");
     assert_eq!(spec_of(&view, &mut cx).url, "https://example.test/a");
 
     // One press, and the whole thing goes — including the character that replaced the
     // selection, which is one edit to a person even though it is a replace then 21 inserts.
-    cx.simulate_keystrokes("ctrl-z");
+    cx.press("ctrl-z");
     assert_eq!(
         spec_of(&view, &mut cx).url, original,
         "select-all then type collapses into a single entry"
     );
 
-    cx.simulate_keystrokes("ctrl-y");
+    cx.press("ctrl-y");
     assert_eq!(spec_of(&view, &mut cx).url, "https://example.test/a", "redo replays it");
 
     // Ctrl+Shift+Z is the other redo spelling, and undo past the start must be a no-op rather
     // than a panic.
-    cx.simulate_keystrokes("ctrl-z ctrl-shift-z");
+    cx.press("ctrl-z ctrl-shift-z");
     assert_eq!(spec_of(&view, &mut cx).url, "https://example.test/a");
     for _ in 0..10 {
-        cx.simulate_keystrokes("ctrl-z");
+        cx.press("ctrl-z");
     }
     cx.simulate_input("ok");
     assert_eq!(spec_of(&view, &mut cx).url, "ok", "undo bottoms out without breaking the input");
@@ -1198,17 +1217,17 @@ async fn moving_the_caret_starts_a_new_undo_entry(cx: &mut TestAppContext) {
     // not the call site — the exact shape of gap this repo keeps getting caught by.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("abc");
 
     // Away and **back**, which is the case the contiguity check alone cannot catch: the caret
     // ends up exactly where the run left it, so without `break_run` the next character would
     // silently rejoin the previous entry.
-    cx.simulate_keystrokes("left right");
+    cx.press("left right");
     cx.simulate_input("d");
     assert_eq!(spec_of(&view, &mut cx).url, "abcd");
 
-    cx.simulate_keystrokes("ctrl-z");
+    cx.press("ctrl-z");
     assert_eq!(
         spec_of(&view, &mut cx).url, "abc",
         "the caret having moved makes `d` its own entry, so undo leaves `abc` standing"
@@ -1222,26 +1241,26 @@ async fn each_text_surface_has_its_own_undo_history(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
 
     // Switch to a text body, then note what the editor holds before we overwrite it.
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("text");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     let body_before = body_text(&view, &mut cx);
 
-    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.press("ctrl-b ctrl-a");
     cx.simulate_input("body text");
     assert_eq!(body_text(&view, &mut cx), "body text");
 
     let url_before = spec_of(&view, &mut cx).url.clone();
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://example.test/x");
 
     // Undo with focus in the URL bar rolls back the URL and leaves the body alone.
-    cx.simulate_keystrokes("ctrl-z");
+    cx.press("ctrl-z");
     assert_eq!(spec_of(&view, &mut cx).url, url_before, "the URL bar's own edit undoes");
     assert_eq!(body_text(&view, &mut cx), "body text", "the body is untouched");
 
     // And the reverse: undo in the body does not disturb the URL.
-    cx.simulate_keystrokes("ctrl-b ctrl-z");
+    cx.press("ctrl-b ctrl-z");
     assert_eq!(body_text(&view, &mut cx), body_before, "the body's own run undoes");
     assert_eq!(spec_of(&view, &mut cx).url, url_before, "the URL bar stays where it was");
 }
@@ -1250,16 +1269,16 @@ async fn each_text_surface_has_its_own_undo_history(cx: &mut TestAppContext) {
 async fn ctrl_backspace_and_ctrl_delete_remove_a_word(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.example.com/posts");
-    cx.simulate_keystrokes("ctrl-backspace");
+    cx.press("ctrl-backspace");
     assert_eq!(
         spec_of(&view, &mut cx).url, "https://api.example.com/",
         "ctrl-backspace takes the word behind the caret, not the whole line"
     );
 
     // Forward deletion from the start eats `https`, leaving its punctuation.
-    cx.simulate_keystrokes("home ctrl-delete");
+    cx.press("home ctrl-delete");
     assert_eq!(spec_of(&view, &mut cx).url, "://api.example.com/");
 }
 
@@ -1271,15 +1290,15 @@ async fn ctrl_home_and_end_span_the_document_in_the_editor(cx: &mut TestAppConte
     author_body(&mut cx, "alpha\nbeta\ngamma");
 
     // The caret is on the last line; plain Home only reaches that line's start.
-    cx.simulate_keystrokes("home");
+    cx.press("home");
     cx.simulate_input(">");
     assert_eq!(body_text(&view, &mut cx), "alpha\nbeta\n>gamma");
 
-    cx.simulate_keystrokes("ctrl-home");
+    cx.press("ctrl-home");
     cx.simulate_input("^");
     assert_eq!(body_text(&view, &mut cx), "^alpha\nbeta\n>gamma", "ctrl-home reaches line one");
 
-    cx.simulate_keystrokes("ctrl-end");
+    cx.press("ctrl-end");
     cx.simulate_input("$");
     assert_eq!(body_text(&view, &mut cx), "^alpha\nbeta\n>gamma$", "ctrl-end reaches the last line");
 }
@@ -1298,10 +1317,10 @@ async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut Te
     let (_, view, mut cx) = boot(cx, None, None);
 
     // ---- the URL bar -------------------------------------------------------
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.example.com/posts");
 
-    cx.simulate_keystrokes("ctrl-left");
+    cx.press("ctrl-left");
     cx.simulate_input("X");
     assert_eq!(
         spec_of(&view, &mut cx).url,
@@ -1311,13 +1330,13 @@ async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut Te
 
     // Two more hops: back over `X`, then over the `/` — punctuation is its own run, so the
     // caret stops between `com` and `/` rather than skipping to the start of `com`.
-    cx.simulate_keystrokes("ctrl-left ctrl-left");
+    cx.press("ctrl-left ctrl-left");
     cx.simulate_input("Y");
     assert_eq!(spec_of(&view, &mut cx).url, "https://api.example.comY/Xposts");
 
     // Selection, and the pair that makes it useful: select a word and replace it.
-    cx.simulate_keystrokes("end");
-    cx.simulate_keystrokes("ctrl-shift-left");
+    cx.press("end");
+    cx.press("ctrl-shift-left");
     cx.simulate_input("Z");
     assert_eq!(
         spec_of(&view, &mut cx).url,
@@ -1326,14 +1345,14 @@ async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut Te
     );
 
     // ---- the body editor, a different entity with its own handlers ---------
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("text");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
-    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.press("ctrl-b ctrl-a");
     cx.simulate_input("alpha beta gamma");
 
-    cx.simulate_keystrokes("ctrl-left");
+    cx.press("ctrl-left");
     cx.simulate_input("Q");
     let spec_949 = spec_of(&view, &mut cx);
     let Body::Raw { text, .. } = &spec_949.http().unwrap().body else {
@@ -1344,7 +1363,7 @@ async fn ctrl_arrow_moves_by_word_in_the_url_bar_and_the_body_editor(cx: &mut Te
         "the editor gets word movement through the same action, not a second implementation"
     );
 
-    cx.simulate_keystrokes("ctrl-shift-right");
+    cx.press("ctrl-shift-right");
     cx.simulate_input("!");
     let spec_959 = spec_of(&view, &mut cx);
     let Body::Raw { text, .. } = &spec_959.http().unwrap().body else {
@@ -1367,29 +1386,29 @@ async fn focus_body_never_lands_on_an_unpainted_handle(cx: &mut TestAppContext) 
     let (_, view, mut cx) = boot(cx, None, None);
 
     let url_reachable = |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| {
-        cx.simulate_keystrokes("ctrl-l");
+        cx.press("ctrl-l");
         cx.update(|window, cx| view.read(cx).url_focus(cx).is_focused(window))
     };
 
     // Raw: the editor is painted, so this always worked.
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     assert!(url_reachable(&view, &mut cx), "raw body: ctrl-l must still reach the URL bar");
 
     // Form: the case that killed the keyboard.
-    cx.simulate_keystrokes("ctrl-shift-f");
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-shift-f");
+    cx.press("ctrl-b");
     assert!(
         url_reachable(&view, &mut cx),
         "form body: ctrl-b must not strand focus on the unpainted editor"
     );
 
     // Multipart, which has the same shape.
-    cx.simulate_keystrokes("ctrl-shift-m");
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-shift-m");
+    cx.press("ctrl-b");
     assert!(url_reachable(&view, &mut cx), "multipart body: same");
 
     // And typing after ctrl-b has to land in the body, not vanish.
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     cx.simulate_input("part-name");
     let spec = spec_of(&view, &mut cx);
     let Body::Multipart(parts) = &spec.http().unwrap().body else {
@@ -1421,12 +1440,12 @@ async fn the_body_region_reports_focus_for_every_body_type(cx: &mut TestAppConte
     };
 
     // Raw: focus the editor and the region reports it.
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     assert!(focused(&view, &mut cx), "a raw body is focused through the editor");
 
     // Form: Ctrl+Shift+F switches the body to a form and focuses the new field's name cell.
     // That cell belongs to the row, not to the editor.
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     assert!(
         matches!(spec_of(&view, &mut cx).http().unwrap().body, Body::Form(_)),
         "ctrl-shift-f switches the body to a form"
@@ -1437,7 +1456,7 @@ async fn the_body_region_reports_focus_for_every_body_type(cx: &mut TestAppConte
     );
 
     // Moving focus out of the body clears it, or the ring would never turn off.
-    cx.simulate_keystrokes("ctrl-l");
+    cx.press("ctrl-l");
     assert!(!focused(&view, &mut cx), "focus in the URL bar is not focus in the body");
 }
 
@@ -1459,7 +1478,7 @@ async fn a_picker_row_spans_the_full_width_of_the_list(cx: &mut TestAppContext) 
     let (window, view, mut cx) = boot(cx, None, None);
     assert_eq!(spec_of(&view, &mut cx).http().unwrap().method, Method::Post);
 
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     cx.simulate_input("del");
     cx.run_until_parked();
 
@@ -1495,14 +1514,14 @@ async fn a_verb_that_could_not_be_sent_is_not_offered(cx: &mut TestAppContext) {
     // a row that fails at send is worse than not offering it.
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     cx.simulate_input("foo bar");
 
     let rows = picker_rows(&window, &mut cx);
     assert!(rows.is_empty(), "should offer nothing at all: {rows:?}");
 
     // A slash would land in the request line too.
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input("GET/../x");
     assert!(picker_rows(&window, &mut cx).is_empty());
 }
@@ -1511,9 +1530,9 @@ async fn a_verb_that_could_not_be_sent_is_not_offered(cx: &mut TestAppContext) {
 async fn muting_a_row_keeps_its_text_but_drops_it_from_the_wire(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-Muted");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("still-here");
 
     let before = spec_of(&view, &mut cx);
@@ -1521,7 +1540,7 @@ async fn muting_a_row_keeps_its_text_but_drops_it_from_the_wire(cx: &mut TestApp
     let enabled_before = before.enabled_headers().count();
 
     // Alt+T mutes whichever row holds focus.
-    cx.simulate_keystrokes("alt-t");
+    cx.press("alt-t");
 
     let after = spec_of(&view, &mut cx);
     assert_eq!(after.headers.len(), total_before, "the row must not be deleted");
@@ -1543,11 +1562,11 @@ async fn rows_can_be_added_and_removed(cx: &mut TestAppContext) {
 
     let baseline = spec_of(&view, &mut cx).headers.len();
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-Temporary");
     assert_eq!(spec_of(&view, &mut cx).headers.len(), baseline + 1);
 
-    cx.simulate_keystrokes("ctrl-shift-k");
+    cx.press("ctrl-shift-k");
     assert_eq!(
         spec_of(&view, &mut cx).headers.len(),
         baseline,
@@ -1582,7 +1601,7 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
     // Until this landed there was none: the Body tab draws `body_header`, not `section_header`,
     // so `Ctrl+Shift+F` was the only way to add a field and nothing on screen said so.
     let (view, mut cx) = open_workspace(cx);
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.run_until_parked();
 
     let before = spec_of(&view, &mut cx);
@@ -1604,7 +1623,7 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
 
     // The other new arm. Asserted positively on purpose — `debug_bounds` reads the last rendered
     // frame, so `is_none()` could not tell "not offered on a raw body" from "not repainted yet".
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.run_until_parked();
     let add_part = cx.debug_bounds("add-part").expect("a multipart body needs one too");
     cx.simulate_click(add_part.center(), gpui::Modifiers::default());
@@ -1644,7 +1663,7 @@ async fn a_form_body_has_a_visible_way_to_add_a_field(cx: &mut TestAppContext) {
 async fn focusing_a_multipart_row_is_what_targets_a_chosen_file(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.run_until_parked();
     let add_part = cx.debug_bounds("add-part").expect("the add control");
     cx.simulate_click(add_part.center(), gpui::Modifiers::default());
@@ -1660,7 +1679,7 @@ async fn focusing_a_multipart_row_is_what_targets_a_chosen_file(cx: &mut TestApp
 
     // Somewhere else entirely first, so focus cannot accidentally agree with the row being
     // targeted — the bug and the fix look identical when it does.
-    cx.simulate_keystrokes("ctrl-l");
+    cx.press("ctrl-l");
     cx.run_until_parked();
     assert_eq!(
         cx.update(|window, cx| view.read(cx).focused_multipart_row(window, cx)),
@@ -1705,7 +1724,7 @@ async fn focusing_a_multipart_row_is_what_targets_a_chosen_file(cx: &mut TestApp
 async fn browsing_fills_the_import_field_and_leaves_it_editable(cx: &mut TestAppContext) {
     let (window, _view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.run_until_parked();
     assert!(cx.debug_bounds("import-panel").is_some(), "the modal must open");
     assert!(
@@ -1762,7 +1781,7 @@ async fn a_file_picker_appears_only_where_it_can_do_something(cx: &mut TestAppCo
     let (window, view, mut cx) = boot(cx, None, None);
 
     // A header row: painted, and must carry neither control.
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.run_until_parked();
     assert!(
         cx.debug_bounds("hdr-remove-0").is_some(),
@@ -1771,7 +1790,7 @@ async fn a_file_picker_appears_only_where_it_can_do_something(cx: &mut TestAppCo
     assert!(cx.debug_bounds("part-kind-0").is_none(), "no type chip on a header");
     assert!(cx.debug_bounds("part-file-0").is_none(), "and no file picker");
 
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.run_until_parked();
 
     // A fresh part sends text: it says so, and offers no picker.
@@ -1824,9 +1843,9 @@ async fn clicking_a_rows_remove_button_deletes_that_row(cx: &mut TestAppContext)
     // disagree in a way the action's own test cannot see.
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-First");
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-Second");
     cx.run_until_parked();
 
@@ -1866,9 +1885,9 @@ async fn query_params_are_editable_independently_of_headers(cx: &mut TestAppCont
 
     let headers_before = spec_of(&view, &mut cx).headers.len();
 
-    cx.simulate_keystrokes("ctrl-shift-y");
+    cx.press("ctrl-shift-y");
     cx.simulate_input("page");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("2");
 
     let spec = spec_of(&view, &mut cx);
@@ -1886,15 +1905,15 @@ async fn query_params_are_editable_independently_of_headers(cx: &mut TestAppCont
 async fn text_editing_keys_are_scoped_to_focused_inputs(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input("https://a.test");
-    cx.simulate_keystrokes("backspace backspace backspace backspace");
+    cx.press("backspace backspace backspace backspace");
     assert_eq!(spec_of(&view, &mut cx).url, "https://a.");
 
     // Move focus off every text input, then press the same key. It must not edit
     // anything — this is what the `TextInput` context predicate buys us.
-    cx.simulate_keystrokes("ctrl-shift-r");
-    cx.simulate_keystrokes("backspace backspace");
+    cx.press("ctrl-shift-r");
+    cx.press("backspace backspace");
     assert_eq!(
         spec_of(&view, &mut cx).url,
         "https://a.",
@@ -1912,7 +1931,7 @@ async fn ctrl_enter_sends_and_the_response_lands_in_the_view(cx: &mut TestAppCon
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/health"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let response: ResponseData = wait_for(&mut cx, "a response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
@@ -1939,7 +1958,7 @@ async fn the_url_bar_enter_key_also_sends(cx: &mut TestAppContext) {
 
     // Bare `enter` is bound only under the UrlBar context, and focus starts there.
     type_url(&mut cx, &format!("{base}/health"));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let response: ResponseData = wait_for(&mut cx, "a response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
@@ -1955,7 +1974,7 @@ async fn a_connection_failure_is_shown_and_not_mistaken_for_a_response(
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let error: EngineError = wait_for(&mut cx, "an error", |cx| {
         cx.update(|_, cx| view.read(cx).error.clone())
@@ -1978,7 +1997,7 @@ async fn a_local_failure_is_reported_without_touching_the_network(cx: &mut TestA
 
     // No server anywhere — an unresolved variable must fail before any socket opens.
     type_url(&mut cx, "{{baseUrl}}/users");
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let error: EngineError = wait_for(&mut cx, "an error", |cx| {
         cx.update(|_, cx| view.read(cx).error.clone())
@@ -1994,7 +2013,7 @@ async fn escape_cancels_an_in_flight_request(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/slow"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     // Confirm it really is in flight before cancelling, so this tests cancellation and
     // not a race with submission.
@@ -2002,7 +2021,7 @@ async fn escape_cancels_an_in_flight_request(cx: &mut TestAppContext) {
         cx.update(|_, cx| view.read(cx).is_sending().then_some(()))
     });
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     cx.update(|_, cx| {
@@ -2027,7 +2046,7 @@ async fn the_in_flight_hint_names_a_key_that_actually_cancels(cx: &mut TestAppCo
     let (window, view, mut cx) = boot(cx, None, None);
 
     type_url(&mut cx, &format!("{base}/slow"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the request to start", |cx| {
         cx.update(|_, cx| view.read(cx).is_sending().then_some(()))
     });
@@ -2045,6 +2064,7 @@ async fn the_in_flight_hint_names_a_key_that_actually_cancels(cx: &mut TestAppCo
     // The binding the hint was drawn from, pressed in gpui's syntax: the hint itself is the
     // platform's display form, `⎋` on macOS, which `simulate_keystrokes` cannot parse.
     let keys = binding_syntax(&crate::actions::CancelRequest, &window, &mut cx);
+    // Raw, not `press`: this is read from the live keymap, already in the platform's spelling.
     cx.simulate_keystrokes(&keys);
     cx.run_until_parked();
 
@@ -2141,12 +2161,18 @@ async fn keybinding_label_matches_the_keymap(cx: &mut TestAppContext) {
         // Both sides lowercased: gpui spells a shifted letter `ctrl-shift-H` while the label
         // capitalizes every part, so the *key's* case legitimately differs. What must not differ
         // is the modifier set, its order, or the key itself.
-        assert_eq!(
-            label.to_lowercase().replace('+', "-"),
-            hint.to_lowercase(),
-            "the two spellings of {}'s binding disagree",
-            action.name()
-        );
+        //
+        // **Off macOS only.** A Mac label is `⇧⌘H`, which no lowercasing turns back into
+        // `cmd-shift-h`; its spelling is pinned exactly by `a_keystroke_is_spelled_for_its_platform`
+        // instead, and pressing the advertised key is `an_advertised_key_actually_fires_its_action`.
+        if !cfg!(target_os = "macos") {
+            assert_eq!(
+                label.to_lowercase().replace('+', "-"),
+                hint.to_lowercase(),
+                "the two spellings of {}'s binding disagree",
+                action.name()
+            );
+        }
     }
 }
 
@@ -2161,24 +2187,27 @@ async fn migrated_hints_render_exactly_what_the_literals_did(cx: &mut TestAppCon
     let (window, _view, mut cx) = boot(cx, None, None);
     use crate::actions::*;
 
-    let expected: Vec<(Box<dyn gpui::Action>, &str)> = vec![
-        (Box::new(AddHeader), "Ctrl+Shift+H"),
-        (Box::new(AddQuery), "Ctrl+Shift+Y"),
-        (Box::new(AddFormField), "Ctrl+Shift+F"),
-        (Box::new(AddMultipartField), "Ctrl+Shift+M"),
-        (Box::new(ChooseBodyFile), "Ctrl+Shift+O"),
-        (Box::new(OpenBodyType), "Ctrl+Shift+B"),
-        (Box::new(ShowHistory), "Ctrl+H"),
-        (Box::new(SendRequest), "Ctrl+Enter"),
-        (Box::new(SaveRequest), "Ctrl+S"),
-        (Box::new(SaveResponse), "Ctrl+Shift+S"),
-        (Box::new(ToggleTheme), "Ctrl+Shift+T"),
-        (Box::new(OpenRequest), "Ctrl+P"),
-        (Box::new(OpenPalette), "Ctrl+K"),
-        (Box::new(SwitchEnvironment), "Ctrl+E"),
+    // Linux/Windows, then macOS — the Mac column is the translation in `platform_keys` spelled the
+    // Mac way, and pins it in the same breath: History is `⌘Y`, not `⌘H`.
+    let expected: Vec<(Box<dyn gpui::Action>, &str, &str)> = vec![
+        (Box::new(AddHeader), "Ctrl+Shift+H", "⇧⌘H"),
+        (Box::new(AddQuery), "Ctrl+Shift+Y", "⇧⌘Y"),
+        (Box::new(AddFormField), "Ctrl+Shift+F", "⇧⌘F"),
+        (Box::new(AddMultipartField), "Ctrl+Shift+M", "⇧⌘M"),
+        (Box::new(ChooseBodyFile), "Ctrl+Shift+O", "⇧⌘O"),
+        (Box::new(OpenBodyType), "Ctrl+Shift+B", "⇧⌘B"),
+        (Box::new(ShowHistory), "Ctrl+H", "⌘Y"),
+        (Box::new(SendRequest), "Ctrl+Enter", "⌘↩"),
+        (Box::new(SaveRequest), "Ctrl+S", "⌘S"),
+        (Box::new(SaveResponse), "Ctrl+Shift+S", "⇧⌘S"),
+        (Box::new(ToggleTheme), "Ctrl+Shift+T", "⇧⌘T"),
+        (Box::new(OpenRequest), "Ctrl+P", "⌘P"),
+        (Box::new(OpenPalette), "Ctrl+K", "⌘K"),
+        (Box::new(SwitchEnvironment), "Ctrl+E", "⌘E"),
     ];
 
-    for (action, want) in expected {
+    for (action, linux, mac) in expected {
+        let want = if cfg!(target_os = "macos") { mac } else { linux };
         let got = window
             .update(&mut cx, |_, window, _| {
                 crate::workspace::keybinding_label(action.as_ref(), window)
@@ -2204,8 +2233,12 @@ async fn an_advertised_key_actually_fires_its_action(cx: &mut TestAppContext) {
 
     let before = cx.update(|_, cx| view.read(cx).headers.len());
 
-    // Back to gpui's spelling, which is what `simulate_keystrokes` parses.
-    cx.simulate_keystrokes(&label.to_lowercase().replace('+', "-"));
+    assert!(!label.is_empty(), "AddHeader has to be advertised with a key");
+    // The binding the label was spelled from, pressed in gpui's own syntax. Not the label turned
+    // back into syntax: that round trip works only for `Ctrl+Shift+H`, and a Mac label is `⇧⌘H`.
+    // Raw, not `press` — the keymap is already in the platform's spelling.
+    let keys = binding_syntax(&crate::actions::AddHeader, &window, &mut cx);
+    cx.simulate_keystrokes(&keys);
     cx.run_until_parked();
 
     assert_eq!(
@@ -2274,7 +2307,7 @@ async fn resending_replaces_the_previous_response(cx: &mut TestAppContext) {
 
     let first = serve_once(OK_JSON);
     type_url(&mut cx, &format!("{first}/one"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the first response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -2286,7 +2319,7 @@ async fn resending_replaces_the_previous_response(cx: &mut TestAppContext) {
          not found";
     let second = serve_once(SECOND);
     type_url(&mut cx, &format!("{second}/two"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let response: ResponseData = wait_for(&mut cx, "the second response", |cx| {
         cx.update(|_, cx| {
@@ -2307,16 +2340,16 @@ async fn edits_made_before_sending_are_the_ones_that_go_out(cx: &mut TestAppCont
     // The whole point of deriving the spec instead of storing one: what's on screen at
     // the moment of Send is what gets sent.
     type_url(&mut cx, &format!("{base}/derived"));
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-Derived");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("yes");
 
     let spec = spec_of(&view, &mut cx);
     assert!(spec.url.ends_with("/derived"));
     assert_eq!(spec.headers.last().unwrap().name, "X-Derived");
 
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     let response: ResponseData = wait_for(&mut cx, "a response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -2360,7 +2393,7 @@ async fn a_json_response_is_indexed_off_thread(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/json"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let (is_json, visible, total) = wait_for_body(&view, &mut cx);
     assert!(is_json, "an application/json body should be parsed");
@@ -2384,7 +2417,7 @@ async fn folding_hides_rows_without_losing_them(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/json"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let (_, visible_before, total) = wait_for_body(&view, &mut cx);
     assert_eq!(visible_before, total);
@@ -2430,7 +2463,7 @@ async fn a_non_json_response_falls_back_to_lines(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/text"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let (is_json, rows, _) = wait_for_body(&view, &mut cx);
     assert!(!is_json, "text/plain should not be parsed as JSON");
@@ -2449,7 +2482,7 @@ async fn malformed_json_shows_raw_text_with_a_notice(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/bad"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let (is_json, rows, _) = wait_for_body(&view, &mut cx);
     assert!(!is_json, "invalid JSON must not be shown as parsed");
@@ -2476,7 +2509,7 @@ async fn resending_reindexes_the_new_body(cx: &mut TestAppContext) {
 
     let first = serve_once(OK_JSON);
     type_url(&mut cx, &format!("{first}/one"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     let (is_json, _, _) = wait_for_body(&view, &mut cx);
     assert!(is_json);
 
@@ -2487,7 +2520,7 @@ async fn resending_reindexes_the_new_body(cx: &mut TestAppContext) {
          plain";
     let second = serve_once(TEXT);
     type_url(&mut cx, &format!("{second}/two"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     // The stale JSON index must be replaced, not kept alongside.
     let is_json = wait_for(&mut cx, "the reindexed body", |cx| {
@@ -2514,9 +2547,9 @@ async fn the_body_editor_accepts_multiple_lines(cx: &mut TestAppContext) {
     cx.simulate_input("{");
     // Bare `enter` inserts a newline here, where it *sends* in the URL bar. Same key,
     // two meanings, separated only by key context.
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.simulate_input("  \"a\": 1");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.simulate_input("}");
 
     let spec = spec_of(&view, &mut cx);
@@ -2538,7 +2571,7 @@ async fn enter_in_the_body_editor_does_not_send(cx: &mut TestAppContext) {
     type_url(&mut cx, &format!("{base}/never"));
     clear_body(&mut cx);
     cx.simulate_input("hello");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     cx.update(|_, cx| {
@@ -2554,7 +2587,7 @@ async fn a_new_line_inherits_the_previous_indent(cx: &mut TestAppContext) {
 
     clear_body(&mut cx);
     cx.simulate_input("    indented");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.simulate_input("next");
 
     let spec = spec_of(&view, &mut cx);
@@ -2571,12 +2604,12 @@ async fn vertical_movement_lands_on_the_line_above(cx: &mut TestAppContext) {
 
     clear_body(&mut cx);
     cx.simulate_input("aaa");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.simulate_input("bbb");
 
     // Up then Home puts the cursor at the start of the first line; typing there proves
     // where it landed.
-    cx.simulate_keystrokes("up home");
+    cx.press("up home");
     cx.simulate_input("X");
 
     let spec = spec_of(&view, &mut cx);
@@ -2609,9 +2642,9 @@ async fn the_body_sub_kind_is_chosen_by_name(cx: &mut TestAppContext) {
 
     // Ctrl+Shift+B used to cycle RawKind; it now opens the picker, so the sub-kind is
     // chosen by name rather than reached by repetition.
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("text");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert!(matches!(
         spec_of(&view, &mut cx).http().unwrap().body,
         Body::Raw { kind: RawKind::Text, .. }
@@ -2624,7 +2657,7 @@ async fn the_first_run_has_nothing_to_diff_against(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
     type_url(&mut cx, &format!("{base}/one"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for_body(&view, &mut cx);
 
     cx.update(|_, cx| {
@@ -2640,7 +2673,7 @@ async fn a_changed_response_is_diffed_against_the_previous_run(cx: &mut TestAppC
 
     let first = serve_once(OK_JSON);
     type_url(&mut cx, &format!("{first}/one"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for_body(&view, &mut cx);
 
     const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\n\
@@ -2650,7 +2683,7 @@ async fn a_changed_response_is_diffed_against_the_previous_run(cx: &mut TestAppC
          {\"e\":\"gone\"}";
     let second = serve_once(NOT_FOUND);
     type_url(&mut cx, &format!("{second}/two"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let diff = wait_for(&mut cx, "a diff", |cx| {
         cx.update(|_, cx| view.read(cx).diff.clone())
@@ -2674,14 +2707,14 @@ async fn an_identical_resend_reports_no_change(cx: &mut TestAppContext) {
 
     let first = serve_once(OK_JSON);
     type_url(&mut cx, &format!("{first}/same"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for_body(&view, &mut cx);
 
     // Byte-identical response from a fresh server. Only timing differs, and timing
     // alone must never claim a change.
     let second = serve_once(OK_JSON);
     type_url(&mut cx, &format!("{second}/same"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let diff = wait_for(&mut cx, "a diff", |cx| {
         cx.update(|_, cx| view.read(cx).diff.clone())
@@ -2698,7 +2731,7 @@ async fn the_diff_describes_the_two_most_recent_runs(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, r#"{"a":1}"#), (201, r#"{"b":2}"#), (202, r#"{"c":3}"#)]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 201);
@@ -2760,7 +2793,7 @@ async fn a_binary_response_is_shown_as_a_hex_dump(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_jpeg();
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -2796,7 +2829,7 @@ async fn a_hex_row_can_be_selected_and_copied(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_jpeg();
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -2858,7 +2891,7 @@ async fn an_html_error_page_opens_as_readable_text(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_once(HTML_500);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 500);
     wait_for_body(&view, &mut cx);
@@ -2894,7 +2927,7 @@ async fn the_html_toggle_swaps_the_body_and_survives_the_next_send(cx: &mut Test
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_html_sequence(2, "<html><body><h1>Boom</h1></body></html>");
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 500);
     wait_for_body(&view, &mut cx);
@@ -2935,7 +2968,7 @@ async fn a_json_body_is_never_treated_as_html(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, r#"{"html":"<h1>not markup</h1>","n":1}"#)]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     let (is_json, ..) = wait_for_body(&view, &mut cx);
@@ -2970,7 +3003,7 @@ async fn the_body_diff_lands_on_the_field_that_changed(cx: &mut TestAppContext) 
         (200, r#"{"id":7,"name":"grace","role":"admin"}"#),
     ]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 200);
@@ -3014,7 +3047,7 @@ async fn the_diff_is_withheld_while_an_older_run_is_on_screen(cx: &mut TestAppCo
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, r#"{"a":1}"#), (200, r#"{"a":2}"#)]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 200);
@@ -3029,8 +3062,8 @@ async fn the_diff_is_withheld_while_an_older_run_is_on_screen(cx: &mut TestAppCo
         );
     });
 
-    cx.simulate_keystrokes("ctrl-h");
-    cx.simulate_keystrokes("down enter");
+    cx.press("ctrl-h");
+    cx.press("down enter");
     assert_eq!(viewing(&view, &mut cx), 1, "the older run is on screen");
 
     cx.update(|_, cx| {
@@ -3052,12 +3085,12 @@ async fn a_failure_clears_the_diff_but_keeps_the_baseline(cx: &mut TestAppContex
 
     let first = serve_once(OK_JSON);
     type_url(&mut cx, &format!("{first}/ok"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for_body(&view, &mut cx);
 
     let dead = closed_port();
     type_url(&mut cx, &format!("{dead}/gone"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     wait_for(&mut cx, "an error", |cx| {
         cx.update(|_, cx| view.read(cx).error.clone())
@@ -3094,7 +3127,7 @@ async fn a_curl_command_on_the_clipboard_becomes_the_request(cx: &mut TestAppCon
   --data-raw '{"name":"zuno"}' \
   --compressed"#,
     );
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
 
     // An import opens a *new* buffer, so the handle taken at open is no longer the one to
@@ -3123,7 +3156,7 @@ async fn an_unparseable_clipboard_reports_instead_of_wrecking_the_request(
     // Genuinely unparseable: an unbalanced quote. (Prose is rejected too, but by the
     // NotCurl guard rather than the tokenizer.)
     put_on_clipboard(&mut cx, "curl 'https://x.test/a");
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
 
     // `NoUrl` is the failure here, and the existing request must be untouched.
@@ -3171,7 +3204,7 @@ async fn a_composed_replacement_leaves_a_copyable_selection(cx: &mut TestAppCont
     );
 
     // The real consequence: an out-of-range selection is a panic waiting for the next copy.
-    cx.simulate_keystrokes("ctrl-c");
+    cx.press("ctrl-c");
     assert_eq!(
         clipboard_text(&mut cx).as_deref(),
         Some("XY"),
@@ -3183,7 +3216,7 @@ async fn a_composed_replacement_leaves_a_copyable_selection(cx: &mut TestAppCont
 async fn newlines_never_enter_a_single_line_input(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     // `shape_line` carries a debug_assert against embedded newlines, so this would
     // panic in a debug build if sanitization regressed.
     cx.simulate_input("https://a.test\nmalicious\r\nsecond");
@@ -3220,7 +3253,7 @@ fn tabs_of(
 async fn ctrl_t_opens_a_buffer_and_focus_follows_it(cx: &mut TestAppContext) {
     let (window, first, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let (count, _) = tabs_of(&window, &mut cx);
     assert_eq!(count, 2);
 
@@ -3247,7 +3280,7 @@ async fn a_new_buffer_gets_a_distinct_id(cx: &mut TestAppContext) {
     let (window, first, mut cx) = boot(cx, None, None);
     let original = spec_of(&first, &mut cx).id;
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let (_, new) = tabs_of(&window, &mut cx);
     assert_ne!(new.id, original, "a new buffer must not reuse an id");
 }
@@ -3257,21 +3290,21 @@ async fn ctrl_tab_cycles_buffers_and_wraps(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
     // Three buffers, each identifiable by its URL.
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://b.test");
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://c.test");
 
     let urls = |cx: &mut VisualTestContext| tabs_of(&window, cx).1.url;
 
     // Sitting on the third, so one forward step must wrap to the first.
-    cx.simulate_keystrokes("ctrl-tab");
+    cx.press("ctrl-tab");
     assert_eq!(urls(&mut cx), RequestSpec::sample().url, "next should wrap to the front");
 
-    cx.simulate_keystrokes("ctrl-shift-tab");
+    cx.press("ctrl-shift-tab");
     assert_eq!(urls(&mut cx), "https://c.test", "prev should wrap to the back");
 
-    cx.simulate_keystrokes("ctrl-shift-tab");
+    cx.press("ctrl-shift-tab");
     assert_eq!(urls(&mut cx), "https://b.test");
 }
 
@@ -3286,7 +3319,7 @@ async fn a_buffer_is_clean_until_edited_and_clean_again_once_saved(cx: &mut Test
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.press("ctrl-shift-e down enter");
     cx.run_until_parked();
     let dirty = |cx: &mut VisualTestContext| {
         window
@@ -3296,12 +3329,12 @@ async fn a_buffer_is_clean_until_edited_and_clean_again_once_saved(cx: &mut Test
 
     assert!(!dirty(&mut cx), "a request just opened from its file is clean");
 
-    cx.simulate_keystrokes("ctrl-l end");
+    cx.press("ctrl-l end");
     cx.simulate_input("/edited");
     cx.run_until_parked();
     assert!(dirty(&mut cx), "typing into the url must make the buffer dirty");
 
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
     assert!(!dirty(&mut cx), "saving must make it clean again");
 
@@ -3430,14 +3463,14 @@ async fn the_certificates_panel_is_reachable_with_nothing_configured(cx: &mut Te
 
     // Escape closes it and leaves the keymap alive — the modal moved focus to an element that
     // is no longer painted, which is the half that dies silently.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert!(
         window
             .update(&mut cx, |workspace, _, _| !workspace.certs_open())
             .expect("window")
     );
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tab_count())
@@ -3466,9 +3499,9 @@ async fn removing_the_active_identity_stops_presenting_it(cx: &mut TestAppContex
         )
     });
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Manage certificates");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     // Row 1 is the saved identity: row 0 is "None".
@@ -3494,16 +3527,16 @@ async fn closing_a_batch_asks_once_for_all_the_dirty_ones(cx: &mut TestAppContex
     let (window, _v, mut cx) = boot(cx, None, None);
 
     for host in ["https://one.test", "https://two.test"] {
-        cx.simulate_keystrokes("ctrl-t");
+        cx.press("ctrl-t");
         cx.simulate_input(host);
         cx.run_until_parked();
     }
     // Three buffers: the original is clean, two were typed into.
     assert_eq!(tabs_of(&window, &mut cx).0, 3);
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Close all tabs");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -3519,7 +3552,7 @@ async fn closing_a_batch_asks_once_for_all_the_dirty_ones(cx: &mut TestAppContex
     // `left`, not `right`: the order is Save · Don't save · Cancel and the default is Cancel,
     // so stepping right wraps to Save all — which, with no collection directory in the harness,
     // fails every write and correctly leaves those buffers open.
-    cx.simulate_keystrokes("left enter");
+    cx.press("left enter");
     cx.run_until_parked();
     assert_eq!(tabs_of(&window, &mut cx).0, 1);
     assert_eq!(
@@ -3535,11 +3568,11 @@ async fn closing_a_dirty_buffer_asks_and_cancelling_keeps_it(cx: &mut TestAppCon
     // the session envelope, and `Ctrl+W` preserved none.
     let (window, _v, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://second.test");
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-w");
+    cx.press("ctrl-w");
     cx.run_until_parked();
     assert_eq!(
         tabs_of(&window, &mut cx).0,
@@ -3552,7 +3585,7 @@ async fn closing_a_dirty_buffer_asks_and_cancelling_keeps_it(cx: &mut TestAppCon
     );
 
     // Escape cancels, and the buffer keeps what was typed.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert_eq!(tabs_of(&window, &mut cx).0, 2, "cancelling must keep the buffer");
     assert_eq!(
@@ -3577,11 +3610,11 @@ async fn an_untouched_new_tab_closes_without_asking(cx: &mut TestAppContext) {
     // typed into is clean and closes silently. Without that, every `ctrl-t` `ctrl-w` prompts.
     let (window, _v, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.run_until_parked();
     assert_eq!(tabs_of(&window, &mut cx).0, 2);
 
-    cx.simulate_keystrokes("ctrl-w");
+    cx.press("ctrl-w");
     cx.run_until_parked();
     assert_eq!(
         tabs_of(&window, &mut cx).0,
@@ -3601,17 +3634,17 @@ async fn saving_from_the_prompt_writes_the_file_and_then_closes(cx: &mut TestApp
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.press("ctrl-shift-e down enter");
     cx.run_until_parked();
     let before = tabs_of(&window, &mut cx).0;
 
-    cx.simulate_keystrokes("ctrl-l end");
+    cx.press("ctrl-l end");
     cx.simulate_input("/edited");
     cx.run_until_parked();
 
     // Prompt opens on Cancel; two steps left reaches Save.
-    cx.simulate_keystrokes("ctrl-w");
-    cx.simulate_keystrokes("left left enter");
+    cx.press("ctrl-w");
+    cx.press("left left enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -3641,16 +3674,16 @@ async fn a_restored_buffer_reads_its_baseline_back_from_disk(cx: &mut TestAppCon
         wait_for(&mut cx, "the collection scan", |cx| {
             (!tree_rows(&window, cx).is_empty()).then_some(())
         });
-        cx.simulate_keystrokes("ctrl-shift-e down enter");
+        cx.press("ctrl-shift-e down enter");
         cx.run_until_parked();
 
         // A send is the save point that writes the session envelope, so the edit has to be the
         // URL that gets sent. It differs from what the file holds, which is the whole point:
         // the session keeps the edit, the file does not.
         let served = serve_once(OK_JSON);
-        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.press("ctrl-l ctrl-a");
         cx.simulate_input(&served);
-        cx.simulate_keystrokes("ctrl-enter");
+        cx.press("ctrl-enter");
         cx.run_until_parked();
     }
 
@@ -3672,8 +3705,8 @@ async fn a_restored_buffer_reads_its_baseline_back_from_disk(cx: &mut TestAppCon
 ///
 /// The prompt opens on Cancel — the safe default — so `left` steps back to "Don't save".
 fn close_discarding(cx: &mut VisualTestContext) {
-    cx.simulate_keystrokes("ctrl-w");
-    cx.simulate_keystrokes("left enter");
+    cx.press("ctrl-w");
+    cx.press("left enter");
     cx.run_until_parked();
 }
 
@@ -3681,7 +3714,7 @@ fn close_discarding(cx: &mut VisualTestContext) {
 async fn ctrl_w_closes_a_buffer_and_leaves_focus_usable(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://second.test");
     close_discarding(&mut cx);
 
@@ -3713,10 +3746,10 @@ async fn closing_a_buffer_cancels_its_in_flight_request(cx: &mut TestAppContext)
     let base = serve_never();
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let doomed = active_view(&window, &mut cx);
     cx.simulate_input(&format!("{base}/slow"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     // Confirm it really is in flight, so this tests cancellation and not a race with
     // submission.
@@ -3740,7 +3773,7 @@ async fn closing_the_last_buffer_leaves_a_fresh_one(cx: &mut TestAppContext) {
     // and must not quit either; that's Ctrl+Q's job.
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-w");
+    cx.press("ctrl-w");
 
     let (count, active) = tabs_of(&window, &mut cx);
     assert_eq!(count, 1, "there must always be a buffer");
@@ -3758,7 +3791,7 @@ async fn a_curl_import_opens_a_new_buffer_instead_of_replacing_one(cx: &mut Test
     let before = spec_of(&first, &mut cx);
 
     put_on_clipboard(&mut cx, "curl https://imported.test/widgets -H 'X-Key: abc'");
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
 
     let (count, active) = tabs_of(&window, &mut cx);
     assert_eq!(count, 2, "the import should open a buffer");
@@ -3776,7 +3809,7 @@ async fn a_curl_import_opens_a_new_buffer_instead_of_replacing_one(cx: &mut Test
 async fn a_tab_is_labelled_from_its_url_as_it_is_typed(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v2/invoices");
 
     let label = cx.update(|_, cx| view.read(cx).label(cx));
@@ -3790,13 +3823,13 @@ async fn every_open_buffer_is_persisted_on_send(cx: &mut TestAppContext) {
     let path = scratch_dir("multisave").join("session.json");
     let (_, _, mut cx) = boot(cx, Some(path.clone()), None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://kept.test/two");
 
     let url = serve_once(OK_JSON);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input(&url);
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     cx.run_until_parked();
 
     let written = std::fs::read(&path).expect("the send should have written a session");
@@ -3898,9 +3931,9 @@ async fn a_send_checkpoints_every_open_buffer(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, Some(path.clone()), None);
 
     let url = serve_once(OK_JSON);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -3941,9 +3974,9 @@ async fn ctrl_s_writes_the_request_as_a_file_named_from_its_url(cx: &mut TestApp
     let (session, root) = scratch_collection("save");
     let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/invoices");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     assert_eq!(collection_files(&root), ["invoices.json"]);
 
@@ -3967,13 +4000,13 @@ async fn saving_twice_overwrites_rather_than_making_a_second_file(cx: &mut TestA
     let (session, root) = scratch_collection("resave");
     let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/invoices");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/invoices?page=2");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     assert_eq!(
         collection_files(&root),
@@ -3996,14 +4029,14 @@ async fn a_buffer_still_knows_its_file_after_a_restart(cx: &mut TestAppContext) 
 
     {
         let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
-        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.press("ctrl-l ctrl-a");
         cx.simulate_input("https://api.test/v1/invoices");
-        cx.simulate_keystrokes("ctrl-s");
+        cx.press("ctrl-s");
         // A send is the save point that writes the session envelope.
         let served = serve_once(OK_JSON);
-        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.press("ctrl-l ctrl-a");
         cx.simulate_input(&served);
-        cx.simulate_keystrokes("ctrl-enter");
+        cx.press("ctrl-enter");
         cx.run_until_parked();
     }
 
@@ -4018,7 +4051,7 @@ async fn a_buffer_still_knows_its_file_after_a_restart(cx: &mut TestAppContext) 
         "the collection file must survive a restart"
     );
 
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     assert_eq!(
         collection_files(&root),
         ["invoices.json"],
@@ -4034,13 +4067,13 @@ async fn two_different_requests_with_the_same_label_both_survive(cx: &mut TestAp
     let (session, root) = scratch_collection("collide");
     let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://one.test/posts");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://two.test/posts");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     assert_eq!(collection_files(&root), ["posts-2.json", "posts.json"]);
 
@@ -4057,7 +4090,7 @@ async fn a_save_with_no_collection_directory_reports_instead_of_failing_silently
 ) {
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     let status = cx.update(|_, cx| view.read(cx).status.clone());
     assert!(
@@ -4078,9 +4111,9 @@ async fn a_url_that_looks_like_a_path_cannot_write_outside_the_collection(
     let (session, root) = scratch_collection("traversal");
     let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://evil.test/../../../../tmp/zuno-escaped");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     let files = collection_files(&root);
     assert_eq!(files.len(), 1, "exactly one file, inside the root: {files:?}");
@@ -4118,19 +4151,19 @@ fn picker_is_open(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestCon
 
 /// Save the active buffer to `url`'s derived name, in a collection.
 fn save_as(cx: &mut VisualTestContext, url: &str) {
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(url);
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 }
 
 #[gpui::test]
 async fn ctrl_p_lists_the_open_buffers(cx: &mut TestAppContext) {
     // Ctrl+P earns its keystroke from the first press, before any collection exists.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://second.test/widgets");
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     assert!(picker_is_open(&window, &mut cx));
 
     let rows = picker_rows(&window, &mut cx);
@@ -4147,14 +4180,14 @@ async fn escape_closes_the_picker_rather_than_cancelling_a_request(cx: &mut Test
     // `register_keymap` and this test is what fails.
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     assert!(picker_is_open(&window, &mut cx));
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     assert!(!picker_is_open(&window, &mut cx), "escape must dismiss");
 
     // And focus has to come back, or every binding silently stops working.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://after-dismiss.test");
     let (_, active) = tabs_of(&window, &mut cx);
     assert_eq!(active.url, "https://after-dismiss.test", "focus was stranded");
@@ -4164,19 +4197,19 @@ async fn escape_closes_the_picker_rather_than_cancelling_a_request(cx: &mut Test
 async fn typing_filters_and_enter_opens_the_selection(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://a.test/invoices");
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://a.test/payments");
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     cx.simulate_input("invo");
 
     let rows = picker_rows(&window, &mut cx);
     assert_eq!(rows.len(), 1, "the filter should narrow to one: {rows:?}");
     assert!(rows[0].contains("invoices"), "{rows:?}");
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert!(!picker_is_open(&window, &mut cx));
 
     let (count, active) = tabs_of(&window, &mut cx);
@@ -4188,11 +4221,11 @@ async fn typing_filters_and_enter_opens_the_selection(cx: &mut TestAppContext) {
 async fn enter_with_no_match_does_nothing(cx: &mut TestAppContext) {
     // A typo must not dismiss the picker you were halfway through using.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     cx.simulate_input("zzzzz");
 
     assert!(picker_rows(&window, &mut cx).is_empty());
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert!(picker_is_open(&window, &mut cx), "should still be open");
 }
 
@@ -4205,10 +4238,10 @@ async fn a_saved_request_can_be_reopened_from_the_picker(cx: &mut TestAppContext
 
     save_as(&mut cx, "https://api.test/v1/invoices");
     // Close it, so the only way back is through the collection.
-    cx.simulate_keystrokes("ctrl-w");
+    cx.press("ctrl-w");
     assert_eq!(tabs_of(&window, &mut cx).0, 1);
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     // The scan is off-thread, so the row arrives after the picker opens.
     let rows = wait_for(&mut cx, "the scanned request", |cx| {
         let rows = picker_rows(&window, cx);
@@ -4217,7 +4250,7 @@ async fn a_saved_request_can_be_reopened_from_the_picker(cx: &mut TestAppContext
     assert!(rows.iter().any(|r| r.contains("invoices.json")), "{rows:?}");
 
     cx.simulate_input("invoices");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let (count, active) = tabs_of(&window, &mut cx);
     assert_eq!(count, 2, "the saved request should open in a new buffer");
@@ -4234,9 +4267,9 @@ async fn reopening_a_saved_request_remembers_its_file(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
     save_as(&mut cx, "https://api.test/v1/invoices");
-    cx.simulate_keystrokes("ctrl-w");
+    cx.press("ctrl-w");
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     wait_for(&mut cx, "the scanned request", |cx| {
         picker_rows(&window, cx)
             .iter()
@@ -4244,9 +4277,9 @@ async fn reopening_a_saved_request_remembers_its_file(cx: &mut TestAppContext) {
             .then_some(())
     });
     cx.simulate_input("invoices");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     assert_eq!(
         collection_files(&root),
         ["invoices.json"],
@@ -4265,7 +4298,7 @@ async fn an_already_open_request_is_not_listed_twice(cx: &mut TestAppContext) {
 
     save_as(&mut cx, "https://api.test/v1/invoices");
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     cx.run_until_parked();
     // Give the scan a chance to add a duplicate row if it were going to.
     let rows = picker_rows(&window, &mut cx);
@@ -4278,10 +4311,10 @@ async fn an_already_open_request_is_not_listed_twice(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn arrow_keys_move_the_selection_and_wrap(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://a.test/second");
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     let selected = |cx: &mut VisualTestContext| {
         window
             .update(cx, |workspace, _, cx| workspace.picker_selection(cx))
@@ -4289,22 +4322,22 @@ async fn arrow_keys_move_the_selection_and_wrap(cx: &mut TestAppContext) {
     };
 
     assert_eq!(selected(&mut cx), 0);
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(selected(&mut cx), 1);
     // Wraps rather than dead-ending at the last row.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(selected(&mut cx), 0);
-    cx.simulate_keystrokes("up");
+    cx.press("up");
     assert_eq!(selected(&mut cx), 1, "up from the top must wrap to the end");
 }
 
 #[gpui::test]
 async fn a_second_ctrl_p_does_not_nest_a_modal(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-p");
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
+    cx.press("ctrl-p");
     assert!(picker_is_open(&window, &mut cx));
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     assert!(!picker_is_open(&window, &mut cx), "one escape must close it");
 }
 
@@ -4318,8 +4351,8 @@ async fn tab_does_not_move_focus_out_of_the_picker(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
     let url_before = spec_of(&view, &mut cx).url;
 
-    cx.simulate_keystrokes("ctrl-p");
-    cx.simulate_keystrokes("tab");
+    cx.press("ctrl-p");
+    cx.press("tab");
     cx.simulate_input("zzzz");
 
     assert!(picker_is_open(&window, &mut cx));
@@ -4342,11 +4375,11 @@ async fn tab_does_not_strand_the_settings_panel(cx: &mut TestAppContext) {
     // says why.
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     assert!(settings_open(&window, &mut cx));
 
-    cx.simulate_keystrokes("tab");
-    cx.simulate_keystrokes("escape");
+    cx.press("tab");
+    cx.press("escape");
 
     assert!(
         !settings_open(&window, &mut cx),
@@ -4360,14 +4393,14 @@ async fn a_picker_cannot_open_over_the_settings_panel(cx: &mut TestAppContext) {
     // so they stacked. Closing the picker then restored focus to the buffer *behind* the panel,
     // stranding it exactly as Tab did — one defect, two routes in.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     assert!(
         !picker_is_open(&window, &mut cx),
         "Ctrl+P must not stack a picker over the panel"
     );
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     assert!(
         !picker_is_open(&window, &mut cx),
         "Ctrl+K must not stack a picker over the panel"
@@ -4378,7 +4411,7 @@ async fn a_picker_cannot_open_over_the_settings_panel(cx: &mut TestAppContext) {
     );
 
     // Still dismissable from the keyboard, which is what stacking took away.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     assert!(!settings_open(&window, &mut cx));
 }
 
@@ -4386,7 +4419,7 @@ async fn a_picker_cannot_open_over_the_settings_panel(cx: &mut TestAppContext) {
 async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     assert!(picker_is_open(&window, &mut cx));
 
     let rows = picker_rows(&window, &mut cx);
@@ -4422,9 +4455,9 @@ async fn a_palette_command_runs_the_same_path_as_its_keybinding(cx: &mut TestApp
     let (window, view, mut cx) = boot(cx, None, None);
     let before = spec_of(&view, &mut cx).headers.len();
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("add head");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     assert!(!picker_is_open(&window, &mut cx), "should close on confirm");
 
@@ -4441,7 +4474,7 @@ async fn a_palette_command_runs_the_same_path_as_its_keybinding(cx: &mut TestApp
 #[gpui::test]
 async fn the_palette_filters_fuzzily(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
 
     cx.simulate_input("tgtm");
     let rows = picker_rows(&window, &mut cx);
@@ -4456,11 +4489,11 @@ async fn escape_closes_the_palette_too(cx: &mut TestAppContext) {
     // The palette reuses the picker's key context, so this is really asserting that the
     // one set of bindings serves both — principle 2 holding up in practice.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-k");
-    cx.simulate_keystrokes("escape");
+    cx.press("ctrl-k");
+    cx.press("escape");
     assert!(!picker_is_open(&window, &mut cx));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://after-palette.test");
     assert_eq!(tabs_of(&window, &mut cx).1.url, "https://after-palette.test");
 }
@@ -4472,9 +4505,9 @@ async fn the_palette_can_open_a_tab_through_a_command(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
     assert_eq!(tabs_of(&window, &mut cx).0, 1);
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("new tab");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     assert_eq!(tabs_of(&window, &mut cx).0, 2, "the command should open a tab");
 }
@@ -4492,17 +4525,17 @@ async fn choosing_a_buffer_leaves_focus_in_that_buffer(cx: &mut TestAppContext) 
     let (window, first, mut cx) = boot(cx, None, None);
     let first_url = spec_of(&first, &mut cx).url;
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.simulate_input("https://second.test/widgets");
 
     // Jump back to the original buffer through the picker. Filter on `graphql`, not on the
     // sample's *name* ("List repositories") — labels derive from the URL, so the row reads
     // as the last path segment of https://api.github.com/graphql.
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     cx.simulate_input("graphql");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input("https://typed-after-picking.test");
 
     let (_, active) = tabs_of(&window, &mut cx);
@@ -4546,7 +4579,7 @@ fn select_setting(
 
     let key = if target > current { "down" } else { "up" };
     for _ in 0..target.abs_diff(current) {
-        cx.simulate_keystrokes(key);
+        cx.press(key);
     }
 }
 
@@ -4569,7 +4602,7 @@ async fn ctrl_comma_shows_the_engine_settings_that_were_previously_invisible(
 ) {
     // §11's whole point: these are honoured on every request with no way to see them.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     assert!(settings_open(&window, &mut cx));
 
     let rows = settings_rows(&window, &mut cx).join("\n");
@@ -4593,9 +4626,9 @@ async fn toggling_a_setting_reaches_the_spec_that_gets_sent(cx: &mut TestAppCont
     let (window, view, mut cx) = boot(cx, None, None);
     assert!(spec_of(&view, &mut cx).settings.cookie_store);
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     select_setting(&window, &mut cx, "Store and replay cookies");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     assert!(
         !spec_of(&view, &mut cx).settings.cookie_store,
@@ -4613,7 +4646,7 @@ async fn clicking_a_setting_reaches_the_request_not_just_the_panel(cx: &mut Test
     let (window, view, mut cx) = boot(cx, None, None);
     assert!(spec_of(&view, &mut cx).settings.verify_tls, "on by default");
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     cx.run_until_parked();
 
     // Row 1 is TLS verification, and deliberately *not* row 0: clicking the row the keyboard
@@ -4634,14 +4667,14 @@ async fn an_edit_survives_dismissing_the_panel(cx: &mut TestAppContext) {
     // There is no OK/Cancel here, so Esc must not silently discard what you changed.
     let (window, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     select_setting(&window, &mut cx, "Store and replay cookies");
-    cx.simulate_keystrokes("enter escape");
+    cx.press("enter escape");
     assert!(!settings_open(&window, &mut cx));
     assert!(!spec_of(&view, &mut cx).settings.cookie_store);
 
     // And focus has to come back, or the keymap is dead.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://after-settings.test");
     assert_eq!(tabs_of(&window, &mut cx).1.url, "https://after-settings.test");
 }
@@ -4649,23 +4682,23 @@ async fn an_edit_survives_dismissing_the_panel(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn arrows_step_the_numeric_settings_within_bounds(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
 
     select_setting(&window, &mut cx, "Maximum redirect hops");
-    cx.simulate_keystrokes("right");
+    cx.press("right");
     assert_eq!(setting_value(&window, &mut cx, "Maximum redirect hops"), "11");
-    cx.simulate_keystrokes("left left");
+    cx.press("left left");
     assert_eq!(setting_value(&window, &mut cx, "Maximum redirect hops"), "9");
     assert_eq!(spec_of(&view, &mut cx).settings.max_redirects, 9);
 
     // Steps in 5s.
     select_setting(&window, &mut cx, "Timeout");
-    cx.simulate_keystrokes("right");
+    cx.press("right");
     assert_eq!(setting_value(&window, &mut cx, "Timeout"), "35s");
 
     // Clamped, not wrapped or underflowed: 30 downward steps would go far below zero.
     for _ in 0..30 {
-        cx.simulate_keystrokes("left");
+        cx.press("left");
     }
     assert_eq!(
         setting_value(&window, &mut cx, "Timeout"),
@@ -4677,7 +4710,7 @@ async fn arrows_step_the_numeric_settings_within_bounds(cx: &mut TestAppContext)
 #[gpui::test]
 async fn the_selection_wraps_in_both_directions(cx: &mut TestAppContext) {
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
 
     let selection = |cx: &mut VisualTestContext| {
         window
@@ -4689,9 +4722,9 @@ async fn the_selection_wraps_in_both_directions(cx: &mut TestAppContext) {
     assert_eq!(selection(&mut cx), 0);
     // Up from the first row must wrap rather than underflow a usize. Derived from the row count
     // rather than written as a literal, which a new row silently invalidates.
-    cx.simulate_keystrokes("up");
+    cx.press("up");
     assert_eq!(selection(&mut cx), last);
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(selection(&mut cx), 0);
 }
 
@@ -4708,9 +4741,9 @@ async fn the_status_bar_says_when_cookies_are_on(cx: &mut TestAppContext) {
 
     assert!(cookies_on(&mut cx), "on by default, matching the engine");
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     select_setting(&window, &mut cx, "Store and replay cookies");
-    cx.simulate_keystrokes("enter escape");
+    cx.press("enter escape");
     assert!(!cookies_on(&mut cx), "the indicator must follow the setting");
 }
 
@@ -4721,10 +4754,10 @@ async fn clearing_cookies_is_reachable_and_reports_back(cx: &mut TestAppContext)
     // whether you pressed it.
     let (window, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     // Clear cookies is the last row.
-    cx.simulate_keystrokes("up");
-    cx.simulate_keystrokes("enter");
+    cx.press("up");
+    cx.press("enter");
 
     assert_eq!(setting_value(&window, &mut cx, "Clear stored cookies now"), "cleared");
     let status = cx.update(|_, cx| view.read(cx).status.clone());
@@ -4742,12 +4775,12 @@ async fn settings_are_per_request_not_global(cx: &mut TestAppContext) {
     // environments has to solve, so this deliberately edits one buffer only.
     let (window, first, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     select_setting(&window, &mut cx, "Store and replay cookies");
-    cx.simulate_keystrokes("enter escape");
+    cx.press("enter escape");
     assert!(!spec_of(&first, &mut cx).settings.cookie_store);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let (_, fresh) = tabs_of(&window, &mut cx);
     assert!(
         fresh.settings.cookie_store,
@@ -4762,12 +4795,12 @@ async fn settings_survive_a_save_and_reopen(cx: &mut TestAppContext) {
     let (session, root) = scratch_collection("settings-roundtrip");
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/insecure");
-    cx.simulate_keystrokes("ctrl-,");
+    cx.press("ctrl-,");
     select_setting(&window, &mut cx, "Verify TLS certificates");
-    cx.simulate_keystrokes("enter escape");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("enter escape");
+    cx.press("ctrl-s");
 
     let bytes = std::fs::read(root.join("insecure.json")).expect("read");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
@@ -4805,7 +4838,7 @@ async fn ctrl_e_lists_environments_with_none_always_offered(cx: &mut TestAppCont
     write_env(&root, "dev.local.json", r#"{"token":"secret"}"#);
 
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
 
     let rows = picker_rows(&window, &mut cx);
     let labels: Vec<&str> = rows
@@ -4844,19 +4877,19 @@ async fn a_variable_is_substituted_on_the_way_to_a_real_socket(cx: &mut TestAppC
 
     let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("dev");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("dev"));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("http://{{host}}/v1/things");
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("Authorization");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("Bearer {{token}}");
 
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -4887,26 +4920,26 @@ async fn a_variable_in_a_form_field_reaches_the_socket_substituted(cx: &mut Test
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
     let (url, server) = serve_capturing(OK_JSON);
 
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("dev");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     // A fresh buffer: the sample ships `Content-Type: application/json`, and an explicit
     // header outranks the form's derived type.
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
     cx.simulate_input(&url);
 
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("client_id");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("{{id}}");
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("client_secret");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("{{secret}}");
 
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -4938,9 +4971,9 @@ async fn an_undefined_variable_is_reported_by_name_instead_of_being_sent(cx: &mu
     // hostname, so without the check this is a pointless DNS lookup and a confusing error.
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://{{baseUrl}}/users");
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let error = wait_for(&mut cx, "the failure", |cx| {
         cx.update(|_, cx| view.read(cx).error.clone())
@@ -4960,9 +4993,9 @@ async fn the_selected_environment_survives_a_restart(cx: &mut TestAppContext) {
 
     {
         let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
-        cx.simulate_keystrokes("ctrl-e");
+        cx.press("ctrl-e");
         cx.simulate_input("staging");
-        cx.simulate_keystrokes("enter");
+        cx.press("enter");
         assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("staging"));
     }
 
@@ -4983,14 +5016,14 @@ async fn selecting_none_turns_substitution_back_off(cx: &mut TestAppContext) {
     write_env(&root, "dev.json", r#"{"a":"1"}"#);
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("dev");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("dev"));
 
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("none");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(active_environment(&window, &mut cx), None);
 
     remove_scratch(&mut cx, &session);
@@ -5008,9 +5041,9 @@ async fn loading_an_environment_with_secrets_writes_the_gitignore_rule(cx: &mut 
     let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
     assert!(!root.join(".gitignore").exists(), "nothing written before a choice is made");
 
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("dev");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     // At switch, not at send: it's the earliest point secrets are known to be in play, and
     // a send clears `status`, so a notice set during one would never be seen.
@@ -5083,7 +5116,7 @@ fn serve_html_sequence(count: usize, body: &'static str) -> String {
 
 /// Send the active request and wait for a response whose status matches.
 fn send_and_wait(cx: &mut VisualTestContext, view: &gpui::Entity<RequestView>, status: u16) {
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(cx, "the response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
             .filter(|response| response.status == status)
@@ -5101,12 +5134,12 @@ async fn ctrl_h_lists_every_retained_run_including_the_live_one(cx: &mut TestApp
     let (window, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{\"a\":1}"), (500, "{\"b\":2}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 500);
 
-    cx.simulate_keystrokes("ctrl-h");
+    cx.press("ctrl-h");
     let rows = picker_rows(&window, &mut cx);
     assert_eq!(rows.len(), 2, "the live run and the one before it: {rows:?}");
     // The status is in the label because "which run was the 500?" is the question you open
@@ -5127,7 +5160,7 @@ async fn choosing_an_earlier_run_shows_it_and_reindexes_its_body(cx: &mut TestAp
     const NEWER: &str = r#"{"a":1,"b":2,"c":3,"d":4,"e":5}"#;
     let url = serve_sequence(&[(200, OLDER), (201, NEWER)]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 201);
@@ -5136,8 +5169,8 @@ async fn choosing_an_earlier_run_shows_it_and_reindexes_its_body(cx: &mut TestAp
         cx.update(|_, cx| view.read(cx).body_view.as_ref().map(|body| body.row_count()))
     });
 
-    cx.simulate_keystrokes("ctrl-h");
-    cx.simulate_keystrokes("down enter");
+    cx.press("ctrl-h");
+    cx.press("down enter");
 
     assert_eq!(viewing(&view, &mut cx), 1);
     let shown = cx
@@ -5169,12 +5202,12 @@ async fn sending_again_returns_the_view_to_live(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}"), (201, "{}"), (202, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 201);
 
-    cx.simulate_keystrokes("ctrl-h down enter");
+    cx.press("ctrl-h down enter");
     assert_eq!(viewing(&view, &mut cx), 1);
 
     send_and_wait(&mut cx, &view, 202);
@@ -5192,13 +5225,13 @@ async fn history_is_capped_and_drops_the_oldest(cx: &mut TestAppContext) {
     ];
     let url = serve_sequence(statuses);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     for (status, _) in statuses {
         send_and_wait(&mut cx, &view, *status);
     }
 
-    cx.simulate_keystrokes("ctrl-h");
+    cx.press("ctrl-h");
     let rows = picker_rows(&window, &mut cx);
     assert_eq!(
         rows.len(),
@@ -5215,7 +5248,7 @@ async fn an_out_of_range_run_is_ignored_rather_than_blanking_the_pane(cx: &mut T
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_once(OK_JSON);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
 
@@ -5236,7 +5269,7 @@ async fn history_does_not_survive_loading_a_different_request(cx: &mut TestAppCo
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}"), (201, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 201);
@@ -5263,7 +5296,7 @@ async fn clicking_a_tab_in_the_strip_activates_that_buffer(cx: &mut TestAppConte
     // is exactly the change that would break it silently.
     let (window, first, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let second = active_view(&window, &mut cx);
     assert_ne!(first.entity_id(), second.entity_id(), "ctrl-t opens a new buffer");
     cx.run_until_parked();
@@ -5285,9 +5318,9 @@ async fn a_long_tab_label_is_ellipsised_before_it_reaches_the_strip(cx: &mut Tes
     // Shaped text is not measurable headlessly, so the only thing assertable is the string
     // handed to the element — which is why the elision lives somewhere a string can be read.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
-    cx.simulate_keystrokes("ctrl-l");
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-t");
+    cx.press("ctrl-l");
+    cx.press("ctrl-a");
     cx.simulate_input("https://example.test/shadcnschemaregistry.json");
     cx.run_until_parked();
 
@@ -5315,7 +5348,7 @@ async fn a_tabs_close_button_stays_inside_the_tab(cx: &mut TestAppContext) {
     // The label width is hardcoded, so this keeps it honest. Widening the padding does not push
     // the × out — the label shrinks instead, silently disagreeing with the elision budget.
     let (_, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.run_until_parked();
 
     let tab = cx.debug_bounds("tab-0").expect("the strip should be painted at two buffers");
@@ -5345,9 +5378,9 @@ async fn clicking_a_tabs_close_button_closes_that_tab_and_not_the_active_one(
     // passes against a handler that forgot to `activate(ix)` first.
     let (window, first, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let second = active_view(&window, &mut cx);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let third = active_view(&window, &mut cx);
     cx.run_until_parked();
     assert_ne!(second.entity_id(), third.entity_id(), "three distinct buffers");
@@ -5412,20 +5445,20 @@ async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1), "authoring is the default");
 
-    cx.simulate_keystrokes("alt-q");
+    cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Capture);
-    cx.simulate_keystrokes("alt-q");
+    cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Assert);
-    cx.simulate_keystrokes("alt-q");
+    cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers, "forward wraps past the end");
-    cx.simulate_keystrokes("alt-q");
+    cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(0));
-    cx.simulate_keystrokes("alt-q");
+    cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1));
 
-    cx.simulate_keystrokes("alt-shift-q");
+    cx.press("alt-shift-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(0), "and back the other way");
-    cx.simulate_keystrokes("alt-shift-q");
+    cx.press("alt-shift-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
 }
 
@@ -5468,7 +5501,7 @@ async fn the_request_tab_is_sticky_per_buffer(cx: &mut TestAppContext) {
     cx.dispatch_action(crate::actions::ShowHeadersTab);
     assert_eq!(request_tab(&first, &mut cx), RequestTab::Headers);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &first, 200);
     assert_eq!(
@@ -5477,7 +5510,7 @@ async fn the_request_tab_is_sticky_per_buffer(cx: &mut TestAppContext) {
         "a response arriving must not move you off the section you were editing"
     );
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let second = active_view(&window, &mut cx);
     assert_eq!(
         request_tab(&second, &mut cx),
@@ -5485,7 +5518,7 @@ async fn the_request_tab_is_sticky_per_buffer(cx: &mut TestAppContext) {
         "a new buffer gets the default, not the other buffer's choice"
     );
 
-    cx.simulate_keystrokes("ctrl-shift-tab");
+    cx.press("ctrl-shift-tab");
     assert_eq!(request_tab(&first, &mut cx), RequestTab::Headers);
     assert_eq!(request_tab(&second, &mut cx), RequestTab::Kind(1));
 }
@@ -5499,30 +5532,30 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
 
     assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
 
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
 
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(
         response_view(&view, &mut cx),
         ResponseView::Timing,
         "the Timing tab is the third stop, not a replacement for one of the first two"
     );
 
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(
         response_view(&view, &mut cx),
         ResponseView::Diff,
         "Diff is the fourth stop — a question about an answer, after both answers"
     );
 
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(
         response_view(&view, &mut cx),
         ResponseView::Body,
@@ -5531,7 +5564,7 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
 
     // Backwards, which is the half `alt-shift-r` exists for: from Body, one step back is the
     // last tab rather than an error or a no-op.
-    cx.simulate_keystrokes("alt-shift-r");
+    cx.press("alt-shift-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Diff);
 
     // The cycle must visit every tab `ResponseView::ALL` declares. Asserting the *count* is
@@ -5539,7 +5572,7 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     // shorter loop — `step` wraps on `ALL.len()`, so a new variant changes this and nothing else.
     let mut seen = vec![response_view(&view, &mut cx)];
     for _ in 1..ResponseView::ALL.len() {
-        cx.simulate_keystrokes("alt-r");
+        cx.press("alt-r");
         seen.push(response_view(&view, &mut cx));
     }
     seen.sort_by_key(|tab| format!("{tab:?}"));
@@ -5583,11 +5616,11 @@ async fn trailers_are_reachable_only_where_they_are_drawn(cx: &mut TestAppContex
         })
     });
     cx.dispatch_action(crate::actions::ShowResponseHeaders);
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Trailers);
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
-    cx.simulate_keystrokes("alt-shift-r");
+    cx.press("alt-shift-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Trailers);
 
     // Switching away from gRPC while on it moves off it.
@@ -5744,15 +5777,15 @@ async fn the_cookie_viewer_shows_the_jar_and_forgets_cookies(cx: &mut TestAppCon
     assert!(cx.debug_bounds("cookie-row-1").is_some(), "both cookies are listed");
 
     // `down` then `delete`: the second row, so this also proves the selection is what is removed.
-    cx.simulate_keystrokes("down delete");
+    cx.press("down delete");
     cx.run_until_parked();
     assert_eq!(names(&mut cx), vec!["session"], "delete forgets the selected cookie only");
 
-    cx.simulate_keystrokes("shift-delete");
+    cx.press("shift-delete");
     cx.run_until_parked();
     assert!(names(&mut cx).is_empty(), "shift-delete clears the jar");
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert!(
         !window
@@ -5774,7 +5807,7 @@ async fn clicking_the_headers_tab_switches_the_response_view(cx: &mut TestAppCon
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     cx.run_until_parked();
@@ -5829,7 +5862,7 @@ async fn a_send_through_the_app_reports_a_measured_connection(cx: &mut TestAppCo
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
 
@@ -5866,12 +5899,12 @@ async fn the_timing_tab_draws_a_row_for_each_phase(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("alt-r alt-r");
+    cx.press("alt-r alt-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
     cx.run_until_parked();
 
@@ -5893,11 +5926,11 @@ async fn the_response_view_survives_a_resend(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}"), (201, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
 
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
 
     send_and_wait(&mut cx, &view, 201);
@@ -5916,13 +5949,13 @@ async fn the_response_view_is_per_buffer(cx: &mut TestAppContext) {
     let (window, first, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, "{}")]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &first, 200);
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(response_view(&first, &mut cx), ResponseView::Headers);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let second = active_view(&window, &mut cx);
     assert_eq!(
         response_view(&second, &mut cx),
@@ -5931,7 +5964,7 @@ async fn the_response_view_is_per_buffer(cx: &mut TestAppContext) {
     );
 
     // And switching back finds the first buffer where it was left.
-    cx.simulate_keystrokes("ctrl-shift-tab");
+    cx.press("ctrl-shift-tab");
     assert_eq!(response_view(&first, &mut cx), ResponseView::Headers);
 }
 
@@ -5967,7 +6000,7 @@ fn respond_with_json_in_window(
     let (window, view, mut cx) = boot(cx, None, None);
     let url = serve_typed("application/json", body);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -5991,7 +6024,7 @@ fn find_position(
 /// context is `"TextInput TextSearch"` — both identifiers in one string, per the leaf-only
 /// predicate rule.
 fn search_for(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext, query: &str) {
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input(query);
     wait_for(cx, "the search to run", |cx| {
         cx.update(|_, cx| {
@@ -6014,7 +6047,7 @@ async fn ctrl_f_opens_the_find_bar_and_counts_matches(cx: &mut TestAppContext) {
         "the bar starts closed"
     );
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     assert!(cx.update(|_, cx| view.read(cx).is_searching()));
 
     search_for(&view, &mut cx, "hit");
@@ -6029,19 +6062,19 @@ async fn ctrl_f_opens_the_find_bar_and_counts_matches(cx: &mut TestAppContext) {
 async fn enter_steps_through_matches_and_wraps(cx: &mut TestAppContext) {
     let (view, mut cx) = respond_with_json(cx, r#"{"a":"x","b":"x","c":"x"}"#);
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "x");
     assert_eq!(find_position(&view, &mut cx), Some((1, 3)));
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(find_position(&view, &mut cx), Some((2, 3)));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(find_position(&view, &mut cx), Some((3, 3)));
 
     // Wrapping in both directions — `rem_euclid`, not a saturating clamp.
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(find_position(&view, &mut cx), Some((1, 3)), "forward wrap");
-    cx.simulate_keystrokes("shift-enter");
+    cx.press("shift-enter");
     assert_eq!(find_position(&view, &mut cx), Some((3, 3)), "backward wrap");
 }
 
@@ -6051,7 +6084,7 @@ async fn the_current_match_is_the_row_the_needle_is_actually_in(cx: &mut TestApp
     // the highlighted row has to be the one holding the match.
     let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1,"beta":2,"gamma":3}"#);
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "gamma");
 
     let row = cx
@@ -6075,14 +6108,14 @@ async fn jumping_to_a_match_unfolds_what_was_hiding_it(cx: &mut TestAppContext) 
     // and the search looks broken while reporting a match.
     let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":{"key":"buried"}},"z":1}"#);
 
-    cx.simulate_keystrokes("alt-f");
+    cx.press("alt-f");
     let folded_rows = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
     let total = cx.update(|_, cx| {
         view.read(cx).body_view.as_ref().unwrap().outline().unwrap().len()
     });
     assert!(folded_rows < total, "alt-f should have hidden rows");
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "buried");
     assert_eq!(find_position(&view, &mut cx), Some((1, 1)));
 
@@ -6102,10 +6135,10 @@ async fn escape_closes_the_find_bar_without_cancelling_the_request(cx: &mut Test
     // it. Reorder `register_keymap` and this is the test that notices.
     let (view, mut cx) = respond_with_json(cx, r#"{"a":"x"}"#);
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "x");
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     assert!(
         !cx.update(|_, cx| view.read(cx).is_searching()),
         "escape must close the bar"
@@ -6121,13 +6154,13 @@ async fn escape_closes_the_find_bar_without_cancelling_the_request(cx: &mut Test
 async fn reopening_the_find_bar_keeps_the_query(cx: &mut TestAppContext) {
     let (view, mut cx) = respond_with_json(cx, r#"{"a":"x","b":"x"}"#);
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "x");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(find_position(&view, &mut cx), Some((2, 2)));
 
     // Ctrl+F again means "put me back in the box", not "throw away what I typed".
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     assert_eq!(
         cx.update(|_, cx| view.read(cx).search.as_ref().unwrap().query.read(cx).text().to_string()),
         "x",
@@ -6152,12 +6185,12 @@ async fn a_resend_rescans_rather_than_leaving_a_stale_count(cx: &mut TestAppCont
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, r#"{"a":"x","b":"x","c":"x"}"#), (201, r#"{"a":"x"}"#)]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "x");
     assert_eq!(find_position(&view, &mut cx), Some((1, 3)));
 
@@ -6180,7 +6213,7 @@ async fn searching_a_non_json_body_uses_lines(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_typed("text/plain", "alpha\nbeta needle\ngamma\nneedle again");
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -6189,13 +6222,13 @@ async fn searching_a_non_json_body_uses_lines(cx: &mut TestAppContext) {
         "this fixture must take the raw-text path or the test proves nothing"
     );
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "needle");
     assert_eq!(find_position(&view, &mut cx), Some((1, 2)));
 
     // Line 1 holds the first, line 3 the second.
     assert_eq!(cx.update(|_, cx| view.read(cx).current_match_row()), Some(1));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).current_match_row()), Some(3));
 }
 
@@ -6260,7 +6293,7 @@ async fn a_query_that_matches_nothing_reports_nothing_rather_than_holding_the_la
 ) {
     let (view, mut cx) = respond_with_json(cx, r#"{"a":"findme"}"#);
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     search_for(&view, &mut cx, "findme");
     assert_eq!(find_position(&view, &mut cx), Some((1, 1)));
 
@@ -6280,12 +6313,12 @@ async fn find_is_per_buffer_and_ctrl_f_leaves_the_headers_tab(cx: &mut TestAppCo
 
     // Searching applies to the body, so opening the bar from the Headers tab has to take you
     // where the search can be seen.
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     assert_eq!(
         cx.update(|_, cx| view.read(cx).response_view),
         ResponseView::Headers
     );
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     assert_eq!(
         cx.update(|_, cx| view.read(cx).response_view),
         ResponseView::Body,
@@ -6462,7 +6495,7 @@ async fn every_find_bar_button_is_painted_once_its_bar_is_open(cx: &mut TestAppC
     let _ = &view;
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     cx.run_until_parked();
     for selector in ["find-prev", "find-next", "find-close"] {
         assert!(cx.debug_bounds(selector).is_some(), "{selector} is not painted");
@@ -6470,8 +6503,8 @@ async fn every_find_bar_button_is_painted_once_its_bar_is_open(cx: &mut TestAppC
 
     // `ctrl-f` means the body when the editor holds focus and the response otherwise — so this
     // reaches the *other* bar, and both can be open at once.
-    cx.simulate_keystrokes("ctrl-b");
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-b");
+    cx.press("ctrl-f");
     cx.run_until_parked();
     for selector in [
         "body-find-prev",
@@ -6523,7 +6556,7 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
     let copy = cx.debug_bounds("action-copy-code").expect("copy-as-code button");
     cx.simulate_click(copy.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     assert!(
         clipboard_text(&mut cx).unwrap_or_default().starts_with("curl "),
@@ -6560,8 +6593,8 @@ async fn the_panel_toggle_is_still_there_once_the_panel_is_hidden(cx: &mut TestA
 
     // Two presses: the first focuses the panel, the second hides it. That middle step is
     // `toggle_collection_panel`'s deliberate three-state behaviour, not an accident here.
-    cx.simulate_keystrokes("ctrl-shift-e");
-    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.press("ctrl-shift-e");
+    cx.press("ctrl-shift-e");
     cx.run_until_parked();
     assert!(!visible(&mut cx), "the panel must be hidden before the real assertion");
 
@@ -6640,10 +6673,10 @@ fn buffer_status(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -
 async fn ctrl_shift_x_copies_the_request_as_curl(cx: &mut TestAppContext) {
     let (_, _view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.example.com/things");
     // The picker opens on curl, so `enter` is what copying as curl now is.
-    cx.simulate_keystrokes("ctrl-shift-x enter");
+    cx.press("ctrl-shift-x enter");
     cx.run_until_parked();
 
     let command = clipboard_text(&mut cx).unwrap_or_default();
@@ -6662,20 +6695,20 @@ async fn copy_as_curl_resolves_variables_but_withholds_secrets(cx: &mut TestAppC
     write_env(&root, "dev.local.json", r#"{"token":"sk-live-do-not-leak"}"#);
 
     let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("dev");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(active_environment(&window, &mut cx).as_deref(), Some("dev"));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://{{host}}/v1/things");
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("Authorization");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("Bearer {{token}}");
 
     // The picker opens on curl, so `enter` is what copying as curl now is.
-    cx.simulate_keystrokes("ctrl-shift-x enter");
+    cx.press("ctrl-shift-x enter");
     cx.run_until_parked();
     let command = clipboard_text(&mut cx).unwrap_or_default();
 
@@ -6707,15 +6740,15 @@ async fn copy_as_curl_says_when_it_withheld_something(cx: &mut TestAppContext) {
     write_env(&root, "dev.local.json", r#"{"token":"s3cret"}"#);
 
     let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
     cx.simulate_input("dev");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     // No secret referenced yet: the status must not claim one was held back.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://{{host}}/a");
     // The picker opens on curl, so `enter` is what copying as curl now is.
-    cx.simulate_keystrokes("ctrl-shift-x enter");
+    cx.press("ctrl-shift-x enter");
     cx.run_until_parked();
     let quiet = buffer_status(&active_view(&window, &mut cx), &mut cx);
     assert!(
@@ -6724,12 +6757,12 @@ async fn copy_as_curl_says_when_it_withheld_something(cx: &mut TestAppContext) {
     );
 
     // Now reference one.
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("Authorization");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("Bearer {{token}}");
     // The picker opens on curl, so `enter` is what copying as curl now is.
-    cx.simulate_keystrokes("ctrl-shift-x enter");
+    cx.press("ctrl-shift-x enter");
     cx.run_until_parked();
 
     let told = buffer_status(&active_view(&window, &mut cx), &mut cx);
@@ -6747,17 +6780,17 @@ async fn copy_as_curl_exports_the_request_on_screen_including_its_body(cx: &mut 
     // rather than some stored copy — the corollary of "derive state rather than mirroring it".
     let (_, _view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://x.test/things");
-    cx.simulate_keystrokes("ctrl-m");
+    cx.press("ctrl-m");
     cx.simulate_input("POST");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     clear_body(&mut cx);
     cx.simulate_input("{\"name\":\"ada\"}");
 
     // The picker opens on curl, so `enter` is what copying as curl now is.
-    cx.simulate_keystrokes("ctrl-shift-x enter");
+    cx.press("ctrl-shift-x enter");
     cx.run_until_parked();
 
     let command = clipboard_text(&mut cx).unwrap_or_default();
@@ -6779,13 +6812,13 @@ async fn copy_as_code_offers_what_each_kind_can_express(cx: &mut TestAppContext)
     let (window, view, mut cx) = boot(cx, None, None);
     type_url(&mut cx, "https://x.test/things");
 
-    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.press("ctrl-shift-x");
     cx.run_until_parked();
     let rows = picker_rows(&window, &mut cx);
     assert!(rows.first().is_some_and(|row| row.starts_with("curl")), "curl leads: {rows:?}");
     assert!(!rows.iter().any(|row| row.contains("grpcurl")), "{rows:?}");
     cx.simulate_input("python");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     let copied = clipboard_text(&mut cx).unwrap_or_default();
     assert!(copied.starts_with("import requests"), "the chosen row is what is copied: {copied}");
@@ -6802,12 +6835,12 @@ async fn copy_as_code_offers_what_each_kind_can_express(cx: &mut TestAppContext)
         })
     });
     type_url(&mut cx, "localhost:50051");
-    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.press("ctrl-shift-x");
     cx.run_until_parked();
     let rows = picker_rows(&window, &mut cx);
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert!(rows[0].starts_with("grpcurl"), "{rows:?}");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     let copied = clipboard_text(&mut cx).unwrap_or_default();
     assert!(
@@ -6822,7 +6855,7 @@ async fn copy_as_code_offers_what_each_kind_can_express(cx: &mut TestAppContext)
             view.set_kind(kind, cx);
         })
     });
-    cx.simulate_keystrokes("ctrl-shift-x");
+    cx.press("ctrl-shift-x");
     cx.run_until_parked();
     assert!(!picker_is_open(&window, &mut cx), "no picker with nothing in it");
     let status = buffer_status(&view, &mut cx);
@@ -6836,19 +6869,19 @@ async fn a_copied_command_imports_back_into_an_equivalent_request(cx: &mut TestA
     // spec, and curl import all have to agree.
     let (window, _view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://x.test/v1/items");
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("X-Trace-Id");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("abc123");
 
     // The picker opens on curl, so `enter` is what copying as curl now is.
-    cx.simulate_keystrokes("ctrl-shift-x enter");
+    cx.press("ctrl-shift-x enter");
     cx.run_until_parked();
 
     // Ctrl+Shift+V imports from the clipboard into a *new* buffer, so the original is untouched.
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
 
     let imported = spec_of(&active_view(&window, &mut cx), &mut cx);
@@ -6906,7 +6939,7 @@ fn selected_row(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) ->
 
 /// Focus the response pane, which is what makes `up`/`down` resolve to the selection verbs.
 fn focus_response(cx: &mut VisualTestContext) {
-    cx.simulate_keystrokes("ctrl-shift-r");
+    cx.press("ctrl-shift-r");
     cx.run_until_parked();
 }
 
@@ -6971,7 +7004,7 @@ async fn clicking_a_row_takes_focus_so_the_keyboard_can_carry_on(cx: &mut TestAp
     cx.run_until_parked();
     assert_eq!(selected_row(&view, &mut cx), Some(1));
 
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     cx.run_until_parked();
     assert_eq!(
         selected_row(&view, &mut cx),
@@ -7016,7 +7049,7 @@ async fn clicking_a_fold_chevron_folds_and_still_leaves_the_keyboard_working(
         "and select it — folding a container and standing on it is one intent, not two"
     );
 
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     cx.run_until_parked();
     assert_eq!(
         selected_row(&view, &mut cx),
@@ -7033,16 +7066,16 @@ async fn the_arrow_keys_step_the_selection_and_stop_at_the_ends(cx: &mut TestApp
     focus_response(&mut cx);
 
     // Rows: 0 `{`, 1 alpha, 2 `}`. The first press lands on an end, not one step in from it.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(selected_row(&view, &mut cx), Some(0));
 
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(selected_row(&view, &mut cx), Some(2));
 
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(selected_row(&view, &mut cx), Some(2), "the last row is the floor");
 
-    cx.simulate_keystrokes("up up up up");
+    cx.press("up up up up");
     assert_eq!(selected_row(&view, &mut cx), Some(0), "and the first is the ceiling");
 }
 
@@ -7053,8 +7086,8 @@ async fn arrow_keys_in_the_url_bar_are_still_the_url_bars(cx: &mut TestAppContex
     // response instead. Driven through the real keymap, which is the only way to see it.
     let (view, mut cx) = respond_with_json(cx, r#"{"alpha":1}"#);
 
-    cx.simulate_keystrokes("ctrl-l");
-    cx.simulate_keystrokes("down down");
+    cx.press("ctrl-l");
+    cx.press("down down");
     cx.run_until_parked();
 
     assert_eq!(
@@ -7071,16 +7104,16 @@ async fn copying_a_row_value_decodes_the_string(cx: &mut TestAppContext) {
     let (view, mut cx) = respond_with_json(cx, r#"{"note":"first\nsecond","n":42}"#);
     focus_response(&mut cx);
 
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(selected_row(&view, &mut cx), Some(1), "the note row");
 
-    cx.simulate_keystrokes("ctrl-c");
+    cx.press("ctrl-c");
     cx.run_until_parked();
     assert_eq!(clipboard_text(&mut cx).as_deref(), Some("first\nsecond"));
 
     // A number keeps its own text — `unquote` passes anything unquoted straight through, which
     // is why there is no match on ScalarKind at the call site.
-    cx.simulate_keystrokes("down ctrl-c");
+    cx.press("down ctrl-c");
     cx.run_until_parked();
     assert_eq!(clipboard_text(&mut cx).as_deref(), Some("42"));
 }
@@ -7092,10 +7125,10 @@ async fn copying_a_container_row_gives_the_whole_subtree(cx: &mut TestAppContext
     let (view, mut cx) = respond_with_json(cx, r#"{"outer":{"inner":1},"z":2}"#);
     focus_response(&mut cx);
 
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(selected_row(&view, &mut cx), Some(1), "the outer object's row");
 
-    cx.simulate_keystrokes("ctrl-c");
+    cx.press("ctrl-c");
     cx.run_until_parked();
     assert_eq!(clipboard_text(&mut cx).as_deref(), Some(r#"{"inner":1}"#));
 }
@@ -7106,10 +7139,10 @@ async fn copying_a_row_path_gives_a_jsonpath(cx: &mut TestAppContext) {
     focus_response(&mut cx);
 
     // 0 `{`, 1 `users` array, 2 the element `{`, 3 email.
-    cx.simulate_keystrokes("down down down down");
+    cx.press("down down down down");
     assert_eq!(selected_row(&view, &mut cx), Some(3), "the email row");
 
-    cx.simulate_keystrokes("alt-c");
+    cx.press("alt-c");
     cx.run_until_parked();
     assert_eq!(clipboard_text(&mut cx).as_deref(), Some("$.users[0].email"));
 }
@@ -7145,10 +7178,10 @@ async fn folding_a_container_keeps_the_selection_on_something_drawn(cx: &mut Tes
     focus_response(&mut cx);
 
     // Land on `inner`, which lives inside `outer`.
-    cx.simulate_keystrokes("down down down");
+    cx.press("down down down");
     assert_eq!(selected_row(&view, &mut cx), Some(2), "the inner row");
 
-    cx.simulate_keystrokes("alt-f");
+    cx.press("alt-f");
     cx.run_until_parked();
 
     let selected = selected_row(&view, &mut cx).expect("still a selection");
@@ -7253,7 +7286,7 @@ async fn hovering_a_menu_row_makes_it_the_one_enter_chooses(cx: &mut TestAppCont
     cx.simulate_mouse_move(second.center(), None, gpui::Modifiers::default());
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -7299,12 +7332,12 @@ async fn the_app_menu_opens_from_the_titlebar_and_from_f10(cx: &mut TestAppConte
     cx.run_until_parked();
     assert!(menu_is_open(&window, &mut cx), "clicking the app name opens the menu");
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert!(!menu_is_open(&window, &mut cx), "escape closes it");
 
     // The mouse path teaches a keystroke, so the keystroke has to exist.
-    cx.simulate_keystrokes("f10");
+    cx.press("f10");
     cx.run_until_parked();
     assert!(menu_is_open(&window, &mut cx), "f10 opens it too");
 }
@@ -7319,14 +7352,14 @@ async fn arrowing_through_the_app_menu_steps_over_its_separators(cx: &mut TestAp
     // without skipping they land on the rule after "Request settings". Walking to the end
     // instead would clamp on the last row either way and prove nothing.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("f10");
+    cx.press("f10");
     cx.run_until_parked();
     assert!(menu_is_open(&window, &mut cx));
 
-    cx.simulate_keystrokes("down down down");
+    cx.press("down down down");
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     assert!(
         !menu_is_open(&window, &mut cx),
@@ -7350,7 +7383,7 @@ async fn the_menu_offers_fold_only_on_a_container(cx: &mut TestAppContext) {
         4,
         "value, path, capture and assert — no fold on a scalar"
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     // A container: one more again.
@@ -7366,7 +7399,7 @@ async fn the_menu_drops_copy_path_on_a_raw_body(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_typed("text/plain", "alpha\nbeta");
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -7396,7 +7429,7 @@ async fn choosing_a_menu_row_runs_it_and_closes(cx: &mut TestAppContext) {
     // And the consequence closing has to deliver: focus is back in the response pane, so the
     // keyboard carries on. Asserting the menu is gone without this would miss a close that
     // strands focus on the dropped entity and kills every binding.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     cx.run_until_parked();
     assert_eq!(
         selected_row(&view, &mut cx),
@@ -7422,7 +7455,7 @@ async fn the_menu_is_keyboard_navigable_and_escape_does_not_cancel_the_request(
     assert_eq!(menu_row_count(&mut cx), 5);
 
     // Last row is Fold. Arrow down to it and confirm.
-    cx.simulate_keystrokes("down down down down enter");
+    cx.press("down down down down enter");
     cx.run_until_parked();
 
     assert!(!menu_is_open(&window, &mut cx), "confirming closes the menu");
@@ -7434,7 +7467,7 @@ async fn the_menu_is_keyboard_navigable_and_escape_does_not_cancel_the_request(
     // And escape dismisses without cancelling the request — the ordering half.
     right_click(&mut cx, row.center());
     assert!(menu_is_open(&window, &mut cx));
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert!(!menu_is_open(&window, &mut cx), "escape must dismiss the menu");
 }
@@ -7448,7 +7481,7 @@ async fn a_menu_cannot_stack_over_another_modal(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let row = cx.debug_bounds("response-row-1").expect("a row");
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.run_until_parked();
 
     right_click(&mut cx, row.center());
@@ -7546,7 +7579,7 @@ fn respond_with_header(
     });
 
     let (_, view, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&format!("http://{addr}"));
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -7564,7 +7597,7 @@ fn respond_with(
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_typed_owned(content_type, body);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
@@ -7627,7 +7660,7 @@ async fn the_arrow_keys_scroll_the_body_sideways_and_clamp(cx: &mut TestAppConte
 
     assert_eq!(body_h_offset(&view, &mut cx), 0.);
 
-    cx.simulate_keystrokes("right");
+    cx.press("right");
     cx.run_until_parked();
     let stepped = body_h_offset(&view, &mut cx);
     assert!(stepped < 0., "right must scroll right; offsets run negative");
@@ -7635,12 +7668,12 @@ async fn the_arrow_keys_scroll_the_body_sideways_and_clamp(cx: &mut TestAppConte
     // Clamped at both ends — by gpui, in `interactivity.prepaint`, not by us. Asserted anyway,
     // because it is the behaviour the pane depends on: without it the view slides into blank
     // space and there is nothing on screen to say which way back is.
-    cx.simulate_keystrokes("left left left");
+    cx.press("left left left");
     cx.run_until_parked();
     assert_eq!(body_h_offset(&view, &mut cx), 0., "left stops at column zero");
 
     for _ in 0..80 {
-        cx.simulate_keystrokes("right");
+        cx.press("right");
     }
     cx.run_until_parked();
     let hidden = body_h_hidden(&view, &mut cx);
@@ -7649,7 +7682,7 @@ async fn the_arrow_keys_scroll_the_body_sideways_and_clamp(cx: &mut TestAppConte
         "right stops at the end of the content"
     );
 
-    cx.simulate_keystrokes("home");
+    cx.press("home");
     cx.run_until_parked();
     assert_eq!(body_h_offset(&view, &mut cx), 0., "home returns to column zero");
 }
@@ -7671,9 +7704,9 @@ async fn arrow_keys_in_the_url_bar_still_move_its_caret(cx: &mut TestAppContext)
     let wide = format!(r#"{{"k":"{}"}}"#, "x".repeat(400));
     let (view, mut cx) = respond_with(cx, "application/json", wide);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("abc");
-    cx.simulate_keystrokes("left");
+    cx.press("left");
     cx.simulate_input("X");
     cx.run_until_parked();
 
@@ -7742,7 +7775,7 @@ async fn the_scroll_bar_sits_at_the_bottom_and_stays_put_while_scrolling(
     let thumb_before = cx.debug_bounds("h-scroll-thumb").expect("the thumb").left();
     focus_response(&mut cx);
     for _ in 0..6 {
-        cx.simulate_keystrokes("right");
+        cx.press("right");
     }
     cx.run_until_parked();
 
@@ -7785,7 +7818,7 @@ async fn a_long_header_value_wraps_instead_of_being_cut_off(cx: &mut TestAppCont
     // this tab all along — it is not virtualized, so a variable row height costs nothing.
     let (view, mut cx) = respond_with_header(cx, &"e".repeat(400));
 
-    cx.simulate_keystrokes("alt-r");
+    cx.press("alt-r");
     cx.run_until_parked();
     assert_eq!(response_view(&view, &mut cx), ResponseView::Headers);
 
@@ -7825,9 +7858,9 @@ async fn a_hand_scroll_in_the_editor_survives_the_next_paint(cx: &mut TestAppCon
     // than a read of the handler's own write.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     cx.simulate_input(&"x".repeat(400));
-    cx.simulate_keystrokes("ctrl-home");
+    cx.press("ctrl-home");
     cx.run_until_parked();
 
     let editor = cx.debug_bounds("body-editor").expect("the body editor");
@@ -7861,7 +7894,7 @@ async fn a_sideways_swipe_in_the_editor_does_not_drift_vertically(cx: &mut TestA
     };
     cx.update(|_, cx| view.update(cx, |view, cx| view.load(spec, cx)));
 
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     cx.run_until_parked();
 
     // Scroll down first, so there is room to drift in *either* direction.
@@ -7902,13 +7935,13 @@ async fn folding_shrinks_the_scroll_region_and_pulls_the_view_back(cx: &mut Test
     assert!(wide > 0., "the long value must overflow to begin with");
 
     for _ in 0..40 {
-        cx.simulate_keystrokes("right");
+        cx.press("right");
     }
     cx.run_until_parked();
     assert!(body_h_offset(&view, &mut cx) < 0., "and we must be scrolled into it");
 
     // Fold everything. The long value is now inside a collapsed container and off screen.
-    cx.simulate_keystrokes("alt-f");
+    cx.press("alt-f");
     cx.run_until_parked();
 
     assert!(
@@ -7936,14 +7969,14 @@ fn body_find_position(
 
 /// Open the body bar and type a query into it.
 fn find_in_body(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext, query: &str) {
-    cx.simulate_keystrokes("ctrl-b");
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-b");
+    cx.press("ctrl-f");
     cx.run_until_parked();
     assert!(
         cx.update(|_, cx| view.read(cx).is_searching_body()),
         "ctrl-f in the body editor must open the body's bar"
     );
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input(query);
     cx.run_until_parked();
 }
@@ -7955,7 +7988,7 @@ async fn ctrl_f_finds_in_whatever_you_are_looking_at(cx: &mut TestAppContext) {
     // either leave the body unsearchable or steal `ctrl-f` from the response everywhere.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-b ctrl-f");
+    cx.press("ctrl-b ctrl-f");
     cx.run_until_parked();
     assert!(
         cx.update(|_, cx| view.read(cx).is_searching_body()),
@@ -7966,10 +7999,10 @@ async fn ctrl_f_finds_in_whatever_you_are_looking_at(cx: &mut TestAppContext) {
         "and must not have opened the response's bar as well"
     );
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-l ctrl-f");
+    cx.press("ctrl-l ctrl-f");
     cx.run_until_parked();
     assert!(
         cx.update(|_, cx| view.read(cx).is_searching()),
@@ -7998,7 +8031,7 @@ async fn the_first_body_match_is_selected_without_pressing_enter(cx: &mut TestAp
     find_in_body(&view, &mut cx, "only");
     assert_eq!(body_find_position(&view, &mut cx), Some((1, 1)));
 
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     cx.simulate_input("X");
     cx.run_until_parked();
     assert_eq!(
@@ -8037,7 +8070,7 @@ async fn a_match_far_down_the_body_is_scrolled_to(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // Back to the top, so any scroll below is the search's doing.
-    cx.simulate_keystrokes("ctrl-home");
+    cx.press("ctrl-home");
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_, cx| f32::from(view.read(cx).http().unwrap().body_editor.read(cx).vertical_offset())),
@@ -8062,13 +8095,13 @@ async fn stepping_a_body_match_selects_it(cx: &mut TestAppContext) {
     find_in_body(&view, &mut cx, r#""a""#);
     assert_eq!(body_find_position(&view, &mut cx), Some((1, 2)));
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     assert_eq!(body_find_position(&view, &mut cx), Some((2, 2)));
 
     // Selecting the match is observable through the editor: replacing the selection is what
     // typing does, so the caret must be sitting on the second `"a"` and not the first.
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     cx.simulate_input("X");
     cx.run_until_parked();
     assert_eq!(
@@ -8087,9 +8120,9 @@ async fn replace_rewrites_the_current_match_only(cx: &mut TestAppContext) {
     assert_eq!(body_find_position(&view, &mut cx), Some((1, 2)));
 
     // Tab from the query into the replace box, which is the only way to reach it by keyboard.
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("server");
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -8114,9 +8147,9 @@ async fn replace_all_rewrites_every_match_even_when_lengths_change(cx: &mut Test
     find_in_body(&view, &mut cx, r#""a""#);
     assert_eq!(body_find_position(&view, &mut cx), Some((1, 3)));
 
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input(r#""alpha""#);
-    cx.simulate_keystrokes("ctrl-alt-enter");
+    cx.press("ctrl-alt-enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -8134,14 +8167,14 @@ async fn a_replace_all_undoes_in_one_press(cx: &mut TestAppContext) {
     author_body(&mut cx, r#"{"a":1,"a":2}"#);
 
     find_in_body(&view, &mut cx, r#""a""#);
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input(r#""z""#);
-    cx.simulate_keystrokes("ctrl-alt-enter");
+    cx.press("ctrl-alt-enter");
     cx.run_until_parked();
     assert_eq!(body_text(&view, &mut cx), r#"{"z":1,"z":2}"#);
 
-    cx.simulate_keystrokes("ctrl-b");
-    cx.simulate_keystrokes("ctrl-z");
+    cx.press("ctrl-b");
+    cx.press("ctrl-z");
     cx.run_until_parked();
     assert_eq!(
         body_text(&view, &mut cx),
@@ -8159,7 +8192,7 @@ async fn escape_closes_the_body_bar_without_cancelling_the_request(cx: &mut Test
     author_body(&mut cx, r#"{"a":1}"#);
     find_in_body(&view, &mut cx, "a");
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert!(
         !cx.update(|_, cx| view.read(cx).is_searching_body()),
@@ -8198,9 +8231,9 @@ async fn the_editors_colouring_follows_the_body_kind(cx: &mut TestAppContext) {
     );
 
     // Switch to plain text through the real picker, the way a person would.
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("text");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_, cx| view.read(cx).body_kind()),
@@ -8212,9 +8245,9 @@ async fn the_editors_colouring_follows_the_body_kind(cx: &mut TestAppContext) {
         "plain text is not JSON and must not be lexed as it"
     );
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("json");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     assert!(
         highlighting(&view, &mut cx),
@@ -8293,9 +8326,9 @@ async fn the_editor_cannot_be_scrolled_past_its_longest_line(cx: &mut TestAppCon
     // could be pushed arbitrarily far off to the left into blank space.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-b");
+    cx.press("ctrl-b");
     cx.simulate_input(&"x".repeat(120));
-    cx.simulate_keystrokes("ctrl-home");
+    cx.press("ctrl-home");
     cx.run_until_parked();
 
     let editor = cx.debug_bounds("body-editor").expect("the body editor");
@@ -8325,16 +8358,16 @@ async fn a_raw_body_copies_the_whole_line_and_refuses_a_path(cx: &mut TestAppCon
     let long = "x".repeat(zuno_core::lines::MAX_DISPLAY_LINE * 2);
     let url = serve_typed_owned("text/plain", format!("alpha\n{long}"));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     wait_for_body(&view, &mut cx);
     focus_response(&mut cx);
 
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(selected_row(&view, &mut cx), Some(1), "the long line");
 
-    cx.simulate_keystrokes("ctrl-c");
+    cx.press("ctrl-c");
     cx.run_until_parked();
     assert_eq!(
         clipboard_text(&mut cx).as_deref(),
@@ -8342,7 +8375,7 @@ async fn a_raw_body_copies_the_whole_line_and_refuses_a_path(cx: &mut TestAppCon
         "the whole line, not the 4KB the viewer draws"
     );
 
-    cx.simulate_keystrokes("alt-c");
+    cx.press("alt-c");
     cx.run_until_parked();
     let status = buffer_status(&view, &mut cx);
     assert!(
@@ -8361,11 +8394,11 @@ async fn ctrl_shift_c_copies_the_response_body_verbatim(cx: &mut TestAppContext)
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"a\":1,\"b\":[2,3]}",
     );
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
 
-    cx.simulate_keystrokes("ctrl-shift-c");
+    cx.press("ctrl-shift-c");
     assert_eq!(
         clipboard_text(&mut cx).as_deref(),
         Some(BODY),
@@ -8389,11 +8422,11 @@ async fn copying_a_binary_response_points_at_saving_instead(cx: &mut TestAppCont
         b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\n\r\n\xff\xfe\xfd\xfc",
     );
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
 
-    cx.simulate_keystrokes("ctrl-shift-c");
+    cx.press("ctrl-shift-c");
     let status = cx
         .update(|_, cx| view.read(cx).status.clone())
         .expect("a status");
@@ -8404,7 +8437,7 @@ async fn copying_a_binary_response_points_at_saving_instead(cx: &mut TestAppCont
 #[gpui::test]
 async fn copying_with_no_response_says_so(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-shift-c");
+    cx.press("ctrl-shift-c");
 
     let status = cx.update(|_, cx| view.read(cx).status.clone());
     assert!(
@@ -8421,15 +8454,15 @@ async fn copying_while_browsing_history_copies_the_run_on_screen(cx: &mut TestAp
     let (_, view, mut cx) = boot(cx, None, None);
     let url = serve_sequence(&[(200, r#"{"older":1}"#), (201, r#"{"newer":2}"#)]);
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     send_and_wait(&mut cx, &view, 201);
 
-    cx.simulate_keystrokes("ctrl-h down enter");
+    cx.press("ctrl-h down enter");
     assert_eq!(viewing(&view, &mut cx), 1);
 
-    cx.simulate_keystrokes("ctrl-shift-c");
+    cx.press("ctrl-shift-c");
     assert_eq!(
         clipboard_text(&mut cx).as_deref(),
         Some(r#"{"older":1}"#),
@@ -8610,7 +8643,7 @@ async fn a_multipart_body_survives_a_curl_import(cx: &mut TestAppContext) {
         &mut cx,
         "curl https://api.test/upload -F name=zuno -F file=@/tmp/payload.bin",
     );
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
 
     let (_, spec) = tabs_of(&window, &mut cx);
@@ -8629,9 +8662,9 @@ async fn saving_a_request_does_not_overwrite_an_imported_body(cx: &mut TestAppCo
     let (_, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
     put_on_clipboard(&mut cx, "curl https://api.test/upload -F name=zuno");
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     let bytes = std::fs::read(root.join("upload.json")).expect("saved file");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
@@ -8642,7 +8675,7 @@ async fn saving_a_request_does_not_overwrite_an_imported_body(cx: &mut TestAppCo
     );
 
     // And it round-trips: reopening must not lose it either.
-    cx.simulate_keystrokes("ctrl-w");
+    cx.press("ctrl-w");
     let reopened = zuno_core::collection::read(&root.join("upload.json")).expect("read");
     assert!(matches!(reopened.http().unwrap().body, Body::Multipart(_)));
 
@@ -8659,7 +8692,7 @@ async fn an_imported_binary_body_arrives_editable(cx: &mut TestAppContext) {
         &mut cx,
         "curl https://api.test/blob -X PUT --data-binary @/tmp/payload.bin",
     );
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
 
     let (_, spec) = tabs_of(&window, &mut cx);
@@ -8704,7 +8737,7 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
     // Empty is a real body type, not an absence to be papered over: typing into the editor
     // is how you get a raw body from here.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     // The *new* buffer, not the one `boot` returned — `ctrl-t` opens one.
     let view = active_view(&window, &mut cx);
 
@@ -8793,7 +8826,7 @@ async fn a_body_less_request_says_none_rather_than_a_retained_sub_kind(cx: &mut 
     // `body_label` folded `Empty` in with `Raw` and returned `body_kind`, which defaults to
     // Json — so a fresh buffer's chip read "JSON" next to a pane reading "No body".
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
 
     assert_eq!(
@@ -8815,8 +8848,8 @@ async fn the_body_type_picker_marks_none_as_current_on_a_fresh_buffer(cx: &mut T
     // existing coverage boots the sample request, whose raw JSON body makes the old label
     // accidentally correct.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-t");
+    cx.press("ctrl-shift-b");
 
     let rows = picker_rows(&window, &mut cx);
     let none = rows.iter().find(|row| row.starts_with("None")).expect("a None row");
@@ -8838,7 +8871,7 @@ async fn a_form_body_reaches_the_wire_urlencoded(cx: &mut TestAppContext) {
     // A *fresh* buffer, because the sample ships `Content-Type: application/json` and an
     // explicit header outranks the derived one — leaving it would send a urlencoded body
     // labelled JSON. That precedence has its own test.
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
     assert!(
         spec_of(&view, &mut cx).headers.is_empty(),
@@ -8847,18 +8880,18 @@ async fn a_form_body_reaches_the_wire_urlencoded(cx: &mut TestAppContext) {
     cx.simulate_input(&url);
 
     // Ctrl+Shift+F switches to a form and adds a field in one go.
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("grant_type");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("client_credentials");
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("scope");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("read write");
 
     assert_eq!(spec_of(&view, &mut cx).http().unwrap().body.label(), "Form");
 
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -8879,16 +8912,16 @@ async fn a_disabled_form_field_is_left_out(cx: &mut TestAppContext) {
     // Same contract as headers and query rows: muting a field must not lose what you typed.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("keep");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("yes");
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("drop");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("no");
     // Focus is in the second row, so this mutes it.
-    cx.simulate_keystrokes("alt-t");
+    cx.press("alt-t");
 
     let spec = spec_of(&view, &mut cx);
     let Body::Form(fields) = &spec.http().unwrap().body else {
@@ -8904,13 +8937,13 @@ async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     let (session, root) = scratch_collection("form-roundtrip");
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/token");
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("grant_type");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("password");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     let bytes = std::fs::read(root.join("token.json")).expect("saved");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
@@ -8920,13 +8953,13 @@ async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     assert_eq!(fields[0].name, "grant_type");
 
     // And reopening gives back an *editable* form, not a preserved blob.
-    cx.simulate_keystrokes("ctrl-w");
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-w");
+    cx.press("ctrl-p");
     wait_for(&mut cx, "the scanned request", |cx| {
         picker_rows(&window, cx).iter().any(|r| r.contains("token")).then_some(())
     });
     cx.simulate_input("token");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let reopened = active_view(&window, &mut cx);
     assert_eq!(
@@ -8934,7 +8967,7 @@ async fn a_form_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
         crate::request_view::BodyType::Form,
         "a reopened form must come back as an editable form"
     );
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("extra");
     let spec_8185 = spec_of(&reopened, &mut cx);
     let Body::Form(fields) = &spec_8185.http().unwrap().body else {
@@ -8953,22 +8986,22 @@ async fn choosing_none_sends_no_body_and_switching_back_is_lossless(cx: &mut Tes
     // back restores it rather than silently emptying your work.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-f");
+    cx.press("ctrl-shift-f");
     cx.simulate_input("field");
     assert_eq!(spec_of(&view, &mut cx).http().unwrap().body.label(), "Form");
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("none");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert!(
         matches!(spec_of(&view, &mut cx).http().unwrap().body, Body::Empty),
         "None must send nothing, whatever the editors still hold: {:?}",
         spec_of(&view, &mut cx).http().unwrap().body
     );
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("form");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     let spec_8217 = spec_of(&view, &mut cx);
     let Body::Form(fields) = &spec_8217.http().unwrap().body else {
         panic!("expected the form back");
@@ -8984,9 +9017,9 @@ async fn a_stale_content_type_header_is_reported_not_silently_obeyed(cx: &mut Te
     // out urlencoded while declaring itself JSON, and the server misparses it.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("form");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let status = cx
         .update(|_, cx| view.read(cx).status.clone())
@@ -8995,9 +9028,9 @@ async fn a_stale_content_type_header_is_reported_not_silently_obeyed(cx: &mut Te
     assert!(status.contains("x-www-form-urlencoded"), "should name what was expected: {status:?}");
 
     // And no false alarm when they agree.
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("json");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert!(
         cx.update(|_, cx| view.read(cx).conflicting_content_type(cx)).is_none(),
         "application/json and a JSON body do not conflict"
@@ -9014,7 +9047,7 @@ async fn an_imported_multipart_body_arrives_editable(cx: &mut TestAppContext) {
         &mut cx,
         "curl https://api.test/upload -F caption=hello -F avatar=@/tmp/pic.png",
     );
-    cx.simulate_keystrokes("ctrl-shift-v");
+    cx.press("ctrl-shift-v");
     cx.run_until_parked();
 
     let imported = active_view(&window, &mut cx);
@@ -9049,7 +9082,7 @@ async fn the_body_type_picker_offers_every_authorable_type(cx: &mut TestAppConte
     // unreachable no matter how many times you pressed it. Every `Body` variant is now here,
     // which is what let `preserved_body` go.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
 
     let rows = picker_rows(&window, &mut cx);
     let labels: Vec<&str> = rows
@@ -9072,9 +9105,9 @@ async fn a_binary_body_with_no_file_chosen_sends_nothing(cx: &mut TestAppContext
     // sending nothing is the honest reading of "no file chosen".
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("binary");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "Binary");
     assert!(
@@ -9097,7 +9130,7 @@ async fn a_chosen_file_becomes_the_body_and_its_bytes_reach_the_wire(cx: &mut Te
 
     // A fresh buffer: the sample's `Content-Type: application/json` header would otherwise
     // mislabel the upload, and `build.rs` sends no type of its own for binary.
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
     cx.simulate_input(&url);
 
@@ -9110,7 +9143,7 @@ async fn a_chosen_file_becomes_the_body_and_its_bytes_reach_the_wire(cx: &mut Te
         "the path should become the body"
     );
 
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the response", |cx| {
         cx.update(|_, cx| view.read(cx).response.clone())
     });
@@ -9145,7 +9178,7 @@ async fn a_missing_body_file_is_reported_rather_than_sent_empty(cx: &mut TestApp
     let (window, _, mut cx) = boot(cx, None, None);
     let url = serve_once(OK_JSON);
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
     cx.simulate_input(&url);
 
@@ -9154,7 +9187,7 @@ async fn a_missing_body_file_is_reported_rather_than_sent_empty(cx: &mut TestApp
     let missing = std::env::temp_dir().join("zuno-no-such-body-file.bin");
     assert!(!missing.exists(), "the test needs this to not exist");
     cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(missing.clone(), cx)));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let error = wait_for(&mut cx, "the failure", |cx| {
         cx.update(|_, cx| view.read(cx).error.clone())
@@ -9173,24 +9206,24 @@ async fn a_binary_body_survives_a_save_and_reopen_as_editable(cx: &mut TestAppCo
     let (session, root) = scratch_collection("binary-roundtrip");
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/upload");
     let file = PathBuf::from("/tmp/zuno-example-payload.bin");
     let view = active_view(&window, &mut cx);
     cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(file.clone(), cx)));
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     let bytes = std::fs::read(root.join("upload.json")).expect("saved");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
     assert_eq!(saved.http().unwrap().body, Body::Binary(file.clone()));
 
-    cx.simulate_keystrokes("ctrl-w");
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-w");
+    cx.press("ctrl-p");
     wait_for(&mut cx, "the scanned request", |cx| {
         picker_rows(&window, cx).iter().any(|r| r.contains("upload")).then_some(())
     });
     cx.simulate_input("upload");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let reopened = active_view(&window, &mut cx);
     assert_eq!(
@@ -9213,20 +9246,20 @@ async fn switching_from_binary_keeps_the_path_for_switching_back(cx: &mut TestAp
     // Same rule as the editor's text and the form rows: what you can still see is kept, so
     // a mistaken type change isn't destructive.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
 
     let file = PathBuf::from("/tmp/zuno-keepme.bin");
     cx.update(|_, cx| view.update(cx, |view, cx| view.set_binary_path(file.clone(), cx)));
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("json");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "JSON");
 
-    cx.simulate_keystrokes("ctrl-shift-b");
+    cx.press("ctrl-shift-b");
     cx.simulate_input("binary");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     assert_eq!(
         spec_of(&view, &mut cx).http().unwrap().body,
         Body::Binary(file),
@@ -9238,9 +9271,9 @@ async fn switching_from_binary_keeps_the_path_for_switching_back(cx: &mut TestAp
 async fn ctrl_shift_m_adds_a_part_and_switches_the_body(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("caption");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("hello");
 
     assert_eq!(cx.update(|_, cx| view.read(cx).body_label()), "Multipart");
@@ -9260,11 +9293,11 @@ async fn attaching_a_file_turns_a_part_into_a_file_part(cx: &mut TestAppContext)
     // path arriving — which is where the text/file distinction is decided.
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("avatar");
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("caption");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("hi");
 
     let file = PathBuf::from("/tmp/zuno-avatar.png");
@@ -9287,7 +9320,7 @@ async fn attaching_a_file_targets_the_focused_part_or_the_whole_body(cx: &mut Te
     // One verb, two meanings, decided by focus. This asserts the decision itself, since the
     // native dialog can't be opened in a test.
     let (window, _, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let view = active_view(&window, &mut cx);
 
     // No multipart body: the file would become the whole binary body.
@@ -9296,9 +9329,9 @@ async fn attaching_a_file_targets_the_focused_part_or_the_whole_body(cx: &mut Te
         None
     );
 
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("first");
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("second");
 
     // Focus is in the second part's name cell, so that's the one a file would attach to.
@@ -9313,11 +9346,11 @@ async fn attaching_a_file_targets_the_focused_part_or_the_whole_body(cx: &mut Te
 async fn a_disabled_part_is_left_out_but_kept(cx: &mut TestAppContext) {
     let (_, view, mut cx) = boot(cx, None, None);
 
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("keep");
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("drop");
-    cx.simulate_keystrokes("alt-t");
+    cx.press("alt-t");
 
     let spec_8563 = spec_of(&view, &mut cx);
     let Body::Multipart(fields) = &spec_8563.http().unwrap().body else {
@@ -9335,19 +9368,19 @@ async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     let (session, root) = scratch_collection("multipart-roundtrip");
     let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/v1/upload");
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("caption");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("hello");
-    cx.simulate_keystrokes("ctrl-shift-m");
+    cx.press("ctrl-shift-m");
     cx.simulate_input("avatar");
 
     let view = active_view(&window, &mut cx);
     let file = PathBuf::from("/tmp/zuno-pic.png");
     cx.update(|_, cx| view.update(cx, |view, cx| view.set_multipart_file(1, file.clone(), cx)));
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     let bytes = std::fs::read(root.join("upload.json")).expect("saved");
     let saved: RequestSpec = serde_json::from_slice(&bytes).expect("parse");
@@ -9358,13 +9391,13 @@ async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
     assert_eq!(fields[1].value, MultipartValue::File(file.clone()));
 
     // Reopen, and the file part must still be a file part rather than text holding a path.
-    cx.simulate_keystrokes("ctrl-w");
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-w");
+    cx.press("ctrl-p");
     wait_for(&mut cx, "the scanned request", |cx| {
         picker_rows(&window, cx).iter().any(|r| r.contains("upload")).then_some(())
     });
     cx.simulate_input("upload");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let reopened = active_view(&window, &mut cx);
     let marks = cx.update(|_, cx| {
@@ -9495,7 +9528,7 @@ async fn a_new_tab_is_scrolled_into_view_rather_than_appearing_off_screen(
             + 2
     });
     for _ in 0..needed {
-        cx.simulate_keystrokes("ctrl-t");
+        cx.press("ctrl-t");
     }
 
     // `wait_for` rather than `run_until_parked`: the reveal is eased over ~140ms through real
@@ -9525,26 +9558,26 @@ async fn closing_other_tabs_keeps_the_right_one(cx: &mut TestAppContext) {
     // Asserted by which buffer *survives*, since a handler that closed the wrong ones would
     // still leave a plausible count behind.
     let (window, first, mut cx) = boot(cx, None, None);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let second = active_view(&window, &mut cx);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let third = active_view(&window, &mut cx);
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
 
     // Land on the second of four, then close the other three.
     window
         .update(&mut cx, |workspace, _, _| workspace.tab_count())
         .expect("window");
-    cx.simulate_keystrokes("ctrl-shift-tab ctrl-shift-tab");
+    cx.press("ctrl-shift-tab ctrl-shift-tab");
     assert_eq!(
         active_view(&window, &mut cx).entity_id(),
         second.entity_id(),
         "the test needs to be standing on the second tab"
     );
 
-    cx.simulate_keystrokes("ctrl-k");
+    cx.press("ctrl-k");
     cx.simulate_input("Close other tabs");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -9596,7 +9629,7 @@ async fn switching_buffers_moves_the_panel_selection_to_that_request(cx: &mut Te
     );
 
     // The direction that was missing: move buffers by keyboard, with the panel untouched.
-    cx.simulate_keystrokes("ctrl-shift-tab");
+    cx.press("ctrl-shift-tab");
     cx.run_until_parked();
 
     assert_eq!(
@@ -9626,7 +9659,7 @@ async fn a_scratch_buffer_leaves_the_panel_selection_where_it_was(cx: &mut TestA
     cx.simulate_click(row.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.run_until_parked();
 
     assert_eq!(
@@ -9779,9 +9812,9 @@ async fn left_steps_out_of_a_directory_before_folding_it(cx: &mut TestAppContext
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.press("ctrl-shift-e");
     // billing → invoices, so the selection is inside the directory about to be folded.
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -9790,7 +9823,7 @@ async fn left_steps_out_of_a_directory_before_folding_it(cx: &mut TestAppContext
     );
 
     // `left` on a request steps out to its parent; `left` again folds it.
-    cx.simulate_keystrokes("left left");
+    cx.press("left left");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -9800,7 +9833,7 @@ async fn left_steps_out_of_a_directory_before_folding_it(cx: &mut TestAppContext
     );
 
     // And stepping from there goes to the *next visible* row, not back into the folded subtree.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -9827,7 +9860,7 @@ async fn a_rescan_keeps_the_selection_on_the_same_request(cx: &mut TestAppContex
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down");
+    cx.press("ctrl-shift-e down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -9836,9 +9869,9 @@ async fn a_rescan_keeps_the_selection_on_the_same_request(cx: &mut TestAppContex
     );
 
     // Saving rescans, and this row lands above the selected one.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://a.test/alpha");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     wait_for(&mut cx, "the new request in the tree", |cx| {
         (tree_rows(&window, cx).len() == 2).then_some(())
     });
@@ -9870,8 +9903,8 @@ async fn opening_a_request_from_the_panel_leaves_the_keymap_alive(cx: &mut TestA
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e");
-    cx.simulate_keystrokes("down enter");
+    cx.press("ctrl-shift-e");
+    cx.press("down enter");
     cx.run_until_parked();
 
     let opened = active_view(&window, &mut cx);
@@ -9881,7 +9914,7 @@ async fn opening_a_request_from_the_panel_leaves_the_keymap_alive(cx: &mut TestA
     );
 
     // The panel still owns the keyboard: `down` moves its selection rather than doing nothing.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -9907,8 +9940,8 @@ async fn hiding_the_panel_leaves_typing_somewhere_to_land(cx: &mut TestAppContex
     // `activate` call and watching this fail.
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-shift-e"); // focus the panel
-    cx.simulate_keystrokes("ctrl-shift-e"); // hide it
+    cx.press("ctrl-shift-e"); // focus the panel
+    cx.press("ctrl-shift-e"); // hide it
     cx.run_until_parked();
 
     // Typing must land somewhere. This is the observable half: with focus left on the
@@ -9931,8 +9964,8 @@ async fn a_dismissed_panel_stays_dismissed_after_a_restart(cx: &mut TestAppConte
 
     {
         let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
-        cx.simulate_keystrokes("ctrl-shift-e"); // focus
-        cx.simulate_keystrokes("ctrl-shift-e"); // hide
+        cx.press("ctrl-shift-e"); // focus
+        cx.press("ctrl-shift-e"); // hide
         assert!(
             !window
                 .update(&mut cx, |workspace, _, _| workspace.panel_is_visible())
@@ -9942,9 +9975,9 @@ async fn a_dismissed_panel_stays_dismissed_after_a_restart(cx: &mut TestAppConte
 
         // A send is the save point that writes the session envelope.
         let served = serve_once(OK_JSON);
-        cx.simulate_keystrokes("ctrl-l ctrl-a");
+        cx.press("ctrl-l ctrl-a");
         cx.simulate_input(&served);
-        cx.simulate_keystrokes("ctrl-enter");
+        cx.press("ctrl-enter");
         cx.run_until_parked();
     }
 
@@ -9970,10 +10003,10 @@ async fn saving_a_request_makes_it_appear_in_the_panel(cx: &mut TestAppContext) 
     cx.run_until_parked();
     assert!(tree_rows(&window, &mut cx).is_empty(), "nothing saved yet");
 
-    cx.simulate_keystrokes("ctrl-l");
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-l");
+    cx.press("ctrl-a");
     cx.simulate_input("https://a.test/fresh");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
 
     wait_for(&mut cx, "the saved request in the tree", |cx| {
         tree_rows(&window, cx)
@@ -9999,8 +10032,8 @@ async fn deleting_a_request_asks_before_it_removes_anything(cx: &mut TestAppCont
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down");
-    cx.simulate_keystrokes("delete");
+    cx.press("ctrl-shift-e down");
+    cx.press("delete");
     cx.run_until_parked();
     assert!(
         root.join("posts.json").is_file(),
@@ -10008,7 +10041,7 @@ async fn deleting_a_request_asks_before_it_removes_anything(cx: &mut TestAppCont
     );
 
     // Escaping out of the confirmation must leave it alone too.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     assert!(root.join("posts.json").is_file(), "escape must keep the file");
     assert_eq!(tree_rows(&window, &mut cx).len(), 1);
@@ -10029,7 +10062,7 @@ async fn confirming_the_delete_removes_the_file_and_the_row(cx: &mut TestAppCont
     });
 
     // First row is `doomed`, since the tree is alphabetical within a level.
-    cx.simulate_keystrokes("ctrl-shift-e down");
+    cx.press("ctrl-shift-e down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -10039,7 +10072,7 @@ async fn confirming_the_delete_removes_the_file_and_the_row(cx: &mut TestAppCont
 
     // `delete` asks; `enter` takes the first row of the confirmation, which is the destructive
     // one. The "Keep it" row below it is what makes that safe to be the default.
-    cx.simulate_keystrokes("delete enter");
+    cx.press("delete enter");
     wait_for(&mut cx, "the row to disappear", |cx| {
         (tree_rows(&window, cx).len() == 1).then_some(())
     });
@@ -10075,7 +10108,7 @@ async fn deleting_a_request_that_is_open_stops_ctrl_s_from_recreating_it(
     });
 
     // Open it, so a buffer is holding the path.
-    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.press("ctrl-shift-e down enter");
     cx.run_until_parked();
     let opened = active_view(&window, &mut cx);
     assert_eq!(
@@ -10083,7 +10116,7 @@ async fn deleting_a_request_that_is_open_stops_ctrl_s_from_recreating_it(
         Some(root.join("posts.json"))
     );
 
-    cx.simulate_keystrokes("delete enter");
+    cx.press("delete enter");
     wait_for(&mut cx, "the row to disappear", |cx| {
         tree_rows(&window, cx).is_empty().then_some(())
     });
@@ -10099,9 +10132,9 @@ async fn deleting_a_request_that_is_open_stops_ctrl_s_from_recreating_it(
     // And saving writes a *fresh* file rather than resurrecting the deleted one at its old path.
     // Both land on `posts.json` here because the name derives from the URL, so the assertion
     // that distinguishes them is `path` above, not the filename.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://a.test/rewritten");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
     assert!(
         !root.join("posts.json").exists(),
@@ -10128,18 +10161,18 @@ async fn renaming_a_folder_moves_the_buffers_inside_it(cx: &mut TestAppContext) 
     });
 
     // Open the request so a buffer points inside the folder, then select the folder.
-    cx.simulate_keystrokes("ctrl-shift-e down down enter");
+    cx.press("ctrl-shift-e down down enter");
     cx.run_until_parked();
-    cx.simulate_keystrokes("up");
+    cx.press("up");
     assert_eq!(
         window.update(&mut cx, |w, _, _| w.tree_selection()).expect("window"),
         Some("billing".to_string()),
         "the folder must be selected for this to test anything"
     );
 
-    cx.simulate_keystrokes("f2");
+    cx.press("f2");
     cx.simulate_input("finance");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     wait_for(&mut cx, "the rescan", |cx| {
         tree_rows(&window, cx)
             .iter()
@@ -10175,12 +10208,12 @@ async fn deleting_a_folder_removes_it_and_the_buffers_forget(cx: &mut TestAppCon
         (tree_rows(&window, cx).len() == 2).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down down enter");
+    cx.press("ctrl-shift-e down down enter");
     cx.run_until_parked();
-    cx.simulate_keystrokes("up delete");
+    cx.press("up delete");
     cx.run_until_parked();
     // The confirmation's destructive row is first; `enter` takes it.
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     wait_for(&mut cx, "the rescan", |cx| {
         tree_rows(&window, cx).is_empty().then_some(())
     });
@@ -10214,7 +10247,7 @@ async fn a_directory_offers_delete_but_not_the_file_only_verbs(cx: &mut TestAppC
         (tree_rows(&window, cx).len() == 2).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down");
+    cx.press("ctrl-shift-e down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -10223,7 +10256,7 @@ async fn a_directory_offers_delete_but_not_the_file_only_verbs(cx: &mut TestAppC
         "the directory must be the selected row for this to test anything"
     );
 
-    cx.simulate_keystrokes("delete");
+    cx.press("delete");
     cx.run_until_parked();
 
     // `delete` asks first, so a menu is exactly what should be open.
@@ -10242,7 +10275,7 @@ async fn a_directory_offers_delete_but_not_the_file_only_verbs(cx: &mut TestAppC
         labels.iter().any(|row| row == "Delete billing and 1 request"),
         "the confirmation must say how much goes with it, got {labels:?}"
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     // The right-click menu offers what works and leaves out what cannot.
@@ -10339,14 +10372,14 @@ async fn renaming_moves_the_file_and_the_open_buffer_follows_it(cx: &mut TestApp
     });
 
     // Open it first, so a buffer is holding the path.
-    cx.simulate_keystrokes("ctrl-shift-e down enter");
+    cx.press("ctrl-shift-e down enter");
     cx.run_until_parked();
     let opened = active_view(&window, &mut cx);
 
-    cx.simulate_keystrokes("f2");
+    cx.press("f2");
     // The box opens with the name selected, so typing replaces it rather than appending.
     cx.simulate_input("articles");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     wait_for(&mut cx, "the renamed row", |cx| {
         tree_rows(&window, cx)
             .iter()
@@ -10363,7 +10396,7 @@ async fn renaming_moves_the_file_and_the_open_buffer_follows_it(cx: &mut TestApp
     );
 
     // And saving overwrites the renamed file rather than recreating the old one beside it.
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
     assert!(!root.join("posts.json").exists(), "Ctrl+S recreated the pre-rename file");
 
@@ -10381,9 +10414,9 @@ async fn escape_abandons_a_rename_and_leaves_the_file_alone(cx: &mut TestAppCont
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down f2");
+    cx.press("ctrl-shift-e down f2");
     cx.simulate_input("articles");
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     assert!(root.join("posts.json").is_file(), "escape must not rename");
@@ -10395,7 +10428,7 @@ async fn escape_abandons_a_rename_and_leaves_the_file_alone(cx: &mut TestAppCont
 
     // The panel has the keyboard back — asserted through a later keystroke, since the rename
     // box owned it and focus must return when the box goes away.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -10421,9 +10454,9 @@ async fn renaming_to_nothing_is_refused_rather_than_leaving_a_nameless_file(
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e down f2");
+    cx.press("ctrl-shift-e down f2");
     // The name arrives selected, so one backspace clears it.
-    cx.simulate_keystrokes("backspace enter");
+    cx.press("backspace enter");
     cx.run_until_parked();
 
     assert!(root.join("posts.json").is_file(), "the file must keep its name");
@@ -10452,8 +10485,8 @@ async fn duplicating_adds_a_row_without_opening_a_tab(cx: &mut TestAppContext) {
     let row = cx.debug_bounds("collection-row-0").expect("the request row");
     right_click(&mut cx, row.center());
     let steps = menu_steps_to(&window, &mut cx, "Duplicate");
-    cx.simulate_keystrokes(&"down ".repeat(steps));
-    cx.simulate_keystrokes("enter");
+    cx.press(&"down ".repeat(steps));
+    cx.press("enter");
     wait_for(&mut cx, "the duplicate", |cx| {
         (tree_rows(&window, cx).len() == 2).then_some(())
     });
@@ -10491,8 +10524,8 @@ async fn the_two_copy_verbs_give_absolute_and_collection_relative_paths(cx: &mut
     let row = cx.debug_bounds("collection-row-1").expect("the request row");
     right_click(&mut cx, row.center());
     let steps = menu_steps_to(&window, &mut cx, "Copy path");
-    cx.simulate_keystrokes(&"down ".repeat(steps));
-    cx.simulate_keystrokes("enter");
+    cx.press(&"down ".repeat(steps));
+    cx.press("enter");
     cx.run_until_parked();
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
@@ -10502,8 +10535,8 @@ async fn the_two_copy_verbs_give_absolute_and_collection_relative_paths(cx: &mut
     let row = cx.debug_bounds("collection-row-1").expect("the request row");
     right_click(&mut cx, row.center());
     let steps = menu_steps_to(&window, &mut cx, "Copy relative path");
-    cx.simulate_keystrokes(&"down ".repeat(steps));
-    cx.simulate_keystrokes("enter");
+    cx.press(&"down ".repeat(steps));
+    cx.press("enter");
     cx.run_until_parked();
     assert_eq!(
         cx.read_from_clipboard().and_then(|item| item.text()),
@@ -10687,7 +10720,7 @@ async fn the_tab_strip_belongs_to_the_editor_area_not_the_window(cx: &mut TestAp
     // buffer, so there is none yet.
     let before = cx.debug_bounds("collection-panel").expect("the panel");
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     cx.run_until_parked();
 
     let after = cx.debug_bounds("collection-panel").expect("the panel");
@@ -10731,16 +10764,16 @@ async fn a_new_folder_is_created_where_the_selection_points(cx: &mut TestAppCont
     });
 
     // With the `billing` directory selected, the folder lands *inside* it.
-    cx.simulate_keystrokes("ctrl-shift-e down");
+    cx.press("ctrl-shift-e down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
             .expect("window"),
         Some("billing".to_string())
     );
-    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.press("ctrl-shift-n");
     cx.simulate_input("EU VAT");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     // Slugged, like every other name that reaches the filesystem from a text box.
@@ -10761,16 +10794,16 @@ async fn a_new_folder_is_created_where_the_selection_points(cx: &mut TestAppCont
     );
 
     // With a *request* selected it lands beside it, in the request's own parent.
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
             .expect("window"),
         Some("invoices".to_string())
     );
-    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.press("ctrl-shift-n");
     cx.simulate_input("drafts");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert!(
@@ -10792,16 +10825,16 @@ async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e ctrl-shift-n");
+    cx.press("ctrl-shift-e ctrl-shift-n");
     cx.simulate_input("nope");
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     assert!(!root.join("nope").exists(), "escape must not create the folder");
 
     // And the panel has the keyboard back — asserted through a later keystroke, since the name
     // box owned it.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -10828,22 +10861,22 @@ async fn moving_a_request_relocates_its_file_and_the_open_buffer(cx: &mut TestAp
     });
 
     // Rows: billing(0), eu(1), invoices(2). Open the root-level one so a buffer holds its path.
-    cx.simulate_keystrokes("ctrl-shift-e down down down");
+    cx.press("ctrl-shift-e down down down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
             .expect("window"),
         Some("invoices".to_string())
     );
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
     let opened = active_view(&window, &mut cx);
 
     let row = cx.debug_bounds("collection-row-2").expect("the request row");
     right_click(&mut cx, row.center());
     let steps = menu_steps_to(&window, &mut cx, "Move to…");
-    cx.simulate_keystrokes(&"down ".repeat(steps));
-    cx.simulate_keystrokes("enter");
+    cx.press(&"down ".repeat(steps));
+    cx.press("enter");
     cx.run_until_parked();
 
     // The picker lists `/` first, then `billing`. `visible_rows` is a test helper that always
@@ -10854,7 +10887,7 @@ async fn moving_a_request_relocates_its_file_and_the_open_buffer(cx: &mut TestAp
         ["/ — current folder", "billing — "],
         "the root must be offered, and the request's own folder marked rather than hidden"
     );
-    cx.simulate_keystrokes("down enter");
+    cx.press("down enter");
     // Polls the filesystem rather than app state, so the probe needs no context.
     wait_for(&mut cx, "the moved request", |_cx| {
         root.join("billing").join("invoices.json").is_file().then_some(())
@@ -10868,7 +10901,7 @@ async fn moving_a_request_relocates_its_file_and_the_open_buffer(cx: &mut TestAp
     );
 
     // And saving writes to the new location rather than recreating it at the root.
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
     assert!(
         !root.join("invoices.json").exists(),
@@ -10938,7 +10971,7 @@ async fn collapsing_everything_leaves_the_selection_somewhere_you_can_see(cx: &m
     });
 
     // Walk down to `create`, three levels deep inside `billing/invoices`.
-    cx.simulate_keystrokes("ctrl-shift-e down down down");
+    cx.press("ctrl-shift-e down down down");
     let selection =
         |cx: &mut VisualTestContext| window.update(cx, |w, _, _| w.tree_selection()).expect("window");
     assert_eq!(
@@ -10959,7 +10992,7 @@ async fn collapsing_everything_leaves_the_selection_somewhere_you_can_see(cx: &m
 
     // The consequence, and the half a reader would actually notice: `down` steps to the next
     // *visible* row. Left on the hidden `create`, this lands somewhere else entirely.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(
         selection(&mut cx).as_deref(),
         Some("users"),
@@ -10985,9 +11018,9 @@ async fn a_folder_you_just_created_can_be_moved_into(cx: &mut TestAppContext) {
         (!tree_rows(&window, cx).is_empty()).then_some(())
     });
 
-    cx.simulate_keystrokes("ctrl-shift-e ctrl-shift-n");
+    cx.press("ctrl-shift-e ctrl-shift-n");
     cx.simulate_input("billing");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     wait_for(&mut cx, "the new folder's row", |cx| {
         tree_rows(&window, cx)
             .iter()
@@ -10996,7 +11029,7 @@ async fn a_folder_you_just_created_can_be_moved_into(cx: &mut TestAppContext) {
     });
 
     // Select the request — rows are billing(0), invoices(1).
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
@@ -11007,8 +11040,8 @@ async fn a_folder_you_just_created_can_be_moved_into(cx: &mut TestAppContext) {
     let row = cx.debug_bounds("collection-row-1").expect("the request row");
     right_click(&mut cx, row.center());
     let steps = menu_steps_to(&window, &mut cx, "Move to…");
-    cx.simulate_keystrokes(&"down ".repeat(steps));
-    cx.simulate_keystrokes("enter");
+    cx.press(&"down ".repeat(steps));
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -11017,7 +11050,7 @@ async fn a_folder_you_just_created_can_be_moved_into(cx: &mut TestAppContext) {
         "the empty folder must be offered — moving a request in is what fills it"
     );
 
-    cx.simulate_keystrokes("down enter");
+    cx.press("down enter");
     wait_for(&mut cx, "the moved request", |_cx| {
         root.join("billing").join("invoices.json").is_file().then_some(())
     });
@@ -11056,10 +11089,10 @@ async fn importing_a_spec_from_a_file_fills_the_collection(cx: &mut TestAppConte
     let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     assert!(cx.debug_bounds("import-panel").is_some(), "the modal must open");
     cx.simulate_input(&spec.display().to_string());
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     wait_for(&mut cx, "the imported requests", |cx| {
         (tree_rows(&window, cx).len() >= 5).then_some(())
@@ -11113,9 +11146,9 @@ async fn importing_a_spec_from_a_url_goes_through_the_engine(cx: &mut TestAppCon
     let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.simulate_input(&served);
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     wait_for(&mut cx, "the fetched spec's requests", |cx| {
         (tree_rows(&window, cx).len() >= 5).then_some(())
@@ -11138,9 +11171,9 @@ async fn a_bad_spec_reports_in_the_dialog_and_leaves_it_open(cx: &mut TestAppCon
     let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.simulate_input(&not_a_spec.display().to_string());
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert!(
@@ -11153,7 +11186,7 @@ async fn a_bad_spec_reports_in_the_dialog_and_leaves_it_open(cx: &mut TestAppCon
     );
 
     // Escape still closes it — the binding is scoped to the field, which is what holds focus.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
     // Asserted through a later keystroke rather than through `debug_bounds`, whose `is_none`
     // reports the previous frame: typing must reach the URL bar again, which it can only do if
@@ -11207,36 +11240,36 @@ async fn the_new_folder_box_lands_as_the_first_row_inside_its_parent(cx: &mut Te
     };
 
     // Nothing selected: the root, so the box goes at the very top, flush left.
-    cx.simulate_keystrokes("ctrl-shift-e ctrl-shift-n");
+    cx.press("ctrl-shift-e ctrl-shift-n");
     assert_eq!(position(&mut cx), Some((0, 0)));
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // On `billing`, which has two children: past both of them, indented one level in.
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
             .expect("window"),
         Some("billing".to_string())
     );
-    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.press("ctrl-shift-n");
     assert_eq!(
         position(&mut cx),
         Some((1, 1)),
         "the box belongs immediately under billing, not after its children — a folder with a \
          screenful of requests would otherwise open the box off screen"
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // On a *request* inside billing: beside it, so the same place and the same indent.
-    cx.simulate_keystrokes("down down");
+    cx.press("down down");
     assert_eq!(
         window
             .update(&mut cx, |workspace, _, _| workspace.tree_selection())
             .expect("window"),
         Some("us".to_string())
     );
-    cx.simulate_keystrokes("ctrl-shift-n");
+    cx.press("ctrl-shift-n");
     assert_eq!(
         position(&mut cx),
         Some((1, 1)),
@@ -11263,7 +11296,7 @@ async fn a_long_label_is_shortened_on_screen_but_still_matches_in_full(cx: &mut 
     let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     wait_for(&mut cx, "the scanned request", |cx| {
         picker_rows(&window, cx)
             .iter()
@@ -11317,7 +11350,7 @@ async fn the_editor_lists_globals_first_then_every_environment(cx: &mut TestAppC
     std::fs::write(root.join("environments/prod.json"), r#"{"host":"prod.test"}"#).expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.press("ctrl-alt-e");
 
     let panel = env_panel(&window, &mut cx);
     // `scan` deliberately hides globals, because it cannot be *selected*. It can be edited,
@@ -11337,7 +11370,7 @@ async fn adding_a_variable_writes_it_to_the_committed_file(cx: &mut TestAppConte
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-e alt-down");
+    cx.press("ctrl-alt-e alt-down");
 
     let panel = env_panel(&window, &mut cx);
     assert_eq!(
@@ -11347,10 +11380,10 @@ async fn adding_a_variable_writes_it_to_the_committed_file(cx: &mut TestAppConte
 
     cx.dispatch_action(crate::actions::EnvNewVariable);
     cx.simulate_input("baseUrl");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("https://dev.test");
     // Closing is what persists — there is no discard, the way the settings panel has none.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     let written = env_file(&root, "dev.json");
     assert!(written.contains("baseUrl"), "{written}");
@@ -11370,11 +11403,11 @@ async fn marking_a_variable_secret_moves_it_to_the_gitignored_file(cx: &mut Test
     std::fs::write(root.join("environments/dev.json"), r#"{"token":"live-key"}"#).expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-e alt-down");
+    cx.press("ctrl-alt-e alt-down");
 
     let panel = env_panel(&window, &mut cx);
     panel.update(&mut cx, |panel, cx| panel.toggle_secret(0, cx));
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // Invariant 10: the committed file is the one that gets reviewed, and a token in it is a
     // token leaked by design.
@@ -11401,7 +11434,7 @@ async fn editing_a_secret_leaves_the_committed_placeholder_alone(cx: &mut TestAp
         .expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-e alt-down");
+    cx.press("ctrl-alt-e alt-down");
 
     let panel = env_panel(&window, &mut cx);
     assert_eq!(
@@ -11415,7 +11448,7 @@ async fn editing_a_secret_leaves_the_committed_placeholder_alone(cx: &mut TestAp
     panel.update(&mut cx, |panel, cx| {
         panel.set_value_for_test(0, "rotated", cx);
     });
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     let committed = env_file(&root, "dev.json");
     assert!(committed.contains("ask-alice"), "the placeholder survived: {committed}");
@@ -11430,10 +11463,10 @@ async fn creating_an_environment_from_the_editor_makes_it_selectable(cx: &mut Te
     let (session, root) = scratch_collection("env-create");
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.press("ctrl-alt-e");
     cx.dispatch_action(crate::actions::EnvNewEnvironment);
     cx.simulate_input("Staging EU");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let panel = env_panel(&window, &mut cx);
     assert_eq!(
@@ -11441,7 +11474,7 @@ async fn creating_an_environment_from_the_editor_makes_it_selectable(cx: &mut Te
         Some("Staging-EU".to_string()),
         "the typed label goes through `slug`, because it becomes a filename",
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // The switcher reads the directory, so the round trip is what proves it is usable.
     assert!(root.join("environments/Staging-EU.json").exists());
@@ -11457,15 +11490,15 @@ async fn renaming_the_selected_environment_keeps_it_selected(cx: &mut TestAppCon
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
     // Select it for real, so the session is pointing at the name that is about to move.
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     // No `alt-down`: the editor opens *on* the selected environment, which is the one being
     // renamed here.
-    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.press("ctrl-alt-e");
     cx.dispatch_action(crate::actions::EnvRenameEnvironment);
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input("local");
-    cx.simulate_keystrokes("enter escape");
+    cx.press("enter escape");
 
     assert!(root.join("environments/local.json").exists(), "both halves moved");
 
@@ -11489,7 +11522,7 @@ async fn globals_cannot_be_renamed_or_removed(cx: &mut TestAppContext) {
     std::fs::write(root.join("environments/globals.json"), r#"{"v":"v1"}"#).expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.press("ctrl-alt-e");
 
     let panel = env_panel(&window, &mut cx);
     assert_eq!(
@@ -11498,7 +11531,7 @@ async fn globals_cannot_be_renamed_or_removed(cx: &mut TestAppContext) {
     );
 
     cx.dispatch_action(crate::actions::EnvTrashEnvironment);
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // It is the always-active layer, not a peer: removing it is not a thing to confirm, it is
     // a thing that has no meaning.
@@ -11511,14 +11544,14 @@ async fn globals_cannot_be_renamed_or_removed(cx: &mut TestAppContext) {
 async fn closing_the_editor_leaves_typing_somewhere_to_land(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-alt-e");
-    cx.simulate_keystrokes("escape");
+    cx.press("ctrl-alt-e");
+    cx.press("escape");
 
     // The panel's inputs are gone, so focus must have been handed back to something painted —
     // otherwise no `TextInput` holds it, no `key_context` node exists, and typing vanishes with
     // nothing on screen explaining why. Asserted through the typing, never through which handle
     // reports focus: the bug leaves focus exactly where the code intended to put it.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/after");
     let url = cx.update(|_, cx| view.read(cx).url.read(cx).text().to_string());
     assert_eq!(url, "https://api.test/after");
@@ -11551,7 +11584,7 @@ async fn the_switcher_does_not_claim_none_means_no_substitution(cx: &mut TestApp
     std::fs::write(root.join("environments/dev.json"), r#"{"host":"dev.test"}"#).expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e");
+    cx.press("ctrl-e");
 
     // Nothing is selected, so this row is current — and it used to read "variables are left
     // unresolved", which is false with anything in `globals.json`. A confident string in the UI
@@ -11579,12 +11612,12 @@ async fn writing_a_global_from_the_editor_updates_the_badge(cx: &mut TestAppCont
     assert_eq!(badge(&mut cx).as_ref(), "none", "nothing to substitute yet");
 
     // `globals` is what the editor opens on when no environment is selected.
-    cx.simulate_keystrokes("ctrl-alt-e");
+    cx.press("ctrl-alt-e");
     cx.dispatch_action(crate::actions::EnvNewVariable);
     cx.simulate_input("v");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("v1");
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // The flag behind the badge is a *cache* — reading `globals.json` every frame would be a
     // file read on the UI thread. So the refresh points are the thing under test, not the read:
@@ -11608,12 +11641,12 @@ fn capture_and_send(
     path: &str,
     name: &str,
 ) {
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(url);
 
     cx.dispatch_action(crate::actions::AddCapture);
     cx.simulate_input(path);
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input(name);
 
     send_and_wait(cx, view, 200);
@@ -11627,7 +11660,7 @@ async fn a_capture_publishes_into_the_selected_environment(cx: &mut TestAppConte
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     let url = serve_sequence(&[(200, r#"{"access_token":"abc123","expires_in":3600}"#)]);
     capture_and_send(&mut cx, &view, &url, "$.access_token", "token");
@@ -11659,7 +11692,7 @@ async fn a_captured_value_resolves_in_the_next_request(cx: &mut TestAppContext) 
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (window, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     let auth = serve_sequence(&[(200, r#"{"access_token":"abc123"}"#)]);
     capture_and_send(&mut cx, &view, &auth, "$.access_token", "token");
@@ -11672,13 +11705,13 @@ async fn a_captured_value_resolves_in_the_next_request(cx: &mut TestAppContext) 
     let (echo, received) = serve_capturing(
         "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
     );
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let next = active_view(&window, &mut cx);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&echo);
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.simulate_input("Authorization");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("Bearer {{token}}");
     send_and_wait(&mut cx, &next, 200);
 
@@ -11698,16 +11731,16 @@ async fn a_capture_does_not_run_on_a_failed_response(cx: &mut TestAppContext) {
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     // An error body has fields too. Publishing one into `{{token}}` produces a chain that fails
     // on the *next* request, which is the hardest kind to read back to its cause.
     let url = serve_sequence(&[(401, r#"{"access_token":"nope"}"#)]);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     cx.dispatch_action(crate::actions::AddCapture);
     cx.simulate_input("$.access_token");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("token");
     send_and_wait(&mut cx, &view, 401);
     cx.run_until_parked();
@@ -11729,7 +11762,7 @@ async fn a_capture_that_matches_nothing_says_so_rather_than_writing_empty(cx: &m
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     let url = serve_sequence(&[(200, r#"{"something_else":1}"#)]);
     capture_and_send(&mut cx, &view, &url, "$.access_token", "token");
@@ -11755,10 +11788,10 @@ async fn capturing_from_a_response_row_publishes_it_immediately(cx: &mut TestApp
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     let url = serve_sequence(&[(200, r#"{"data":{"access_token":"abc"}}"#)]);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     cx.run_until_parked();
@@ -11767,7 +11800,7 @@ async fn capturing_from_a_response_row_publishes_it_immediately(cx: &mut TestApp
     // behind `Alt+C` — so it is right by construction rather than typed twice.
     let row = cx.debug_bounds("response-row-2").expect("the token row");
     cx.simulate_click(row.center(), gpui::Modifiers::default());
-    cx.simulate_keystrokes("alt-shift-c");
+    cx.press("alt-shift-c");
     cx.run_until_parked();
 
     let spec = spec_of(&view, &mut cx);
@@ -11802,19 +11835,19 @@ async fn capturing_a_row_publishes_into_the_environment_selected_now(cx: &mut Te
     std::fs::write(root.join("environments/prod.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter"); // dev
+    cx.press("ctrl-e down enter"); // dev
 
     let url = serve_sequence(&[(200, r#"{"access_token":"abc"}"#)]);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     cx.run_until_parked();
 
     // Switch after sending, then capture.
-    cx.simulate_keystrokes("ctrl-e down down enter"); // prod
+    cx.press("ctrl-e down down enter"); // prod
     let row = cx.debug_bounds("response-row-1").expect("the token row");
     cx.simulate_click(row.center(), gpui::Modifiers::default());
-    cx.simulate_keystrokes("alt-shift-c");
+    cx.press("alt-shift-c");
 
     wait_for(&mut cx, "prod to receive it", |_| {
         let text = std::fs::read_to_string(root.join("environments/prod.local.json")).ok()?;
@@ -11838,26 +11871,26 @@ async fn capturing_from_a_retained_run_says_why_it_will_not(cx: &mut TestAppCont
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     let url = serve_sequence(&[
         (200, r#"{"access_token":"first"}"#),
         (200, r#"{"access_token":"second"}"#),
     ]);
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input(&url);
     send_and_wait(&mut cx, &view, 200);
     cx.run_until_parked();
     send_and_wait(&mut cx, &view, 200);
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-h down enter");
+    cx.press("ctrl-h down enter");
     cx.run_until_parked();
     assert_eq!(viewing(&view, &mut cx), 1, "the older run is on screen");
 
     let row = cx.debug_bounds("response-row-1").expect("the token row");
     cx.simulate_click(row.center(), gpui::Modifiers::default());
-    cx.simulate_keystrokes("alt-shift-c");
+    cx.press("alt-shift-c");
     cx.run_until_parked();
 
     let status = wait_for(&mut cx, "the refusal", |cx| {
@@ -11877,13 +11910,13 @@ async fn captures_survive_a_save_and_reopen(cx: &mut TestAppContext) {
     let (session, root) = scratch_collection("capture-round-trip");
     let (_, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/token");
     cx.dispatch_action(crate::actions::AddCapture);
     cx.simulate_input("$.access_token");
-    cx.simulate_keystrokes("tab");
+    cx.press("tab");
     cx.simulate_input("token");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
 
     let saved = collection_files(&root);
@@ -11905,7 +11938,7 @@ async fn browsing_the_history_does_not_republish_an_old_capture(cx: &mut TestApp
     std::fs::write(root.join("environments/dev.json"), "{}").expect("write");
 
     let (_, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-e down enter");
+    cx.press("ctrl-e down enter");
 
     let url = serve_sequence(&[
         (200, r#"{"access_token":"first"}"#),
@@ -11924,7 +11957,7 @@ async fn browsing_the_history_does_not_republish_an_old_capture(cx: &mut TestApp
     });
 
     // Now look at the older run.
-    cx.simulate_keystrokes("ctrl-h down enter");
+    cx.press("ctrl-h down enter");
     cx.run_until_parked();
     assert_eq!(viewing(&view, &mut cx), 1, "the older run is on screen");
 
@@ -11947,9 +11980,9 @@ async fn the_defaults_panel_does_not_touch_this_request(cx: &mut TestAppContext)
 
     // A different trigger, not a scope row: the titlebar's gear is app-level furniture, so
     // where it lives is what says what it changes.
-    cx.simulate_keystrokes("ctrl-shift-,");
+    cx.press("ctrl-shift-,");
     select_setting(&window, &mut cx, "Verify TLS certificates");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     // The open buffer must not move. Its settings live in its own collection file, and shifting
     // them under it would change what a saved request means.
@@ -11970,13 +12003,13 @@ async fn a_new_tab_starts_from_the_defaults(cx: &mut TestAppContext) {
     // `app.json`. `None` for the directory keeps the write in memory (invariant 6).
     cx.update(|_, cx| crate::app_state::install_at(cx, None, Vec::new()));
 
-    cx.simulate_keystrokes("ctrl-shift-,");
+    cx.press("ctrl-shift-,");
     select_setting(&window, &mut cx, "Verify TLS certificates");
-    cx.simulate_keystrokes("enter escape");
+    cx.press("enter escape");
 
     assert!(spec_of(&first, &mut cx).settings.verify_tls, "the existing buffer is untouched");
 
-    cx.simulate_keystrokes("ctrl-t");
+    cx.press("ctrl-t");
     let fresh = active_view(&window, &mut cx);
     assert!(
         !spec_of(&fresh, &mut cx).settings.verify_tls,
@@ -12079,18 +12112,18 @@ async fn assertions_survive_a_load_and_save_before_any_ui_can_edit_them(cx: &mut
     .expect("write");
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-p");
+    cx.press("ctrl-p");
     // The scan is off-thread, so the row arrives after the picker opens.
     cx.run_until_parked();
     cx.simulate_input("health");
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     let opened = active_view(&window, &mut cx);
     assert_eq!(spec_of(&opened, &mut cx).url, "https://api.test/health", "the file opened");
 
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
 
     let bytes = std::fs::read(root.join("health.json")).expect("read");
@@ -12112,7 +12145,7 @@ async fn asserting_on_a_response_row_fills_the_path_from_the_outline(cx: &mut Te
 
     let row = cx.debug_bounds("response-row-2").expect("the status row");
     cx.simulate_click(row.center(), gpui::Modifiers::default());
-    cx.simulate_keystrokes("alt-shift-a");
+    cx.press("alt-shift-a");
     cx.run_until_parked();
 
     let spec = spec_of(&view, &mut cx);
@@ -12189,9 +12222,9 @@ async fn editing_a_capture_or_an_assertion_makes_the_buffer_dirty(cx: &mut TestA
     let (session, root) = scratch_collection("dirty-rules");
     let (window, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/thing");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
     assert!(!cx.update(|_, cx| view.read(cx).is_dirty(cx)), "clean straight after a save");
 
@@ -12203,7 +12236,7 @@ async fn editing_a_capture_or_an_assertion_makes_the_buffer_dirty(cx: &mut TestA
         "a capture edit has to mark the buffer"
     );
 
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
     assert!(!cx.update(|_, cx| view.read(cx).is_dirty(cx)));
 
@@ -12256,14 +12289,14 @@ async fn running_a_folder_reports_every_request_in_it(cx: &mut TestAppContext) {
     seed_runnable(&root, "other.json", &url, Some(200));
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.press("ctrl-shift-e");
     // The scan is off-thread, so the rows arrive after the panel opens — selecting before this
     // moves through an empty tree.
     cx.run_until_parked();
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-r");
+    cx.press("ctrl-r");
     let panel = run_panel(&window, &mut cx);
     let rows = wait_for(&mut cx, "the run to finish", |cx| {
         let done = panel.read_with(cx, |panel, _| !panel.running());
@@ -12297,7 +12330,7 @@ async fn a_cancelled_run_says_it_stopped_early(cx: &mut TestAppContext) {
     seed_runnable(&root, "a.json", &url, Some(200));
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-r");
+    cx.press("ctrl-r");
     let panel = run_panel(&window, &mut cx);
     wait_for(&mut cx, "the run to finish", |cx| {
         panel.read_with(cx, |panel, _| (!panel.running()).then_some(()))
@@ -12322,18 +12355,18 @@ async fn closing_the_report_leaves_typing_somewhere_to_land(cx: &mut TestAppCont
     seed_runnable(&root, "a.json", &url, Some(200));
 
     let (window, view, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-r");
+    cx.press("ctrl-r");
     let panel = run_panel(&window, &mut cx);
     wait_for(&mut cx, "the run to finish", |cx| {
         panel.read_with(cx, |panel, _| (!panel.running()).then_some(()))
     });
 
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     // Asserted through the typing, never through which handle reports focus: the bug leaves
     // focus exactly where the code intended to put it.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://api.test/after-run");
     let url = cx.update(|_, cx| view.read(cx).url.read(cx).text().to_string());
     assert_eq!(url, "https://api.test/after-run");
@@ -12384,9 +12417,9 @@ async fn a_flow_runs_across_folders_in_the_order_it_names(cx: &mut TestAppContex
     );
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-r");
+    cx.press("ctrl-alt-r");
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let panel = run_panel(&window, &mut cx);
     let rows = wait_for(&mut cx, "the flow to finish", |cx| {
@@ -12417,9 +12450,9 @@ async fn a_flow_step_whose_file_is_gone_fails_rather_than_vanishing(cx: &mut Tes
     write_flow(&root, "stale", &["a.json", "deleted.json"]);
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-alt-r");
+    cx.press("ctrl-alt-r");
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
 
     let panel = run_panel(&window, &mut cx);
     let rows = wait_for(&mut cx, "the flow to finish", |cx| {
@@ -12452,8 +12485,8 @@ async fn reordering_a_step_writes_the_new_order_and_follows_the_selection(
 
     // Third step to the top, one press at a time. **The selection follows the step**, so three
     // presses of the same key move the same one — otherwise each press moves a different step.
-    cx.simulate_keystrokes("down down");
-    cx.simulate_keystrokes("alt-up alt-up");
+    cx.press("down down");
+    cx.press("alt-up alt-up");
     cx.run_until_parked();
 
     assert_eq!(
@@ -12476,14 +12509,14 @@ async fn adding_the_selected_request_appends_it_to_a_flow(cx: &mut TestAppContex
     write_flow(&root, "smoke", &["existing.json"]);
 
     let (window, _, mut cx) = boot(cx, Some(session), Some(root.clone()));
-    cx.simulate_keystrokes("ctrl-shift-e");
+    cx.press("ctrl-shift-e");
     cx.run_until_parked();
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     cx.run_until_parked();
 
     cx.dispatch_action(crate::actions::AddToFlow);
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     // Appended, never inserted: where a step goes is the editor's job, and a picker that also
@@ -12503,7 +12536,7 @@ async fn creating_a_flow_from_the_editor_makes_it_runnable(cx: &mut TestAppConte
     cx.dispatch_action(crate::actions::EditFlows);
     cx.dispatch_action(crate::actions::FlowNew);
     cx.simulate_input("User lifecycle");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     let panel = flow_panel(&window, &mut cx);
@@ -12512,7 +12545,7 @@ async fn creating_a_flow_from_the_editor_makes_it_runnable(cx: &mut TestAppConte
         Some("User-lifecycle".to_string()),
         "the typed label goes through `slug`, because it becomes a filename",
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     assert!(root.join("flows/User-lifecycle.json").exists());
@@ -12560,9 +12593,9 @@ async fn a_postman_export_imports_as_a_tree_with_its_environment_selected(cx: &m
 
     let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     // Postman's folders become directories, so the collection arrives filed the way it was
@@ -12647,9 +12680,9 @@ async fn a_postman_environment_export_lands_split_and_gitignored(cx: &mut TestAp
 
     let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     let environments = root.join("environments");
@@ -12714,9 +12747,9 @@ async fn a_postman_globals_export_lands_on_the_base_layer_and_selects_nothing(
 
     let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert!(
@@ -12796,9 +12829,9 @@ async fn a_recovered_script_arrives_on_the_request_it_came_from(cx: &mut TestApp
 
     let (_window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
-    cx.simulate_keystrokes("ctrl-shift-i");
+    cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     let written = root.join("Suite").join("Login.json");
@@ -12830,11 +12863,11 @@ async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAp
     // stopped doing so, formatting would become destructive and nothing else would say so.
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.press("ctrl-b ctrl-a");
     cx.simulate_input(r#"{"b":1,"a":[2,3]}"#);
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("alt-shift-f");
+    cx.press("alt-shift-f");
     cx.run_until_parked();
 
     let formatted = cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string());
@@ -12844,7 +12877,7 @@ async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAp
         "the body must be reformatted in place, with key order kept"
     );
 
-    cx.simulate_keystrokes("ctrl-z");
+    cx.press("ctrl-z");
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string()),
@@ -12853,9 +12886,9 @@ async fn formatting_the_body_rewrites_it_and_ctrl_z_puts_it_back(cx: &mut TestAp
     );
 
     // And minify is the inverse, from the formatted text.
-    cx.simulate_keystrokes("alt-shift-f");
+    cx.press("alt-shift-f");
     cx.run_until_parked();
-    cx.simulate_keystrokes("alt-shift-m");
+    cx.press("alt-shift-m");
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_, cx| view.read(cx).http().unwrap().body_editor.read(cx).text().to_string()),
@@ -12868,11 +12901,11 @@ async fn a_body_that_is_not_json_is_refused_with_a_reason_and_left_alone(cx: &mu
     // Both refusals matter, and for the same reason: the verb must never half-rewrite a body.
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.press("ctrl-b ctrl-a");
     cx.simulate_input(r#"{"a":1,}"#);
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("alt-shift-f");
+    cx.press("alt-shift-f");
     cx.run_until_parked();
 
     assert_eq!(
@@ -12888,12 +12921,12 @@ async fn a_body_that_is_not_json_is_refused_with_a_reason_and_left_alone(cx: &mu
 
     // A body labelled something else is refused by *label*, not by whether it happens to parse —
     // so the verb's behaviour can be read off the chip on screen.
-    cx.simulate_keystrokes("ctrl-b ctrl-a");
+    cx.press("ctrl-b ctrl-a");
     cx.simulate_input(r#"{"a":1}"#);
     view.update(&mut cx, |view, cx| view.set_body_kind(zuno_core::RawKind::Xml, cx));
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("alt-shift-f");
+    cx.press("alt-shift-f");
     cx.run_until_parked();
 
     assert_eq!(
@@ -12929,9 +12962,9 @@ async fn a_request_created_in_a_folder_saves_back_into_that_folder(cx: &mut Test
     cx.simulate_click(folder.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("ctrl-n");
+    cx.press("ctrl-n");
     cx.simulate_input("Refunds");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     let written = root.join("billing").join("Refunds.json");
@@ -12946,9 +12979,9 @@ async fn a_request_created_in_a_folder_saves_back_into_that_folder(cx: &mut Test
     );
 
     // Now edit and save: it must overwrite, not spawn `Refunds.json` at the root.
-    cx.simulate_keystrokes("ctrl-l ctrl-a");
+    cx.press("ctrl-l ctrl-a");
     cx.simulate_input("https://a.test/refunds");
-    cx.simulate_keystrokes("ctrl-s");
+    cx.press("ctrl-s");
     cx.run_until_parked();
 
     assert_eq!(
@@ -13001,7 +13034,7 @@ async fn creating_a_request_beside_one_uses_its_folder_and_never_overwrites(cx: 
     cx.run_until_parked();
 
     cx.simulate_input("invoices");
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert!(
@@ -13061,33 +13094,65 @@ async fn no_two_global_bindings_claim_the_same_keystroke(cx: &mut TestAppContext
     // `ctrl-shift-r` from `FocusResponse` this way was noticed only because two unrelated
     // response tests went red — which is luck, not coverage.
     //
-    // Scoped bindings are deliberately *not* checked: sharing a keystroke across contexts is the
-    // whole point of contexts, and `ctrl-f` meaning the body in the editor and the response
-    // elsewhere is a documented design decision.
+    // Sharing a keystroke *across* contexts is deliberately allowed: that is the whole point of
+    // contexts, and `ctrl-f` meaning the body in the editor and the response elsewhere is a
+    // documented design decision. Two different actions in the **same** context is the bug.
+    //
+    // **Both platforms' keymaps, from whichever host runs this.** The macOS translation moves keys
+    // onto each other — `ctrl-m` and `ctrl-shift-m` both became `⌘⇧M` in its first draft — and
+    // this is what makes that a failure on a Linux machine rather than a surprise on a Mac. The
+    // same action twice on one key is harmless (on a Mac `ctrl-y` and `ctrl-shift-z` are both
+    // `⌘⇧Z`, both redo), so only a *different* action counts.
     let _ = cx;
-    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for mac in [false, true] {
+        let platform = if mac { "macOS" } else { "Linux/Windows" };
+        let mut seen: std::collections::BTreeMap<(String, String), String> =
+            std::collections::BTreeMap::new();
 
-    for binding in crate::bindings() {
-        if binding.predicate().is_some() {
-            continue;
-        }
-        let keystroke = binding
-            .keystrokes()
-            .iter()
-            .map(|key| key.inner().unparse())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let action = binding.action().name().to_string();
+        for binding in crate::bindings_for(mac) {
+            let context = binding
+                .predicate()
+                .map(|predicate| predicate.to_string())
+                .unwrap_or_else(|| "(global)".to_string());
+            let keystroke = binding
+                .keystrokes()
+                .iter()
+                .map(|key| key.inner().unparse())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let action = binding.action().name().to_string();
 
-        if let Some(previous) = seen.insert(keystroke.clone(), action.clone()) {
-            panic!(
-                "{keystroke:?} is bound globally twice — to {previous} and then {action}, and \
-                 the later one silently wins"
-            );
+            if let Some(previous) = seen.insert((context.clone(), keystroke.clone()), action.clone())
+                && previous != action
+            {
+                panic!(
+                    "{platform}: {keystroke:?} in {context} is bound twice — to {previous} and \
+                     then {action}, and the later one silently wins"
+                );
+            }
         }
+
+        assert!(seen.len() > 30, "{platform}: the list should be substantial: {}", seen.len());
     }
+}
 
-    assert!(seen.len() > 30, "the list should be substantial: {}", seen.len());
+/// **UI copy spells a key the way its platform does** — `Ctrl+Shift+H` off a Mac, `⇧⌘H` on one,
+/// in Apple's modifier order with no separators. Pure, so both are checked from any host.
+#[test]
+fn a_keystroke_is_spelled_for_its_platform() {
+    use crate::workspace::spell_keystroke;
+    use gpui::Modifiers;
+
+    let shift_cmd = Modifiers { shift: true, platform: true, ..Modifiers::default() };
+    let ctrl_shift = Modifiers { control: true, shift: true, ..Modifiers::default() };
+    let cmd = Modifiers { platform: true, ..Modifiers::default() };
+    let alt = Modifiers { alt: true, ..Modifiers::default() };
+
+    assert_eq!(spell_keystroke(&ctrl_shift, "h", false), "Ctrl+Shift+H");
+    assert_eq!(spell_keystroke(&shift_cmd, "h", true), "⇧⌘H");
+    assert_eq!(spell_keystroke(&cmd, "enter", true), "⌘↩");
+    assert_eq!(spell_keystroke(&alt, "backspace", true), "⌥⌫");
+    assert_eq!(spell_keystroke(&ctrl_shift, "m", true), "⌃⇧M", "Apple's order: ⌃ ⌥ ⇧ ⌘");
 }
 
 // ---------------------------------------------------------------------------
@@ -13255,7 +13320,7 @@ async fn the_header_suggestion_list_anchors_under_the_cell_and_typing_still_land
 ) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.run_until_parked();
     cx.simulate_input("auth");
     cx.run_until_parked();
@@ -13293,7 +13358,7 @@ async fn the_header_suggestion_list_anchors_under_the_cell_and_typing_still_land
 async fn enter_does_nothing_until_a_suggestion_is_highlighted(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.run_until_parked();
     // A prefix of a real header, so the list is definitely open and definitely non-empty —
     // a name matching nothing would pass this test for the wrong reason.
@@ -13304,7 +13369,7 @@ async fn enter_does_nothing_until_a_suggestion_is_highlighted(cx: &mut TestAppCo
         "the list has to be open, or this asserts nothing"
     );
 
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -13320,14 +13385,14 @@ async fn enter_does_nothing_until_a_suggestion_is_highlighted(cx: &mut TestAppCo
 async fn down_then_enter_accepts_a_suggestion(cx: &mut TestAppContext) {
     let (view, mut cx) = open_workspace(cx);
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.run_until_parked();
     cx.simulate_input("auth");
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("down");
+    cx.press("down");
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     assert_eq!(
@@ -13347,7 +13412,7 @@ async fn escape_in_a_header_cell_still_cancels_an_in_flight_request(cx: &mut Tes
     let (window, view, mut cx) = boot(cx, None, None);
 
     // A header whose name matches nothing, so no list is open and `escape` has to fall through.
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.run_until_parked();
     cx.simulate_input("X-Trace-Id");
     cx.run_until_parked();
@@ -13362,7 +13427,7 @@ async fn escape_in_a_header_cell_still_cancels_an_in_flight_request(cx: &mut Tes
     );
 
     type_url(&mut cx, &format!("{base}/slow"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the request to start", |cx| {
         cx.update(|_, cx| view.read(cx).is_sending().then_some(()))
     });
@@ -13371,7 +13436,7 @@ async fn escape_in_a_header_cell_still_cancels_an_in_flight_request(cx: &mut Tes
     let cell = cx.debug_bounds("hdr-name-0").expect("the header name cell");
     cx.simulate_click(cell.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     cx.update(|_, cx| {
@@ -13390,7 +13455,7 @@ async fn an_empty_header_cell_offers_the_whole_table(cx: &mut TestAppContext) {
     let (window, view, mut cx) = boot(cx, None, None);
     let _ = &view;
 
-    cx.simulate_keystrokes("ctrl-shift-h");
+    cx.press("ctrl-shift-h");
     cx.run_until_parked();
 
     // Asserted on the list's *contents* rather than on paint, which is the reason those two are
@@ -13450,7 +13515,7 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
     });
     type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
 
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the socket to open", |cx| {
         cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
     });
@@ -13472,7 +13537,7 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
         })
     });
     cx.simulate_input("ping");
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let echoed = wait_for(&mut cx, "the server's reply", |cx| {
         cx.update(|_, cx| {
@@ -13538,7 +13603,7 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
     // branch returns before reaching — so the search opened, `open_search` focused a handle
     // whose element was never painted, and every keystroke vanished. Checking that
     // `view.search` is `Some` would have passed against exactly that bug.
-    cx.simulate_keystrokes("ctrl-f");
+    cx.press("ctrl-f");
     cx.simulate_input("re:");
     let typed = cx.update(|_, cx| {
         view.read(cx)
@@ -13551,7 +13616,7 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
         Some("re:"),
         "typing after Ctrl+F must land in the find bar, not nowhere"
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
 
     // **Copy reads the frame, not `displayed()`.** A session has no response, so the handler
     // used to fall straight through to "No response to copy yet" on every socket.
@@ -13569,7 +13634,7 @@ async fn ctrl_enter_on_an_open_socket_sends_rather_than_reconnecting(cx: &mut Te
 
     // Escape closes politely, and the transcript survives it — a closed conversation is still
     // the result of the run.
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     wait_for(&mut cx, "the close", |cx| {
         cx.update(|_, cx| {
             view.read(cx)
@@ -13706,7 +13771,7 @@ async fn a_kind_without_a_method_offers_no_method_picker(cx: &mut TestAppContext
         picker_is_open(&window, &mut cx),
         "an HTTP request must still get its method picker"
     );
-    cx.simulate_keystrokes("escape");
+    cx.press("escape");
     cx.run_until_parked();
 
     cx.update(|_, cx| {
@@ -13767,7 +13832,7 @@ async fn a_socket_that_fails_stops_reporting_itself_as_open(cx: &mut TestAppCont
         })
     });
     type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let reason = wait_for(&mut cx, "the failure to land", |cx| {
         cx.update(|_, cx| {
@@ -13844,7 +13909,7 @@ async fn an_sse_response_becomes_a_transcript_rather_than_a_body(cx: &mut TestAp
 
     let (view, mut cx) = open_workspace(cx);
     type_url(&mut cx, &format!("http://127.0.0.1:{port}/events"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let named = wait_for(&mut cx, "the event to arrive", |cx| {
         cx.update(|_, cx| {
@@ -13961,7 +14026,7 @@ async fn the_transcript_drops_the_oldest_frames_and_moves_the_selection(cx: &mut
         })
     });
     type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     wait_for(&mut cx, "the first frames", |cx| {
         cx.update(|_, cx| {
@@ -13985,7 +14050,7 @@ async fn the_transcript_drops_the_oldest_frames_and_moves_the_selection(cx: &mut
         })
     });
     cx.simulate_input("go");
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let (kept, dropped) = wait_for(&mut cx, "the ring to evict", |cx| {
         cx.update(|_, cx| {
@@ -14056,7 +14121,7 @@ async fn an_unresolved_variable_in_a_frame_is_announced_rather_than_blocked(
         })
     });
     type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the socket to open", |cx| {
         cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
     });
@@ -14068,7 +14133,7 @@ async fn an_unresolved_variable_in_a_frame_is_announced_rather_than_blocked(
         })
     });
     cx.simulate_input("{{apiKey}}");
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let notice = wait_for(&mut cx, "the unresolved-variable notice", |cx| {
         cx.update(|_, cx| {
@@ -14145,7 +14210,7 @@ async fn the_ping_button_sends_a_real_ping_frame(cx: &mut TestAppContext) {
         })
     });
     type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
     wait_for(&mut cx, "the socket to open", |cx| {
         cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
     });
@@ -14307,7 +14372,7 @@ async fn a_grpc_request_is_authored_and_sent(cx: &mut TestAppContext) {
     // fields directly would assert the engine and skip the half most likely to be miswired.
     cx.dispatch_action(crate::actions::OpenGrpcMethod);
     cx.run_until_parked();
-    cx.simulate_keystrokes("enter");
+    cx.press("enter");
     cx.run_until_parked();
 
     let chosen = cx.update(|_, cx| {
@@ -14335,7 +14400,7 @@ async fn a_grpc_request_is_authored_and_sent(cx: &mut TestAppContext) {
         })
     });
     cx.simulate_input(r#"{"name": "zuno"}"#);
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let body = wait_for(&mut cx, "the decoded reply", |cx| {
         cx.update(|_, cx| {
@@ -14436,7 +14501,7 @@ async fn a_client_streaming_call_sends_repeatedly_and_closes(cx: &mut TestAppCon
         })
     });
     cx.simulate_input(r#"{"name":"first"}"#);
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     // **The transcript has to open before the reply**, or nothing below is reachable.
     wait_for(&mut cx, "the call to open", |cx| {
@@ -14452,9 +14517,9 @@ async fn a_client_streaming_call_sends_repeatedly_and_closes(cx: &mut TestAppCon
     });
     // **Select all first.** A gRPC message editor is never cleared by sending — it is the
     // request's saved message, not a draft — so typing straight into it would append.
-    cx.simulate_keystrokes("ctrl-a");
+    cx.press("ctrl-a");
     cx.simulate_input(r#"{"name":"second"}"#);
-    cx.simulate_keystrokes("ctrl-enter");
+    cx.press("ctrl-enter");
 
     let sent = wait_for(&mut cx, "both sent messages to show", |cx| {
         cx.update(|_, cx| {
