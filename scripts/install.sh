@@ -284,7 +284,9 @@ download() {
     dir=$3
     base=$(download_base "$version")
 
-    info "Downloading $file…"
+    # Braced: bash 3.2 — macOS's /bin/sh — reads the first byte of `…` as part of the name,
+    # and `set -u` then dies on a variable called `file\342`.
+    info "Downloading ${file}…"
     # HTTPS only — plus `file`, for a `ZUNO_DOWNLOAD_BASE` pointing at a local directory when
     # testing this script before a release exists. Safe to allow: it applies to the URL as
     # given, and curl never follows a *redirect* into `file://`, so the default GitHub download
