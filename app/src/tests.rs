@@ -41,6 +41,11 @@ impl Press for VisualTestContext {
     }
 }
 
+/// A displayed keystroke as this platform spells it, for asserting on labels.
+fn spelled<'a>(linux: &'a str, mac: &'a str) -> &'a str {
+    if cfg!(target_os = "macos") { mac } else { linux }
+}
+
 /// Boot a window the same way `main` does, so the keymap, theme, and engine under test
 /// are the real ones rather than a test-only arrangement.
 fn open_workspace(cx: &mut TestAppContext) -> (gpui::Entity<RequestView>, VisualTestContext) {
@@ -2291,12 +2296,15 @@ async fn a_hint_for_an_unbound_action_drops_the_clause(cx: &mut TestAppContext) 
         "ClearCookies is supposed to be unbound; this test proves nothing otherwise"
     );
     assert_eq!(dropped, "No cookies", "the whole clause and the dash must go");
+    let add_header = spelled("Ctrl+Shift+H", "⇧⌘H");
     assert_eq!(
-        kept, "No headers — Ctrl+Shift+H to add",
+        kept,
+        format!("No headers — {add_header} to add"),
         "a bound action still renders, in the conventional spelling"
     );
     assert_eq!(
-        mixed, "No parts — Ctrl+Shift+H to add",
+        mixed,
+        format!("No parts — {add_header} to add"),
         "one unbound clause among several drops only itself"
     );
 }
@@ -6651,7 +6659,10 @@ async fn a_tooltip_names_the_keystroke_from_the_keymap(cx: &mut TestAppContext) 
         })
         .expect("window");
 
-    assert_eq!(label, "Find in response · Ctrl+F");
+    assert_eq!(
+        label,
+        format!("Find in response · {}", spelled("Ctrl+F", "⌘F"))
+    );
 
     // And an unbound action must not leave a dangling separator.
     let unbound = window
@@ -10622,7 +10633,7 @@ async fn a_menu_row_names_its_keystroke_even_when_the_binding_is_scoped(cx: &mut
 
     // `f2` and `delete` are both registered `Some("CollectionPanel")`.
     assert_eq!(detail("Rename"), "F2");
-    assert_eq!(detail("Delete…"), "Delete");
+    assert_eq!(detail("Delete…"), spelled("Delete", "⌦"));
     // And a verb with no binding still draws no column, rather than inventing one.
     assert_eq!(detail("Copy relative path"), "");
 
@@ -10650,10 +10661,16 @@ async fn the_response_row_menu_names_its_keystrokes_too(cx: &mut TestAppContext)
     assert_eq!(
         details,
         [
-            ("Copy value".to_string(), "Ctrl+C".to_string()),
-            ("Copy path".to_string(), "Alt+C".to_string()),
-            ("Capture as variable".to_string(), "Alt+Shift+C".to_string()),
-            ("Assert on this".to_string(), "Alt+Shift+A".to_string()),
+            ("Copy value".to_string(), spelled("Ctrl+C", "⌘C").to_string()),
+            ("Copy path".to_string(), spelled("Alt+C", "⌃C").to_string()),
+            (
+                "Capture as variable".to_string(),
+                spelled("Alt+Shift+C", "⌃⇧C").to_string()
+            ),
+            (
+                "Assert on this".to_string(),
+                spelled("Alt+Shift+A", "⌃⇧A").to_string()
+            ),
             ("Fold".to_string(), "Space".to_string()),
         ]
     );
