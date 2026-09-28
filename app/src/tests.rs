@@ -8761,6 +8761,8 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
 
 
 
+// macOS draws its own window controls, so there is no close button of ours to click.
+#[cfg(not(target_os = "macos"))]
 #[gpui::test]
 async fn clicking_a_window_control_does_not_also_start_a_window_drag(cx: &mut TestAppContext) {
     // The whole titlebar is a drag handle, and `on_mouse_down` registers a *Bubble*-phase

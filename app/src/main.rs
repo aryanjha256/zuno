@@ -150,9 +150,12 @@ fn main() {
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // On macOS the system's traffic lights sit over our own titlebar, which the
+                // content view extends under; elsewhere both fields are ignored.
                 titlebar: Some(TitlebarOptions {
                     title: Some("Zuno".into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(crate::chrome::TRAFFIC_LIGHTS),
                 }),
                 window_min_size: Some(size(px(720.), px(480.))),
                 // Explicit, because the default is `None` — which left the window

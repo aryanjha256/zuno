@@ -11,9 +11,9 @@
 //! way to resize — the window had borders in name only.
 
 use gpui::{
-    CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    StatefulInteractiveElement,
-    ParentElement, ResizeEdge, SharedString, Stateful, Styled, Window, div, px,
+    CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, Pixels, Point, ResizeEdge, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, div, point, px,
 };
 
 use crate::theme::{Appearance, Theme};
@@ -25,13 +25,28 @@ use crate::ui::Icon;
 /// steal clicks from the content underneath.
 const RESIZE_GRAB: f32 = 6.0;
 
-/// Draw the titlebar.
-///
-/// The whole bar is a drag handle (`start_window_move`) and double-click maximises, which
-/// is what people expect of a titlebar whether or not the OS drew it.
 /// The bar's height, which the application menu anchors itself below.
 pub const TITLEBAR_HEIGHT: f32 = 34.;
 
+/// **macOS draws its own window controls**, the traffic lights, over the left of this bar — so
+/// there the bar draws no minimize, maximize or close of its own, and no resize strips, since
+/// AppKit resizes the window from its real edges. A compile-time switch rather than
+/// `window_decorations()`, which the test platform reports as `Server` on every host.
+const NATIVE_CONTROLS: bool = cfg!(target_os = "macos");
+
+/// Where the traffic lights sit, from the window's top-left: centred in the bar (the buttons are
+/// 14pt tall), with the usual margin from the left edge.
+pub const TRAFFIC_LIGHTS: Point<Pixels> = point(px(12.), px((TITLEBAR_HEIGHT - 14.) / 2.));
+
+/// How far the bar's own content starts from the left on macOS, clearing the three lights.
+const TRAFFIC_LIGHTS_INSET: f32 = 80.;
+
+/// Draw the titlebar.
+///
+/// The whole bar is a drag handle and double-click zooms, which is what people expect of a
+/// titlebar whether or not the OS drew it. On macOS AppKit moves the window itself — gpui's
+/// `start_window_move` is a no-op there — and a double-click does whatever the person chose in
+/// System Settings, which is what `titlebar_double_click` reads.
 pub fn titlebar(
     title: SharedString,
     panel_visible: bool,
@@ -53,16 +68,21 @@ pub fn titlebar(
         .justify_between()
         .flex_none()
         .h(px(TITLEBAR_HEIGHT))
-        .pl_3()
+        .pl(px(if NATIVE_CONTROLS {
+            TRAFFIC_LIGHTS_INSET
+        } else {
+            12.
+        }))
         .bg(theme.bg_panel)
         .border_b_1()
         .border_color(theme.border)
         // Dragging anywhere on the bar moves the window.
         .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
-            if event.click_count == 2 {
-                window.zoom_window();
-            } else {
-                window.start_window_move();
+            match (event.click_count, NATIVE_CONTROLS) {
+                (2, true) => window.titlebar_double_click(),
+                (2, false) => window.zoom_window(),
+                (_, true) => {}
+                (_, false) => window.start_window_move(),
             }
         })
         .child(
@@ -253,21 +273,26 @@ pub fn titlebar(
                         theme,
                     )),
                 )
-                .children(controls.minimize.then(|| {
+                .children((controls.minimize && !NATIVE_CONTROLS).then(|| {
                     control_button("minimize", Icon::Minimize, theme, false, |window| {
                         window.minimize_window()
                     })
                 }))
-                .children(controls.maximize.then(|| {
+                .children((controls.maximize && !NATIVE_CONTROLS).then(|| {
                     // The icon reflects what the button will *do*, not the current state.
                     let icon = if maximized { Icon::Restore } else { Icon::Maximize };
                     control_button("maximize", icon, theme, false, |window| {
                         window.zoom_window()
                     })
                 }))
-                .child(control_button("close", Icon::Close, theme, true, |window| {
-                    window.remove_window()
-                })),
+                .children((!NATIVE_CONTROLS).then(|| {
+                    control_button("close", Icon::Close, theme, true, |window| {
+                        window.remove_window()
+                    })
+                }))
+                // Without a close button of our own the last control would sit flush against
+                // the window's edge.
+                .pr(px(if NATIVE_CONTROLS { 4. } else { 0. })),
         )
 }
 
@@ -321,9 +346,9 @@ fn control_button(
 /// edges it overlaps.
 ///
 /// Skipped entirely while maximised — there is nothing to drag, and live strips would
-/// just eat clicks along the content's edge.
+/// just eat clicks along the content's edge — and on macOS, where the window resizes itself.
 pub fn resize_handles(window: &Window) -> Vec<Stateful<Div>> {
-    if window.is_maximized() {
+    if NATIVE_CONTROLS || window.is_maximized() {
         return Vec::new();
     }
 
