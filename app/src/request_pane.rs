@@ -131,9 +131,11 @@ pub fn render(
                             )),
                         ),
                 )
+                // Over the editor it searches — here only when that is the query.
                 .children(
                     view.body_search
                         .as_ref()
+                        .filter(|_| view.search_slot == 0)
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(
@@ -174,6 +176,13 @@ pub fn render(
                             graphql.variables.read(cx).cursor_offset(),
                             theme,
                         )),
+                )
+                // The variables are an editor too, so `Ctrl+F` here searches them.
+                .children(
+                    view.body_search
+                        .as_ref()
+                        .filter(|_| view.search_slot == 1)
+                        .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(
                     editor_region(theme, focused_editor(&graphql.variables, window, cx))

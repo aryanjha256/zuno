@@ -615,6 +615,8 @@ pub struct RequestView {
     /// The request body's own find bar. Separate from `search` because both can be open at
     /// once — you can be hunting for a field in what you are sending *and* in what came back.
     pub body_search: Option<TextSearch>,
+    /// Which of the kind's tabs the find bar searches — see `searched_editor`.
+    pub search_slot: u8,
     /// Holding it keeps it alive; replacing it cancels a superseded scan, the same contract as
     /// `diff_task`. Typing fast enough to outrun a 10MB scan is exactly when that matters.
     search_task: Option<Task<()>>,
@@ -702,6 +704,7 @@ impl RequestView {
             body_task: None,
             search: None,
             body_search: None,
+            search_slot: 1,
             search_task: None,
             body_scroll: UniformListScrollHandle::new(),
             diff_scroll: UniformListScrollHandle::new(),
@@ -2170,7 +2173,16 @@ impl RequestView {
     /// Reveals the Body tab first, for the same reason the response bar switches to the Body
     /// view: a find bar that appears over a section you cannot see reads as doing nothing.
     pub fn open_body_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_tab = RequestTab::Kind(1);
+        // **The editor you are looking at.** Slot 1 is the body for HTTP, the composer for a
+        // socket and the message for gRPC — each kind's one editor. GraphQL has two, the query
+        // (0) and the variables (1), and this was a fixed `Kind(1)` once: `Ctrl+F` on the Query
+        // tab jumped to Variables while searching the query, with the bar drawn on neither.
+        self.search_slot = match (&self.kind, self.request_tab) {
+            (KindEditor::GraphQl(_), RequestTab::Kind(1)) => 1,
+            (KindEditor::GraphQl(_), _) => 0,
+            _ => 1,
+        };
+        self.request_tab = RequestTab::Kind(self.search_slot);
 
         if self.body_search.is_none() {
             let query = cx.new(|cx| {
@@ -2206,13 +2218,23 @@ impl RequestView {
 
     /// Close it, putting focus back in the editor rather than leaving it on a dropped input.
     pub fn close_body_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.body_search.take().is_some() {
-            // Whichever surface this kind searches — the body editor for a raw HTTP body, the
-            // document for GraphQL. Focusing an unpainted handle is what kills the keymap.
-            if let Some(handle) = self.body_focus(cx) {
-                window.focus(&handle);
+        if self.body_search.is_some() {
+            // Back into the editor that was searched — the one on screen. Focusing an unpainted
+            // handle is what kills the keymap.
+            if let Some(editor) = self.searched_editor() {
+                window.focus(&editor.read(cx).focus_handle(cx));
             }
+            self.body_search = None;
             cx.notify();
+        }
+    }
+
+    /// The editor the find bar searches: GraphQL's variables when opened from that tab, and
+    /// otherwise the kind's main editor.
+    pub fn searched_editor(&self) -> Option<Entity<Editor>> {
+        match (&self.kind, self.search_slot) {
+            (KindEditor::GraphQl(graphql), 1) => Some(graphql.variables.clone()),
+            _ => self.primary_editor().cloned(),
         }
     }
 
@@ -2232,7 +2254,7 @@ impl RequestView {
     pub fn run_body_search(&mut self, cx: &mut Context<Self>) {
         let Some(search) = &self.body_search else { return };
         let query = search.query.read(cx).text().to_string();
-        let Some(editor) = self.primary_editor().cloned() else { return };
+        let Some(editor) = self.searched_editor() else { return };
         let content = editor.read(cx).text().to_string();
 
         let hits = if query.is_empty() {
@@ -2281,7 +2303,7 @@ impl RequestView {
         let Some(&start) = search.offsets.get(search.current) else { return };
         let len = search.query.read(cx).text().len();
 
-        let Some(editor) = self.primary_editor().cloned() else { return };
+        let Some(editor) = self.searched_editor() else { return };
         editor.update(cx, |editor, cx| {
             editor.select_range(start as usize, start as usize + len, cx);
         });
@@ -2300,7 +2322,7 @@ impl RequestView {
         let with = replace.read(cx).text().to_string();
         let len = search.query.read(cx).text().len();
 
-        let Some(editor) = self.primary_editor().cloned() else { return 0 };
+        let Some(editor) = self.searched_editor() else { return 0 };
         editor.update(cx, |editor, cx| {
             editor.replace_range(start as usize..start as usize + len, &with, window, cx);
         });
@@ -2332,7 +2354,7 @@ impl RequestView {
             .rev()
             .map(|start| *start as usize..*start as usize + len)
             .collect();
-        let Some(editor) = self.primary_editor().cloned() else { return 0 };
+        let Some(editor) = self.searched_editor() else { return 0 };
         editor.update(cx, |editor, cx| {
             editor.replace_ranges(&ranges, &with, window, cx);
         });

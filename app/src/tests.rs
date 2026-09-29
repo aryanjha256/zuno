@@ -6051,6 +6051,71 @@ async fn graphql_validation_marks_the_problem_and_never_a_stale_one(cx: &mut Tes
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// **`Ctrl+F` in a GraphQL request searches the editor on screen.** It was a fixed jump to the
+/// kind's second tab — Variables — while searching the query, so from the Query tab it moved you
+/// away with the bar drawn on neither. From Variables it has to search, and replace in, the
+/// variables, leaving the query alone.
+#[gpui::test]
+async fn find_in_a_graphql_request_searches_the_tab_it_was_opened_from(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+    let spec = RequestSpec {
+        url: "https://api.test/graphql".to_string(),
+        kind: zuno_core::RequestKind::GraphQl(zuno_core::GraphQlRequest {
+            query: "query Q($id: Int) { user(id: $id) { name } }".to_string(),
+            variables: r#"{ "id": 1 }"#.to_string(),
+            ..Default::default()
+        }),
+        ..RequestSpec::default()
+    };
+    cx.update(|_, cx| view.update(cx, |view, cx| view.load(spec, cx)));
+    cx.run_until_parked();
+    let focus = |cx: &mut VisualTestContext, slot: u8| {
+        cx.update(|window, cx| {
+            view.update(cx, |view, _| {
+                view.request_tab = crate::request_view::RequestTab::Kind(slot);
+            });
+            let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+            let editor = if slot == 0 { graphql.query.clone() } else { graphql.variables.clone() };
+            window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+        });
+        cx.run_until_parked();
+    };
+    let tab = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).request_tab);
+    let texts = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+            (
+                graphql.query.read(cx).text().to_string(),
+                graphql.variables.read(cx).text().to_string(),
+            )
+        })
+    };
+
+    focus(&mut cx, 0);
+    cx.press("ctrl-f");
+    cx.run_until_parked();
+    assert_eq!(tab(&mut cx), crate::request_view::RequestTab::Kind(0), "find stays on Query");
+    cx.press("escape");
+    cx.run_until_parked();
+
+    focus(&mut cx, 1);
+    cx.press("ctrl-f");
+    cx.run_until_parked();
+    assert_eq!(tab(&mut cx), crate::request_view::RequestTab::Kind(1), "and on Variables");
+    cx.simulate_input("\"id\"");
+    cx.update(|window, cx| {
+        let replace = view.read(cx).body_search.as_ref().and_then(|search| search.replace.clone());
+        replace.expect("a replace field").update(cx, |input, cx| {
+            gpui::EntityInputHandler::replace_text_in_range(input, None, "\"uid\"", window, cx);
+        });
+    });
+    cx.press("ctrl-alt-enter");
+    cx.run_until_parked();
+    let (query, variables) = texts(&mut cx);
+    assert_eq!(variables, r#"{ "uid": 1 }"#, "the variables were searched and replaced");
+    assert_eq!(query, "query Q($id: Int) { user(id: $id) { name } }", "the query was not");
+}
+
 /// **The schema browser opens on the query root and every link goes somewhere**: Browse opens it
 /// under the query, a field's type opens that type's page, Back returns, and the filter narrows
 /// the list to what a click then opens. Each of these is a click that could dispatch nothing —
