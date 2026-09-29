@@ -59,7 +59,8 @@ use crate::actions::{
     OpenBodyType, PrevRequestTab,
     OpenAppMenu, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
-    SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
+    SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev, CompleteNext, CompletePrev,
+    CompleteAccept, CompleteConfirm, CompleteDismiss, TriggerCompletion,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     ClearCookies, CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove,
@@ -552,5 +553,15 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         bind!(mac, "shift-up", editor::SelectUp, Some("BodyEditor")),
         bind!(mac, "shift-down", editor::SelectDown, Some("BodyEditor")),
         bind!(mac, "enter", editor::Newline, Some("BodyEditor")),
+        // GraphQL completion. **Last in the list, deliberately**: `GraphQlQuery` sits in the same
+        // leaf context as `BodyEditor`, so these tie with the editor's own `up`, `down` and
+        // `enter` (and the global `tab` and `escape`) and win only by registering later. Each
+        // handler forwards to what the key did before whenever no list is open.
+        bind!(mac, "down", CompleteNext, Some("GraphQlQuery")),
+        bind!(mac, "up", CompletePrev, Some("GraphQlQuery")),
+        bind!(mac, "tab", CompleteAccept, Some("GraphQlQuery")),
+        bind!(mac, "enter", CompleteConfirm, Some("GraphQlQuery")),
+        bind!(mac, "escape", CompleteDismiss, Some("GraphQlQuery")),
+        bind!(mac, "ctrl-space", TriggerCompletion, Some("GraphQlQuery")),
     ]
 }

@@ -5847,6 +5847,101 @@ async fn from_server_saves_a_graphql_schema_and_points_the_request_at_it(
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// **GraphQL completion, driven by keys the way a person types.** Five rules in one pass, each
+/// invisible when broken:
+///
+/// - the list comes from the schema file, loaded off the UI thread;
+/// - `Tab` accepts the top row, and the list then closes over the word it wrote;
+/// - `Enter` with nothing highlighted is a newline, never a silent accept — §6l's rule;
+/// - `Ctrl+Space` opens it where nothing is typed yet, and the arrows then choose;
+/// - with no list open, `up` still moves the caret. These bindings win over the editor's own, so
+///   without the fallback every GraphQL document would lose its arrow keys.
+#[gpui::test]
+async fn graphql_completion_follows_the_schema_and_the_keys(cx: &mut TestAppContext) {
+    const SDL: &str = "schema { query: Query }\n\
+        type Query { user(id: ID!, verbose: Boolean): User  users: [User!]! }\n\
+        type User { id: ID!  name: String  username: String @deprecated }\n";
+
+    let dir = scratch_dir("graphql-complete");
+    std::fs::create_dir_all(dir.join("schemas")).expect("scratch");
+    std::fs::write(dir.join("schemas/test.graphql"), SDL).expect("write");
+
+    let (window, view, mut cx) = boot(cx, None, Some(dir.clone()));
+    let spec = RequestSpec {
+        url: "https://api.test/graphql".to_string(),
+        kind: zuno_core::RequestKind::GraphQl(zuno_core::GraphQlRequest {
+            schema: "test.graphql".to_string(),
+            ..Default::default()
+        }),
+        ..RequestSpec::default()
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.load(spec, cx);
+            // The Query tab, or the editor is never painted and typing reaches nothing.
+            view.request_tab = crate::request_view::RequestTab::Kind(0);
+        })
+    });
+    cx.run_until_parked();
+    // `load` leaves focus on a dropped input (the trap in CLAUDE.md), so focus the editor itself.
+    cx.update(|window, cx| {
+        let editor = view.read(cx).kind.as_graphql().expect("GraphQL").query.clone();
+        window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+    });
+    cx.run_until_parked();
+
+    let list = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, window, cx| workspace.completion_for_test(window, cx))
+            .expect("window")
+    };
+    let text = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+            graphql.query.read(cx).text().to_string()
+        })
+    };
+
+    cx.simulate_input("{ us");
+    let (items, highlighted) = wait_for(&mut cx, "the schema to load and the list to open", list);
+    assert_eq!(items, ["user", "users"]);
+    assert_eq!(highlighted, None, "typing never highlights");
+
+    cx.press("tab");
+    cx.run_until_parked();
+    assert_eq!(text(&mut cx), "{ user", "Tab accepts the top row");
+    assert_eq!(list(&mut cx), None, "and the list closes over the word it wrote");
+
+    cx.simulate_input("(");
+    assert_eq!(list(&mut cx), None, "nothing typed, nothing asked: no list");
+    cx.press("ctrl-space");
+    cx.run_until_parked();
+    assert_eq!(list(&mut cx).map(|(items, _)| items), Some(vec!["id".into(), "verbose".into()]));
+    cx.press("down");
+    cx.press("enter");
+    cx.run_until_parked();
+    assert_eq!(text(&mut cx), "{ user(id: ", "Enter accepts the row the arrow chose");
+
+    cx.simulate_input("1) {");
+    cx.press("enter");
+    cx.simulate_input("na");
+    cx.run_until_parked();
+    assert_eq!(
+        list(&mut cx).map(|(items, _)| items),
+        Some(vec!["name".into(), "username".into(), "__typename".into()])
+    );
+    cx.press("enter");
+    cx.run_until_parked();
+    assert_eq!(text(&mut cx), "{ user(id: 1) {\nna\n", "Enter with nothing chosen is a newline");
+
+    cx.press("up");
+    cx.simulate_input("X");
+    cx.run_until_parked();
+    assert_eq!(text(&mut cx), "{ user(id: 1) {\nXna\n", "up still moves the caret with no list open");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 /// **The cookie viewer shows the jar, forgets one cookie, and clears the rest** — reached
 /// through the `cookies on` badge, which is the mouse path, and driven by the keys the footer
 /// advertises.

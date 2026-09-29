@@ -13,10 +13,10 @@
 //!   and `⌃↑` is Mission Control.
 //! - **Text editing follows the Mac, not a rule**: words move on `⌥←`/`⌥→` (`⌃←` switches desktops),
 //!   delete on `⌥⌫`/`⌥⌦`, the document ends on `⌘↑`/`⌘↓`, and redo is only `⌘⇧Z`.
-//! - **Three exceptions**, each a collision with the system or with another binding: history is
+//! - **Four exceptions**, each a collision with the system or with another binding: history is
 //!   `⌘Y` as in Safari (`⌘H` hides the app), the method picker is `⌃M` (`⌘M` minimizes, and `⌘⇧M`
-//!   is already *Add multipart field*), and tab switching stays `⌃Tab` (`⌘Tab` is the app
-//!   switcher, and Mac browsers use `⌃Tab` too).
+//!   is already *Add multipart field*), tab switching stays `⌃Tab` (`⌘Tab` is the app switcher,
+//!   and Mac browsers use `⌃Tab` too), and completion stays `⌃Space` (`⌘Space` is Spotlight).
 //!
 //! `mac` is a parameter rather than a `cfg!`, so a test on any host can translate the whole keymap
 //! and check it for collisions — `a_mac_keymap_has_no_collisions`, which is how `⌘⇧M` was caught.
@@ -38,6 +38,8 @@ fn mac_keystroke(keystroke: &str) -> String {
         "ctrl-h" => Some("cmd-y"),
         "ctrl-m" => Some("ctrl-m"),
         "ctrl-tab" => Some("ctrl-tab"),
+        // Completion. `⌘Space` is Spotlight; `⌃Space` is what Mac code editors use.
+        "ctrl-space" => Some("ctrl-space"),
         "ctrl-shift-tab" => Some("ctrl-shift-tab"),
         "ctrl-left" => Some("alt-left"),
         "ctrl-right" => Some("alt-right"),
@@ -106,6 +108,7 @@ mod tests {
             ("ctrl-h", "cmd-y"),
             ("ctrl-m", "ctrl-m"),
             ("ctrl-tab", "ctrl-tab"),
+            ("ctrl-space", "ctrl-space"),
             // Plain keys never change.
             ("escape", "escape"),
             ("shift-tab", "shift-tab"),

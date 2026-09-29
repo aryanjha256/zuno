@@ -644,6 +644,24 @@ pub fn field_box(input: Entity<crate::input::TextInput>, theme: &Theme) -> impl 
         .child(input)
 }
 
+/// One row of a `select_list`: a label, and optionally a dimmer detail to its right — a GraphQL
+/// field's type, say. `dimmed` greys the whole row, for an entry that is offered but discouraged.
+pub struct SelectRow {
+    pub label: SharedString,
+    pub detail: Option<SharedString>,
+    pub dimmed: bool,
+}
+
+impl From<SharedString> for SelectRow {
+    fn from(label: SharedString) -> Self {
+        Self {
+            label,
+            detail: None,
+            dimmed: false,
+        }
+    }
+}
+
 /// An anchored list pinned under a control — a **select**, not a menu.
 ///
 /// **The distinction is the whole reason this exists separately from `context_menu`.** That one
@@ -665,7 +683,7 @@ pub fn field_box(input: Entity<crate::input::TextInput>, theme: &Theme) -> impl 
 pub fn select_list<V, H, C>(
     id: &'static str,
     at: gpui::Point<gpui::Pixels>,
-    items: Vec<SharedString>,
+    items: Vec<SelectRow>,
     highlighted: Option<usize>,
     min_width: gpui::Pixels,
     theme: &Theme,
@@ -681,12 +699,15 @@ where
     let rows: Vec<_> = items
         .into_iter()
         .enumerate()
-        .map(|(ix, label)| {
+        .map(|(ix, row)| {
             let (bg, fg) = if highlighted == Some(ix) {
                 (theme.bg_hover, theme.text)
             } else {
                 (theme.bg_elevated, theme.text_muted)
             };
+            // Dimmed rows stay dim under the highlight: "this one is deprecated" is the one thing
+            // the row must still say at the moment you are about to choose it.
+            let fg = if row.dimmed { theme.text_faint } else { fg };
             let highlight = on_highlight.clone();
             let choose = on_choose.clone();
             div()
@@ -711,7 +732,15 @@ where
                         choose(view, ix, window, cx)
                     }),
                 )
-                .child(label)
+                .flex()
+                .flex_row()
+                .gap_3()
+                .justify_between()
+                .child(row.label)
+                .children(
+                    row.detail
+                        .map(|detail| div().flex_none().text_color(theme.text_faint).child(detail)),
+                )
         })
         .collect();
 

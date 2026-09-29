@@ -82,6 +82,10 @@ pub struct Editor {
     /// from `RawKind`, so switching a body to XML turns colour off rather than mis-colouring it.
     highlight_json: bool,
     is_selecting: bool,
+    /// The key context, which is always both of `TextInput BodyEditor` and may name one more
+    /// identifier — `GraphQlQuery`, whose completion keys must win only inside that editor. One
+    /// string, because gpui matches only the leaf context.
+    key_context: &'static str,
 }
 
 impl Editor {
@@ -107,6 +111,7 @@ impl Editor {
             suppress_history: false,
             highlight_json: false,
             is_selecting: false,
+            key_context: "TextInput BodyEditor",
         }
     }
 
@@ -115,6 +120,39 @@ impl Editor {
     #[cfg(test)]
     pub fn vertical_offset(&self) -> Pixels {
         self.scroll.offset().y
+    }
+
+    /// Replace the key context — the whole string, which must still contain `TextInput
+    /// BodyEditor` or every editing binding stops matching.
+    pub fn set_key_context(&mut self, context: &'static str) {
+        debug_assert!(context.contains("TextInput") && context.contains("BodyEditor"));
+        self.key_context = context;
+    }
+
+    /// Where the caret is, as a byte offset.
+    pub fn cursor_offset(&self) -> usize {
+        self.cursor()
+    }
+
+    /// Whether any text is selected.
+    pub fn has_selection(&self) -> bool {
+        !self.selection.is_empty()
+    }
+
+    /// The caret's rectangle in window coordinates, as last painted — `None` before the first
+    /// paint, or when the caret's line is scrolled out of the painted window.
+    ///
+    /// `last_bounds` is the whole content's box, already moved by the scroll container, so the
+    /// line's top is a plain multiple of the line height — the arithmetic paint itself uses.
+    pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        let bounds = self.last_bounds?;
+        let cursor = self.cursor();
+        let line = self.line_of(cursor);
+        let (_, layout) = self.last_layouts.iter().find(|(ix, _)| *ix == line)?;
+        let x = bounds.left() - self.h_offset
+            + layout.x_for_index(cursor.saturating_sub(self.line_start(line)));
+        let top = bounds.top() + self.last_line_height * (line as f32);
+        Some(Bounds::new(point(x, top), size(px(1.), self.last_line_height)))
     }
 
     pub fn set_highlight_json(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -968,7 +1006,7 @@ impl Render for Editor {
             // Both identifiers: the shared text bindings match on `TextInput`, the
             // line-aware ones on `BodyEditor`. GPUI matches only the leaf context, so
             // they have to live in one string.
-            .key_context("TextInput BodyEditor")
+            .key_context(self.key_context)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))

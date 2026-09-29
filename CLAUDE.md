@@ -40,7 +40,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 1080 tests, ~50s
+cargo test --workspace                   # 1087 tests, ~50s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -345,7 +345,7 @@ with no error anywhere.
 `main.rs` goes through `bind!(mac, "ctrl-…", …)`, which runs `platform_keys::for_platform` — the
 identity off macOS, so the Linux keymap is exactly what it says; on a Mac `ctrl-` becomes `⌘`,
 `alt-`+letter becomes `⌃`, and text editing follows Mac conventions (the module lists the rules
-and the three exceptions). **Tests press keys with `cx.press("ctrl-enter")`, never
+and the four exceptions). **Tests press keys with `cx.press("ctrl-enter")`, never
 `simulate_keystrokes`**, so the macOS CI job exercises the Mac bindings through the same
 translation — a raw `simulate_keystrokes("ctrl-enter")` passes on Linux and fails on the Mac
 runner. The one exception is a key read back from the live keymap (`binding_syntax`), which is

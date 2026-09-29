@@ -7,6 +7,8 @@
 //! `TextInput` nested two levels down. Handlers that need buffer state reach into the
 //! active `RequestView` through its entity.
 
+mod completion;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -242,6 +244,12 @@ pub struct Workspace {
     suggest: Option<(usize, Option<usize>)>,
     /// The row whose list was dismissed with `escape`, so it stays shut until focus moves.
     suggest_dismissed: Option<usize>,
+    /// The GraphQL completion list's highlight and where it was dismissed or asked for — see
+    /// `completion.rs`. The list itself is derived, like the header list.
+    completion: completion::CompletionState,
+    /// Parsed GraphQL schemas by file, filled off the UI thread the first time a request names
+    /// one. *From server* drops its file's entry so the fresh copy is read.
+    graphql_schemas: std::collections::HashMap<std::path::PathBuf, completion::SchemaSlot>,
     /// The open multipart type select: which row, and where its chip was.
     part_select: Option<(usize, gpui::Point<gpui::Pixels>)>,
 }
@@ -474,6 +482,8 @@ impl Workspace {
             update_task: None,
             suggest: None,
             suggest_dismissed: None,
+            completion: Default::default(),
+            graphql_schemas: Default::default(),
             part_select: None,
         };
 
@@ -5693,7 +5703,7 @@ impl Workspace {
         Some(crate::ui::select_list(
             "part-kind-select",
             at,
-            vec![SharedString::from("text"), SharedString::from("file")],
+            vec![SharedString::from("text").into(), SharedString::from("file").into()],
             Some(current),
             px(84.),
             &theme,
@@ -6070,7 +6080,7 @@ impl Workspace {
         Some(crate::ui::select_list(
             "header-suggestions",
             at,
-            items.iter().map(|name| SharedString::from(*name)).collect(),
+            items.iter().map(|name| SharedString::from(*name).into()).collect(),
             highlighted,
             px(180.),
             &theme,
@@ -6876,7 +6886,8 @@ impl Workspace {
         // The tab that asked, for `reflect_schema`'s reason.
         let target = view.downgrade();
         let (_job, events) = engine.send(spec);
-        cx.spawn_in(window, async move |_, cx| {
+        let schemas = root.join(zuno_core::graphql::DIRECTORY);
+        cx.spawn_in(window, async move |this, cx| {
             let response = loop {
                 match events.recv().await {
                     Ok(zuno_core::engine::Event::Done { response, .. }) => break response,
@@ -6915,6 +6926,16 @@ impl Workspace {
                     Ok::<_, String>((name, types))
                 })
                 .await;
+
+            // A re-fetch writes over the same file, so completion must read it again rather
+            // than keep offering the schema as it was.
+            if let Ok((name, _)) = &saved {
+                let path = schemas.join(name);
+                let _ = this.update(cx, |workspace, cx| {
+                    workspace.forget_graphql_schema(&path);
+                    cx.notify();
+                });
+            }
 
             let _ = target.update_in(cx, |view, window, cx| {
                 match saved {
@@ -7116,6 +7137,9 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let focused_region = self.focused_region(window, cx);
+        // Before anything reads it: a GraphQL request's schema is parsed off-thread the first
+        // time it is on screen, so completion is ready by the time someone types.
+        self.load_graphql_schema(cx);
         let status_message = self.status_message(cx);
         let cookies = self.cookies_enabled(cx);
         let cert_files = crate::app_state::tls(cx);
@@ -7321,6 +7345,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::suggest_prev))
             .on_action(cx.listener(Self::suggest_confirm))
             .on_action(cx.listener(Self::suggest_dismiss))
+            .on_action(cx.listener(Self::complete_next))
+            .on_action(cx.listener(Self::complete_prev))
+            .on_action(cx.listener(Self::complete_accept))
+            .on_action(cx.listener(Self::complete_confirm))
+            .on_action(cx.listener(Self::complete_dismiss))
+            .on_action(cx.listener(Self::trigger_completion))
             .on_action(cx.listener(Self::menu_next))
             .on_action(cx.listener(Self::menu_prev))
             .on_action(cx.listener(Self::menu_confirm))
@@ -7441,6 +7471,7 @@ impl Render for Workspace {
             .children(self.flows.as_ref().map(|state| state.panel.clone()))
             .children(self.menu.as_ref().map(|state| state.menu.clone()))
             .children(self.header_suggestions(window, cx))
+            .children(self.graphql_completion(window, cx))
             .children(self.part_kind_select(cx))
             // Built here rather than held as an `Entity`: it owns no input and no state beyond
             // which button is selected, so it is plain workspace state like `RenameState`.

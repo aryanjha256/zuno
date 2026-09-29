@@ -165,10 +165,17 @@ request then names in its new `schema` field. `gRPC`'s reflection rule for the s
 committable, offline, and still there once production turns introspection off. Parsed by
 `apollo-compiler` before it is written, which is also what the next two build on.
 
-What remains for GraphQL, in order: **assisted editing** — completion in the query editor from
-that schema, which needs the app's first completion popup inside the multi-line editor, and
-then validation against it. That is the actual differentiator: a query you write with the schema
-helping, not a checkbox tree. Then a **schema browser**. That last one is
+**Completion — done, for fields and arguments.** The query editor offers the fields of the type
+under the caret and the arguments a field has left, from that saved schema: while a name is being
+typed, or anywhere on `Ctrl+Space`. `Tab` accepts the top row and `Enter` only one the arrows
+chose — the header list's rule (architecture.md §6l), one surface over, in the app's first popup
+inside the multi-line editor. A tolerant scanner finds *where* the caret is (`graphql::complete`),
+so a half-typed document still completes. Not yet: enum values, `... on` type names, `$variables`.
+
+What remains for GraphQL, in order: **validation** against the schema — unknown fields and wrong
+argument types marked where they are typed — then those remaining completions. That is the
+actual differentiator: a query you write with the schema helping, not a checkbox tree. Then a
+**schema browser**. That last one is
 where the **buffer generalization** comes in — a schema browser is not a request, so it is the
 first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
 currently has exactly one document type and around ten overlays, and making the browser overlay

@@ -44,7 +44,13 @@ impl GraphQlEditor {
     pub fn from_spec(graphql: &GraphQlRequest, cx: &mut Context<RequestView>) -> Self {
         Self {
             method: graphql.method.clone(),
-            query: cx.new(|cx| Editor::new(&graphql.query, "query { … }", cx)),
+            // `GraphQlQuery` scopes the completion keys to this editor alone — see
+            // `Workspace::graphql_completion`.
+            query: cx.new(|cx| {
+                let mut editor = Editor::new(&graphql.query, "query { … }", cx);
+                editor.set_key_context("TextInput BodyEditor GraphQlQuery");
+                editor
+            }),
             variables: cx.new(|cx| Editor::new(&graphql.variables, "{ }", cx)),
             operation: cx.new(|cx| {
                 TextInput::new(

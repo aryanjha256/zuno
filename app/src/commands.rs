@@ -219,6 +219,14 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::SuggestPrev", "only valid inside the header name list"),
     ("zuno::SuggestConfirm", "only valid inside the header name list"),
     ("zuno::SuggestDismiss", "only valid inside the header name list"),
+    // Keys inside the GraphQL query editor, for the header list's reason — and opening the list
+    // from the palette would move focus out of the editor it completes in.
+    ("zuno::CompleteNext", "only valid inside the GraphQL completion list"),
+    ("zuno::CompletePrev", "only valid inside the GraphQL completion list"),
+    ("zuno::CompleteAccept", "only valid inside the GraphQL completion list"),
+    ("zuno::CompleteConfirm", "only valid inside the GraphQL completion list"),
+    ("zuno::CompleteDismiss", "only valid inside the GraphQL completion list"),
+    ("zuno::TriggerCompletion", "completes at the caret, which the palette takes focus from"),
     // The chip in the titlebar is the entry point, and it only exists when there is something
     // to say. Same reasoning as `OpenAppMenu`: reaching a menu from the palette is backwards.
     ("zuno::OpenUpdateMenu", "a menu reached from the palette is backwards"),

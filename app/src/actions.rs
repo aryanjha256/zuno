@@ -244,6 +244,13 @@ actions!(
         SuggestPrev,
         SuggestConfirm,
         SuggestDismiss,
+        // GraphQL completion in the query editor
+        CompleteNext,
+        CompletePrev,
+        CompleteAccept,
+        CompleteConfirm,
+        CompleteDismiss,
+        TriggerCompletion,
         // Updates
         OpenUpdateMenu,
         CopyInstallCommand,
