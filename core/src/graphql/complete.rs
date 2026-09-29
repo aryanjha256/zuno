@@ -43,6 +43,26 @@ pub enum Spot {
         field: String,
         used: Vec<String>,
     },
+    /// After `argument:`, where its value goes — an enum's values, or `true`/`false`.
+    Value {
+        root: Root,
+        path: Vec<Step>,
+        field: String,
+        argument: String,
+    },
+    /// After `argument: $`, where a variable goes. `declared` are the operation's own, as
+    /// `(name, type)`, since a variable can only be one the operation declares.
+    Variable {
+        root: Root,
+        path: Vec<Step>,
+        field: String,
+        argument: String,
+        declared: Vec<(String, String)>,
+    },
+    /// After `on`, where a type goes. `within` is the selection set an inline fragment sits in,
+    /// which limits it to the types that field can be; `None` for a `fragment X on` definition,
+    /// which may name any composite type.
+    TypeCondition { within: Option<(Root, Vec<Step>)> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +76,7 @@ pub struct Context {
 }
 
 /// Where the caret at byte `cursor` is, or `None` where nothing is offered: in a string or a
-/// comment, among variables or directives, inside an argument's value, or outside any operation.
+/// comment, after `@`, inside an input object or list, or outside any operation.
 pub fn context(document: &str, cursor: usize) -> Option<Context> {
     let cursor = cursor.min(document.len());
     if !document.is_char_boundary(cursor) {
@@ -76,13 +96,35 @@ pub fn context(document: &str, cursor: usize) -> Option<Context> {
     if bytes.get(start).is_some_and(u8::is_ascii_digit) && start < cursor {
         return None;
     }
-    // `$id` and `@include` are variables and directives, which this does not complete.
-    if start > 0 && matches!(bytes[start - 1], b'$' | b'@') {
+    // `@include` is a directive, which this does not complete.
+    if start > 0 && bytes[start - 1] == b'@' {
         return None;
     }
+    // `$id` is a variable — offered only where a value goes, since elsewhere a `$` is
+    // declaring one, and a new name is not something a list can know.
+    let dollar = start > 0 && bytes[start - 1] == b'$';
 
-    let tokens = lex(&document[..start])?;
-    let spot = walk(&tokens)?;
+    let tokens = lex(&document[..if dollar { start - 1 } else { start }])?;
+    let (spot, declared) = walk(&tokens)?;
+    let spot = match (dollar, spot) {
+        (
+            true,
+            Spot::Value {
+                root,
+                path,
+                field,
+                argument,
+            },
+        ) => Spot::Variable {
+            root,
+            path,
+            field,
+            argument,
+            declared,
+        },
+        (true, _) => return None,
+        (false, spot) => spot,
+    };
     Some(Context {
         spot,
         prefix: document[start..cursor].to_string(),
@@ -193,7 +235,13 @@ struct Arguments {
     depth: usize,
 }
 
-fn walk(tokens: &[Token]) -> Option<Spot> {
+/// Where the tokens leave the caret, and the variables the operation around it declares.
+fn walk(tokens: &[Token]) -> Option<(Spot, Vec<(String, String)>)> {
+    // The operation header's `($id: ID!, …)`, collected until its `)` and then read by
+    // `definitions` — declared on the header, in force inside the operation's `{`.
+    let mut defining: Option<(usize, Vec<Token>)> = None;
+    let mut pending_declared: Vec<(String, String)> = Vec::new();
+    let mut declared: Vec<(String, String)> = Vec::new();
     let mut root: Option<Root> = None;
     let mut pending_root: Option<Root> = None;
     // The step each open selection set was entered by; `None` for the operation's own and for
@@ -214,6 +262,21 @@ fn walk(tokens: &[Token]) -> Option<Spot> {
     while i < tokens.len() {
         let token = &tokens[i];
         i += 1;
+
+        if let Some((depth, collected)) = defining.as_mut() {
+            match token {
+                Token::Punct(b'(') => *depth += 1,
+                Token::Punct(b')') if *depth == 1 => {
+                    pending_declared = definitions(collected);
+                    defining = None;
+                    continue;
+                }
+                Token::Punct(b')') => *depth -= 1,
+                _ => {}
+            }
+            collected.push(token.clone());
+            continue;
+        }
 
         if skip_parens > 0 {
             match token {
@@ -284,13 +347,14 @@ fn walk(tokens: &[Token]) -> Option<Spot> {
                         _ => 0,
                     };
                 }
-                // Variable definitions, whose `$id: ID!` is nothing to complete.
-                Token::Punct(b'(') => skip_parens = 1,
+                // Variable definitions: read, so a `$` later can offer them.
+                Token::Punct(b'(') => defining = Some((1, Vec::new())),
                 Token::Punct(b'{') => {
                     root = Some(pending_root.take().unwrap_or(Root::Query));
                     fragment = 0;
                     frames.push(None);
                     last_field = None;
+                    declared = std::mem::take(&mut pending_declared);
                 }
                 _ => {}
             },
@@ -340,34 +404,81 @@ fn walk(tokens: &[Token]) -> Option<Spot> {
                 spread = 0;
                 if frames.is_empty() {
                     root = None;
+                    declared.clear();
                 }
             }
             _ => {}
         }
     }
 
-    if skip_parens > 0 || directive || directive_named {
+    if skip_parens > 0 || defining.is_some() || directive || directive_named {
         return None;
+    }
+    if frames.is_empty() {
+        // `fragment Name on |` — any composite type may follow.
+        return (fragment == 3).then_some((Spot::TypeCondition { within: None }, Vec::new()));
     }
     let root = root?;
-    if frames.is_empty() {
-        return None;
-    }
     let path: Vec<Step> = frames.into_iter().flatten().collect();
 
-    if let Some(args) = arguments {
-        return (args.expect == Expect::Name && args.depth == 0).then_some(Spot::Argument {
-            root,
-            path,
-            field: args.field,
-            used: args.used,
-        });
-    }
-    // After `...` a fragment's name or `on` is typed, and after `on` a type: neither is a field.
-    if spread != 0 || pending_on.is_some() {
+    let spot = if let Some(args) = arguments {
+        if args.depth != 0 {
+            // Inside an input object or a list: a later slice's question.
+            return None;
+        }
+        match args.expect {
+            Expect::Name => Spot::Argument {
+                root,
+                path,
+                field: args.field,
+                used: args.used,
+            },
+            Expect::Value => Spot::Value {
+                root,
+                path,
+                field: args.field,
+                // The name the `:` followed is the last one written.
+                argument: args.used.last()?.clone(),
+            },
+            Expect::Colon | Expect::Variable => return None,
+        }
+    } else if spread == 2 {
+        Spot::TypeCondition {
+            within: Some((root, path)),
+        }
+    } else if spread != 0 || pending_on.is_some() {
+        // After `...` a fragment's name is typed, and after `on Type` a `{`: neither is a field.
         return None;
+    } else {
+        Spot::Field { root, path }
+    };
+    Some((spot, declared))
+}
+
+/// `$id: ID!, $n: [Int!] = [1]` as `(name, type)` pairs, the type written as SDL writes it.
+fn definitions(tokens: &[Token]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if let (Token::Punct(b'$'), Some(Token::Name(name)), Some(Token::Punct(b':'))) =
+            (&tokens[i], tokens.get(i + 1), tokens.get(i + 2))
+        {
+            i += 3;
+            let mut ty = String::new();
+            while let Some(token) = tokens.get(i) {
+                match token {
+                    Token::Name(part) => ty.push_str(part),
+                    Token::Punct(byte @ (b'[' | b']' | b'!')) => ty.push(*byte as char),
+                    _ => break,
+                }
+                i += 1;
+            }
+            out.push((name.clone(), ty));
+            continue;
+        }
+        i += 1;
     }
-    Some(Spot::Field { root, path })
+    out
 }
 
 /// One row of the list.
@@ -415,6 +526,20 @@ impl SchemaIndex {
                 field,
                 used,
             } => self.arguments(root, path, field, used),
+            Spot::Value {
+                root,
+                path,
+                field,
+                argument,
+            } => self.values(root, path, field, argument),
+            Spot::Variable {
+                root,
+                path,
+                field,
+                argument,
+                declared,
+            } => self.variables(root, path, field, argument, declared),
+            Spot::TypeCondition { within } => self.type_conditions(within.as_ref()),
         };
 
         let needle = prefix.to_ascii_lowercase();
@@ -474,6 +599,138 @@ impl SchemaIndex {
                 insert: format!("{}: ", arg.name),
             })
             .collect()
+    }
+
+    /// The type an argument takes, as written — `Status!`, `[ID!]`.
+    fn argument_type(
+        &self,
+        root: &Root,
+        path: &[Step],
+        field: &str,
+        argument: &str,
+    ) -> Option<&apollo_compiler::ast::Type> {
+        let ty = self.resolve(root, path)?;
+        let definition = self.field(&ty, field)?;
+        definition
+            .arguments
+            .iter()
+            .find(|arg| arg.name == argument)
+            .map(|arg| &*arg.ty)
+    }
+
+    /// An enum argument's values, or `true`/`false` for a Boolean. Anything else is a value no
+    /// list can know — a string, a number, an ID — and is offered nothing rather than a guess.
+    fn values(&self, root: &Root, path: &[Step], field: &str, argument: &str) -> Vec<Suggestion> {
+        let Some(ty) = self.argument_type(root, path, field, argument) else {
+            return Vec::new();
+        };
+        let named = ty.inner_named_type();
+        match self.schema.types.get(named) {
+            Some(apollo_compiler::schema::ExtendedType::Enum(enumeration)) => enumeration
+                .values
+                .values()
+                .map(|value| Suggestion {
+                    label: value.value.to_string(),
+                    detail: named.to_string(),
+                    deprecated: value.directives.get("deprecated").is_some(),
+                    insert: value.value.to_string(),
+                })
+                .collect(),
+            _ if named == "Boolean" => ["true", "false"]
+                .into_iter()
+                .map(|value| Suggestion {
+                    label: value.to_string(),
+                    detail: "Boolean".to_string(),
+                    deprecated: false,
+                    insert: value.to_string(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The operation's declared variables, **those whose type fits the argument first** — a
+    /// `$id: ID!` where the argument takes `ID!`. The rest still follow: GraphQL allows a
+    /// non-null variable where a nullable argument is taken, and the validator is what says
+    /// whether a particular pairing works, not this list.
+    fn variables(
+        &self,
+        root: &Root,
+        path: &[Step],
+        field: &str,
+        argument: &str,
+        declared: &[(String, String)],
+    ) -> Vec<Suggestion> {
+        let wanted = self
+            .argument_type(root, path, field, argument)
+            .map(|ty| ty.to_string());
+        let row = |(name, ty): &(String, String)| Suggestion {
+            label: name.clone(),
+            detail: ty.clone(),
+            deprecated: false,
+            insert: name.clone(),
+        };
+        let (fits, rest): (Vec<_>, Vec<_>) = declared
+            .iter()
+            .partition(|(_, ty)| wanted.as_deref() == Some(ty.as_str()));
+        fits.into_iter().chain(rest).map(row).collect()
+    }
+
+    /// The types an `on` may name. Inside a selection set, the ones the field there can actually
+    /// be — a union's members, an interface and its implementers, an object itself — since any
+    /// other would never match. In a `fragment … on`, every object, interface and union.
+    fn type_conditions(&self, within: Option<&(Root, Vec<Step>)>) -> Vec<Suggestion> {
+        use apollo_compiler::schema::ExtendedType;
+
+        let kind = |name: &str| match self.schema.types.get(name) {
+            Some(ExtendedType::Object(_)) => "type",
+            Some(ExtendedType::Interface(_)) => "interface",
+            Some(ExtendedType::Union(_)) => "union",
+            _ => "",
+        };
+        let row = |name: &str| Suggestion {
+            label: name.to_string(),
+            detail: kind(name).to_string(),
+            deprecated: false,
+            insert: name.to_string(),
+        };
+
+        let Some((root, path)) = within else {
+            return self
+                .schema
+                .types
+                .iter()
+                .filter(|(name, ty)| {
+                    !name.starts_with("__")
+                        && matches!(
+                            ty,
+                            ExtendedType::Object(_)
+                                | ExtendedType::Interface(_)
+                                | ExtendedType::Union(_)
+                        )
+                })
+                .map(|(name, _)| row(name))
+                .collect();
+        };
+        let Some(current) = self.resolve(root, path) else {
+            return Vec::new();
+        };
+        match self.schema.types.get(current.as_str()) {
+            Some(ExtendedType::Union(union)) => {
+                union.members.iter().map(|member| row(member)).collect()
+            }
+            Some(ExtendedType::Interface(_)) => {
+                let implementers = self.schema.implementers_map();
+                let mut out = vec![row(&current)];
+                if let Some(found) = implementers.get(current.as_str()) {
+                    out.extend(found.objects.iter().map(|name| row(name)));
+                    out.extend(found.interfaces.iter().map(|name| row(name)));
+                }
+                out
+            }
+            Some(ExtendedType::Object(_)) => vec![row(&current)],
+            _ => Vec::new(),
+        }
     }
 
     /// Every problem `document` has against this schema, as byte ranges into it.
@@ -705,20 +962,61 @@ mod tests {
         );
     }
 
+    /// After `argument:` a value goes, after `argument: $` a declared variable, and after `on` a
+    /// type — each its own spot, carrying what its answer needs.
+    #[test]
+    fn values_variables_and_type_conditions_have_spots_of_their_own() {
+        let value = |argument: &str| Spot::Value {
+            root: Root::Query,
+            path: vec![],
+            field: "users".into(),
+            argument: argument.into(),
+        };
+        assert_eq!(at("{ users(status: |").map(|c| c.spot), Some(value("status")));
+        let found = at("{ users(first: 2, status: AC|").expect("a value being typed");
+        assert_eq!(found.spot, value("status"));
+        assert_eq!(found.prefix, "AC");
+
+        // The operation's declarations travel with a `$`, types and all.
+        let found =
+            at("query Q($s: Status!, $ids: [ID!] = [\"1\"]) { users(status: $|").expect("a variable");
+        assert_eq!(
+            found.spot,
+            Spot::Variable {
+                root: Root::Query,
+                path: vec![],
+                field: "users".into(),
+                argument: "status".into(),
+                declared: vec![("s".into(), "Status!".into()), ("ids".into(), "[ID!]".into())],
+            }
+        );
+        // A `$` in the header is declaring a name, which no list can know.
+        assert_eq!(at("query Q($|"), None);
+
+        assert_eq!(
+            at("{ node(id: 1) { ... on |").map(|c| c.spot),
+            Some(Spot::TypeCondition {
+                within: Some((Root::Query, vec![step("node")])),
+            })
+        );
+        assert_eq!(
+            at("fragment F on Us|").map(|c| c.spot),
+            Some(Spot::TypeCondition { within: None })
+        );
+    }
+
     /// Where a name is not a field or an argument, nothing is offered rather than a wrong list.
     #[test]
     fn nothing_is_offered_where_no_field_or_argument_goes() {
         for marked in [
             "|",
             "query Q|",
-            "{ user(id: |",
-            "{ user(id: us|",
             "{ user(filter: { na|",
-            "{ user(id: $i|",
             "{ user @inc|",
             "{ ...Fra|",
-            "{ ... on Us|",
+            "{ ... on User |",
             "{ user(name: \"na|",
+            "{ user($|",
             "# a comment { |",
             "{ user } |",
             "query Q($|",
@@ -731,10 +1029,11 @@ mod tests {
         schema { query: Query }
         type Query {
           user(id: ID!, verbose: Boolean): User
-          users(first: Int, after: String): [User!]!
+          users(first: Int, after: String, status: Status): [User!]!
           node(id: ID!): Node
           result: Result
         }
+        enum Status { ACTIVE DRAFT ARCHIVED @deprecated }
         interface Node { id: ID! }
         type User implements Node {
           id: ID!
@@ -742,8 +1041,54 @@ mod tests {
           username: String @deprecated(reason: "Use name.")
           friends: [User!]!
         }
-        union Result = User
+        type Post implements Node { id: ID! }
+        union Result = User | Post
     "#;
+
+    #[test]
+    fn values_variables_and_type_conditions_are_answered_from_the_schema() {
+        let index = SchemaIndex::parse(SDL).expect("parses");
+        let labels = |found: Vec<Suggestion>| -> Vec<String> {
+            found.into_iter().map(|s| s.label).collect()
+        };
+        let value = |field: &str, argument: &str| Spot::Value {
+            root: Root::Query,
+            path: vec![],
+            field: field.into(),
+            argument: argument.into(),
+        };
+
+        let status = index.suggest(&value("users", "status"), "");
+        assert_eq!(labels(status.clone()), ["ACTIVE", "DRAFT", "ARCHIVED"]);
+        assert!(status[2].deprecated && status[0].detail == "Status");
+        assert_eq!(labels(index.suggest(&value("user", "verbose"), "")), ["true", "false"]);
+        // A value no list can know — an ID — gets nothing rather than a guess.
+        assert!(index.suggest(&value("user", "id"), "").is_empty());
+
+        // The variable whose type fits comes first; the others still follow.
+        let variables = index.suggest(
+            &Spot::Variable {
+                root: Root::Query,
+                path: vec![],
+                field: "user".into(),
+                argument: "id".into(),
+                declared: vec![("n".into(), "Int".into()), ("id".into(), "ID!".into())],
+            },
+            "",
+        );
+        assert_eq!(labels(variables), ["id", "n"]);
+
+        let within = |field: &str| Spot::TypeCondition {
+            within: Some((Root::Query, vec![step(field)])),
+        };
+        assert_eq!(labels(index.suggest(&within("result"), "")), ["User", "Post"]);
+        assert_eq!(labels(index.suggest(&within("node"), "")), ["Node", "User", "Post"]);
+        let anywhere = labels(index.suggest(&Spot::TypeCondition { within: None }, ""));
+        for name in ["Query", "Node", "User", "Post", "Result"] {
+            assert!(anywhere.iter().any(|label| label == name), "{name} in {anywhere:?}");
+        }
+        assert!(!anywhere.iter().any(|label| label == "Status"), "an enum is not a fragment's type");
+    }
 
     #[test]
     fn a_schema_answers_with_fields_prefix_first() {

@@ -170,7 +170,10 @@ under the caret and the arguments a field has left, from that saved schema: whil
 typed, or anywhere on `Ctrl+Space`. `Tab` accepts the top row and `Enter` only one the arrows
 chose — the header list's rule (architecture.md §6l), one surface over, in the app's first popup
 inside the multi-line editor. A tolerant scanner finds *where* the caret is (`graphql::complete`),
-so a half-typed document still completes. Not yet: enum values, `... on` type names, `$variables`.
+so a half-typed document still completes. Then the rest of what a query is typed from: an enum
+argument's values (and `true`/`false`), the types an `... on` can name — only those the field can
+actually be — and after `$`, the operation's declared variables, the ones whose type fits first.
+Not yet: values inside an input object or list.
 
 **Validation — done, as marks, never a gate.** GraphQL's own validation (`apollo-compiler`)
 runs against the saved schema after each pause in typing, off the UI thread: each problem is a
@@ -179,8 +182,8 @@ what it is. Send sends regardless, because the saved schema can be older than th
 one typo is reported twice (the field, and its parent left with no valid selection), only the
 inner one is kept. Not yet: the Variables JSON checked against the declared `$variable` types.
 
-What remains for GraphQL, in order: the remaining completions — enum values, `... on` type
-names, `$variables` — and checking the Variables JSON. Then a **schema browser**. That last one is
+What remains for GraphQL, in order: checking the Variables JSON against the declared types. Then
+a **schema browser**. That last one is
 where the **buffer generalization** comes in — a schema browser is not a request, so it is the
 first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
 currently has exactly one document type and around ten overlays, and making the browser overlay

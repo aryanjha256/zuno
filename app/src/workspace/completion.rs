@@ -134,7 +134,11 @@ impl Workspace {
             return None;
         }
         let context = complete::context(editor.read(cx).text(), spot.1)?;
-        if context.prefix.is_empty() && self.completion.forced != Some(spot) {
+        // A `$` in a value is itself the request for a variable, so it opens the list with
+        // nothing typed after it. Nowhere else does an empty name open it unasked.
+        let asked = matches!(context.spot, complete::Spot::Variable { .. })
+            || self.completion.forced == Some(spot);
+        if context.prefix.is_empty() && !asked {
             return None;
         }
         let items = index.suggest(&context.spot, &context.prefix);

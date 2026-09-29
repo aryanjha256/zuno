@@ -5939,6 +5939,15 @@ async fn graphql_completion_follows_the_schema_and_the_keys(cx: &mut TestAppCont
     cx.run_until_parked();
     assert_eq!(text(&mut cx), "{ user(id: 1) {\nXna\n", "up still moves the caret with no list open");
 
+    // A `$` where a value goes is itself the request: the declared variables open unasked.
+    cx.press("ctrl-a");
+    cx.simulate_input("query Q($uid: ID!) { user(id: $");
+    cx.run_until_parked();
+    assert_eq!(list(&mut cx).map(|(items, _)| items), Some(vec!["uid".into()]));
+    cx.press("tab");
+    cx.run_until_parked();
+    assert_eq!(text(&mut cx), "query Q($uid: ID!) { user(id: $uid");
+
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
