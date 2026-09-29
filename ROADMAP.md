@@ -13,9 +13,8 @@ directional, and anything beyond that is a name and a reason.
 ## Where we are
 
 **M1, M2 and M3 are all complete, and Zuno ships on Linux, macOS and Windows.** §11 of
-`architecture.md` — the list of engine capability with no way to reach it — has two entries,
-neither an oversight: both are gRPC gaps open by decision (reflection is a one-time import, and a
-bidirectional call has no hang-up short of closing the tab). This section said "what's left is reuse, see M3" for a while after M3
+`architecture.md` — the list of engine capability with no way to reach it — has one entry, open
+by decision rather than oversight: gRPC reflection is a one-time import, not a per-call lookup. This section said "what's left is reuse, see M3" for a while after M3
 was finished; rewritten rather than patched, per the note at the top of this file.
 
 - **M1 — the loop.** Author a request, send it over real HTTP with streaming progress and

@@ -2271,6 +2271,11 @@ fn frame_preview(frame: &zuno_core::Frame) -> (SharedString, bool) {
 /// The strip above the transcript: what was negotiated, and whether it is still open.
 fn session_line(session: &crate::request_view::Transcript, theme: &Theme) -> Div {
     let (label, colour) = match &session.closed {
+        // Ended on purpose from this side: neither a failure nor the server's doing.
+        Some(_) if session.hung_up => (SharedString::from("hung up"), theme.text_muted),
+        None if session.done_sending => {
+            (SharedString::from("open · done sending"), theme.status_success)
+        }
         None => (SharedString::from("open"), theme.status_success),
         // No code and no reason: the peer went away without a Close frame, which is an
         // ordinary ending rather than a fault.
@@ -2408,14 +2413,32 @@ fn session_line(session: &crate::request_view::Transcript, theme: &Theme) -> Div
     // over the action it dispatches, so `CancelRequest` and `SendRequest` produce two `impl
     // IntoElement`s that no `if` can unify.
     let control = if session.is_open() {
-        crate::ui::text_action(
-            "session-disconnect",
-            SharedString::from("Disconnect"),
-            "Disconnect",
-            CancelRequest,
-            theme,
-        )
-        .into_any_element()
+        // **On a bidirectional gRPC call, two verbs**: Done sending finishes your half and keeps
+        // listening — what Disconnect used to do there — and Disconnect really ends the call.
+        // Done sending goes once used; there is no half left to finish.
+        let finish = (session.bidirectional && !session.done_sending).then(|| {
+            crate::ui::text_action(
+                "session-done-sending",
+                SharedString::from("Done sending"),
+                "Finish sending and keep listening for the rest",
+                crate::actions::DoneSending,
+                theme,
+            )
+        });
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .children(finish)
+            .child(crate::ui::text_action(
+                "session-disconnect",
+                SharedString::from("Disconnect"),
+                "Disconnect",
+                CancelRequest,
+                theme,
+            ))
+            .into_any_element()
     } else {
         // **Manual, and only here.** SSE picks itself up because the protocol can resume from
         // `Last-Event-ID`; a socket has no such mechanism, so reconnecting one silently would

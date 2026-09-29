@@ -3059,8 +3059,12 @@ answer. Three details are load-bearing:
   of the conversation. Ending there half-closed the request and the server answered as if the
   messages before the typo were all of it.
 
-Disconnect on a bidirectional call means *done sending* and keeps reading; §11 records that it has
-no hang-up.
+A bidirectional call has two verbs where every other session has one. **Done sending** is the
+half-close and keeps reading, so the server can finish what it is still sending; **Disconnect**
+(and `Escape`) cancels the call outright and keeps the transcript, marked *hung up*. Disconnect was
+once the half-close, which left a stream that never ends with no way to stop it short of closing
+the tab — and closing the tab discarded the transcript, the whole result of the call. On a
+client-streaming call Disconnect still half-closes, because that is how such a call finishes.
 
 ### The verdict
 
@@ -3628,11 +3632,11 @@ UI work, not engine work.
 | ~~Custom HTTP methods~~ | **Reachable.** The method picker offers the typed text as a verb when it isn't one of the seven, so `Method::Other` finally has a UI path |
 | ~~**Ping**~~ | **Reachable.** A Ping button beside Save in the message header, plus a *Send a ping frame* palette row. It was the half of this entry worth reaching — a socket that has gone quiet is indistinguishable from one the network dropped, and a Ping is the protocol's own way to ask; the peer must answer with a Pong, and the transcript records both |
 | **Live gRPC reflection** | **Not reachable, and deliberately.** *From server* fetches the schema once and writes it into the collection's `protos/` as a `.desc`; nothing looks it up per call. That buys three things a live lookup does not — the request works offline and against a server with reflection later disabled, the schema is committable so a teammate gets it by cloning, and no send pays for a round trip whose answer almost never changes. Re-fetching is one keystroke. If per-call reflection is ever wanted it is a flag on `GrpcRequest`, not a rewrite |
-| **Hanging up a bidirectional gRPC call** | **Not reachable.** Disconnect on one means *done sending*: it half-closes the request and keeps listening, because stopping the read there truncates whatever the server was still sending — a wrong answer on screen rather than an inconvenience. So there is no hang-up short of closing the tab, which `Engine::cancel` handles. A separate "done sending" verb would let Disconnect mean Disconnect again; it is not worth inventing one until somebody wants it |
+| ~~Hanging up a bidirectional gRPC call~~ | **Reachable.** The separate verb this row said to wait for: *Done sending* half-closes and keeps listening, and *Disconnect* (and `Escape`) now really ends the call, keeping the transcript marked *hung up*. See §6q |
 | ~~Binary frames — sending one~~ | **Reachable.** A *File* button beside Ping, plus a *Send a file as a binary frame* palette row, sends a chosen file's bytes as one binary frame — a file for the reason a binary *body* is one: what goes out as binary is a blob that already exists, not something typed. Read off the UI thread and capped at 16 MB, past which most servers refuse the frame and close the socket. **Pong is deliberately not listed**: tungstenite answers a received Ping itself, so a hand-sent Pong is a frame with no question behind it |
 
-**Nothing remains** *of the items this table originally listed*; the two rows still open — both
-gRPC, and open by decision rather than omission (§6q) — arrived after. `Ctrl+,` closed five, the method picker
+**Nothing remains** *of the items this table originally listed*; the one row still open — live
+gRPC reflection, open by decision rather than omission (§6q) — arrived after. `Ctrl+,` closed five, the method picker
 a sixth, `Ctrl+H` a seventh, and body authoring took form, binary, and multipart — the last of
 which was the only item here that ever needed engine work rather than UI.
 

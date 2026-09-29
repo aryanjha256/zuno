@@ -179,6 +179,14 @@ pub struct Transcript {
     /// `Some` once the socket has closed, carrying the close code and reason. A `None` code
     /// inside means the peer vanished without a Close frame, which is an ordinary ending.
     pub closed: Option<(Option<u16>, String)>,
+    /// A bidirectional gRPC call — the one kind of session where finishing your half and ending
+    /// the call are different verbs, so the strip offers both. Read off the chosen method when it
+    /// opens.
+    pub bidirectional: bool,
+    /// Your half is finished — Done sending was pressed — and the call is still listening.
+    pub done_sending: bool,
+    /// Ended from this side on purpose, which the strip must not paint as a failure.
+    pub hung_up: bool,
 }
 
 impl Transcript {
@@ -1389,6 +1397,12 @@ impl RequestView {
                     retained: 0,
                     frame_count: 0,
                     closed: None,
+                    bidirectional: self
+                        .kind
+                        .as_grpc()
+                        .is_some_and(|grpc| grpc.client_streaming && grpc.server_streaming),
+                    done_sending: false,
+                    hung_up: false,
                 });
                 cx.notify();
                 true
@@ -1602,6 +1616,46 @@ impl RequestView {
     ///
     /// Cancellation has two halves and needs both: dropping the task stops the UI
     /// consuming events, and `Engine::cancel` is what actually stops the socket.
+    /// Whether the open session is a bidirectional gRPC call — where hanging up and finishing your
+    /// half are different verbs.
+    pub fn is_bidirectional_call(&self) -> bool {
+        self.is_connected() && self.session.as_ref().is_some_and(|session| session.bidirectional)
+    }
+
+    /// Finish sending on a bidirectional call and keep listening: the half-close, which lets the
+    /// server finish what it is still sending. Returns whether there was a half left to close.
+    pub fn done_sending(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session.as_mut().filter(|session| session.is_open()) else {
+            return false;
+        };
+        if session.done_sending {
+            return false;
+        }
+        session.done_sending = true;
+        engine.close(session.job);
+        self.push_notice("done sending — still listening");
+        cx.notify();
+        true
+    }
+
+    /// End the call now, in both directions, and keep the transcript.
+    ///
+    /// **Cancel, not close**: on a gRPC call `close` is the half-close, which keeps listening —
+    /// the exact thing someone hanging up on a stream that never ends is trying to stop. Closed
+    /// here rather than by an event, because a cancelled job sends none.
+    pub fn hang_up(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) {
+        let Some(inflight) = self.inflight.take() else {
+            return;
+        };
+        engine.cancel(inflight.job);
+        drop(inflight);
+        if let Some(session) = self.session.as_mut().filter(|session| session.is_open()) {
+            session.hung_up = true;
+            session.closed = Some((None, "hung up".to_string()));
+        }
+        cx.notify();
+    }
+
     pub fn cancel(&mut self, engine: &Arc<Engine>, cx: &mut Context<Self>) -> bool {
         let Some(inflight) = self.inflight.take() else {
             return false;
@@ -1898,7 +1952,9 @@ impl RequestView {
         let Some(job) = self
             .session
             .as_ref()
-            .filter(|session| session.is_open())
+            // Not after Done sending: that half is closed, and a message sent into it would be
+            // lost with no answer.
+            .filter(|session| session.is_open() && !session.done_sending)
             .map(|session| session.job)
         else {
             return;

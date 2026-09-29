@@ -14987,6 +14987,127 @@ async fn a_grpc_request_is_authored_and_sent(cx: &mut TestAppContext) {
     drop(server);
 }
 
+/// **A bidirectional call against a stream that never ends: Done sending keeps listening, and
+/// Disconnect really ends it.** Disconnect used to be the half-close — the call went on
+/// listening — so against a server that never finishes, only closing the tab stopped it, and
+/// that threw the transcript away. The server here answers once and then holds its stream open
+/// forever, which is exactly that case.
+#[gpui::test]
+async fn a_bidirectional_call_can_finish_sending_and_can_be_hung_up(cx: &mut TestAppContext) {
+    use bytes::Bytes;
+    use std::io::Write;
+
+    let dir = scratch_dir("grpc-bidi");
+    let proto = dir.join("chat.proto");
+    std::fs::File::create(&proto)
+        .expect("create")
+        .write_all(
+            br#"
+                syntax = "proto3";
+                package helloworld;
+                message HelloRequest { string name = 1; }
+                message HelloReply { string message = 1; }
+                service Greeter { rpc Chat (stream HelloRequest) returns (stream HelloReply); }
+            "#,
+        )
+        .expect("write");
+
+    // One reply, then a stream that never ends. The request body is never read, so the server
+    // waits on nothing the client does.
+    let (port_tx, port_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let _ = port_tx.send(listener.local_addr().expect("addr").port());
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let service = hyper::service::service_fn(|_: http::Request<hyper::body::Incoming>| async {
+                let text = "hello";
+                let mut message = vec![0x0a, text.len() as u8];
+                message.extend_from_slice(text.as_bytes());
+                let first: Result<hyper::body::Frame<Bytes>, std::convert::Infallible> =
+                    Ok(hyper::body::Frame::data(Bytes::from(zuno_core::grpc::frame(&message))));
+                let body = futures_util::StreamExt::chain(
+                    futures_util::stream::iter(vec![first]),
+                    futures_util::stream::pending(),
+                );
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(http_body_util::StreamBody::new(body))
+                        .expect("response"),
+                )
+            });
+            let _ = hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+    });
+    let port = port_rx.recv_timeout(Duration::from_secs(10)).expect("the server must bind");
+
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
+            view.set_kind(kind, cx);
+            if let Some(grpc) = view.kind.as_grpc_mut() {
+                grpc.service = "helloworld.Greeter".to_string();
+                grpc.method = "Chat".to_string();
+                grpc.client_streaming = true;
+                grpc.server_streaming = true;
+            }
+        })
+    });
+    type_url(&mut cx, &format!("http://127.0.0.1:{port}"));
+    cx.update(|window, cx| {
+        view.update(cx, |view, cx| {
+            let field = view.kind.as_grpc().expect("a gRPC buffer").proto.clone();
+            window.focus(&gpui::Focusable::focus_handle(field.read(cx), cx));
+        })
+    });
+    cx.simulate_input(&proto.display().to_string());
+    cx.press("ctrl-enter");
+
+    wait_for(&mut cx, "the server's first reply", |cx| {
+        cx.update(|_, cx| {
+            view.read(cx).session.as_ref()?.rows.iter().any(|row| {
+                matches!(
+                    row.kind,
+                    crate::request_view::TranscriptKind::Frame {
+                        direction: zuno_core::engine::Direction::Received,
+                        ..
+                    }
+                )
+            })
+            .then_some(())
+        })
+    });
+
+    cx.dispatch_action(crate::actions::DoneSending);
+    cx.run_until_parked();
+    let (done, open) = cx.update(|_, cx| {
+        let view = view.read(cx);
+        (view.session.as_ref().is_some_and(|s| s.done_sending), view.is_connected())
+    });
+    assert!(done && open, "Done sending finishes our half and keeps listening");
+
+    cx.dispatch_action(crate::actions::CancelRequest);
+    wait_for(&mut cx, "the call to end", |cx| {
+        cx.update(|_, cx| (!view.read(cx).is_connected()).then_some(()))
+    });
+    assert!(
+        cx.update(|_, cx| view.read(cx).session.as_ref().is_some_and(|s| s.hung_up && !s.is_open())),
+        "hung up, and the transcript kept"
+    );
+
+    drop(server);
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 /// **A client-streaming call: send repeatedly, then Disconnect finishes it.**
 ///
 /// The shape nothing else in Zuno has — many messages up, one reply back — and the one that

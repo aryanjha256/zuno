@@ -14,8 +14,8 @@ Three docs, three jobs. Read them in this order:
 - **`CLAUDE.md`** (this file) — mechanics: commands, invariants, and the traps.
 
 **M1, M2 and M3 are all complete.** architecture.md §11 — engine capability with no UI path — has
-two entries, both gRPC gaps kept open by decision: reflection is a one-time import rather than a
-per-call lookup, and a bidirectional call has no hang-up short of closing the tab. The loop, the navigation thesis, and reuse are all built;
+one entry, kept open by decision: gRPC reflection is a one-time import rather than a per-call
+lookup. The loop, the navigation thesis, and reuse are all built;
 response search and the body/headers tabs landed after, then GraphQL, WebSocket and gRPC as request
 kinds of their own (gRPC's design is §6q). ROADMAP's audit section, not its milestone headings, is
 where the remaining work lives.
@@ -39,7 +39,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 1100 tests, ~50s
+cargo test --workspace                   # 1101 tests, ~50s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 

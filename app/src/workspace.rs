@@ -30,7 +30,7 @@ use zuno_core::collection::{Node, NodeKind};
 use crate::actions::{
     ChooseSchemaFile, OpenGraphQlTransport, OpenGrpcMethod, ReflectSchema, SaveMessage,
     ToggleSchemaBrowser,
-    SendPing, SendBinaryFile,
+    SendPing, SendBinaryFile, DoneSending,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -7169,6 +7169,19 @@ impl Workspace {
         .detach();
     }
 
+    /// Finish your half of a bidirectional gRPC call and keep listening for the rest.
+    fn done_sending(&mut self, _: &DoneSending, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let Some(engine) = cx.engine() else { return };
+        if !view.read(cx).is_bidirectional_call() {
+            self.set_status("Only a live bidirectional gRPC call has a half to finish", cx);
+            return;
+        }
+        if view.update(cx, |view, cx| view.done_sending(&engine, cx)) {
+            self.set_status("Done sending — still listening", cx);
+        }
+    }
+
     fn cancel_request(&mut self, _: &CancelRequest, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
         let Some(engine) = cx.engine() else { return };
@@ -7177,6 +7190,14 @@ impl Workspace {
         // stands, which reaches the server as a reset; `close` runs the closing handshake so
         // the peer is told. The transcript stays on screen either way — it is the result of
         // the run, and hanging up is the end of the run, not the end of wanting to read it.
+        // **A bidirectional gRPC call is hung up, not closed** — there, `close` is the
+        // half-close, which keeps listening; Done sending is that verb now. Without this a stream
+        // that never ends could only be stopped by closing its tab, losing the transcript.
+        if view.read(cx).is_bidirectional_call() {
+            view.update(cx, |view, cx| view.hang_up(&engine, cx));
+            self.set_status("Hung up", cx);
+            return;
+        }
         if view.read(cx).is_connected() {
             if let Some(job) = view.read(cx).session.as_ref().map(|session| session.job) {
                 engine.close(job);
@@ -7477,6 +7498,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_message))
             .on_action(cx.listener(Self::send_ping))
             .on_action(cx.listener(Self::send_binary_file))
+            .on_action(cx.listener(Self::done_sending))
             .on_action(cx.listener(Self::choose_schema_file))
             .on_action(cx.listener(Self::toggle_schema_browser))
             .on_action(cx.listener(Self::open_grpc_method))
