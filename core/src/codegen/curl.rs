@@ -6,10 +6,11 @@
 //! Multi-line with `\` continuations, one flag per line, which is what devtools emits and what
 //! reads as a repro in an issue.
 
-use super::{PartValue, Wire, WireBody, shell_quote};
+use super::{PartValue, Shell, Wire, WireBody};
 
-pub(super) fn render(wire: &Wire) -> String {
-    let mut parts: Vec<String> = vec![format!("curl {}", shell_quote(&wire.url))];
+pub(super) fn render(wire: &Wire, shell: Shell) -> String {
+    let quote = |text: &str| shell.quote(text);
+    let mut parts: Vec<String> = vec![format!("{} {}", shell.program("curl"), quote(&wire.url))];
 
     // curl infers POST from a body, so `-X` is redundant for a plain POST — but emitting it
     // always is what makes the round trip exact, and it is how devtools writes it. The one case
@@ -20,13 +21,13 @@ pub(super) fn render(wire: &Wire) -> String {
     }
 
     for (name, value) in &wire.headers {
-        parts.push(format!("-H {}", shell_quote(&header(name, value))));
+        parts.push(format!("-H {}", quote(&header(name, value))));
     }
     // **curl labels a body with no type as a form**, and Zuno sends a file body with none. An
     // empty `Content-Type:` is curl's way of saying "not that one", so the command sends what Zuno
     // sends. Found by running the output, not by reading it.
     if matches!(wire.body, WireBody::File(_)) && !has_content_type(wire) {
-        parts.push(format!("-H {}", shell_quote("Content-Type:")));
+        parts.push(format!("-H {}", quote("Content-Type:")));
     }
 
     // Only flags that are **wire-observable and differ from curl's own default**, which is the
@@ -59,11 +60,11 @@ pub(super) fn render(wire: &Wire) -> String {
         // here already encoded by `encode_form`, which keeps it byte-exact with what Zuno sends —
         // one `--data-urlencode` per field would let curl do the encoding, and curl only encodes
         // after the `=`.
-        WireBody::Text(text) => parts.push(format!("--data-raw {}", shell_quote(text))),
+        WireBody::Text(text) => parts.push(format!("--data-raw {}", quote(text))),
         // `--data-binary`, because `-d`/`--data` would strip newlines out of a binary file.
         WireBody::File(path) => parts.push(format!(
             "--data-binary {}",
-            shell_quote(&format!("@{}", path.display()))
+            quote(&format!("@{}", path.display()))
         )),
         WireBody::Multipart(fields) => {
             for part in fields {
@@ -73,12 +74,12 @@ pub(super) fn render(wire: &Wire) -> String {
                     // exactly as the engine does — so the part arrives with the same name.
                     PartValue::File(path) => format!("{}=@{}", part.name, path.display()),
                 };
-                parts.push(format!("-F {}", shell_quote(&value)));
+                parts.push(format!("-F {}", quote(&value)));
             }
         }
     }
 
-    parts.join(" \\\n  ")
+    shell.join(&parts)
 }
 
 /// A header as curl spells it — shared with PHP's curl extension, which is the same library.

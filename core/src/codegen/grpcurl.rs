@@ -8,11 +8,12 @@
 
 use std::path::Path;
 
-use super::shell_quote;
+use super::Shell;
 use crate::engine::build;
 use crate::request::{RequestSettings, RequestSpec};
 
-pub(super) fn render(spec: &RequestSpec, collection: Option<&Path>) -> Option<String> {
+pub(super) fn render(spec: &RequestSpec, collection: Option<&Path>, shell: Shell) -> Option<String> {
+    let quote = |text: &str| shell.quote(text);
     let grpc = spec.grpc()?;
     let (service, method) = (grpc.service.trim(), grpc.method.trim());
     if service.is_empty() || method.is_empty() {
@@ -39,19 +40,19 @@ pub(super) fn render(spec: &RequestSpec, collection: Option<&Path>) -> Option<St
             Some("desc" | "protoset" | "pb")
         );
         if descriptor_set {
-            parts.push(format!("-protoset {}", shell_quote(&path.display().to_string())));
+            parts.push(format!("-protoset {}", quote(&path.display().to_string())));
         } else {
             // The file's own directory as the import path, as `Schema::compile` does — so a
             // `.proto` importing a sibling resolves the same way in both.
             let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
             if let Some(dir) = dir {
-                parts.push(format!("-import-path {}", shell_quote(&dir.display().to_string())));
+                parts.push(format!("-import-path {}", quote(&dir.display().to_string())));
             }
             let file = path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
-            parts.push(format!("-proto {}", shell_quote(&file)));
+            parts.push(format!("-proto {}", quote(&file)));
         }
     }
 
@@ -61,7 +62,7 @@ pub(super) fn render(spec: &RequestSpec, collection: Option<&Path>) -> Option<St
         }
         parts.push(format!(
             "-H {}",
-            shell_quote(&format!("{}: {}", header.name.trim(), header.value))
+            quote(&format!("{}: {}", header.name.trim(), header.value))
         ));
     }
 
@@ -72,12 +73,12 @@ pub(super) fn render(spec: &RequestSpec, collection: Option<&Path>) -> Option<St
     }
 
     if !grpc.message.trim().is_empty() {
-        parts.push(format!("-d {}", shell_quote(grpc.message.trim())));
+        parts.push(format!("-d {}", quote(grpc.message.trim())));
     }
 
-    parts.push(shell_quote(&address));
-    parts.push(shell_quote(&format!("{service}/{method}")));
-    Some(parts.join(" \\\n  "))
+    parts.push(quote(&address));
+    parts.push(quote(&format!("{service}/{method}")));
+    Some(shell.join(&parts))
 }
 
 /// `host:port`, and whether it is plaintext.
@@ -136,8 +137,12 @@ mod tests {
 
     #[test]
     fn a_call_names_its_schema_address_and_method() {
-        let out = render(&spec("localhost:50051", "greeter.proto"), Some(Path::new("/work/api")))
-            .expect("a gRPC call renders");
+        let out = render(
+            &spec("localhost:50051", "greeter.proto"),
+            Some(Path::new("/work/api")),
+            Shell::Posix,
+        )
+        .expect("a gRPC call renders");
         assert_eq!(
             out,
             format!(
@@ -154,13 +159,17 @@ mod tests {
     /// schema at all means grpcurl reflects, so nothing is emitted for one.
     #[test]
     fn a_descriptor_set_or_no_schema_is_said_the_way_grpcurl_reads_it() {
-        let out = render(&spec("https://api.test", "api.test.desc"), Some(Path::new("/w")))
-            .expect("renders");
+        let out = render(
+            &spec("https://api.test", "api.test.desc"),
+            Some(Path::new("/w")),
+            Shell::Posix,
+        )
+        .expect("renders");
         let protoset = format!("-protoset '{}'", shown("/w", &["protos", "api.test.desc"]));
         assert!(out.contains(&protoset), "{out}");
         assert!(out.contains("'api.test:443'") && !out.contains("-plaintext"), "{out}");
 
-        let out = render(&spec("https://api.test", ""), None).expect("renders");
+        let out = render(&spec("https://api.test", ""), None, Shell::Posix).expect("renders");
         assert!(!out.contains("-proto") && !out.contains("-protoset"), "{out}");
     }
 
@@ -170,6 +179,23 @@ mod tests {
         if let RequestKind::Grpc(grpc) = &mut unchosen.kind {
             grpc.method.clear();
         }
-        assert_eq!(render(&unchosen, None), None);
+        assert_eq!(render(&unchosen, None, Shell::Posix), None);
+    }
+
+    /// The PowerShell spelling: backtick continuations, and a quote in the message doubled rather
+    /// than closed and reopened — the POSIX `'\''` would end the string in PowerShell.
+    #[test]
+    fn powershell_continues_with_a_backtick_and_doubles_a_quote() {
+        let mut call = spec("localhost:50051", "");
+        if let RequestKind::Grpc(grpc) = &mut call.kind {
+            grpc.message = r#"{"name": "o'brien"}"#.into();
+        }
+        call.headers.clear();
+        let out = render(&call, None, Shell::PowerShell).expect("renders");
+        assert_eq!(
+            out,
+            "grpcurl `\n  -plaintext `\n  -d '{\"name\": \"o''brien\"}' `\n  \
+             'localhost:50051' `\n  'helloworld.Greeter/SayHello'"
+        );
     }
 }

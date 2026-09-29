@@ -40,7 +40,7 @@ cargo check --workspace --all-targets    # the fast loop (~0.5s warm)
 # Shipped once: `UniformListScrollHandle::logical_scroll_top_index` is test-only, and
 # `cargo run` failed on a tree where check, --all-targets and the full suite were all green.
 cargo check -p zuno                      # what `cargo run` actually compiles
-cargo test --workspace                   # 1073 tests, ~50s
+cargo test --workspace                   # 1074 tests, ~50s
 cargo test -p zuno-core                  # core only, no GPUI link
 ZUNO_TIMING=1 cargo run                  # boot stages + per-request + body-index timings
 
@@ -66,7 +66,8 @@ cargo test -p zuno-core --test grpc -- --ignored --nocapture
 
 # Copy as code, **run** rather than read: each scenario goes through the engine and through every
 # installed language's snippet to one local server, and the two requests are compared. Needs node,
-# python3 + requests, go, java, ruby, dotnet; a missing toolchain is skipped and named. Not
+# python3 + requests, go, java, ruby, dotnet, and pwsh (PowerShell 7) for curl's PowerShell
+# spelling; a missing toolchain is skipped and named. Not
 # optional after touching `codegen` — it found two curl bugs every exact-text test agreed with.
 cargo test -p zuno-core --test codegen -- --ignored --nocapture
 

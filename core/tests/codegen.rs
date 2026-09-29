@@ -15,8 +15,9 @@
 //! cargo test -p zuno-core --test codegen -- --ignored --nocapture
 //! ```
 //!
-//! HTTPie, PHP and grpcurl have no runner here; their renderers are pinned by exact-text unit
-//! tests instead.
+//! curl runs twice — under `sh`, and as its PowerShell spelling under `pwsh` (PowerShell 7). HTTPie,
+//! PHP and grpcurl have no runner here; their renderers are pinned by exact-text unit tests
+//! instead.
 
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
@@ -174,7 +175,7 @@ fn scenarios(port: u16, dir: &Path) -> Vec<(&'static str, RequestSpec)> {
                 "/items",
                 Body::Raw {
                     // Quotes, a backslash, a newline, `$` and `#{}` and `${}`, and non-ASCII.
-                    text: "{\"name\": \"café \\\"q\\\"\", \"note\": \"line1\\nline2 $HOME #{x} ${y}\"}"
+                    text: "{\"name\": \"café \\\"q\\\"\", \"note\": \"line1\\nline2 $HOME #{x} ${y} it's o\u{2019}brien\"}"
                         .into(),
                     kind: RawKind::Json,
                 },
@@ -229,8 +230,9 @@ struct Runner {
     tool: &'static str,
 }
 
-const RUNNERS: [Runner; 7] = [
+const RUNNERS: [Runner; 8] = [
     Runner { target: Target::Curl, tool: "curl" },
+    Runner { target: Target::CurlPowerShell, tool: "pwsh" },
     Runner { target: Target::Fetch, tool: "node" },
     Runner { target: Target::Python, tool: "python3" },
     Runner { target: Target::Go, tool: "go" },
@@ -292,6 +294,28 @@ fn execute(runner: &Runner, code: &str, dir: &Path, csharp_project: &Path) {
         Target::Curl => {
             let mut command = Command::new("sh");
             command.args(["-c", &format!("{code} --silent --output /dev/null")]);
+            run(command, &what);
+        }
+        // A script file rather than `-Command`, so the snippet reaches PowerShell's parser exactly
+        // as pasted, backticks and all. `curl.exe` is the name only Windows has; elsewhere it is
+        // aliased to the curl on PATH, which is the same program.
+        Target::CurlPowerShell => {
+            let file = dir.join("snippet.ps1");
+            let alias = if cfg!(windows) {
+                ""
+            } else {
+                "Set-Alias -Name curl.exe -Value curl\n"
+            };
+            let sink = dir.join("pwsh-out");
+            let script = format!(
+                "{alias}{code} --silent --output '{}'\nexit $LASTEXITCODE\n",
+                sink.display()
+            );
+            std::fs::write(&file, script).expect("write");
+            let mut command = Command::new("pwsh");
+            command
+                .args(["-NoProfile", "-NonInteractive", "-File"])
+                .arg(&file);
             run(command, &what);
         }
         Target::Fetch => {

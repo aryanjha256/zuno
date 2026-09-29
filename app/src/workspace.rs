@@ -6395,7 +6395,10 @@ impl Workspace {
         }
         let Some(view) = self.active() else { return };
 
-        let offered = zuno_core::codegen::Target::offered_for(&view.read(cx).kind.to_spec(cx));
+        let offered = zuno_core::codegen::Target::offered_for(
+            &view.read(cx).kind.to_spec(cx),
+            cfg!(target_os = "windows"),
+        );
         if offered.is_empty() {
             self.set_status(
                 "A WebSocket has no code to copy — it is a conversation, not a request",

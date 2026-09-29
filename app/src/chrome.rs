@@ -13,7 +13,7 @@
 use gpui::{
     CursorStyle, Div, FontWeight, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Pixels, Point, ResizeEdge, SharedString, Stateful,
-    StatefulInteractiveElement, Styled, Window, div, point, px,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, point, px,
 };
 
 use crate::theme::{Appearance, Theme};
@@ -33,6 +33,18 @@ pub const TITLEBAR_HEIGHT: f32 = 34.;
 /// AppKit resizes the window from its real edges. A compile-time switch rather than
 /// `window_decorations()`, which the test platform reports as `Server` on every host.
 const NATIVE_CONTROLS: bool = cfg!(target_os = "macos");
+
+/// **Windows moves, snaps and maximizes the window itself**, from areas we mark with
+/// `window_control_area`: gpui answers `WM_NCHITTEST` with them, so a `Drag` area is a real
+/// caption — Aero Snap, double-click to maximize *and restore* — and `Max` is what gives the
+/// Windows 11 snap-layouts flyout. gpui's `start_window_move` and `start_window_resize` do
+/// nothing there, so our own drag and resize paths are dead on Windows and step aside.
+///
+/// **A control area must never contain a clickable.** gpui resolves the first registered area
+/// under the cursor, and a parent registers before its children, so a whole-bar `Drag` would turn
+/// every button on it into a caption. The drag areas are the bar's *empty* parts — the spacer and
+/// the title — beside the buttons rather than around them.
+const NATIVE_HIT_TEST: bool = cfg!(target_os = "windows");
 
 /// Where the traffic lights sit, from the window's top-left: centred in the bar (the buttons are
 /// 14pt tall), with the usual margin from the left edge.
@@ -78,6 +90,11 @@ pub fn titlebar(
         .border_color(theme.border)
         // Dragging anywhere on the bar moves the window.
         .on_mouse_down(MouseButton::Left, |event: &MouseDownEvent, window, _| {
+            // Windows does both from the `Drag` areas. Zooming here as well would maximize and
+            // then have the native double-click restore it again.
+            if NATIVE_HIT_TEST {
+                return;
+            }
             match (event.click_count, NATIVE_CONTROLS) {
                 (2, true) => window.titlebar_double_click(),
                 (2, false) => window.zoom_window(),
@@ -174,6 +191,7 @@ pub fn titlebar(
                         .flex_none()
                         .text_sm()
                         .text_color(theme.text)
+                        .window_control_area(WindowControlArea::Drag)
                         .child(title),
                 )
                 // **In the titlebar rather than at the end of the tab strip**, which is where a
@@ -187,6 +205,14 @@ pub fn titlebar(
                     crate::actions::NewTab,
                     theme,
                 )),
+        )
+        // The empty middle of the bar: where Windows is told the caption is. A sibling of both
+        // button clusters, never their parent — see `NATIVE_HIT_TEST`.
+        .child(
+            div()
+                .flex_1()
+                .h_full()
+                .window_control_area(WindowControlArea::Drag),
         )
         .child(
             div()
@@ -274,19 +300,19 @@ pub fn titlebar(
                     )),
                 )
                 .children((controls.minimize && !NATIVE_CONTROLS).then(|| {
-                    control_button("minimize", Icon::Minimize, theme, false, |window| {
+                    control_button("minimize", WindowControlArea::Min, Icon::Minimize, theme, false, |window| {
                         window.minimize_window()
                     })
                 }))
                 .children((controls.maximize && !NATIVE_CONTROLS).then(|| {
                     // The icon reflects what the button will *do*, not the current state.
                     let icon = if maximized { Icon::Restore } else { Icon::Maximize };
-                    control_button("maximize", icon, theme, false, |window| {
+                    control_button("maximize", WindowControlArea::Max, icon, theme, false, |window| {
                         window.zoom_window()
                     })
                 }))
                 .children((!NATIVE_CONTROLS).then(|| {
-                    control_button("close", Icon::Close, theme, true, |window| {
+                    control_button("close", WindowControlArea::Close, Icon::Close, theme, true, |window| {
                         window.remove_window()
                     })
                 }))
@@ -298,6 +324,7 @@ pub fn titlebar(
 
 fn control_button(
     id: &'static str,
+    area: WindowControlArea,
     icon: Icon,
     theme: &Theme,
     danger: bool,
@@ -332,7 +359,15 @@ fn control_button(
         // click, so without stopping here the button acts *and then* the titlebar calls
         // `start_window_move` — the compositor starts dragging a window the user was trying to
         // close. Verified against gpui 0.2.2's `Window::dispatch_mouse_event`, not assumed.
+        // Windows' own button behaviour, from the hit test: minimize, maximize *or restore* —
+        // `zoom_window` there only ever maximizes — and close through `WM_CLOSE`.
+        .window_control_area(area)
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            // Left unhandled on Windows, so the click reaches the native button above instead of
+            // acting twice.
+            if NATIVE_HIT_TEST {
+                return;
+            }
             cx.stop_propagation();
             action(window);
         })
@@ -346,9 +381,10 @@ fn control_button(
 /// edges it overlaps.
 ///
 /// Skipped entirely while maximised — there is nothing to drag, and live strips would
-/// just eat clicks along the content's edge — and on macOS, where the window resizes itself.
+/// just eat clicks along the content's edge — and on macOS and Windows, where the window resizes
+/// itself from its real frame.
 pub fn resize_handles(window: &Window) -> Vec<Stateful<Div>> {
-    if NATIVE_CONTROLS || window.is_maximized() {
+    if NATIVE_CONTROLS || NATIVE_HIT_TEST || window.is_maximized() {
         return Vec::new();
     }
 

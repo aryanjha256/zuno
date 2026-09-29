@@ -6,10 +6,11 @@
 //! with no type carries an empty `Content-Type:` — HTTPie's syntax for "send none", which is what
 //! Zuno sends; and multipart needs `--multipart` to turn items into form fields.
 
-use super::{PartValue, Wire, WireBody, shell_quote};
+use super::{PartValue, Shell, Wire, WireBody};
 
-pub(super) fn render(wire: &Wire) -> String {
-    let mut parts: Vec<String> = vec![format!("http {} {}", wire.method, shell_quote(&wire.url))];
+pub(super) fn render(wire: &Wire, shell: Shell) -> String {
+    let quote = |text: &str| shell.quote(text);
+    let mut parts: Vec<String> = vec![format!("http {} {}", wire.method, quote(&wire.url))];
 
     // HTTPie follows nothing and verifies by default — the opposite of Zuno on the first.
     if wire.follow_redirects {
@@ -22,7 +23,7 @@ pub(super) fn render(wire: &Wire) -> String {
         parts.push(format!("--timeout={}", timeout.as_secs()));
     }
     match &wire.body {
-        WireBody::Text(text) => parts.push(format!("--raw {}", shell_quote(text))),
+        WireBody::Text(text) => parts.push(format!("--raw {}", quote(text))),
         WireBody::Multipart(_) => parts.push("--multipart".to_string()),
         WireBody::None | WireBody::File(_) => {}
     }
@@ -35,7 +36,7 @@ pub(super) fn render(wire: &Wire) -> String {
         } else {
             format!("{name}:{value}")
         };
-        parts.push(shell_quote(&item));
+        parts.push(quote(&item));
     }
 
     match &wire.body {
@@ -45,9 +46,16 @@ pub(super) fn render(wire: &Wire) -> String {
                 .iter()
                 .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             {
-                parts.push(shell_quote("Content-Type:"));
+                parts.push(quote("Content-Type:"));
             }
-            parts.push(format!("< {}", shell_quote(&path.display().to_string())));
+            // **PowerShell has no `<`** — it is a reserved operator there — so the body file is
+            // HTTPie's own `@path` item instead, which reads it as the raw body. The empty
+            // `Content-Type:` above still wins over the type `@` would guess from the extension.
+            let path = path.display().to_string();
+            parts.push(match shell {
+                Shell::Posix => format!("< {}", quote(&path)),
+                Shell::PowerShell => quote(&format!("@{path}")),
+            });
         }
         WireBody::Multipart(fields) => {
             for part in fields {
@@ -56,13 +64,13 @@ pub(super) fn render(wire: &Wire) -> String {
                     PartValue::Text(text) => format!("{name}={text}"),
                     PartValue::File(path) => format!("{name}@{}", path.display()),
                 };
-                parts.push(shell_quote(&item));
+                parts.push(quote(&item));
             }
         }
         WireBody::None | WireBody::Text(_) => {}
     }
 
-    parts.join(" \\\n  ")
+    shell.join(&parts)
 }
 
 /// Backslash the characters HTTPie reads as item separators, so a part name containing one is
@@ -99,13 +107,16 @@ mod tests {
 
     #[test]
     fn a_text_body_goes_raw_and_headers_are_items() {
-        let out = render(&wire(
-            WireBody::Text(r#"{"name":"ada"}"#.into()),
-            vec![
-                ("X-Empty".into(), String::new()),
-                ("Content-Type".into(), "application/json".into()),
-            ],
-        ));
+        let out = render(
+            &wire(
+                WireBody::Text(r#"{"name":"ada"}"#.into()),
+                vec![
+                    ("X-Empty".into(), String::new()),
+                    ("Content-Type".into(), "application/json".into()),
+                ],
+            ),
+            Shell::Posix,
+        );
         assert_eq!(
             out,
             "http POST 'https://api.test/items' \\\n  --follow \\\n  --raw '{\"name\":\"ada\"}' \\\n  \
@@ -115,19 +126,26 @@ mod tests {
 
     #[test]
     fn a_binary_body_is_stdin_with_no_invented_type() {
-        let out = render(&wire(WireBody::File(PathBuf::from("/tmp/blob.bin")), vec![]));
+        let body = || wire(WireBody::File(PathBuf::from("/tmp/blob.bin")), vec![]);
+        let out = render(&body(), Shell::Posix);
         assert!(out.ends_with("'Content-Type:' \\\n  < '/tmp/blob.bin'"), "{out}");
+        // PowerShell reserves `<`, so the file is HTTPie's own `@` item there.
+        let out = render(&body(), Shell::PowerShell);
+        assert!(out.ends_with("'Content-Type:' `\n  '@/tmp/blob.bin'"), "{out}");
     }
 
     #[test]
     fn a_part_name_cannot_become_a_header() {
-        let out = render(&wire(
-            WireBody::Multipart(vec![super::super::Part {
-                name: "a:b".into(),
-                value: PartValue::Text("1".into()),
-            }]),
-            vec![],
-        ));
+        let out = render(
+            &wire(
+                WireBody::Multipart(vec![super::super::Part {
+                    name: "a:b".into(),
+                    value: PartValue::Text("1".into()),
+                }]),
+                vec![],
+            ),
+            Shell::Posix,
+        );
         assert!(out.contains(r"'a\:b=1'"), "{out}");
     }
 }

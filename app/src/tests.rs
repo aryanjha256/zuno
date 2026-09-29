@@ -6849,8 +6849,10 @@ async fn copy_as_code_offers_what_each_kind_can_express(cx: &mut TestAppContext)
     cx.press("ctrl-shift-x");
     cx.run_until_parked();
     let rows = picker_rows(&window, &mut cx);
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(rows[0].starts_with("grpcurl"), "{rows:?}");
+    // Plus its PowerShell spelling on Windows, after it.
+    let expected = if cfg!(target_os = "windows") { 2 } else { 1 };
+    assert_eq!(rows.len(), expected, "{rows:?}");
+    assert!(rows.iter().all(|row| row.starts_with("grpcurl")), "{rows:?}");
     cx.press("enter");
     cx.run_until_parked();
     let copied = clipboard_text(&mut cx).unwrap_or_default();
@@ -8761,8 +8763,9 @@ async fn a_fresh_buffer_starts_with_no_body(cx: &mut TestAppContext) {
 
 
 
-// macOS draws its own window controls, so there is no close button of ours to click.
-#[cfg(not(target_os = "macos"))]
+// macOS draws its own window controls, and on Windows ours hand the click to the native button,
+// which the test platform does not simulate — so only Linux's close runs our handler.
+#[cfg(target_os = "linux")]
 #[gpui::test]
 async fn clicking_a_window_control_does_not_also_start_a_window_drag(cx: &mut TestAppContext) {
     // The whole titlebar is a drag handle, and `on_mouse_down` registers a *Bubble*-phase

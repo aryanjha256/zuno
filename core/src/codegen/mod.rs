@@ -40,45 +40,65 @@ use crate::request::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
     Curl,
+    CurlPowerShell,
     Fetch,
     Python,
     Httpie,
+    HttpiePowerShell,
     Go,
     Java,
     Ruby,
     CSharp,
     Php,
     Grpcurl,
+    GrpcurlPowerShell,
 }
 
 impl Target {
     /// Picker order: curl first, as the command people paste into issues; then roughly by how
-    /// often each is asked for.
-    pub const ALL: [Target; 10] = [
+    /// often each is asked for. Each PowerShell spelling follows its POSIX twin.
+    pub const ALL: [Target; 13] = [
         Target::Curl,
+        Target::CurlPowerShell,
         Target::Fetch,
         Target::Python,
         Target::Httpie,
+        Target::HttpiePowerShell,
         Target::Go,
         Target::Java,
         Target::Ruby,
         Target::CSharp,
         Target::Php,
         Target::Grpcurl,
+        Target::GrpcurlPowerShell,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Target::Curl => "curl",
+            Target::CurlPowerShell => "curl — PowerShell",
             Target::Fetch => "JavaScript — fetch",
             Target::Python => "Python — requests",
             Target::Httpie => "HTTPie",
+            Target::HttpiePowerShell => "HTTPie — PowerShell",
             Target::Go => "Go — net/http",
             Target::Java => "Java — HttpClient",
             Target::Ruby => "Ruby — Net::HTTP",
             Target::CSharp => "C# — HttpClient",
             Target::Php => "PHP — curl",
             Target::Grpcurl => "grpcurl",
+            Target::GrpcurlPowerShell => "grpcurl — PowerShell",
+        }
+    }
+
+    /// The shell a command-line target is quoted for, or `None` for a program in a language.
+    fn shell(self) -> Option<Shell> {
+        match self {
+            Target::Curl | Target::Httpie | Target::Grpcurl => Some(Shell::Posix),
+            Target::CurlPowerShell | Target::HttpiePowerShell | Target::GrpcurlPowerShell => {
+                Some(Shell::PowerShell)
+            }
+            _ => None,
         }
     }
 
@@ -87,6 +107,11 @@ impl Target {
     pub fn hint(self) -> &'static str {
         match self {
             Target::Curl | Target::Httpie | Target::Grpcurl => "paste into a shell",
+            // 7 and not 5.1, which strips the `"` from every argument it hands a program — so a
+            // JSON body would arrive as `{a:1}`. There is no spelling that survives both.
+            Target::CurlPowerShell | Target::HttpiePowerShell | Target::GrpcurlPowerShell => {
+                "paste into PowerShell 7+"
+            }
             Target::Fetch => "node file.mjs, or a browser console",
             Target::Python => "python — needs requests",
             Target::Go => "go run main.go",
@@ -104,18 +129,25 @@ impl Target {
     /// a standard way to hold one open and type into it — exporting its handshake as a plain GET
     /// would be a snippet that runs and does something else.
     pub fn supports(self, kind: &RequestKind) -> bool {
+        let grpcurl = matches!(self, Target::Grpcurl | Target::GrpcurlPowerShell);
         match kind {
-            RequestKind::Http(_) | RequestKind::GraphQl(_) => self != Target::Grpcurl,
-            RequestKind::Grpc(_) => self == Target::Grpcurl,
+            RequestKind::Http(_) | RequestKind::GraphQl(_) => !grpcurl,
+            RequestKind::Grpc(_) => grpcurl,
             RequestKind::WebSocket(_) => false,
         }
     }
 
     /// The targets offered for a request, in picker order.
-    pub fn offered_for(kind: &RequestKind) -> Vec<Target> {
+    ///
+    /// **The PowerShell spellings only on Windows**, where they sit beside the POSIX ones rather
+    /// than replacing them: Git Bash and WSL are common there, and what they want is exactly the
+    /// POSIX command. A parameter rather than a `cfg!`, so either platform's list is testable
+    /// from any host.
+    pub fn offered_for(kind: &RequestKind, windows: bool) -> Vec<Target> {
         Target::ALL
             .into_iter()
             .filter(|target| target.supports(kind))
+            .filter(|target| windows || target.shell() != Some(Shell::PowerShell))
             .collect()
     }
 
@@ -127,21 +159,25 @@ impl Target {
         if !self.supports(&spec.kind) {
             return None;
         }
-        if self == Target::Grpcurl {
-            return grpcurl::render(spec, collection);
+        if matches!(self, Target::Grpcurl | Target::GrpcurlPowerShell) {
+            return grpcurl::render(spec, collection, self.shell()?);
         }
         let wire = Wire::of(spec)?;
         Some(match self {
-            Target::Curl => curl::render(&wire),
+            Target::Curl => curl::render(&wire, Shell::Posix),
+            Target::CurlPowerShell => curl::render(&wire, Shell::PowerShell),
             Target::Fetch => fetch::render(&wire),
             Target::Python => python::render(&wire),
-            Target::Httpie => httpie::render(&wire),
+            Target::Httpie => httpie::render(&wire, Shell::Posix),
+            Target::HttpiePowerShell => httpie::render(&wire, Shell::PowerShell),
             Target::Go => go::render(&wire),
             Target::Java => java::render(&wire),
             Target::Ruby => ruby::render(&wire),
             Target::CSharp => csharp::render(&wire),
             Target::Php => php::render(&wire),
-            Target::Grpcurl => unreachable!("rendered from the gRPC half above"),
+            Target::Grpcurl | Target::GrpcurlPowerShell => {
+                unreachable!("rendered from the gRPC half above")
+            }
         })
     }
 }
@@ -373,13 +409,58 @@ fn url_text(spec: &RequestSpec) -> String {
     text
 }
 
-/// Wrap in single quotes for a POSIX shell.
-///
-/// Single quotes make every other metacharacter literal, so the only thing needing care is a single
-/// quote itself: close, emit an escaped one, reopen. Getting this wrong is a shell-injection bug in
-/// a string the user is about to paste into a terminal.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', r"'\''"))
+/// The shell a command is written for: how it quotes, continues a line, and names the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Shell {
+    Posix,
+    /// PowerShell 7.3+, whose arguments reach a native program exactly as quoted.
+    PowerShell,
+}
+
+impl Shell {
+    /// One argument, quoted so the shell passes it through untouched.
+    ///
+    /// Both use single quotes, which make every other metacharacter literal — `$` included, in
+    /// both — so only a single quote itself needs care. POSIX closes, emits an escaped one and
+    /// reopens; PowerShell doubles it. **PowerShell also reads the typographic quotes `‘ ’ ‚ ‛` as
+    /// single quotes**, so a message with a curly apostrophe would end the string early: each is
+    /// doubled too, which PowerShell reads as that same character. Getting either wrong is a
+    /// shell-injection bug in a string the user is about to paste into a terminal.
+    pub(crate) fn quote(self, text: &str) -> String {
+        match self {
+            Shell::Posix => format!("'{}'", text.replace('\'', r"'\''")),
+            Shell::PowerShell => {
+                let mut out = String::with_capacity(text.len() + 2);
+                out.push('\'');
+                for ch in text.chars() {
+                    if matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+                        out.push(ch);
+                    }
+                    out.push(ch);
+                }
+                out.push('\'');
+                out
+            }
+        }
+    }
+
+    /// Arguments one per line, with each shell's continuation: `\` or PowerShell's backtick.
+    pub(crate) fn join(self, parts: &[String]) -> String {
+        match self {
+            Shell::Posix => parts.join(" \\\n  "),
+            Shell::PowerShell => parts.join(" `\n  "),
+        }
+    }
+
+    /// The program to run. **`curl.exe`, not `curl`, in PowerShell**: Windows PowerShell aliases
+    /// `curl` to `Invoke-WebRequest`, which takes none of curl's flags, and naming the `.exe`
+    /// reaches the curl Windows ships in either version.
+    pub(crate) fn program(self, name: &str) -> String {
+        match (self, name) {
+            (Shell::PowerShell, "curl") => "curl.exe".to_string(),
+            _ => name.to_string(),
+        }
+    }
 }
 
 /// A double-quoted string literal valid in JavaScript, Python, Go, Java and C#.
@@ -504,16 +585,24 @@ mod tests {
     #[test]
     fn each_kind_is_offered_only_what_can_express_it() {
         let http = RequestKind::Http(HttpRequest::default());
-        let offered = Target::offered_for(&http);
+        let offered = Target::offered_for(&http, false);
         assert_eq!(offered.first(), Some(&Target::Curl), "curl leads the list");
         assert!(!offered.contains(&Target::Grpcurl));
-        assert_eq!(offered.len(), Target::ALL.len() - 1);
+        assert!(!offered.contains(&Target::CurlPowerShell), "PowerShell only on Windows");
+        assert_eq!(offered.len(), 9);
+        let on_windows = Target::offered_for(&http, true);
+        assert_eq!(on_windows[..2], [Target::Curl, Target::CurlPowerShell]);
+        assert!(on_windows.contains(&Target::HttpiePowerShell));
 
         let grpc = RequestKind::Grpc(crate::request::GrpcRequest::default());
-        assert_eq!(Target::offered_for(&grpc), vec![Target::Grpcurl]);
+        assert_eq!(Target::offered_for(&grpc, false), vec![Target::Grpcurl]);
+        assert_eq!(
+            Target::offered_for(&grpc, true),
+            vec![Target::Grpcurl, Target::GrpcurlPowerShell]
+        );
 
         let socket = RequestKind::WebSocket(crate::request::WebSocketRequest::default());
-        assert!(Target::offered_for(&socket).is_empty());
+        assert!(Target::offered_for(&socket, true).is_empty());
     }
 
     /// A chosen timeout is part of the request; Zuno's own default is not.
@@ -557,6 +646,8 @@ mod tests {
             format!("\"x{}u2028y\"", '\\')
         );
         assert_eq!(single_quoted(r"it's #{x} $y \"), r"'it\'s #{x} $y \\'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(Shell::Posix.quote("it's"), r"'it'\''s'");
+        assert_eq!(Shell::PowerShell.quote("it's $x"), "'it''s $x'");
+        assert_eq!(Shell::PowerShell.quote("don\u{2019}t"), "'don\u{2019}\u{2019}t'");
     }
 }
