@@ -5127,11 +5127,24 @@ fn serve_html_sequence(count: usize, body: &'static str) -> String {
 }
 
 /// Send the active request and wait for a response whose status matches.
+/// Send, and wait for **this** send's response.
+///
+/// **Not just "a response with this status is showing"**: when two sends in a row answer 200, that
+/// is already true of the *first* response, so the wait returned while the second was still in
+/// flight. It passed on Linux because the local server answered before the next step anyway, and
+/// failed on a Windows runner that was slower once — `capturing_from_a_retained_run_says_why_it_will_not`
+/// opened the history with one run in it. `press` runs the send handler synchronously, so the
+/// request is in flight when it returns, and `is_sending` going false means this send finished.
 fn send_and_wait(cx: &mut VisualTestContext, view: &gpui::Entity<RequestView>, status: u16) {
     cx.press("ctrl-enter");
     wait_for(cx, "the response", |cx| {
-        cx.update(|_, cx| view.read(cx).response.clone())
-            .filter(|response| response.status == status)
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            if view.is_sending() {
+                return None;
+            }
+            view.response.clone().filter(|response| response.status == status)
+        })
     });
 }
 
