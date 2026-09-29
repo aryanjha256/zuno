@@ -511,6 +511,11 @@ impl SchemaIndex {
         }
     }
 
+    /// The parsed schema, for `variables`' checks.
+    pub(super) fn schema(&self) -> &apollo_compiler::Schema {
+        &self.schema
+    }
+
     /// What may be typed at `spot`, filtered by `prefix`.
     ///
     /// **Prefix matches first, then names that merely contain it, and never fuzzy** — the

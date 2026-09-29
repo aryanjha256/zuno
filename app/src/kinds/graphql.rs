@@ -38,7 +38,14 @@ pub struct GraphQlEditor {
     /// of the request — derived, and shown only while the query still *is* that text, since a
     /// range into text that has since changed points at the wrong characters.
     pub validated: Option<(String, Vec<zuno_core::graphql::complete::Problem>)>,
+    /// The Variables JSON's problems, with the three texts they depend on — the query (which
+    /// declares the variables), the JSON, and the operation name — shown only while all three
+    /// still read that way.
+    pub variables_validated: Option<(VariablesKey, Vec<zuno_core::graphql::complete::Problem>)>,
 }
+
+/// What a variables check was computed against: the query, the variables JSON, the operation.
+pub type VariablesKey = (String, String, String);
 
 impl GraphQlEditor {
     pub fn new(cx: &mut Context<RequestView>) -> Self {
@@ -69,7 +76,24 @@ impl GraphQlEditor {
                 TextInput::new(graphql.schema.clone(), "api.graphql", "GraphQlSchema", cx)
             }),
             validated: None,
+            variables_validated: None,
         }
+    }
+
+    /// The texts a variables check depends on, as they read now.
+    pub fn variables_key(&self, cx: &App) -> VariablesKey {
+        (
+            self.query.read(cx).text().to_string(),
+            self.variables.read(cx).text().to_string(),
+            self.operation.read(cx).text().trim().to_string(),
+        )
+    }
+
+    /// The variables' problems as things stand, or `None` when any of the three texts has changed
+    /// since the last check.
+    pub fn variable_problems(&self, cx: &App) -> Option<&[zuno_core::graphql::complete::Problem]> {
+        let (key, problems) = self.variables_validated.as_ref()?;
+        (*key == self.variables_key(cx)).then_some(problems.as_slice())
     }
 
     /// The problems in the query as it stands, or `None` when it has changed since the last

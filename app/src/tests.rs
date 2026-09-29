@@ -6023,6 +6023,31 @@ async fn graphql_validation_marks_the_problem_and_never_a_stale_one(cx: &mut Tes
         "and it was checked, rather than never looked at"
     );
 
+    // **The Variables JSON, against what the query declares**: `true` where `ID!` is wanted is
+    // underlined on `true` itself, in the Variables editor.
+    cx.press("ctrl-a");
+    cx.simulate_input("query Q($id: ID!) { user(id: $id) { name } }");
+    cx.update(|window, cx| {
+        view.update(cx, |view, _| {
+            view.request_tab = crate::request_view::RequestTab::Kind(1);
+        });
+        let editor = view.read(cx).kind.as_graphql().expect("GraphQL").variables.clone();
+        window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+    });
+    cx.run_until_parked();
+    let json = r#"{ "id": true }"#;
+    cx.simulate_input(json);
+    settle(&mut cx);
+    let marked = wait_for(&mut cx, "the variable to be marked", |cx| {
+        let ranges = cx.update(|_, cx| {
+            let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+            graphql.variables.read(cx).problems_for_test().to_vec()
+        });
+        (!ranges.is_empty()).then_some(ranges)
+    });
+    assert_eq!(marked.iter().map(|range| &json[range.clone()]).collect::<Vec<_>>(), ["true"]);
+    assert!(underlined(&mut cx).is_empty(), "the query itself is fine");
+
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 

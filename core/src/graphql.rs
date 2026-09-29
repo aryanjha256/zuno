@@ -12,6 +12,7 @@
 
 pub mod complete;
 pub mod introspection;
+pub mod variables;
 
 use std::path::{Path, PathBuf};
 

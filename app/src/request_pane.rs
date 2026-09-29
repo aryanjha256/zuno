@@ -133,7 +133,27 @@ pub fn render(
                 // "add" button on a text editor whose only effect was to jump you to the
                 // document tab, because `AddQuery` shows slot 0 and then adds a row to a table
                 // a GraphQL request does not have.
-                .child(editor_header("Variables", "", theme))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .bg(theme.bg_panel)
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_xs()
+                        .text_color(theme.text_muted)
+                        .child(div().flex_none().child("Variables"))
+                        // The same note as the Query header's, about the JSON below it.
+                        .children(problems_note(
+                            "graphql-variable-problems",
+                            graphql.variable_problems(cx).unwrap_or_default(),
+                            graphql.variables.read(cx).cursor_offset(),
+                            theme,
+                        )),
+                )
                 .child(
                     editor_region(theme, focused_editor(&graphql.variables, window, cx))
                         .child(graphql.variables.clone()),
@@ -1470,6 +1490,44 @@ fn body_region(
     }
 }
 
+/// **What the schema says about an editor's text**: a count, or — with the caret on a problem —
+/// that problem's own message, since the underline shows *where* and only this says *what*. Every
+/// message is in the tooltip. `None` when there is nothing to say, or no schema to ask.
+fn problems_note(
+    id: &'static str,
+    problems: &[zuno_core::graphql::complete::Problem],
+    caret: usize,
+    theme: &Theme,
+) -> Option<impl IntoElement + use<>> {
+    if problems.is_empty() {
+        return None;
+    }
+    let here = problems
+        .iter()
+        .find(|problem| problem.range.start <= caret && caret <= problem.range.end);
+    let label = match here {
+        Some(problem) => zuno_core::request::elide(&problem.message, 70).into_owned(),
+        None if problems.len() == 1 => "1 problem".to_string(),
+        None => format!("{} problems", problems.len()),
+    };
+    let messages: Vec<SharedString> = problems
+        .iter()
+        .map(|problem| SharedString::from(problem.message.clone()))
+        .collect();
+    Some(
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .flex_shrink()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_color(theme.status_server_error)
+            .tooltip(move |_, cx| crate::ui::Tooltip::lines(messages.clone(), cx))
+            .child(SharedString::from(label)),
+    )
+}
+
 /// The header over the GraphQL query editor: what it is, and which operation to run.
 ///
 /// **`operationName` lives here rather than beside the URL**, because it names one of the
@@ -1493,26 +1551,12 @@ fn graphql_query_header(
         zuno_core::GraphQlTransport::WebSocket => "websocket",
     };
 
-    // **What the schema says about the query**: a count, or — with the caret on a problem — that
-    // problem's own message, since the underline shows *where* and only this says *what*. Every
-    // message is in the tooltip. Absent when there is nothing to say, or no schema to ask.
-    let problems = graphql.problems(cx).unwrap_or_default();
-    let caret = graphql.query.read(cx).cursor_offset();
-    let note = (!problems.is_empty()).then(|| {
-        let here = problems
-            .iter()
-            .find(|problem| problem.range.start <= caret && caret <= problem.range.end);
-        let label = match here {
-            Some(problem) => zuno_core::request::elide(&problem.message, 70).into_owned(),
-            None if problems.len() == 1 => "1 problem".to_string(),
-            None => format!("{} problems", problems.len()),
-        };
-        let messages: Vec<SharedString> = problems
-            .iter()
-            .map(|problem| SharedString::from(problem.message.clone()))
-            .collect();
-        (SharedString::from(label), messages)
-    });
+    let note = problems_note(
+        "graphql-problems",
+        graphql.problems(cx).unwrap_or_default(),
+        graphql.query.read(cx).cursor_offset(),
+        theme,
+    );
 
     div()
         .flex()
@@ -1526,18 +1570,7 @@ fn graphql_query_header(
         .text_xs()
         .text_color(theme.text_muted)
         .child(div().flex_none().child("Query"))
-        .children(note.map(|(label, messages)| {
-            div()
-                .id("graphql-problems")
-                .debug_selector(|| "graphql-problems".to_string())
-                .flex_shrink()
-                .min_w(px(0.))
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_color(theme.status_server_error)
-                .tooltip(move |_, cx| crate::ui::Tooltip::lines(messages.clone(), cx))
-                .child(label)
-        }))
+        .children(note)
         .child(div().flex_1().min_w(px(0.)))
         .child(crate::ui::text_action(
             "graphql-transport",

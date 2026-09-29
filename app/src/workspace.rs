@@ -251,9 +251,9 @@ pub struct Workspace {
     /// Parsed GraphQL schemas by file, filled off the UI thread the first time a request names
     /// one. *From server* drops its file's entry so the fresh copy is read.
     graphql_schemas: std::collections::HashMap<std::path::PathBuf, completion::SchemaSlot>,
-    /// The query text last sent for validation, and whose editor — so render schedules a check
-    /// once per distinct text rather than once per frame. See `validation.rs`.
-    validating: Option<(gpui::EntityId, String)>,
+    /// The query, variables and operation last sent for validation, and whose editor — so render
+    /// schedules a check once per distinct input rather than once per frame. See `validation.rs`.
+    validating: Option<(gpui::EntityId, crate::kinds::graphql::VariablesKey)>,
     /// The open multipart type select: which row, and where its chip was.
     part_select: Option<(usize, gpui::Point<gpui::Pixels>)>,
 }

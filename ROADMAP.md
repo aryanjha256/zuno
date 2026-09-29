@@ -180,10 +180,13 @@ runs against the saved schema after each pause in typing, off the UI thread: eac
 wavy underline where it is, and the Query header counts them — or, with the caret on one, says
 what it is. Send sends regardless, because the saved schema can be older than the server. Where
 one typo is reported twice (the field, and its parent left with no valid selection), only the
-inner one is kept. Not yet: the Variables JSON checked against the declared `$variable` types.
+inner one is kept. The Variables JSON is checked in the same pass, the way GraphQL's input
+coercion will read it (`graphql::variables`): a wrong type, a bad enum value or input field, a
+variable the operation never declared, and a required one left out — each underlined on its own
+text in the Variables editor, with nested mistakes placed on their variable's value and named by
+path (`$filter.status`).
 
-What remains for GraphQL, in order: checking the Variables JSON against the declared types. Then
-a **schema browser**. That last one is
+What remains for GraphQL is a **schema browser**. That one is
 where the **buffer generalization** comes in — a schema browser is not a request, so it is the
 first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
 currently has exactly one document type and around ten overlays, and making the browser overlay
