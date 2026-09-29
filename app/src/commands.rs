@@ -70,6 +70,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         ),
         command("Save the composed message", SaveMessage),
         command("Send a ping frame", SendPing),
+        command("Send a file as a binary frame", SendBinaryFile),
         command("Choose the schema file", ChooseSchemaFile),
         command("Browse the GraphQL schema", ToggleSchemaBrowser),
         command("Choose the gRPC method", OpenGrpcMethod),

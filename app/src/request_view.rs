@@ -1853,6 +1853,21 @@ impl RequestView {
         cx.notify();
     }
 
+    /// Send `bytes` as one binary frame down the open socket. The engine reports it back as a sent
+    /// frame, so it lands in the transcript like any other — labelled binary, with its size.
+    pub fn send_binary(&mut self, engine: &Arc<Engine>, bytes: bytes::Bytes, cx: &mut Context<Self>) {
+        let Some(job) = self
+            .session
+            .as_ref()
+            .filter(|session| session.is_open())
+            .map(|session| session.job)
+        else {
+            return;
+        };
+        engine.send_frame(job, Frame::Binary(bytes));
+        cx.notify();
+    }
+
     /// Say so if a frame was handed to the engine and never acknowledged.
     ///
     /// The first line only, elided: a transcript row is one line, and the point is to identify

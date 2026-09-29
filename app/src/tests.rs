@@ -14707,6 +14707,62 @@ async fn the_ping_button_sends_a_real_ping_frame(cx: &mut TestAppContext) {
     server.join().expect("server thread");
 }
 
+/// **A file goes down the socket as one binary frame, byte for byte.** Driven one layer below the
+/// dialog, which the test platform cannot open: the same `send_file_frame` the button reaches,
+/// against a real WebSocket server that records what arrived. The bytes are not valid UTF-8, so
+/// a frame sent as text would be refused rather than quietly pass.
+#[gpui::test]
+async fn a_file_is_sent_as_one_binary_frame(cx: &mut TestAppContext) {
+    use std::net::TcpListener;
+    use tokio_tungstenite::tungstenite;
+
+    let dir = scratch_dir("binary-frame");
+    let file = dir.join("blob.bin");
+    let payload: Vec<u8> = vec![0x00, 0xff, 0xfe, b'z', 0x80, 0x01];
+    std::fs::write(&file, &payload).expect("fixture");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (got_tx, got_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let stream = accept_before(&listener, Duration::from_secs(10)).expect("a connection");
+        let mut ws = tungstenite::accept(stream).expect("handshake");
+        while let Ok(message) = ws.read() {
+            match message {
+                tungstenite::Message::Binary(bytes) => {
+                    let _ = got_tx.send(bytes.to_vec());
+                }
+                tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let (window, view, mut cx) = boot(cx, None, None);
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::WebSocket, cx);
+            view.set_kind(kind, cx);
+        })
+    });
+    type_url(&mut cx, &format!("ws://127.0.0.1:{port}/"));
+    cx.press("ctrl-enter");
+    wait_for(&mut cx, "the socket to open", |cx| {
+        cx.update(|_, cx| view.read(cx).is_connected()).then_some(())
+    });
+
+    window
+        .update(&mut cx, |workspace, _, cx| workspace.send_file_frame(&view, file.clone(), cx))
+        .expect("window");
+    // Polled rather than `recv_timeout`: the file is read on the executor this thread drives, so
+    // blocking here would stop the read it is waiting for.
+    let received = wait_for(&mut cx, "the server to receive a binary frame", |_| got_rx.try_recv().ok());
+    assert_eq!(received, payload, "every byte, as sent");
+
+    drop(server);
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 /// An h2 server that speaks enough gRPC for one unary call.
 ///
 /// `hyper`'s own server rather than a hand-written socket, for `core/tests/websocket.rs`'s

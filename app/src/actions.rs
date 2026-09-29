@@ -178,6 +178,7 @@ actions!(
         AddQuery,
         SaveMessage,
         SendPing,
+        SendBinaryFile,
         ChooseSchemaFile,
         OpenGrpcMethod,
         ReflectSchema,

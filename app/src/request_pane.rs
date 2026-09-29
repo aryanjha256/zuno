@@ -1836,6 +1836,16 @@ fn message_header(saved: usize, theme: &Theme) -> Div {
                     theme.text_muted,
                     theme,
                 ))
+                // Beside Ping, the other frame the composer cannot type: bytes from a file.
+                .child(crate::ui::icon_text_action(
+                    "send-file",
+                    Icon::File,
+                    "File".into(),
+                    "Send a file as one binary frame",
+                    crate::actions::SendBinaryFile,
+                    theme.text_muted,
+                    theme,
+                ))
                 .child(crate::ui::icon_text_action(
                     "save-message",
                     Icon::Plus,

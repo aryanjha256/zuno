@@ -30,7 +30,7 @@ use zuno_core::collection::{Node, NodeKind};
 use crate::actions::{
     ChooseSchemaFile, OpenGraphQlTransport, OpenGrpcMethod, ReflectSchema, SaveMessage,
     ToggleSchemaBrowser,
-    SendPing,
+    SendPing, SendBinaryFile,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
     AddFormField, AddHeader, AddMultipartField, AddQuery, CancelRequest, ChooseBodyFile,
@@ -7096,6 +7096,79 @@ impl Workspace {
         view.update(cx, |view, cx| view.send_ping(&engine, cx));
     }
 
+    /// Pick a file and send its bytes as one binary frame — the composer only ever types text.
+    ///
+    /// **A file rather than bytes typed**, for the reason a binary *body* is one: what goes out as
+    /// binary is a blob that already exists — an image, a protobuf, a captured payload — and
+    /// nobody types those.
+    fn send_binary_file(&mut self, _: &SendBinaryFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        if view.read(cx).kind.as_websocket().is_none() || !view.read(cx).is_connected() {
+            self.set_status("No open WebSocket to send a binary frame on", cx);
+            return;
+        }
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Send as binary frame".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |workspace, cx| workspace.send_file_frame(&view, path, cx));
+        })
+        .detach();
+    }
+
+    /// Read `path` off the UI thread and send it down `view`'s socket — the tab that asked, not
+    /// whichever is active when the read finishes. Separate from the dialog so a test can drive it;
+    /// `prompt_for_paths` is `unimplemented!()` in the test platform.
+    ///
+    /// **Capped at `MAX_BINARY_FRAME`**, refused with the size rather than sent: tungstenite, like
+    /// most servers, rejects a frame past 16 MiB, and a failure there closes the socket with a
+    /// reason that names the protocol, not the file.
+    pub(crate) fn send_file_frame(
+        &mut self,
+        view: &Entity<RequestView>,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        const MAX_BINARY_FRAME: u64 = 16 * 1024 * 1024;
+        let Some(engine) = cx.engine() else { return };
+        let target = view.downgrade();
+        cx.spawn(async move |this, cx| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    let size = std::fs::metadata(&path).map_err(|error| error.to_string())?.len();
+                    if size > MAX_BINARY_FRAME {
+                        return Err(format!(
+                            "{} is larger than a WebSocket frame should be (16 MB)",
+                            format_bytes(size)
+                        ));
+                    }
+                    std::fs::read(&path).map_err(|error| error.to_string())
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| match read {
+                Ok(bytes) => {
+                    let size = format_bytes(bytes.len() as u64);
+                    let _ = target.update(cx, |view, cx| {
+                        view.send_binary(&engine, bytes::Bytes::from(bytes), cx)
+                    });
+                    workspace.set_status(&format!("Sent {name} as a binary frame ({size})"), cx);
+                }
+                Err(reason) => workspace.set_status(&format!("Could not send {name}: {reason}"), cx),
+            });
+        })
+        .detach();
+    }
+
     fn cancel_request(&mut self, _: &CancelRequest, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
         let Some(engine) = cx.engine() else { return };
@@ -7403,6 +7476,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel_request))
             .on_action(cx.listener(Self::save_message))
             .on_action(cx.listener(Self::send_ping))
+            .on_action(cx.listener(Self::send_binary_file))
             .on_action(cx.listener(Self::choose_schema_file))
             .on_action(cx.listener(Self::toggle_schema_browser))
             .on_action(cx.listener(Self::open_grpc_method))
