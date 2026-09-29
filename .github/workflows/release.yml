@@ -204,7 +204,7 @@ jobs:
           esac
 
       # Always uploaded, so a workflow_dispatch run is downloadable without a release.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zuno-linux
           path: |
@@ -268,7 +268,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zuno-macos
           path: target/macos/*.tar.gz
@@ -338,7 +338,7 @@ jobs:
           Compress-Archive -Path $stage -DestinationPath "target\windows\$name.zip"
           Get-Item "target\windows\$name.zip" | Format-List Name, Length
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zuno-windows
           path: target/windows/*.zip
