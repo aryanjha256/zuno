@@ -110,13 +110,26 @@ pub fn render(
                         .py_2()
                         .border_b_1()
                         .border_color(theme.border)
-                        .child(schema_row(
-                            graphql.schema.clone(),
-                            ["graphql-schema-file", "graphql-introspect"],
-                            "Choose a schema file (.graphql)",
-                            theme,
-                            cx,
-                        )),
+                        .child(
+                            schema_row(
+                                graphql.schema.clone(),
+                                ["graphql-schema-file", "graphql-introspect"],
+                                "Choose a schema file (.graphql)",
+                                theme,
+                                cx,
+                            )
+                            // After From server, in the order they are used: get a schema,
+                            // then read it.
+                            .child(crate::ui::icon_text_action(
+                                "graphql-browse",
+                                Icon::Search,
+                                if graphql.browser.is_some() { "Hide" } else { "Browse" }.into(),
+                                "Browse the schema under the query",
+                                crate::actions::ToggleSchemaBrowser,
+                                theme.text_muted,
+                                theme,
+                            )),
+                        ),
                 )
                 .children(
                     view.body_search
@@ -126,6 +139,14 @@ pub fn render(
                 .child(
                     editor_region(theme, focused_editor(&graphql.query, window, cx))
                         .child(graphql.query.clone()),
+                )
+                // Under the query, sharing the tab's height: see `schema_browser` for why a split
+                // by height rather than by width, or a tab of its own.
+                .children(
+                    graphql
+                        .browser
+                        .as_ref()
+                        .map(|browser| crate::schema_browser::render(browser, theme, cx)),
                 ),
             (KindEditor::GraphQl(graphql), _) => pane
                 // **Not `section_header`.** That one is for row tables and draws an add

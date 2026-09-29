@@ -29,6 +29,7 @@ use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
     ChooseSchemaFile, OpenGraphQlTransport, OpenGrpcMethod, ReflectSchema, SaveMessage,
+    ToggleSchemaBrowser,
     SendPing,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
@@ -6642,6 +6643,36 @@ impl Workspace {
         self.show_picker(items, "No transports", window, cx);
     }
 
+    /// Open the schema browser under the GraphQL query, or close it.
+    ///
+    /// **Shows the Query tab first**, because that is where the browser lives — asked for from
+    /// the palette while Variables is showing, it would otherwise open somewhere unseen. Refused,
+    /// with the way to get one, when the request names no schema yet.
+    fn toggle_schema_browser(
+        &mut self,
+        _: &ToggleSchemaBrowser,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        let Some(graphql) = view.read(cx).kind.as_graphql() else {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a GraphQL request has a schema to browse, not {kind}"), cx);
+            return;
+        };
+        if graphql.schema.read(cx).text().trim().is_empty() {
+            self.set_status("No schema yet — use From server on the Query tab", cx);
+            return;
+        }
+        view.update(cx, |view, cx| {
+            view.request_tab = crate::request_view::RequestTab::Kind(0);
+            if let Some(graphql) = view.kind.as_graphql_mut() {
+                graphql.toggle_browser(cx);
+            }
+            cx.notify();
+        });
+    }
+
     /// Fill the schema field — a gRPC `.proto` or a GraphQL SDL file — from the native dialog.
     ///
     /// **Fills the field rather than acting on the choice**, which is the convention every file
@@ -7373,6 +7404,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_message))
             .on_action(cx.listener(Self::send_ping))
             .on_action(cx.listener(Self::choose_schema_file))
+            .on_action(cx.listener(Self::toggle_schema_browser))
             .on_action(cx.listener(Self::open_grpc_method))
             .on_action(cx.listener(Self::reflect_schema))
             .on_action(cx.listener(Self::open_graphql_transport))

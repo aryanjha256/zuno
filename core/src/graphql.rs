@@ -10,6 +10,7 @@
 //! `None`, and `None` means "send it the way we always did". A sniff that guesses wrong must
 //! never be the reason a working request stops working.
 
+pub mod browse;
 pub mod complete;
 pub mod introspection;
 pub mod variables;

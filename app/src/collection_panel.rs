@@ -268,9 +268,11 @@ pub fn resize_handle(
     // The edge the seam names is the one being drawn, so this follows the panel in rather than
     // waiting at the settled width with nothing under it.
     let width = workspace.revealed_panel_width(window);
-    // Nothing else in the app calls `on_drag`, so an active drag is *this* drag. Read rather
-    // than stored, which is what keeps it honest: the flag cannot outlive the gesture.
-    let dragging = cx.has_active_drag();
+    // Asked of the drag's cursor rather than of whether *a* drag is live: the schema browser's
+    // split drags too, and gpui keeps the dragged value private. A drag takes the cursor of the
+    // element that started it — this seam's column resize, the browser's row resize — so the
+    // cursor says whose it is. Read rather than stored, so it cannot outlive the gesture.
+    let dragging = cx.active_drag_cursor_style() == Some(gpui::CursorStyle::ResizeColumn);
 
     // Invisible at rest — the panel's own border is what shows through, focus colour and all.
     // Hover and drag override it, because hover is transient and only appears while the

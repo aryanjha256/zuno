@@ -186,11 +186,18 @@ variable the operation never declared, and a required one left out — each unde
 text in the Variables editor, with nested mistakes placed on their variable's value and named by
 path (`$filter.status`).
 
-What remains for GraphQL is a **schema browser**. That one is
-where the **buffer generalization** comes in — a schema browser is not a request, so it is the
-first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
-currently has exactly one document type and around ten overlays, and making the browser overlay
-eleven is the mistake this note exists to prevent.
+**Schema browser — done, under the query rather than beside it or in a tab of its own.**
+*Browse* on the Schema row splits the Query tab by height: the query above, and below it a type
+list (roots first, filtered as you type) beside the chosen type's page — fields with their
+arguments and types, descriptions, deprecations, and every named type a link, with Back.
+
+This note once planned a **workspace tab**, the first to hold something other than a request, and
+called the work a "buffer generalization". That step did not follow from its own premise. The
+premise holds — not a modal; the app has around ten overlays and an eleventh is the mistake — but
+a tab of its own still means switching away from the query to read the schema, which is what a
+browser should spare you. Under the query is the only place both can be read at once; by height,
+because the request and response panes already sit side by side and halving the width would leave
+quarter-width strips. Not saved with the session, so nothing on disk changed.
 
 **Subscriptions are out of scope and stay out**, not by oversight: a subscription is a session
 over WebSocket, which is the transport this file already files under *Named, not planned*. It

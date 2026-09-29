@@ -53,6 +53,16 @@ impl Workspace {
                 Some(SchemaSlot::Ready(index)) => Some(index.clone()),
                 _ => None,
             });
+        // The request pane cannot reach this cache, so the schema is handed down to the editor —
+        // which is what the browser reads. Only on a change, so render does not notify itself.
+        let handed = index.clone();
+        view.update(cx, |view, cx| {
+            if let Some(graphql) = view.kind.as_graphql_mut()
+                && graphql.set_index(handed)
+            {
+                cx.notify();
+            }
+        });
         let Some(index) = index else {
             // No schema to check against, or not loaded yet — which render will retry.
             self.validating = None;

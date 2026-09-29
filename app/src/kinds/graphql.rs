@@ -42,6 +42,12 @@ pub struct GraphQlEditor {
     /// declares the variables), the JSON, and the operation name — shown only while all three
     /// still read that way.
     pub variables_validated: Option<(VariablesKey, Vec<zuno_core::graphql::complete::Problem>)>,
+    /// The parsed schema this request names, handed down by `Workspace` once it has loaded —
+    /// the request pane cannot reach `Workspace`'s cache itself. `None` without one.
+    pub index: Option<std::sync::Arc<zuno_core::graphql::complete::SchemaIndex>>,
+    /// The schema browser under the query, when open. Not part of the request and not saved:
+    /// it is a way of looking, for as long as this tab is open.
+    pub browser: Option<crate::schema_browser::SchemaBrowser>,
 }
 
 /// What a variables check was computed against: the query, the variables JSON, the operation.
@@ -77,7 +83,38 @@ impl GraphQlEditor {
             }),
             validated: None,
             variables_validated: None,
+            index: None,
+            browser: None,
         }
+    }
+
+    /// Take the schema `Workspace` loaded, passing it on to an open browser. Returns whether
+    /// anything changed, so the caller notifies only then.
+    pub fn set_index(
+        &mut self,
+        index: Option<std::sync::Arc<zuno_core::graphql::complete::SchemaIndex>>,
+    ) -> bool {
+        let same = match (&self.index, &index) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return false;
+        }
+        if let Some(browser) = self.browser.as_mut() {
+            browser.set_index(index.clone());
+        }
+        self.index = index;
+        true
+    }
+
+    /// Open the browser under the query, or close it.
+    pub fn toggle_browser(&mut self, cx: &mut Context<RequestView>) {
+        self.browser = match self.browser.take() {
+            Some(_) => None,
+            None => Some(crate::schema_browser::SchemaBrowser::new(self.index.clone(), cx)),
+        };
     }
 
     /// The texts a variables check depends on, as they read now.

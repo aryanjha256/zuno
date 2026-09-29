@@ -6051,6 +6051,85 @@ async fn graphql_validation_marks_the_problem_and_never_a_stale_one(cx: &mut Tes
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// **The schema browser opens on the query root and every link goes somewhere**: Browse opens it
+/// under the query, a field's type opens that type's page, Back returns, and the filter narrows
+/// the list to what a click then opens. Each of these is a click that could dispatch nothing —
+/// the browser reads a schema `Workspace` hands down, and a missed hand-off draws an empty page.
+#[gpui::test]
+async fn the_schema_browser_opens_on_the_root_and_follows_links(cx: &mut TestAppContext) {
+    const SDL: &str = "schema { query: Query }\n\
+        type Query { user(id: ID!): User  posts: [Post!]! }\n\
+        type User { id: ID!  name: String }\n\
+        type Post { id: ID!  title: String }\n";
+
+    let dir = scratch_dir("graphql-browse");
+    std::fs::create_dir_all(dir.join("schemas")).expect("scratch");
+    std::fs::write(dir.join("schemas/test.graphql"), SDL).expect("write");
+
+    let (_, view, mut cx) = boot(cx, None, Some(dir.clone()));
+    let spec = RequestSpec {
+        url: "https://api.test/graphql".to_string(),
+        kind: zuno_core::RequestKind::GraphQl(zuno_core::GraphQlRequest {
+            schema: "test.graphql".to_string(),
+            ..Default::default()
+        }),
+        ..RequestSpec::default()
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.load(spec, cx);
+            view.request_tab = crate::request_view::RequestTab::Kind(0);
+        })
+    });
+    cx.run_until_parked();
+
+    let page = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+            graphql
+                .browser
+                .as_ref()
+                .and_then(|browser| browser.selected().map(str::to_string))
+        })
+    };
+    let click = |cx: &mut VisualTestContext, selector: &'static str| {
+        let bounds = cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn"));
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+    };
+
+    // The schema loads off-thread; Browse is only worth pressing once it has.
+    wait_for(&mut cx, "the schema to reach the editor", |cx| {
+        cx.update(|_, cx| view.read(cx).kind.as_graphql()?.index.as_ref().map(|_| ()))
+    });
+    // `load` leaves focus on a dropped input (the trap in CLAUDE.md), where a dispatched action
+    // reaches nothing — so focus the editor, as a person clicking into the tab would have.
+    cx.update(|window, cx| {
+        let editor = view.read(cx).kind.as_graphql().expect("GraphQL").query.clone();
+        window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+    });
+    cx.run_until_parked();
+    click(&mut cx, "graphql-browse");
+    assert_eq!(page(&mut cx).as_deref(), Some("Query"), "it opens where exploring starts");
+
+    click(&mut cx, "schema-field-0");
+    assert_eq!(page(&mut cx).as_deref(), Some("User"), "a field's type is a link to its page");
+    click(&mut cx, "schema-back");
+    assert_eq!(page(&mut cx).as_deref(), Some("Query"), "Back returns");
+
+    cx.update(|window, cx| {
+        let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+        let filter = graphql.browser.as_ref().expect("open").filter.clone();
+        window.focus(&gpui::Focusable::focus_handle(filter.read(cx), cx));
+    });
+    cx.simulate_input("pos");
+    cx.run_until_parked();
+    click(&mut cx, "schema-type-0");
+    assert_eq!(page(&mut cx).as_deref(), Some("Post"), "the filter narrows the list to Post");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 /// **The cookie viewer shows the jar, forgets one cookie, and clears the rest** — reached
 /// through the `cookies on` badge, which is the mouse path, and driven by the keys the footer
 /// advertises.

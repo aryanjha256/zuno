@@ -182,6 +182,7 @@ actions!(
         OpenGrpcMethod,
         ReflectSchema,
         OpenGraphQlTransport,
+        ToggleSchemaBrowser,
         ToggleRow,
         RemoveRow,
         OpenBodyType,

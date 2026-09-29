@@ -32,6 +32,7 @@ mod paths;
 mod picker;
 mod platform_keys;
 mod run_panel;
+mod schema_browser;
 mod request_pane;
 mod request_view;
 mod response_pane;
