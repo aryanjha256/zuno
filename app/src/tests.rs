@@ -5942,6 +5942,81 @@ async fn graphql_completion_follows_the_schema_and_the_keys(cx: &mut TestAppCont
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// **Validation underlines the typo, forgets it the moment the text changes, and clears once
+/// fixed.** The middle rule is the invisible one: an underline computed for other text sits on
+/// the wrong characters, so it must go before the next check lands, not after.
+#[gpui::test]
+async fn graphql_validation_marks_the_problem_and_never_a_stale_one(cx: &mut TestAppContext) {
+    const SDL: &str = "schema { query: Query }\n\
+        type Query { user(id: ID!): User }\n\
+        type User { id: ID!  name: String }\n";
+
+    let dir = scratch_dir("graphql-validate");
+    std::fs::create_dir_all(dir.join("schemas")).expect("scratch");
+    std::fs::write(dir.join("schemas/test.graphql"), SDL).expect("write");
+
+    let (_, view, mut cx) = boot(cx, None, Some(dir.clone()));
+    let spec = RequestSpec {
+        url: "https://api.test/graphql".to_string(),
+        kind: zuno_core::RequestKind::GraphQl(zuno_core::GraphQlRequest {
+            schema: "test.graphql".to_string(),
+            ..Default::default()
+        }),
+        ..RequestSpec::default()
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.load(spec, cx);
+            view.request_tab = crate::request_view::RequestTab::Kind(0);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let editor = view.read(cx).kind.as_graphql().expect("GraphQL").query.clone();
+        window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
+    });
+    cx.run_until_parked();
+
+    let underlined = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let graphql = view.read(cx).kind.as_graphql().expect("GraphQL");
+            graphql.query.read(cx).problems_for_test().to_vec()
+        })
+    };
+    // Past the pause, on the simulated clock the test dispatcher runs.
+    let settle = |cx: &mut VisualTestContext| {
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+    };
+
+    cx.simulate_input("{ user(id: 1) { nmae } }");
+    settle(&mut cx);
+    let ranges = wait_for(&mut cx, "the typo to be marked", |cx| {
+        let ranges = underlined(cx);
+        (!ranges.is_empty()).then_some(ranges)
+    });
+    assert_eq!(ranges, vec![16..20], "exactly `nmae`");
+
+    // One more character: the old underline no longer describes this text, so it goes now —
+    // before the clock moves and the next check runs.
+    cx.simulate_input(" ");
+    cx.run_until_parked();
+    assert!(underlined(&mut cx).is_empty(), "a stale underline must not outlive its text");
+
+    cx.press("ctrl-a");
+    cx.simulate_input("{ user(id: 1) { name } }");
+    settle(&mut cx);
+    cx.run_until_parked();
+    assert!(underlined(&mut cx).is_empty(), "a valid query has nothing marked");
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).kind.as_graphql().expect("GraphQL").problems(cx).map(<[_]>::len)),
+        Some(0),
+        "and it was checked, rather than never looked at"
+    );
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 /// **The cookie viewer shows the jar, forgets one cookie, and clears the rest** — reached
 /// through the `cookies on` badge, which is the mouse path, and driven by the keys the footer
 /// advertises.

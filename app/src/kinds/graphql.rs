@@ -34,6 +34,10 @@ pub struct GraphQlEditor {
     /// The schema file: a bare name inside the collection's `schemas/`, or a path anywhere —
     /// `GrpcEditor::proto`'s field, for the same reasons.
     pub schema: Entity<TextInput>,
+    /// The query's problems against the schema, with the exact text they were found in. Not part
+    /// of the request — derived, and shown only while the query still *is* that text, since a
+    /// range into text that has since changed points at the wrong characters.
+    pub validated: Option<(String, Vec<zuno_core::graphql::complete::Problem>)>,
 }
 
 impl GraphQlEditor {
@@ -64,7 +68,15 @@ impl GraphQlEditor {
             schema: cx.new(|cx| {
                 TextInput::new(graphql.schema.clone(), "api.graphql", "GraphQlSchema", cx)
             }),
+            validated: None,
         }
+    }
+
+    /// The problems in the query as it stands, or `None` when it has changed since the last
+    /// validation (or there has been none).
+    pub fn problems(&self, cx: &App) -> Option<&[zuno_core::graphql::complete::Problem]> {
+        let (text, problems) = self.validated.as_ref()?;
+        (self.query.read(cx).text() == text).then_some(problems.as_slice())
     }
 
     /// Whether anything has been typed here — see `KindEditor::has_content`.

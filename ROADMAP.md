@@ -172,10 +172,15 @@ chose — the header list's rule (architecture.md §6l), one surface over, in th
 inside the multi-line editor. A tolerant scanner finds *where* the caret is (`graphql::complete`),
 so a half-typed document still completes. Not yet: enum values, `... on` type names, `$variables`.
 
-What remains for GraphQL, in order: **validation** against the schema — unknown fields and wrong
-argument types marked where they are typed — then those remaining completions. That is the
-actual differentiator: a query you write with the schema helping, not a checkbox tree. Then a
-**schema browser**. That last one is
+**Validation — done, as marks, never a gate.** GraphQL's own validation (`apollo-compiler`)
+runs against the saved schema after each pause in typing, off the UI thread: each problem is a
+wavy underline where it is, and the Query header counts them — or, with the caret on one, says
+what it is. Send sends regardless, because the saved schema can be older than the server. Where
+one typo is reported twice (the field, and its parent left with no valid selection), only the
+inner one is kept. Not yet: the Variables JSON checked against the declared `$variable` types.
+
+What remains for GraphQL, in order: the remaining completions — enum values, `... on` type
+names, `$variables` — and checking the Variables JSON. Then a **schema browser**. That last one is
 where the **buffer generalization** comes in — a schema browser is not a request, so it is the
 first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
 currently has exactly one document type and around ten overlays, and making the browser overlay

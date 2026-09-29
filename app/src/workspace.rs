@@ -8,6 +8,7 @@
 //! active `RequestView` through its entity.
 
 mod completion;
+mod validation;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -250,6 +251,9 @@ pub struct Workspace {
     /// Parsed GraphQL schemas by file, filled off the UI thread the first time a request names
     /// one. *From server* drops its file's entry so the fresh copy is read.
     graphql_schemas: std::collections::HashMap<std::path::PathBuf, completion::SchemaSlot>,
+    /// The query text last sent for validation, and whose editor — so render schedules a check
+    /// once per distinct text rather than once per frame. See `validation.rs`.
+    validating: Option<(gpui::EntityId, String)>,
     /// The open multipart type select: which row, and where its chip was.
     part_select: Option<(usize, gpui::Point<gpui::Pixels>)>,
 }
@@ -484,6 +488,7 @@ impl Workspace {
             suggest_dismissed: None,
             completion: Default::default(),
             graphql_schemas: Default::default(),
+            validating: None,
             part_select: None,
         };
 
@@ -7140,6 +7145,7 @@ impl Render for Workspace {
         // Before anything reads it: a GraphQL request's schema is parsed off-thread the first
         // time it is on screen, so completion is ready by the time someone types.
         self.load_graphql_schema(cx);
+        self.schedule_graphql_validation(cx);
         let status_message = self.status_message(cx);
         let cookies = self.cookies_enabled(cx);
         let cert_files = crate::app_state::tls(cx);

@@ -86,6 +86,10 @@ pub struct Editor {
     /// identifier — `GraphQlQuery`, whose completion keys must win only inside that editor. One
     /// string, because gpui matches only the leaf context.
     key_context: &'static str,
+    /// Byte ranges drawn with a wavy underline — problems a validator found. Set from outside
+    /// and meaningful only for the text they were computed against, so the owner clears them
+    /// the moment that text changes.
+    problems: Vec<Range<usize>>,
 }
 
 impl Editor {
@@ -112,6 +116,7 @@ impl Editor {
             highlight_json: false,
             is_selecting: false,
             key_context: "TextInput BodyEditor",
+            problems: Vec::new(),
         }
     }
 
@@ -127,6 +132,20 @@ impl Editor {
     pub fn set_key_context(&mut self, context: &'static str) {
         debug_assert!(context.contains("TextInput") && context.contains("BodyEditor"));
         self.key_context = context;
+    }
+
+    /// The ranges currently underlined, for tests — the paint itself is not observable headlessly.
+    #[cfg(test)]
+    pub fn problems_for_test(&self) -> &[Range<usize>] {
+        &self.problems
+    }
+
+    /// Underline these byte ranges as problems, replacing any drawn before.
+    pub fn set_problems(&mut self, problems: Vec<Range<usize>>, cx: &mut Context<Self>) {
+        if self.problems != problems {
+            self.problems = problems;
+            cx.notify();
+        }
     }
 
     /// Where the caret is, as a byte offset.
@@ -1183,6 +1202,22 @@ impl Element for EditorElement {
                 })
             });
             let runs = build_runs(&text, &style, color, &spans, marked);
+            // The problems on this line, relative to it — after colouring, as a second pass,
+            // so an underline can cross token boundaries without the colours knowing about it.
+            let problems: Vec<Range<usize>> = if is_empty {
+                Vec::new()
+            } else {
+                editor
+                    .problems
+                    .iter()
+                    .filter(|problem| problem.start < line_end && problem.end > line_start)
+                    .map(|problem| {
+                        problem.start.max(line_start) - line_start
+                            ..problem.end.min(line_end) - line_start
+                    })
+                    .collect()
+            };
+            let runs = underline_problems(runs, &problems, theme.status_server_error);
 
             let layout = window
                 .text_system()
@@ -1388,6 +1423,54 @@ fn build_runs(
             strikethrough: None,
         })
         .collect()
+}
+
+/// Give every part of `runs` inside one of `problems` a wavy underline, splitting runs at the
+/// problems' edges so the underline starts and stops exactly where the problem does. An IME
+/// underline already on a run wins: what is being composed is the more immediate thing.
+fn underline_problems(
+    runs: Vec<TextRun>,
+    problems: &[Range<usize>],
+    color: gpui::Hsla,
+) -> Vec<TextRun> {
+    if problems.is_empty() {
+        return runs;
+    }
+    let wavy = UnderlineStyle {
+        color: Some(color),
+        thickness: px(1.0),
+        wavy: true,
+    };
+    let mut out = Vec::with_capacity(runs.len() + problems.len() * 2);
+    let mut at = 0;
+    for run in runs {
+        let end = at + run.len;
+        let mut cuts = vec![at, end];
+        for problem in problems {
+            for edge in [problem.start, problem.end] {
+                if edge > at && edge < end {
+                    cuts.push(edge);
+                }
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for pair in cuts.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            let inside = problems.iter().any(|p| p.start <= from && p.end >= to);
+            out.push(TextRun {
+                len: to - from,
+                underline: if inside && run.underline.is_none() {
+                    Some(wavy.clone())
+                } else {
+                    run.underline.clone()
+                },
+                ..run.clone()
+            });
+        }
+        at = end;
+    }
+    out
 }
 
 #[cfg(test)]

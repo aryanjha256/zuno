@@ -476,6 +476,69 @@ impl SchemaIndex {
             .collect()
     }
 
+    /// Every problem `document` has against this schema, as byte ranges into it.
+    ///
+    /// **GraphQL's own validation, all of it**, through `apollo-compiler` — syntax, unknown
+    /// fields, arguments and types, wrong argument types, missing required arguments, undefined
+    /// variables and fragments. The schema is taken as valid without checking, for `parse`'s
+    /// reason: it is what the server runs, and a rule it breaks is not the query's problem.
+    ///
+    /// An empty document has no problems. Nothing has been written yet, and "expected a
+    /// definition" under an empty editor is noise.
+    pub fn validate(&self, document: &str) -> Vec<Problem> {
+        use apollo_compiler::diagnostic::ToCliReport as _;
+
+        if document.trim().is_empty() {
+            return Vec::new();
+        }
+        const PATH: &str = "query.graphql";
+        let schema = apollo_compiler::validation::Valid::assume_valid_ref(&self.schema);
+        let Err(with_errors) =
+            apollo_compiler::ExecutableDocument::parse_and_validate(schema, document, PATH)
+        else {
+            return Vec::new();
+        };
+
+        let problems: Vec<Problem> = with_errors
+            .errors
+            .iter()
+            .map(|diagnostic| {
+                // Only locations inside the query itself: a diagnostic can also point into the
+                // schema, and those offsets mean nothing in the editor.
+                let span = diagnostic.error.location().filter(|span| {
+                    diagnostic
+                        .sources
+                        .get(&span.file_id())
+                        .is_some_and(|file| file.path() == std::path::Path::new(PATH))
+                });
+                let range = match span {
+                    Some(span) => span.offset()..span.end_offset(),
+                    None => 0..0,
+                };
+                Problem {
+                    range: visible(range, document),
+                    message: diagnostic.error.to_string(),
+                }
+            })
+            .collect();
+
+        // **The specific problem, not its echo.** One typo inside `user { nmae }` is reported
+        // twice — once on `nmae`, and again on the whole of `user { … }`, which is left with no
+        // valid selection. Underlining the whole field hides where the mistake is, so a problem
+        // whose range contains another's is dropped in favour of the one inside it.
+        problems
+            .iter()
+            .filter(|outer| {
+                !problems.iter().any(|inner| {
+                    inner.range != outer.range
+                        && outer.range.start <= inner.range.start
+                        && inner.range.end <= outer.range.end
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The type a selection set at `path` selects from.
     fn resolve(&self, root: &Root, path: &[Step]) -> Option<String> {
         let definition = &self.schema.schema_definition;
@@ -505,6 +568,35 @@ impl SchemaIndex {
             _ => None,
         }
     }
+}
+
+/// One problem in a document: where, and what the validator said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub range: Range<usize>,
+    pub message: String,
+}
+
+/// A range at least one character wide, inside `document`, on character boundaries — so an error
+/// reported *at* a point (a missing `}` at the end) still has something to underline.
+fn visible(range: Range<usize>, document: &str) -> Range<usize> {
+    let len = document.len();
+    let mut start = range.start.min(len);
+    let mut end = range.end.min(len);
+    if start == end {
+        if end < len {
+            end += 1;
+        } else if start > 0 {
+            start -= 1;
+        }
+    }
+    while start > 0 && !document.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < len && !document.is_char_boundary(end) {
+        end += 1;
+    }
+    start..end
 }
 
 fn field_row(field: &apollo_compiler::schema::FieldDefinition) -> Suggestion {
@@ -680,6 +772,32 @@ mod tests {
         );
         // A path through a field that does not exist offers nothing rather than guessing.
         assert!(index.suggest(&root(&[step("nope")]), "").is_empty());
+    }
+
+    /// **Problems are located where they are in the query**, which is what an underline needs,
+    /// and an empty editor has none.
+    #[test]
+    fn validation_places_each_problem_in_the_query() {
+        let index = SchemaIndex::parse(SDL).expect("parses");
+        assert!(index.validate("").is_empty());
+        assert!(index.validate("{ user(id: 1) { name } }").is_empty(), "a valid query");
+
+        let query = "{ user(id: 1) { nmae } }";
+        let problems = index.validate(query);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(&query[problems[0].range.clone()], "nmae", "{problems:?}");
+        assert!(problems[0].message.contains("nmae"), "{problems:?}");
+
+        // A required argument left out is reported on the field that needs it.
+        let problems = index.validate("{ user { name } }");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].message.contains("id"), "{problems:?}");
+
+        // A syntax error at the very end still gets a character to underline.
+        let query = "{ user(id: 1) { name }";
+        let problems = index.validate(query);
+        assert!(!problems.is_empty());
+        assert!(problems.iter().all(|problem| !problem.range.is_empty()), "{problems:?}");
     }
 
     #[test]

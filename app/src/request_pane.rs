@@ -1493,6 +1493,27 @@ fn graphql_query_header(
         zuno_core::GraphQlTransport::WebSocket => "websocket",
     };
 
+    // **What the schema says about the query**: a count, or — with the caret on a problem — that
+    // problem's own message, since the underline shows *where* and only this says *what*. Every
+    // message is in the tooltip. Absent when there is nothing to say, or no schema to ask.
+    let problems = graphql.problems(cx).unwrap_or_default();
+    let caret = graphql.query.read(cx).cursor_offset();
+    let note = (!problems.is_empty()).then(|| {
+        let here = problems
+            .iter()
+            .find(|problem| problem.range.start <= caret && caret <= problem.range.end);
+        let label = match here {
+            Some(problem) => zuno_core::request::elide(&problem.message, 70).into_owned(),
+            None if problems.len() == 1 => "1 problem".to_string(),
+            None => format!("{} problems", problems.len()),
+        };
+        let messages: Vec<SharedString> = problems
+            .iter()
+            .map(|problem| SharedString::from(problem.message.clone()))
+            .collect();
+        (SharedString::from(label), messages)
+    });
+
     div()
         .flex()
         .items_center()
@@ -1505,6 +1526,18 @@ fn graphql_query_header(
         .text_xs()
         .text_color(theme.text_muted)
         .child(div().flex_none().child("Query"))
+        .children(note.map(|(label, messages)| {
+            div()
+                .id("graphql-problems")
+                .debug_selector(|| "graphql-problems".to_string())
+                .flex_shrink()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(theme.status_server_error)
+                .tooltip(move |_, cx| crate::ui::Tooltip::lines(messages.clone(), cx))
+                .child(label)
+        }))
         .child(div().flex_1().min_w(px(0.)))
         .child(crate::ui::text_action(
             "graphql-transport",

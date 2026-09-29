@@ -61,7 +61,7 @@ struct Open {
 
 impl Workspace {
     /// The active request's query editor and schema file, when it is a GraphQL request with one.
-    fn graphql_target(&self, cx: &gpui::App) -> Option<(Entity<Editor>, PathBuf)> {
+    pub(super) fn graphql_target(&self, cx: &gpui::App) -> Option<(Entity<Editor>, PathBuf)> {
         let graphql = self.active()?.read(cx).kind.as_graphql()?;
         let schema = graphql.schema.read(cx).text().trim().to_string();
         if schema.is_empty() {
