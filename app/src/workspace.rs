@@ -25,7 +25,7 @@ use zuno_core::{
 use zuno_core::collection::{Node, NodeKind};
 
 use crate::actions::{
-    ChooseProtoFile, OpenGraphQlTransport, OpenGrpcMethod, ReflectSchema, SaveMessage,
+    ChooseSchemaFile, OpenGraphQlTransport, OpenGrpcMethod, ReflectSchema, SaveMessage,
     SendPing,
     CopyInstallCommand, DismissUpdate, OpenUpdateMenu,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev,
@@ -6627,36 +6627,42 @@ impl Workspace {
         self.show_picker(items, "No transports", window, cx);
     }
 
-    /// Fill the `.proto` field from the native dialog.
+    /// Fill the schema field — a gRPC `.proto` or a GraphQL SDL file — from the native dialog.
     ///
     /// **Fills the field rather than acting on the choice**, which is the convention every file
     /// path here follows: the field stays editable, so browsing is a faster way to answer the
     /// same question rather than a second verb with different behaviour.
     ///
-    /// The path is written back **relative to the collection's `protos/` when it sits there**,
-    /// because that is the spelling that survives being cloned by somebody else — an absolute
-    /// path into one person's home directory is broken for every teammate. Anywhere else is
-    /// written as chosen, since there is nothing portable to shorten it to.
-    fn choose_proto_file(
+    /// The path is written back **relative to the collection's schema directory when it sits
+    /// there** — `protos/` or `schemas/` — because that is the spelling that survives being cloned
+    /// by somebody else: an absolute path into one person's home directory is broken for every
+    /// teammate. Anywhere else is written as chosen, since there is nothing portable to shorten it
+    /// to.
+    fn choose_schema_file(
         &mut self,
-        _: &ChooseProtoFile,
+        _: &ChooseSchemaFile,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(view) = self.active() else { return };
-        if view.read(cx).kind.as_grpc().is_none() {
-            let kind = view.read(cx).kind.choice().label();
-            self.set_status(&format!("Only a gRPC request has a schema, not {kind}"), cx);
+        let kind = &view.read(cx).kind;
+        let (field, directory, prompt) = if let Some(grpc) = kind.as_grpc() {
+            (grpc.proto.clone(), zuno_core::grpc::DIRECTORY, "Choose .proto")
+        } else if let Some(graphql) = kind.as_graphql() {
+            (graphql.schema.clone(), zuno_core::graphql::DIRECTORY, "Choose schema")
+        } else {
+            let kind = kind.choice().label();
+            self.set_status(&format!("Only gRPC and GraphQL requests have a schema, not {kind}"), cx);
             return;
-        }
+        };
 
-        let protos = crate::collections::root(cx).map(|root| root.join(zuno_core::grpc::DIRECTORY));
+        let home = crate::collections::root(cx).map(|root| root.join(directory));
 
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose .proto".into()),
+            prompt: Some(prompt.into()),
         });
 
         // The tab that opened the dialog, for `reflect_schema`'s reason: a dialog left open is
@@ -6670,27 +6676,24 @@ impl Workspace {
                 return;
             };
 
-            // Shortened only when it really is in `protos/`, and only to its file name —
-            // `resolve_proto` treats anything with a separator as a literal path, so a nested
-            // `protos/a/b.proto` must stay a path rather than become a bare name that would
-            // then resolve to the wrong place.
-            let written = protos
+            // Shortened only when it really is in that directory, and only to its file name —
+            // `resolve_proto` and `resolve_schema` treat anything with a separator as a literal
+            // path, so a nested `protos/a/b.proto` must stay a path rather than become a bare
+            // name that would then resolve to the wrong place.
+            let written = home
                 .as_deref()
-                .and_then(|protos| path.parent().filter(|parent| *parent == protos))
+                .and_then(|home| path.parent().filter(|parent| *parent == home))
                 .and_then(|_| path.file_name())
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.display().to_string());
 
-            let _ = target.update_in(cx, |view, window, cx| {
-                if let Some(grpc) = view.kind.as_grpc() {
-                    let field = grpc.proto.clone();
-                    field.update(cx, |input, cx| {
-                        input.select_all_text(cx);
-                        gpui::EntityInputHandler::replace_text_in_range(
-                            input, None, &written, window, cx,
-                        );
-                    });
-                }
+            let _ = target.update_in(cx, |_, window, cx| {
+                field.update(cx, |input, cx| {
+                    input.select_all_text(cx);
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        input, None, &written, window, cx,
+                    );
+                });
                 cx.notify();
             });
         })
@@ -6711,9 +6714,13 @@ impl Workspace {
     /// exactly like a hand-written one, and everything downstream already knows how to read it.
     fn reflect_schema(&mut self, _: &ReflectSchema, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
+        if view.read(cx).kind.as_graphql().is_some() {
+            self.introspect(view, window, cx);
+            return;
+        }
         if view.read(cx).kind.as_grpc().is_none() {
             let kind = view.read(cx).kind.choice().label();
-            self.set_status(&format!("Only a gRPC request has a schema, not {kind}"), cx);
+            self.set_status(&format!("Only gRPC and GraphQL requests have a schema, not {kind}"), cx);
             return;
         }
 
@@ -6823,6 +6830,114 @@ impl Workspace {
                     "Saved {name} — {} method(s). Choose one to call",
                     methods.len()
                 )));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ask a GraphQL server for its schema and keep it with the collection, as SDL in `schemas/`.
+    ///
+    /// **A one-time import, for `reflect_schema`'s reasons** — offline, committable, and still
+    /// there once production turns introspection off, which it usually does. Only when asked: the
+    /// query is a real request carrying the request's own auth, and firing one on opening a tab
+    /// would be a request nobody pressed Send for.
+    ///
+    /// **The request as written, with the introspection query in place of the document**, so the
+    /// URL, headers, auth, TLS settings and proxy are all the ones the request itself uses. Always
+    /// a POST over HTTP, whatever the request's own method and transport: a subscription's socket
+    /// cannot answer a query, and a GET would put the whole introspection query in the URL.
+    fn introspect(&mut self, view: gpui::Entity<RequestView>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(engine) = cx.engine() else {
+            self.set_status("The HTTP engine failed to start — restart Zuno", cx);
+            return;
+        };
+        let Some(root) = crate::collections::root(cx).map(std::path::Path::to_path_buf) else {
+            self.set_status("Open a collection first — the schema is saved into its schemas/", cx);
+            return;
+        };
+
+        let mut spec = self.resolver(cx).apply(&view.read(cx).spec(cx));
+        if spec.url.trim().is_empty() {
+            self.set_status("Enter the server's address first", cx);
+            return;
+        }
+        if let zuno_core::RequestKind::GraphQl(graphql) = &mut spec.kind {
+            graphql.method = zuno_core::Method::Post;
+            graphql.transport = zuno_core::GraphQlTransport::Http;
+            graphql.query = zuno_core::graphql::introspection::QUERY.to_string();
+            graphql.variables.clear();
+            graphql.operation = Some(zuno_core::graphql::introspection::OPERATION.to_string());
+        }
+
+        let label = zuno_core::collection::slug(&spec.url);
+        self.set_status("Asking the server for its schema…", cx);
+
+        // The tab that asked, for `reflect_schema`'s reason.
+        let target = view.downgrade();
+        let (_job, events) = engine.send(spec);
+        cx.spawn_in(window, async move |_, cx| {
+            let response = loop {
+                match events.recv().await {
+                    Ok(zuno_core::engine::Event::Done { response, .. }) => break response,
+                    Ok(zuno_core::engine::Event::Failed { error, .. }) => {
+                        let _ = target.update(cx, |view, cx| {
+                            view.error = Some(error);
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            };
+
+            // Invariant 3: converting and parsing a schema, and writing it, off the UI thread.
+            let status = response.status;
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    use zuno_core::graphql::introspection::{IntrospectionError, to_sdl};
+                    let (sdl, types) = to_sdl(&response.body).map_err(|error| match error {
+                        // Not JSON from a server that also said no: the status is the useful half
+                        // — a 404 means the wrong URL, not a broken reply.
+                        IntrospectionError::NotGraphQl(_) if !(200..300).contains(&status) => {
+                            format!("the server answered {status}, not a GraphQL response")
+                        }
+                        other => other.to_string(),
+                    })?;
+                    let directory = root.join(zuno_core::graphql::DIRECTORY);
+                    std::fs::create_dir_all(&directory)
+                        .map_err(|error| format!("could not create schemas/: {error}"))?;
+                    let name = format!("{label}.graphql");
+                    std::fs::write(directory.join(&name), sdl)
+                        .map_err(|error| format!("could not write {name}: {error}"))?;
+                    Ok::<_, String>((name, types))
+                })
+                .await;
+
+            let _ = target.update_in(cx, |view, window, cx| {
+                match saved {
+                    Ok((name, types)) => {
+                        if let Some(graphql) = view.kind.as_graphql() {
+                            // The bare filename, which is the portable spelling.
+                            let field = graphql.schema.clone();
+                            field.update(cx, |input, cx| {
+                                input.select_all_text(cx);
+                                gpui::EntityInputHandler::replace_text_in_range(
+                                    input, None, &name, window, cx,
+                                );
+                            });
+                        }
+                        view.status =
+                            Some(SharedString::from(format!("Saved {name} — {types} types")));
+                    }
+                    // In the response pane, for `reflect_schema`'s reason: "introspection is not
+                    // allowed" is the answer most people will get, and it is an instruction.
+                    Err(reason) => {
+                        view.error = Some(zuno_core::engine::EngineError::Other { reason });
+                    }
+                }
                 cx.notify();
             });
         })
@@ -7221,7 +7336,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::cancel_request))
             .on_action(cx.listener(Self::save_message))
             .on_action(cx.listener(Self::send_ping))
-            .on_action(cx.listener(Self::choose_proto_file))
+            .on_action(cx.listener(Self::choose_schema_file))
             .on_action(cx.listener(Self::open_grpc_method))
             .on_action(cx.listener(Self::reflect_schema))
             .on_action(cx.listener(Self::open_graphql_transport))

@@ -93,6 +93,11 @@ hyper = { version = "1", features = ["client", "http1"] }
 protox = "0.9"
 prost-reflect = { version = "0.16", features = ["serde"] }
 prost = "0.14"
+# GraphQL schema. Apollo's Rust compiler: the schema model, an error-tolerant parser (what
+# completion needs, over a document that is half-typed on nearly every keystroke), and
+# spec-complete validation with positions. The alternative was extending `graphql.rs`'s scanner,
+# which is the right size for routing and the wrong one for validating against a schema.
+apollo-compiler = "1.33"
 
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Reading HTTP/2 **trailers**, which is where gRPC puts its status and which reqwest names

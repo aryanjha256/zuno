@@ -42,6 +42,8 @@ http-body-util.workspace = true
 protox.workspace = true
 prost-reflect.workspace = true
 prost.workspace = true
+# GraphQL schema. See the workspace manifest.
+apollo-compiler.workspace = true
 
 [dev-dependencies]
 # **A spike, and the reason it is a dev-dependency.** gRPC reports its status in HTTP/2

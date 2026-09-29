@@ -31,6 +31,9 @@ pub struct GraphQlEditor {
     /// types into it, it is picked — so a live input would be state for something only ever
     /// read.
     pub transport: GraphQlTransport,
+    /// The schema file: a bare name inside the collection's `schemas/`, or a path anywhere —
+    /// `GrpcEditor::proto`'s field, for the same reasons.
+    pub schema: Entity<TextInput>,
 }
 
 impl GraphQlEditor {
@@ -52,6 +55,9 @@ impl GraphQlEditor {
                 )
             }),
             transport: graphql.transport,
+            schema: cx.new(|cx| {
+                TextInput::new(graphql.schema.clone(), "api.graphql", "GraphQlSchema", cx)
+            }),
         }
     }
 
@@ -65,6 +71,7 @@ impl GraphQlEditor {
             // A transport that was chosen rather than defaulted is a decision, and a kind
             // switch would throw it away as surely as it throws away the document.
             || self.transport != GraphQlTransport::default()
+            || !self.schema.read(cx).text().trim().is_empty()
     }
 
     /// What `spec()` reads back out. The mirror of `from_spec`, and the reason a GraphQL
@@ -79,6 +86,7 @@ impl GraphQlEditor {
             // would be sent as `operationName: ""`, which several servers reject.
             operation: (!operation.is_empty()).then_some(operation),
             transport: self.transport,
+            schema: self.schema.read(cx).text().trim().to_string(),
         }
     }
 
@@ -94,6 +102,7 @@ impl GraphQlEditor {
             variables,
             operation,
             transport,
+            schema,
         } = base;
 
         let typed = self.operation.read(cx).text().trim().to_string();
@@ -104,6 +113,7 @@ impl GraphQlEditor {
             || self.variables.read(cx).text() != variables
             || typed.as_deref() != operation.as_deref()
             || self.transport != *transport
+            || self.schema.read(cx).text().trim() != schema
     }
 
     /// Whether this will open a socket, as the engine will decide it.
@@ -125,5 +135,6 @@ impl GraphQlEditor {
         self.query.read(cx).focus_handle(cx).is_focused(window)
             || self.variables.read(cx).focus_handle(cx).is_focused(window)
             || self.operation.read(cx).focus_handle(cx).is_focused(window)
+            || self.schema.read(cx).focus_handle(cx).is_focused(window)
     }
 }

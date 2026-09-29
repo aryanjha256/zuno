@@ -1342,6 +1342,7 @@ mod tests {
                 variables: variables.to_string(),
                 operation: None,
                 transport: Default::default(),
+                schema: String::new(),
             }),
             ..RequestSpec::default()
         }

@@ -3365,7 +3365,10 @@ async fn a_graphql_request_survives_being_loaded_and_read_back(cx: &mut TestAppC
             query: "query Repos($n: Int!) {\n  viewer { repositories(first: $n) { id } }\n}"
                 .to_string(),
             variables: "{\n  \"n\": 50\n}".to_string(),
-            operation: Some("Repos".to_string()), transport: Default::default() }),
+            operation: Some("Repos".to_string()),
+            transport: Default::default(),
+            schema: "api.test.graphql".to_string(),
+        }),
         ..RequestSpec::default()
     };
 
@@ -5751,6 +5754,96 @@ async fn reflection_answers_the_tab_that_asked(cx: &mut TestAppContext) {
     );
 
     drop(server);
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
+/// **From server fetches a GraphQL schema into `schemas/` and points the request at it.**
+///
+/// The request is set to a WebSocket transport on purpose: introspection is a query, which a
+/// subscription's socket cannot answer, so it must go out as a POST whatever the request says.
+/// Asserted on the request the server actually received, then on the file and the field.
+#[gpui::test]
+async fn from_server_saves_a_graphql_schema_and_points_the_request_at_it(
+    cx: &mut TestAppContext,
+) {
+    const REPLY: &str = r#"{"data":{"__schema":{"queryType":{"name":"Query"},"mutationType":null,
+        "subscriptionType":null,"directives":[],"types":[{"kind":"OBJECT","name":"Query",
+        "description":null,"interfaces":[],"inputFields":null,"enumValues":null,
+        "possibleTypes":null,"fields":[{"name":"me","description":null,"args":[],
+        "isDeprecated":false,"deprecationReason":null,
+        "type":{"kind":"SCALAR","name":"String","ofType":null}}]}]}}}"#;
+
+    let dir = scratch_dir("graphql-introspect");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (seen, received) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let Ok((mut stream, _)) = listener.accept() else { return };
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        // The whole request — headers, then `Content-Length` bytes of body — before answering,
+        // so the client is never reset mid-send by a server that stopped reading.
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let Ok(read) = stream.read(&mut chunk) else { break };
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&request);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0usize);
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        let _ = seen.send(String::from_utf8_lossy(&request).into_owned());
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{REPLY}",
+            REPLY.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+
+    let (_, view, mut cx) = boot(cx, None, Some(dir.clone()));
+    cx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::GraphQl, cx);
+            view.set_kind(kind, cx);
+            if let Some(graphql) = view.kind.as_graphql_mut() {
+                graphql.transport = zuno_core::GraphQlTransport::WebSocket;
+            }
+        })
+    });
+    type_url(&mut cx, &format!("http://127.0.0.1:{port}/graphql"));
+
+    let button = cx.debug_bounds("graphql-introspect").expect("From server on the Query tab");
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+
+    let request = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the server must be asked");
+    assert!(request.starts_with("POST /graphql "), "a POST, whatever the transport: {request}");
+    assert!(request.contains("__schema"), "the introspection query: {request}");
+
+    let name = wait_for(&mut cx, "the schema field to be filled", |cx| {
+        cx.update(|_, cx| {
+            let graphql = view.read(cx).kind.as_graphql()?;
+            let text = graphql.schema.read(cx).text().to_string();
+            (!text.is_empty()).then_some(text)
+        })
+    });
+    assert!(name.ends_with(".graphql") && !name.contains('/'), "a bare, portable name: {name}");
+    let sdl = std::fs::read_to_string(dir.join("schemas").join(&name)).expect("the file is saved");
+    assert!(sdl.contains("type Query {\n  me: String\n}"), "{sdl}");
+
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 

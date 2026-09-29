@@ -243,6 +243,7 @@ mod tests {
             variables: r#"{"n":1}"#.into(),
             operation: Some("Me".into()),
             transport: Default::default(),
+            schema: String::new(),
         });
         write(&root.join("me.json"), &spec).expect("write");
 

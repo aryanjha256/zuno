@@ -158,9 +158,17 @@ carried in someone's head — the failure this file's own header predicts:
   vector means a new dependency; an iterator complicates the call site. Five elements in a path
   that already builds an element tree.
 
-What remains for GraphQL, in order: **introspection and assisted editing** — the *builder*, and
-the actual differentiator: a query you write with the schema helping, not a checkbox tree. Then a
-**schema browser**. That last one is
+**Introspection — done, as a one-time import.** *From server* on the Query tab sends the
+request as written with the introspection query in its place — always a POST, whatever the
+request's transport — and saves the answer as SDL in the collection's `schemas/`, which the
+request then names in its new `schema` field. `gRPC`'s reflection rule for the same reasons:
+committable, offline, and still there once production turns introspection off. Parsed by
+`apollo-compiler` before it is written, which is also what the next two build on.
+
+What remains for GraphQL, in order: **assisted editing** — completion in the query editor from
+that schema, which needs the app's first completion popup inside the multi-line editor, and
+then validation against it. That is the actual differentiator: a query you write with the schema
+helping, not a checkbox tree. Then a **schema browser**. That last one is
 where the **buffer generalization** comes in — a schema browser is not a request, so it is the
 first thing that needs a tab holding something other than one. It is a tab, not a modal: the app
 currently has exactly one document type and around ten overlays, and making the browser overlay

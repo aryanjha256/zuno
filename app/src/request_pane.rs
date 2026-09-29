@@ -15,7 +15,7 @@ use gpui::{
 
 use crate::actions::{
     AddAssertion, AddCapture, AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext,
-    ChooseProtoFile, OpenGrpcMethod, ReflectSchema,
+    ChooseSchemaFile, OpenGrpcMethod, ReflectSchema,
     BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCode, ImportCurl,
     OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
     SendRequest, ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
@@ -103,6 +103,21 @@ pub fn render(
                 ),
             (KindEditor::GraphQl(graphql), 0) => pane
                 .child(graphql_query_header(graphql, theme, cx))
+                // Over the document it describes, as gRPC's schema row sits over its method.
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(schema_row(
+                            graphql.schema.clone(),
+                            ["graphql-schema-file", "graphql-introspect"],
+                            "Choose a schema file (.graphql)",
+                            theme,
+                            cx,
+                        )),
+                )
                 .children(
                     view.body_search
                         .as_ref()
@@ -1880,21 +1895,30 @@ fn grpc_method_tab(
             .flex_col()
             .gap_2()
             .p_3()
-            .child(grpc_schema_row(grpc, theme, cx))
+            .child(schema_row(
+                grpc.proto.clone(),
+                ["grpc-proto-file", "grpc-reflect"],
+                "Choose a .proto file",
+                theme,
+                cx,
+            ))
             .child(grpc_method_row(grpc, theme))
             .into_any_element(),
     ]
 }
 
-/// The `.proto` field, with the two ways to fill it: a file, or the server itself.
+/// A schema field — gRPC's `.proto`, GraphQL's SDL — with the two ways to fill it: a file, or
+/// the server itself. One row for both kinds, so the two cannot drift apart.
 ///
 /// **A path you must type is a path you have to already know**, which is why every file field
 /// here pairs an editable input with a dialog that *fills* it rather than acting on selection.
 /// The field stays editable so browsing is a faster way to answer rather than a different verb.
 /// *From server* sits here rather than beside the method, because it answers this row's
-/// question — where the schema comes from — for someone who has no `.proto` at all.
-fn grpc_schema_row(
-    grpc: &crate::kinds::GrpcEditor,
+/// question — where the schema comes from — for someone who has no schema file at all.
+fn schema_row(
+    field: gpui::Entity<crate::input::TextInput>,
+    [file_id, reflect_id]: [&'static str; 2],
+    file_tooltip: &'static str,
     theme: &Theme,
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
@@ -1908,12 +1932,12 @@ fn grpc_schema_row(
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .child(crate::ui::field_box(grpc.proto.clone(), theme)),
+                .child(crate::ui::field_box(field, theme)),
         )
         .child(
             div()
-                .id("grpc-proto-file")
-                .debug_selector(|| "grpc-proto-file".to_string())
+                .id(file_id)
+                .debug_selector(move || file_id.to_string())
                 .group(crate::ui::ICON_GROUP)
                 .flex_none()
                 .flex()
@@ -1925,8 +1949,8 @@ fn grpc_schema_row(
                 .hover(|style| style.bg(theme.bg_hover))
                 .tooltip(move |window, cx| {
                     crate::ui::Tooltip::for_action(
-                        "Choose a .proto file",
-                        &ChooseProtoFile,
+                        file_tooltip,
+                        &ChooseSchemaFile,
                         window,
                         cx,
                     )
@@ -1938,7 +1962,7 @@ fn grpc_schema_row(
                         // `track_focus`, whose focus-on-click is an ordinary bubble listener,
                         // so without this the click is taken back by the root.
                         cx.stop_propagation();
-                        window.dispatch_action(Box::new(ChooseProtoFile), cx);
+                        window.dispatch_action(Box::new(ChooseSchemaFile), cx);
                     }),
                 )
                 .child(crate::ui::glyph(
@@ -1952,7 +1976,7 @@ fn grpc_schema_row(
         // question someone without a `.proto` is actually stuck on — and that is precisely the
         // person who cannot discover a keystroke for it.
         .child(crate::ui::icon_text_action(
-            "grpc-reflect",
+            reflect_id,
             Icon::Download,
             "From server".into(),
             "Ask the server for its schema and save it in the collection",

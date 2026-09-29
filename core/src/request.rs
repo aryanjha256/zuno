@@ -310,6 +310,16 @@ pub struct GraphQlRequest {
     /// churn the additive format exists to avoid. Only a transport somebody chose reaches disk.
     #[serde(default, skip_serializing_if = "GraphQlTransport::is_default")]
     pub transport: GraphQlTransport,
+    /// The server's schema, as an SDL file — named, not embedded, for `GrpcRequest::proto`'s
+    /// reasons, and resolved by `graphql::resolve_schema` the same way: a bare filename lives in
+    /// the collection's `schemas/`. Empty means none, which is every request until someone fetches
+    /// one; nothing about sending depends on it.
+    ///
+    /// Both serde attributes for `transport`'s reason: files written before this existed open,
+    /// and an untouched request re-saves byte for byte. **An older Zuno drops it on save** — it
+    /// does not know the key — which loses the link and never the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub schema: String,
 }
 
 /// A gRPC call: which schema, which method on it, and the request message as JSON.
@@ -428,6 +438,7 @@ impl Default for GraphQlRequest {
             variables: String::new(),
             operation: None,
             transport: GraphQlTransport::default(),
+            schema: String::new(),
         }
     }
 }
@@ -1470,6 +1481,7 @@ mod tests {
                 variables: r#"{"n": 50}"#.to_string(),
                 operation: Some("R".to_string()),
                 transport: Default::default(),
+                schema: "api.test.graphql".to_string(),
             }),
             ..RequestSpec::default()
         };
@@ -1547,6 +1559,10 @@ mod tests {
             !written.contains("transport"),
             "an untouched transport must leave no trace in the file: {written}"
         );
+        assert!(
+            !written.contains("schema"),
+            "nor may a schema nobody fetched: {written}"
+        );
 
         spec.kind = RequestKind::GraphQl(GraphQlRequest {
             transport: GraphQlTransport::WebSocket,
@@ -1574,6 +1590,30 @@ mod tests {
         assert!(spec.kind.opens_a_transcript());
         assert!(spec.kind.accepts_more_messages());
         assert!(spec.kind.opens_a_websocket());
+    }
+
+    /// **A GraphQL request written before `schema` existed still opens**, with none. Read from the
+    /// older bytes rather than trusting `#[serde(default)]` is still on the field.
+    #[test]
+    fn a_graphql_request_written_before_schemas_still_opens() {
+        let older = r#"{
+            "id": 0,
+            "name": "me",
+            "url": "https://api.test/graphql",
+            "headers": [],
+            "settings": {},
+            "kind": { "GraphQl": {
+                "method": "Post",
+                "query": "query { me { id } }",
+                "variables": "",
+                "operation": null
+            } }
+        }"#;
+
+        let spec: RequestSpec = serde_json::from_str(older).expect("an older GraphQL file must open");
+        let graphql = spec.graphql().expect("still GraphQL");
+        assert_eq!(graphql.schema, "");
+        assert_eq!(graphql.query, "query { me { id } }");
     }
 
     /// A field added to `WebSocketRequest` later must not orphan every socket written today.

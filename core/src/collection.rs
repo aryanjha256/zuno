@@ -265,6 +265,7 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, skipped: &m
             if name == crate::environment::DIRECTORY
                 || name == crate::flow::DIRECTORY
                 || name == crate::grpc::DIRECTORY
+                || name == crate::graphql::DIRECTORY
             {
                 continue;
             }
@@ -596,6 +597,7 @@ fn collect_folders(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>)
             || name == crate::environment::DIRECTORY
             || name == crate::flow::DIRECTORY
             || name == crate::grpc::DIRECTORY
+            || name == crate::graphql::DIRECTORY
         {
             continue;
         }

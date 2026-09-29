@@ -178,7 +178,7 @@ actions!(
         AddQuery,
         SaveMessage,
         SendPing,
-        ChooseProtoFile,
+        ChooseSchemaFile,
         OpenGrpcMethod,
         ReflectSchema,
         OpenGraphQlTransport,

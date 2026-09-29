@@ -403,6 +403,7 @@ mod tests {
             variables: r#"{"n": 1}"#.into(),
             operation: None,
             transport: Default::default(),
+            schema: String::new(),
         });
         write(&root.join("me.json"), &gql).expect("write");
 

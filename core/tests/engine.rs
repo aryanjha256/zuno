@@ -1127,6 +1127,7 @@ fn a_graphql_request_sends_its_envelope_as_json() {
         variables: r#"{"n": 50}"#.to_string(),
         operation: Some("Me".to_string()),
         transport: Default::default(),
+        schema: String::new(),
     });
 
     let (_, events) = engine.send(spec);
@@ -1161,6 +1162,7 @@ fn a_get_graphql_request_sends_no_body() {
         variables: String::new(),
         operation: None,
         transport: Default::default(),
+        schema: String::new(),
     });
 
     let (_, events) = engine.send(spec);

@@ -1,13 +1,36 @@
 //! Reading a GraphQL document well enough to route it.
 //!
-//! **Not a parser.** The only question asked here is which operation will run and what kind it
-//! is, because a subscription needs a transport that stays open and a query does not. Validation
-//! is the server's job and always was; a full grammar would be a large dependency answering a
-//! question nobody asked.
+//! **Routing is not a parser's job.** The only question asked here is which operation will run and
+//! what kind it is, because a subscription needs a transport that stays open and a query does not
+//! — a question the scanner below answers without a grammar. Anything that needs the schema lives
+//! in `introspection` instead, on `apollo-compiler`, which is a real GraphQL compiler; routing
+//! stays on the scanner so a send never depends on a document that parses.
 //!
 //! It is deliberately permissive in one direction: anything it cannot make sense of returns
 //! `None`, and `None` means "send it the way we always did". A sniff that guesses wrong must
 //! never be the reason a working request stops working.
+
+pub mod introspection;
+
+use std::path::{Path, PathBuf};
+
+/// The reserved directory a collection keeps GraphQL schemas in, as `protos/` holds gRPC's.
+///
+/// Reserved like `environments/` and `flows/`: `collection::scan` walks everything, and a
+/// directory of schemas is not a directory of requests.
+pub const DIRECTORY: &str = "schemas";
+
+/// Where a request's schema file actually lives — `grpc::resolve_proto`'s rule, for the same
+/// reason: a bare filename means the collection's `schemas/`, which keeps a committed collection
+/// portable; anything with a separator is used as written.
+pub fn resolve_schema(schema: &str, collection: Option<&Path>) -> PathBuf {
+    let schema = schema.trim();
+    let bare = !schema.contains(std::path::MAIN_SEPARATOR) && !schema.contains('/');
+    match collection.filter(|_| bare) {
+        Some(root) => root.join(DIRECTORY).join(schema),
+        None => PathBuf::from(schema),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationKind {
