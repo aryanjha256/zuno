@@ -101,8 +101,9 @@ pub enum Target {
     Method(zuno_core::Method),
     /// How a GraphQL operation reaches the server.
     GraphQlTransport(zuno_core::GraphQlTransport),
-    /// Which method a gRPC call makes.
-    GrpcMethod(zuno_core::grpc::Method),
+    /// Which method a gRPC call makes, and its request message as a JSON skeleton — built while
+    /// the picker's schema is compiled anyway, so choosing needs no second compile.
+    GrpcMethod(zuno_core::grpc::Method, Option<String>),
     /// Copy the active request as code in this language.
     CopyAs(zuno_core::codegen::Target),
     /// Change what kind of request this is — HTTP, GraphQL, and later gRPC or MQTT.
@@ -154,7 +155,7 @@ impl Clone for Target {
             Self::Action(action) => Self::Action(action.boxed_clone()),
             Self::Method(method) => Self::Method(method.clone()),
             Self::GraphQlTransport(transport) => Self::GraphQlTransport(*transport),
-            Self::GrpcMethod(method) => Self::GrpcMethod(method.clone()),
+            Self::GrpcMethod(method, example) => Self::GrpcMethod(method.clone(), example.clone()),
             Self::CopyAs(target) => Self::CopyAs(*target),
             Self::RequestKind(choice) => Self::RequestKind(*choice),
             Self::RequestKindConfirmed(choice) => Self::RequestKindConfirmed(*choice),

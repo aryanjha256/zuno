@@ -26,7 +26,10 @@ pub mod reflection;
 use std::path::{Path, PathBuf};
 
 use prost::Message;
-use prost_reflect::{DescriptorPool, DynamicMessage, MethodDescriptor};
+use prost_reflect::{
+    DescriptorPool, DynamicMessage, Kind, MessageDescriptor, MethodDescriptor, SerializeOptions,
+    Value,
+};
 // The trait, for `DynamicMessage::serialize`. `prost::Message` above is the *encoding* half and
 // this is the JSON half; both are traits and both are needed by name.
 use serde::Serialize;
@@ -292,6 +295,33 @@ impl Schema {
         })
     }
 
+    /// A JSON skeleton of `method`'s request message: every field, at its default value.
+    ///
+    /// What fills an empty message editor when a method is chosen, so the first question a new
+    /// call asks — "what do I type here?" — is answered by the schema rather than by a trip to
+    /// the `.proto`.
+    ///
+    /// **Built by prost-reflect and serialized by it, never hand-written**, so the example is
+    /// exactly what `encode` accepts: canonical JSON names, 64-bit integers as strings, enums by
+    /// name, well-known types in their JSON forms. A hand-written walk would be a second
+    /// description of protobuf's JSON mapping, and would drift from the one that reads it back.
+    pub fn example(&self, method: &Method) -> Result<String, GrpcError> {
+        let input = self.method(method)?.input();
+        let message = skeleton(&input, &mut Vec::new());
+
+        let mut buffer = Vec::new();
+        let mut serializer = serde_json::Serializer::pretty(&mut buffer);
+        let options = SerializeOptions::new().skip_default_fields(false);
+        let failed = |reason: String| GrpcError::BadRequest {
+            message: input.full_name().to_string(),
+            reason,
+        };
+        message
+            .serialize_with_options(&mut serializer, &options)
+            .map_err(|error| failed(error.to_string()))?;
+        String::from_utf8(buffer).map_err(|error| failed(error.to_string()))
+    }
+
     fn method(&self, method: &Method) -> Result<MethodDescriptor, GrpcError> {
         let service = self
             .pool
@@ -309,6 +339,60 @@ impl Schema {
                 method: method.name.clone(),
             })
     }
+}
+
+/// How deep a skeleton nests before it stops filling in messages.
+const SKELETON_DEPTH: usize = 6;
+
+/// A message with every field shown, for `Schema::example`.
+///
+/// Serializing with defaults included already shows every field that has no presence — scalars,
+/// lists, maps. What it omits are the fields that *do* track presence until something sets them,
+/// so this sets exactly those: nested messages (one element in a list of them, so its shape shows),
+/// the first member of each `oneof` — only one may be set, and a second would replace the first —
+/// and proto3 `optional` scalars.
+///
+/// **A message on its own path is left unset**, so a recursive type (`Node { Node child }`) stops
+/// rather than recursing forever; `SKELETON_DEPTH` bounds the rest. Three well-known types are left
+/// unset too: an `Any` cannot serialize without a type URL, and a `Value` or `ListValue` holds a
+/// kind only once one is chosen.
+fn skeleton(descriptor: &MessageDescriptor, path: &mut Vec<String>) -> DynamicMessage {
+    let mut message = DynamicMessage::new(descriptor.clone());
+    if path.len() >= SKELETON_DEPTH {
+        return message;
+    }
+    path.push(descriptor.full_name().to_string());
+
+    let mut oneofs_set: Vec<String> = Vec::new();
+    for field in descriptor.fields() {
+        let oneof = field.containing_oneof().map(|oneof| oneof.full_name().to_string());
+        if oneof.as_ref().is_some_and(|oneof| oneofs_set.contains(oneof)) {
+            continue;
+        }
+        let value = match field.kind() {
+            Kind::Message(inner) if !field.is_map() => {
+                let unfillable = matches!(
+                    inner.full_name(),
+                    "google.protobuf.Any" | "google.protobuf.Value" | "google.protobuf.ListValue"
+                );
+                if unfillable || path.iter().any(|seen| seen == inner.full_name()) {
+                    continue;
+                }
+                let nested = Value::Message(skeleton(&inner, path));
+                if field.is_list() { Value::List(vec![nested]) } else { nested }
+            }
+            _ if field.supports_presence() => Value::default_value_for_field(&field),
+            // Shown by the serializer already, at its default.
+            _ => continue,
+        };
+        message.set_field(&field, value);
+        if let Some(oneof) = oneof {
+            oneofs_set.push(oneof);
+        }
+    }
+
+    path.pop();
+    message
 }
 
 /// The reserved directory a collection keeps its schemas in.
@@ -594,6 +678,68 @@ mod tests {
         assert_eq!(methods[1].shape(), Shape::ServerStreaming);
         assert_eq!(methods[2].shape(), Shape::ClientStreaming);
         assert_eq!(methods[3].shape(), Shape::BidiStreaming);
+    }
+
+    #[test]
+    fn an_example_names_every_field_at_its_default() {
+        let schema = Schema::compile(fixture("example-greeter", GREETER)).expect("compile");
+        let method = schema.methods().into_iter().next().expect("a method");
+        assert_eq!(
+            schema.example(&method).expect("an example"),
+            "{\n  \"name\": \"\",\n  \"times\": 0\n}"
+        );
+    }
+
+    /// **Every shape of field that could make a skeleton wrong**, and the assertion that matters
+    /// is the last one: whatever the example says, `encode` has to accept it, or filling the
+    /// editor with it hands someone an error they did not write.
+    #[test]
+    fn an_example_of_a_rich_message_is_one_encode_accepts() {
+        let source = r#"
+            syntax = "proto3";
+            package shop;
+            import "google/protobuf/timestamp.proto";
+            import "google/protobuf/any.proto";
+
+            enum Status { STATUS_UNKNOWN = 0; STATUS_OPEN = 1; }
+            message Address { string city = 1; }
+            message Node { string label = 1; Node child = 2; }
+            message Item { string sku = 1; int64 cents = 2; }
+            message Order {
+              Address ship_to = 1;
+              repeated Item items = 2;
+              Status status = 3;
+              oneof payment { string card = 4; string voucher = 5; }
+              optional string note = 6;
+              map<string, int32> tags = 7;
+              google.protobuf.Timestamp placed_at = 8;
+              google.protobuf.Any extra = 9;
+              Node tree = 10;
+              repeated string labels = 11;
+            }
+            service Shop { rpc Place (Order) returns (Order); }
+        "#;
+        let schema = Schema::compile(fixture("example-rich", source)).expect("compile");
+        let method = schema.methods().into_iter().next().expect("a method");
+        let example = schema.example(&method).expect("an example");
+        let json: serde_json::Value = serde_json::from_str(&example).expect("valid JSON");
+
+        assert_eq!(json["shipTo"], serde_json::json!({ "city": "" }), "{example}");
+        assert_eq!(json["items"], serde_json::json!([{ "sku": "", "cents": "0" }]), "{example}");
+        assert_eq!(json["status"], "STATUS_UNKNOWN", "{example}");
+        assert_eq!(json["card"], "", "the first oneof member: {example}");
+        assert!(json.get("voucher").is_none(), "only one oneof member: {example}");
+        assert_eq!(json["note"], "", "{example}");
+        assert_eq!(json["tags"], serde_json::json!({}), "{example}");
+        assert_eq!(json["placedAt"], "1970-01-01T00:00:00Z", "{example}");
+        assert!(json.get("extra").is_none(), "an Any has no example: {example}");
+        // A recursive type stops at itself rather than never finishing.
+        assert_eq!(json["tree"], serde_json::json!({ "label": "" }), "{example}");
+        assert_eq!(json["labels"], serde_json::json!([]), "{example}");
+
+        schema
+            .encode(&method, &example)
+            .expect("the example must be a message encode accepts");
     }
 
     /// **JSON in, protobuf out, JSON back** — the whole authoring loop, without a socket.

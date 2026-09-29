@@ -14432,13 +14432,32 @@ async fn a_grpc_request_is_authored_and_sent(cx: &mut TestAppContext) {
     // version of this test see an empty schema field.
     cx.dispatch_action(crate::actions::ShowBodyTab);
     cx.run_until_parked();
+    let message = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let grpc = view.read(cx).kind.as_grpc().expect("a gRPC buffer");
+            grpc.message.read(cx).text().to_string()
+        })
+    };
+    // Choosing the method filled the empty editor with its request message.
+    assert_eq!(message(&mut cx), "{\n  \"name\": \"\"\n}", "the example is there to fill in");
+
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             let editor = view.kind.as_grpc().expect("a gRPC buffer").message.clone();
             window.focus(&gpui::Focusable::focus_handle(editor.read(cx), cx));
         })
     });
+    cx.press("ctrl-a");
     cx.simulate_input(r#"{"name": "zuno"}"#);
+
+    // **And choosing again must not replace what was typed** — the example is for an empty
+    // editor, and a message already written is work, not a placeholder.
+    cx.dispatch_action(crate::actions::OpenGrpcMethod);
+    cx.run_until_parked();
+    cx.press("enter");
+    cx.run_until_parked();
+    assert_eq!(message(&mut cx), r#"{"name": "zuno"}"#, "a typed message survives choosing");
+
     cx.press("ctrl-enter");
 
     let body = wait_for(&mut cx, "the decoded reply", |cx| {

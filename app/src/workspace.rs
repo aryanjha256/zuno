@@ -3770,11 +3770,25 @@ impl Workspace {
                 self.switch_request_kind(choice, true, window, cx);
             }
             picker::Target::CopyAs(target) => self.copy_as(target, cx),
-            picker::Target::GrpcMethod(method) => {
+            picker::Target::GrpcMethod(method, example) => {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| {
                         if let Some(grpc) = view.kind.as_grpc_mut() {
                             grpc.choose(&method);
+                            // **Only into an empty editor.** Choosing a method answers "what do
+                            // I type here?" for someone who has not typed yet; a message already
+                            // written — for this method or the last — is theirs, and replacing
+                            // it would be losing work to a convenience. Through the ordinary edit
+                            // path, so undo takes the example back out.
+                            let editor = grpc.message.clone();
+                            if let Some(example) = example
+                                && editor.read(cx).text().trim().is_empty()
+                            {
+                                editor.update(cx, |editor, cx| {
+                                    let end = editor.text().len();
+                                    editor.replace_range(0..end, &example, window, cx);
+                                });
+                            }
                         }
                         cx.notify();
                     });
@@ -6844,18 +6858,23 @@ impl Workspace {
         // bounded by the size of a `.proto`, and the alternative is a picker that opens empty
         // and fills in a frame later, which reads as a schema with no methods. Worth revisiting
         // if a large schema ever makes it felt.
+        //
+        // Each method's example is built here too, from the same compile, so choosing one needs
+        // no second parse. Bounded by the same thing: a skeleton per method of one `.proto`.
         let path = zuno_core::grpc::resolve_proto(&spec.proto, root.as_deref());
-        let methods = match zuno_core::grpc::Schema::compile(path) {
-            Ok(schema) => schema.methods(),
+        let schema = match zuno_core::grpc::Schema::compile(path) {
+            Ok(schema) => schema,
             Err(error) => {
                 self.set_status(&error.to_string(), cx);
                 return;
             }
         };
 
-        let items = methods
+        let items = schema
+            .methods()
             .into_iter()
             .map(|method| {
+                let example = schema.example(&method).ok();
                 let chosen = Some(format!("{}/{}", method.service, method.name));
                 picker::Item {
                     label: SharedString::from(method.name.clone()),
@@ -6866,7 +6885,7 @@ impl Workspace {
                     } else {
                         format!("{} · {}", method.service, method.shape().label())
                     }),
-                    target: picker::Target::GrpcMethod(method),
+                    target: picker::Target::GrpcMethod(method, example),
                 }
             })
             .collect();
