@@ -1,7 +1,8 @@
 name: Release
 
-# Push a tag, get a GitHub Release carrying the .deb, the Linux tarball, the AppImage and
-# Zuno.app for macOS — built by `deb` and `macos`, published together by `publish`, then
+# Push a tag, get a GitHub Release carrying the .deb, the Linux tarball, the AppImage, Zuno.app
+# for macOS and a zip for Windows — built by `deb`, `macos` and `windows`, published together by
+# `publish`, then
 # installed for real by the `smoke*` jobs. `scripts/release.sh` does the local
 # half — bump, lock, test, commit, tag — and pushes only with `--push`:
 #
@@ -273,12 +274,82 @@ jobs:
           path: target/macos/*.tar.gz
           if-no-files-found: error
 
+  # **zuno.exe for x86-64 Windows, in a zip** that `scripts/install.ps1` installs. Not code-signed,
+  # for the macOS job's reason and with the same answer: PowerShell's own download sets no Mark of
+  # the Web, so SmartScreen has nothing to act on.
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      # **The C runtime linked in**, or zuno.exe needs VCRUNTIME140.dll — present on most machines
+      # because so much else installs it, absent on a clean Windows, where Zuno would not start.
+      # Here rather than in `.cargo/config.toml`, which this `RUSTFLAGS` would silently override.
+      RUSTFLAGS: "-D warnings -C target-feature=+crt-static"
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use current stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version; cargo --version
+
+      - name: Test
+        timeout-minutes: 20
+        run: cargo test --workspace
+
+      # Also embeds the icon: `app/build.rs` fails the build rather than ship an exe without it.
+      - name: Build
+        run: cargo build --release -p zuno
+
+      # **The exe's contract, asserted**, as the other jobs assert theirs. Both failures here are
+      # invisible from a build log and obvious to a user: a console window beside the app, or an
+      # app that does not start on a machine without the Visual C++ runtime.
+      - name: Check the exe
+        run: |
+          $exe = 'target\release\zuno.exe'
+          # The PE header's Subsystem field: 2 is a GUI program, 3 a console one.
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [BitConverter]::ToUInt16($bytes, $pe + 0x5C)
+          if ($subsystem -ne 2) { throw "zuno.exe is not a GUI program (subsystem $subsystem)" }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $dependents = & $dumpbin /dependents $exe | Out-String
+          Write-Host $dependents
+          if ($dependents -match '(?i)vcruntime|msvcp|ucrtbase|api-ms-win-crt') {
+            throw 'zuno.exe links the C runtime dynamically; it would not start without the redistributable'
+          }
+
+      - name: Pack the zip
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages |
+            Where-Object name -eq 'zuno' | Select-Object -ExpandProperty version
+          $name = "zuno-$version-x86_64-windows"
+          $stage = "target\windows\$name"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target\release\zuno.exe, README.md, LICENSE $stage
+          # What install.ps1 reads to know what is installed, as the Linux tarball's VERSION.
+          [IO.File]::WriteAllText("$PWD\$stage\VERSION", "$version`n")
+          Compress-Archive -Path $stage -DestinationPath "target\windows\$name.zip"
+          Get-Item "target\windows\$name.zip" | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zuno-windows
+          path: target/windows/*.zip
+          if-no-files-found: error
+
   # **One job publishes, after every build has finished**, so a release is either complete or
   # absent — never Linux-only because the Mac build was still running or had failed. Runs on a
   # `workflow_dispatch` too, publishing nothing, so the checksums and notes are exercised before
   # a tag depends on them.
   publish:
-    needs: [deb, macos]
+    needs: [deb, macos, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -301,7 +372,7 @@ jobs:
           # a worse artifact to read and was the spelling that broke the installer's lookup on
           # the first release to carry this file. The installer tolerates both now; this keeps
           # the published list plain.
-          sha256sum -- *.deb *.tar.gz *.AppImage > sha256sums.txt
+          sha256sum -- *.deb *.tar.gz *.AppImage *.zip > sha256sums.txt
           cat sha256sums.txt
 
       # Written to a file rather than piped: `--notes-file` and `--generate-notes` are
@@ -325,6 +396,16 @@ jobs:
             echo 'the command rather than downloading the macOS archive in a browser: the app'
             echo 'is not notarized yet, and macOS blocks a notarization-less app a browser'
             echo 'downloaded, while one installed this way opens normally.'
+            echo
+            echo 'On Windows, in PowerShell:'
+            echo
+            echo '```powershell'
+            echo 'irm https://raw.githubusercontent.com/aryanjha256/zuno/main/scripts/install.ps1 | iex'
+            echo '```'
+            echo
+            echo 'It installs for your user only, with no admin rights, and adds Zuno to the'
+            echo 'Start menu, the desktop, your PATH and Settings > Apps, where Uninstall removes'
+            echo 'all of it. Running it again updates Zuno.'
             echo
             echo '<details><summary>Or install the .deb by hand</summary>'
             echo
@@ -360,7 +441,8 @@ jobs:
             echo '</details>'
             echo
             echo 'Requires x86-64 Linux with glibc 2.35+: Ubuntu 22.04+, Debian 12+,'
-            echo 'Fedora 36+, or anything as recent — or an Apple Silicon Mac on macOS 11+.'
+            echo 'Fedora 36+, or anything as recent — or an Apple Silicon Mac on macOS 11+,'
+            echo 'or 64-bit Windows 10 or 11.'
             echo
             echo 'Zuno renders through Vulkan. On a machine with no GPU driver present,'
             echo 'install `mesa-vulkan-drivers` as well.'
@@ -578,3 +660,40 @@ jobs:
             *"already the latest"*) echo "ok: re-run is a no-op" ;;
             *) echo "::error::re-running the installer did not report an up-to-date install"; exit 1 ;;
           esac
+
+  # **The published zip, installed through `install.ps1` under Windows PowerShell 5.1** — the
+  # shell a fresh Windows opens — then uninstalled the way Settings > Apps does it.
+  smoke-windows:
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-2022
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the published release
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:ZUNO_VERSION = "$env:GITHUB_REF_NAME".TrimStart('v')
+          $env:ZUNO_ASSUME_YES = '1'
+          Invoke-Expression (Get-Content -Raw scripts/install.ps1)
+
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\Zuno'
+          $exe = Join-Path $dir 'zuno.exe'
+          if (-not (Test-Path $exe)) { throw 'no zuno.exe' }
+          if ((Get-Content (Join-Path $dir 'VERSION')).Trim() -ne $env:ZUNO_VERSION) { throw 'wrong VERSION' }
+          # No Mark of the Web, which is the whole premise of installing through PowerShell.
+          if (Get-Item -LiteralPath $exe -Stream Zone.Identifier -ErrorAction SilentlyContinue) {
+            throw 'zuno.exe carries the Mark of the Web, so SmartScreen will stop it'
+          }
+
+          $out = Invoke-Expression (Get-Content -Raw scripts/install.ps1) *>&1 | Out-String
+          if ($out -notmatch 'already the latest') { throw "re-running was not a no-op: $out" }
+
+          $uninstall = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Zuno').UninstallString
+          $process = Start-Process -FilePath cmd.exe -ArgumentList "/d /c $uninstall" -Wait -PassThru -NoNewWindow
+          if ($process.ExitCode -ne 0 -or (Test-Path $dir)) { throw 'the uninstaller did not remove Zuno' }

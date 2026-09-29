@@ -27,9 +27,19 @@ It downloads from the latest release and verifies the checksum, then:
 - **on a Mac with Apple Silicon** it installs `Zuno.app` into `/Applications`, asking for
   `sudo` only if your account cannot write there.
 
-On macOS, use the command rather than downloading the archive in a browser. The app is signed
-but not yet notarized, and macOS blocks such an app when a browser downloaded it; installed this
-way it opens normally.
+**On Windows**, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/aryanjha256/zuno/main/scripts/install.ps1 | iex
+```
+
+It installs for your user only — no admin rights — into `%LOCALAPPDATA%\Programs\Zuno`, and adds
+Zuno to the Start menu, the desktop, your `PATH` and **Settings → Apps**, whose Uninstall button
+removes all of it again. Run it again to update.
+
+On macOS and Windows, use the command rather than downloading the archive in a browser. Zuno is
+not yet notarized or code-signed, so macOS blocks it and Windows SmartScreen warns about it when a
+browser downloaded it; installed by the command it opens normally.
 
 `ZUNO_VERSION=0.2.4` pins a specific release if you need to go back, and `ZUNO_METHOD=tarball`
 takes the no-`sudo` route on Debian too.
@@ -75,9 +85,7 @@ It needs FUSE, which desktop systems have; where it is missing, run it with
 anything as recent. Zuno renders through Vulkan, so on a machine with no GPU driver installed
 you also want one: `mesa-vulkan-drivers` on Debian and Fedora — apt suggests it with the
 `.deb`, but only installs it if you accept recommends. On macOS: Apple Silicon, macOS 11 or
-later.
-
-Windows is not packaged yet. It builds and passes the test suite in CI.
+later. On Windows: 64-bit Windows 10 or 11.
 
 ## Build from source
 

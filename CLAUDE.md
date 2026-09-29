@@ -282,6 +282,22 @@ when it isn't. `installer.yml`'s `macos` job proves that path against fake relea
 **`COPYFILE_DISABLE=1` on the macOS `tar`** | Otherwise it writes `._` AppleDouble files for extended attributes, which unpack inside the bundle and break the signature's seal. |
 **Sign last, copy with `ditto`** | The signature seals every file in the bundle, so any edit after `codesign` invalidates it; `ditto` is the copy macOS defines as preserving a bundle exactly. Both are checked by `codesign --verify` after the install, not just after the build. |
 
+**Windows: a zip, installed by `scripts/install.ps1`** (`irm … | iex`) into
+`%LOCALAPPDATA%\Programs\Zuno` with no admin rights, plus a Start-menu shortcut, a desktop one on
+first install, the user `PATH`, and a Settings → Apps entry whose Uninstall runs a generated
+`uninstall.ps1`. Not code-signed, for macOS's reason: PowerShell's download sets no Mark of the
+Web, so SmartScreen has nothing to act on. `installer.yml`'s `windows` job runs the whole thing
+under **both** PowerShell 7 and Windows PowerShell 5.1 against fake releases; `smoke-windows`
+installs the real zip under 5.1 at tag time.
+
+| Trap | Why |
+|---|---|
+**The icon lives inside `zuno.exe`** | gpui loads resource #1 of type ICON from the executable (`load_icon`), so it is a build step: `app/build.rs` draws `zuno.svg` into an `.ico` and embeds it, Windows only. `manifest_required`, not `optional`, whatever the name says — `optional` treats "no resource compiler" as success and ships the generic icon silently. |
+**No `windows_subsystem`, and every launch opens a console** | Release builds are `windows_subsystem = "windows"`; debug keeps its console for `ZUNO_TIMING`. The release job reads the PE header and fails on anything but subsystem 2. |
+**`VCRUNTIME140.dll` by default** | Present wherever something else installed it, absent on a clean Windows, where Zuno would not start. The release job links it statically (`+crt-static`, in its own `RUSTFLAGS`, since the workflow's `RUSTFLAGS` overrides `.cargo/config.toml`) and `dumpbin /dependents` fails on any CRT import. |
+**`install.ps1` is ASCII only and never calls `exit`** | 5.1 reads a BOM-less `.ps1` as ANSI, where an em dash's bytes include a curly `”` that PowerShell honours as a quote — one in a message breaks the parse. And under `iex` the script runs in the user's own session, so `exit` would close their terminal; every failure is a `throw`. |
+**A running exe can be renamed, not overwritten** | So an update while Zuno is open moves `zuno.exe` to `zuno.exe.old` and copies the new one in; the next run removes the old one. |
+
 `.github/workflows/release.yml` on a `v*` tag → `.deb` on a GitHub Release.
 `workflow_dispatch` runs the same build without publishing. Four things here are
 counter-intuitive enough that the workflow asserts each one rather than trusting it:

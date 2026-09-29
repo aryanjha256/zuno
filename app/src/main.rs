@@ -4,6 +4,10 @@
 //! live HTTP, a virtualized response viewer, and diffing against the previous run.
 //! See architecture.md §10.
 
+// A GUI program on Windows, or it opens a console window beside itself on every launch. Release
+// only, so a debug build keeps its console for `ZUNO_TIMING` and panics.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[macro_use]
 mod timing;
 

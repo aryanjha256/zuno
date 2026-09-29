@@ -22,6 +22,8 @@ on:
       - ".github/scripts/test-tarball-install.sh"
       - ".github/scripts/test-macos-install.sh"
       - "scripts/macos-bundle.sh"
+      - "scripts/install.ps1"
+      - ".github/scripts/test-windows-install.ps1"
       - ".github/workflows/installer.yml"
   pull_request:
     branches: ["main"]
@@ -30,6 +32,8 @@ on:
       - ".github/scripts/test-tarball-install.sh"
       - ".github/scripts/test-macos-install.sh"
       - "scripts/macos-bundle.sh"
+      - "scripts/install.ps1"
+      - ".github/scripts/test-windows-install.ps1"
       - ".github/workflows/installer.yml"
 
 jobs:
@@ -145,3 +149,39 @@ jobs:
       - name: Install from a fake release
         timeout-minutes: 8
         run: sh .github/scripts/test-macos-install.sh "$PWD"
+
+  # **`install.ps1`, on Windows, under both PowerShells.** Windows PowerShell 5.1 is what a
+  # fresh Windows opens, PowerShell 7 is what developers install, and the two differ in web
+  # requests, encodings and error handling — so each runs the whole test. Fake releases again,
+  # and the test uninstalls at the end, which is what lets the second run start clean.
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from a fake release (PowerShell 7)
+        timeout-minutes: 4
+        shell: pwsh
+        run: ./.github/scripts/test-windows-install.ps1 -Repo $PWD
+
+      - name: Install from a fake release (Windows PowerShell 5.1)
+        timeout-minutes: 4
+        shell: powershell
+        run: ./.github/scripts/test-windows-install.ps1 -Repo $PWD
+
+      # The one path the fakes cannot take: finding "latest" from GitHub's redirect. Until a
+      # release carries a Windows zip, the honest outcome is the installer saying so.
+      - name: Resolve the latest release (Windows PowerShell 5.1)
+        timeout-minutes: 2
+        shell: powershell
+        run: |
+          $env:ZUNO_ASSUME_YES = '1'
+          try {
+            Invoke-Expression (Get-Content -Raw scripts/install.ps1)
+            & "$env:LOCALAPPDATA\Programs\Zuno\uninstall.ps1"
+          } catch {
+            if ($_.Exception.Message -notmatch 'before Windows builds existed') { throw }
+            Write-Host "ok: latest resolved, and it predates Windows builds"
+          }

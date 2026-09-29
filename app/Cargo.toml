@@ -32,6 +32,15 @@ url.workspace = true
 # Known Folder API on Windows — which is the half not worth writing by hand. See `paths.rs`.
 dirs = "7"
 
+# `build.rs` draws `assets/icons/zuno.svg` into an `.ico` and embeds it in `zuno.exe`, where gpui
+# reads the window icon from. Windows only, so Linux and macOS builds compile none of these.
+# `resvg` is gpui's version for the dev-dependency's reason below; `embed-resource` 3 is the one
+# gpui already builds with on Windows.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+resvg = "0.45"
+ico = "0.5"
+embed-resource = "3"
+
 # GPUI's headless test platform, which is the only way to drive real keystrokes and
 # focus through the app without a display server. Dev-only, so `cargo build` keeps
 # the default feature set.
