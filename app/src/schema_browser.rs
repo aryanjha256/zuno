@@ -178,7 +178,7 @@ pub fn render(
                 cx.notify();
             },
         ))
-        .child(divider(theme, cx))
+        .relative()
         .child(
             div()
                 .flex_1()
@@ -188,18 +188,25 @@ pub fn render(
                 .child(type_list(browser, view.clone(), theme, cx))
                 .child(type_page(browser, view, theme)),
         )
+        // Last, so it is on top for hit-testing where it overlaps the content.
+        .child(divider(theme, cx))
 }
 
 /// The grab strip along the top edge. Double-click puts the height back.
+///
+/// **Laid over the border rather than in the column**, as the collection panel's seam is: a strip
+/// wide enough to hit would otherwise push the browser's content down by its own height.
 fn divider(theme: &Theme, cx: &mut Context<RequestView>) -> impl IntoElement + use<> {
     let dragging = cx.active_drag_cursor_style() == Some(gpui::CursorStyle::ResizeRow);
     div()
         .id("schema-browser-divider")
         .debug_selector(|| "schema-browser-divider".to_string())
         .group("schema-resize")
-        .flex_none()
+        .absolute()
+        .top(px(-3.))
+        .left_0()
+        .right_0()
         .h(px(5.))
-        .w_full()
         .flex()
         .items_center()
         .cursor_row_resize()
@@ -322,7 +329,9 @@ fn type_page(
         .flex_1()
         .min_w(px(0.))
         .overflow_y_scroll()
-        .p_3()
+        .px_3()
+        .pt_1()
+        .pb_3()
         .flex()
         .flex_col()
         .gap_2()
