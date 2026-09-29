@@ -8025,19 +8025,24 @@ fn is_tchar(byte: u8) -> bool {
 ///
 /// gpui's own spelling, so it matches the command palette's trailing column. For prose that reads
 /// "press X to do Y", use [`keybinding_label`].
+///
+/// **Except on macOS, where it is the prose spelling too.** gpui's Mac form is its own — `^` for
+/// Control, `⌘` before `⇧`, `enter` as a word — so the palette would have read `⌘⇧H` and `⌘enter`
+/// beside menus, tooltips and hints reading `⇧⌘H` and `⌘↩`. A Mac has one convention for a
+/// shortcut, in every surface, and that is Apple's.
 pub fn keybinding_hint(action: &dyn gpui::Action, window: &Window) -> String {
-    window
-        .bindings_for_action(action)
-        .first()
-        .map(|binding| {
-            binding
-                .keystrokes()
-                .iter()
-                .map(|keystroke| keystroke.to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default()
+    let Some(binding) = window.bindings_for_action(action).into_iter().next() else {
+        return String::new();
+    };
+    if cfg!(target_os = "macos") {
+        return spell(&binding);
+    }
+    binding
+        .keystrokes()
+        .iter()
+        .map(|keystroke| keystroke.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The same binding spelled `Ctrl+Shift+H`, for hints written into a sentence.

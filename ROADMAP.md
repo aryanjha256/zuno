@@ -12,11 +12,12 @@ directional, and anything beyond that is a name and a reason.
 
 ## Where we are
 
-**M1, M2 and M3 are all complete.** §11 of `architecture.md` — the list of engine capability
-with no way to reach it — was empty and has one entry again: the engine sends any WebSocket frame
-type and the composer can only ask for text. This section said "what's left is reuse, see M3" for
-a while after M3 was finished; rewritten rather than patched, per the note at the top of this
-file.
+**M1, M2 and M3 are all complete, and Zuno ships on Linux, macOS and Windows.** §11 of
+`architecture.md` — the list of engine capability with no way to reach it — has three entries,
+none of them an oversight: the WebSocket composer cannot author a binary frame, and two gRPC gaps
+are open by decision (reflection is a one-time import, and a bidirectional call has no hang-up
+short of closing the tab). This section said "what's left is reuse, see M3" for a while after M3
+was finished; rewritten rather than patched, per the note at the top of this file.
 
 - **M1 — the loop.** Author a request, send it over real HTTP with streaming progress and
   cancellation, read the response through a virtualized JSON viewer, diff it against the previous
@@ -49,6 +50,18 @@ file.
   *inline* overlay in the app and the discoverability rule one level below `affordances()`: that
   table proves every action has a mouse path, and says nothing about someone who cannot name the
   header they need to type. See architecture.md §6l.
+- **Protocols beyond HTTP.** GraphQL, WebSocket and gRPC as request *kinds* of their own — gRPC in
+  all four call shapes, with `.proto` files or server reflection (architecture.md §6q). Around
+  them: **copy as code** in ten targets, each checked by *running* the snippet against a real
+  server rather than by reading it, and a **cookie viewer** over the one jar the engine holds.
+- **Three platforms.** Written once for Linux and carried to the other two without a second
+  codebase: config paths through each platform's own directories, every keybinding written once
+  and translated for macOS (`⌘`, Mac text editing, Apple's glyphs in every place a shortcut is
+  shown), the native traffic lights on macOS and native drag and snap on Windows, and copy as
+  code in PowerShell there. Distribution kept its one-command shape everywhere — `install.sh` on
+  Linux and macOS, `install.ps1` on Windows — which is also what makes an unsigned app open
+  cleanly: a browser marks what it downloads, and a script's download is not marked. CI builds,
+  tests and installs every artifact on its own platform. See CLAUDE.md's Packaging section.
 
   Adding to this list rather than leaving it is deliberate: the paragraph below is about this
   exact list going stale, and a slice that updates architecture.md and skips the file owning
@@ -1320,8 +1333,12 @@ Reasons recorded so a future session can judge them, not commitments.
   both, and nothing acts on them — a dropped stream stays dropped until you send again. And the
   transcript cap above applies here too, more sharply: a subscription is the likeliest thing in
   the app to run for hours.
-- **macOS and Windows builds.** Keybindings assume `ctrl`; `session.rs` assumes XDG paths. Both
-  are marked in code.
+- **Code signing and notarization.** macOS and Windows ship now (see *Where we are*) unsigned —
+  ad-hoc signed on macOS — which is fine through the install commands and not through a browser,
+  where Gatekeeper blocks the app and SmartScreen warns. Signing costs an Apple Developer account
+  and a Windows certificate, and buys a download link that works for someone who will not open a
+  terminal. Worth it when that person is the audience; not before. Intel Macs and Windows on
+  ARM (beyond x64 emulation) are the same kind of item: a build matrix entry, waiting on demand.
 
 ---
 

@@ -2107,8 +2107,8 @@ fn advertised_actions() -> Vec<Box<dyn gpui::Action>> {
 /// An action's first binding in gpui's own syntax — `ctrl-shift-h` — however the platform
 /// displays it.
 ///
-/// **The display form is not the syntax.** `keybinding_hint` renders through `Display`, which on
-/// macOS is `^⇧h` and `⎋`: right on screen, and neither parseable by `simulate_keystrokes` nor
+/// **The display form is not the syntax.** `keybinding_hint` is a display form, which on macOS is
+/// `⇧⌘H` and `⎋`: right on screen, and neither parseable by `simulate_keystrokes` nor
 /// comparable with a binding as the keymap writes it. Three tests used the one as the other and
 /// passed on Linux, where the two happen to coincide; the first macOS CI run failed all three.
 fn binding_syntax(
@@ -4439,8 +4439,8 @@ async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
         .iter()
         .find(|row| row.starts_with("Send request"))
         .expect("Send request should be listed");
-    // As the platform displays it — `ctrl-enter` on Linux, `^enter` on macOS — so the check is
-    // that the row carries the live binding, not one spelling of it.
+    // As the platform displays it — `ctrl-enter` on Linux, `⌘↩` on macOS — so the check is that
+    // the row carries the live binding, not one spelling of it.
     let shown = window
         .update(&mut cx, |_, window, _| {
             crate::workspace::keybinding_hint(&crate::actions::SendRequest, window)
@@ -4448,6 +4448,10 @@ async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
         .expect("window");
     assert!(!shown.is_empty(), "Send request must be bound");
     assert!(send.contains(&shown), "missing its keybinding {shown:?}: {send:?}");
+    // And on a Mac, in Apple's spelling like every other surface — gpui's own is `⌘enter`.
+    if cfg!(target_os = "macos") {
+        assert!(send.contains("⌘↩"), "{send:?}");
+    }
 
     // Text-editing actions are keystrokes, not commands, and must never appear.
     for row in &rows {
