@@ -2776,10 +2776,14 @@ Accepting writes through `select_all_text` plus the ordinary edit path rather th
 content, so `Ctrl+Z` undoes it and `Changed` still fires — body prettify's reasoning, applied to a
 single-line input.
 
-*Deliberately absent:* header **values**. `Content-Type` has a known short set and is the obvious
-second consumer, but doing both at once means debugging the anchoring and the data at the same
-time. Query parameter names get nothing at all, and never will: they are the API's vocabulary,
-not HTTP's.
+**Header values came second**, through the same list: a value cell offers
+`headers::value_suggestions` for its row's name, and only for the dozen headers with a small
+vocabulary — `User-Agent` offers nothing rather than noise. The state is keyed by `HeaderCell`
+(name or value, by row) rather than by row, since both cells share the `HeaderCell` key context
+and only the row knows which has focus. Ordered most-used first, not alphabetically, and
+`multipart/form-data` is left out: the engine overwrites it on a multipart body, and on any other
+body a hand-typed one has no boundary. Query parameter names get nothing at all, and never will:
+they are the API's vocabulary, not HTTP's.
 
 ---
 

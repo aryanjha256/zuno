@@ -1210,14 +1210,24 @@ impl RequestView {
             .position(|row| row.name.read(cx).focus_handle(cx).is_focused(window))
     }
 
-    /// Where a header name cell last painted, in window coordinates. `None` until it has been
-    /// drawn once.
-    pub fn header_name_bounds(
+    /// The header-*value* cell that currently has focus — `focused_header_name`'s twin.
+    pub fn focused_header_value(&self, window: &Window, cx: &App) -> Option<usize> {
+        self.headers
+            .iter()
+            .position(|row| row.value.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// Where a header cell last painted, in window coordinates. `None` until it has been drawn
+    /// once.
+    pub fn header_cell_bounds(
         &self,
         row: usize,
+        value: bool,
         cx: &App,
     ) -> Option<gpui::Bounds<gpui::Pixels>> {
-        self.headers.get(row)?.name.read(cx).last_bounds()
+        let row = self.headers.get(row)?;
+        let cell = if value { &row.value } else { &row.name };
+        cell.read(cx).last_bounds()
     }
 
     pub fn url_focus(&self, cx: &App) -> FocusHandle {

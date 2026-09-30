@@ -75,6 +75,26 @@ use crate::settings_panel::{Scope, SettingsEvent, SettingsPanel};
 use crate::request_view::{BodyType, RequestTab, RequestView, ResponseView, RowKind};
 use crate::theme::{ActiveTheme, Theme};
 
+/// Which header cell the suggestion list belongs to. A row's two cells share one key context,
+/// so which of them has focus is only known by asking the row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HeaderCell {
+    Name(usize),
+    Value(usize),
+}
+
+impl HeaderCell {
+    fn row(self) -> usize {
+        match self {
+            HeaderCell::Name(row) | HeaderCell::Value(row) => row,
+        }
+    }
+
+    fn is_value(self) -> bool {
+        matches!(self, HeaderCell::Value(_))
+    }
+}
+
 pub struct Workspace {
     focus_handle: FocusHandle,
     /// Last title handed to the OS, so `set_window_title` isn't called every frame.
@@ -243,9 +263,9 @@ pub struct Workspace {
     /// The list itself is *derived* in render from the focused cell's text rather than stored —
     /// `headers::suggestions` is pure and cheap, and a stored copy is a mirror that can
     /// disagree with the box it describes.
-    suggest: Option<(usize, Option<usize>)>,
-    /// The row whose list was dismissed with `escape`, so it stays shut until focus moves.
-    suggest_dismissed: Option<usize>,
+    suggest: Option<(HeaderCell, Option<usize>)>,
+    /// The cell whose list was dismissed with `escape`, so it stays shut until focus moves.
+    suggest_dismissed: Option<HeaderCell>,
     /// The GraphQL completion list's highlight and where it was dismissed or asked for — see
     /// `completion.rs`. The list itself is derived, like the header list.
     completion: completion::CompletionState,
@@ -6018,12 +6038,21 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The header name being typed.
-    fn suggest_target(&self, window: &Window, cx: &App) -> Option<(usize, String)> {
+    /// The header cell being typed in, and everything it could offer. A value cell offers what
+    /// suits its row's name — `Content-Type` values under `Content-Type`.
+    fn suggest_target(&self, window: &Window, cx: &App) -> Option<(HeaderCell, Vec<&'static str>)> {
         let view = self.active()?.read(cx);
-        let row = view.focused_header_name(window, cx)?;
-        let typed = view.headers.get(row)?.name.read(cx).text().to_string();
-        Some((row, typed))
+        if let Some(row) = view.focused_header_name(window, cx) {
+            let typed = view.headers.get(row)?.name.read(cx).text();
+            return Some((HeaderCell::Name(row), zuno_core::headers::suggestions(typed)));
+        }
+        let row = view.focused_header_value(window, cx)?;
+        let header = view.headers.get(row)?;
+        let items = zuno_core::headers::value_suggestions(
+            header.name.read(cx).text(),
+            header.value.read(cx).text(),
+        );
+        Some((HeaderCell::Value(row), items))
     }
 
     /// What the list holds right now. Read by tests directly — `debug_bounds` reports a stale
@@ -6040,16 +6069,12 @@ impl Workspace {
     /// highlight only survives while focus stays on the row it was set for — a stale index
     /// against a different row would highlight an unrelated entry.
     fn suggest_items(&self, window: &Window, cx: &App) -> Option<(Vec<&'static str>, Option<usize>)> {
-        let (row, typed) = self.suggest_target(window, cx)?;
-        if self.suggest_dismissed == Some(row) {
-            return None;
-        }
-        let items = zuno_core::headers::suggestions(&typed);
-        if items.is_empty() {
+        let (cell, items) = self.suggest_target(window, cx)?;
+        if self.suggest_dismissed == Some(cell) || items.is_empty() {
             return None;
         }
         let highlighted = match self.suggest {
-            Some((highlighted_row, ix)) if highlighted_row == row => {
+            Some((highlighted_cell, ix)) if highlighted_cell == cell => {
                 ix.filter(|ix| *ix < items.len())
             }
             _ => None,
@@ -6057,7 +6082,7 @@ impl Workspace {
         Some((items, highlighted))
     }
 
-    /// The dropdown under the focused header-name cell.
+    /// The dropdown under the focused header cell, name or value.
     ///
     /// **Owned here rather than inside the row**, which is what makes it possible at all: the
     /// request pane has ten `overflow_hidden` ancestors, and an absolutely-positioned child is
@@ -6073,11 +6098,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement + use<>> {
         let theme = cx.theme().clone();
-        let (row, _) = self.suggest_target(window, cx)?;
+        let (cell, _) = self.suggest_target(window, cx)?;
         let (items, highlighted) = self.suggest_items(window, cx)?;
         // The one thing that genuinely needs the cell to have been painted. A frame behind on
         // the very first draw of a new row, and harmless: a cell does not move while you type.
-        let bounds = self.active()?.read(cx).header_name_bounds(row, cx)?;
+        let bounds = self.active()?.read(cx).header_cell_bounds(cell.row(), cell.is_value(), cx)?;
 
         // Bottom-left of the cell, in window coordinates — `last_bounds` is already absolute,
         // so reading it as local would add the parent origin twice.
@@ -6092,8 +6117,8 @@ impl Workspace {
             &theme,
             cx,
             |workspace, ix, cx| {
-                if let Some((row, _)) = workspace.suggest {
-                    workspace.suggest = Some((row, Some(ix)));
+                if let Some((cell, _)) = workspace.suggest {
+                    workspace.suggest = Some((cell, Some(ix)));
                     cx.notify();
                 }
             },
@@ -6101,36 +6126,40 @@ impl Workspace {
         ))
     }
 
-    /// Write the chosen name into the cell.
+    /// Write the chosen name or value into the cell.
     ///
     /// Through select-all plus the ordinary edit path rather than by assigning the content, so
     /// `Ctrl+Z` undoes it and `Changed` still fires — the same reasoning as body prettify going
     /// through `Editor::replace_range`.
     fn accept_suggestion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((row, _)) = self.suggest_target(window, cx) else {
+        let Some((cell, _)) = self.suggest_target(window, cx) else {
             return;
         };
         let Some((items, _)) = self.suggest_items(window, cx) else {
             return;
         };
-        let Some(name) = items.get(ix).copied() else {
+        let Some(text) = items.get(ix).copied() else {
             return;
         };
         let Some(view) = self.active() else {
             return;
         };
         view.update(cx, |view, cx| {
-            let Some(input) = view.headers.get(row).map(|row| row.name.clone()) else {
+            let Some(input) = view.headers.get(cell.row()).map(|row| match cell {
+                HeaderCell::Name(_) => row.name.clone(),
+                HeaderCell::Value(_) => row.value.clone(),
+            }) else {
                 return;
             };
             input.update(cx, |input, cx| {
                 input.select_all_text(cx);
-                gpui::EntityInputHandler::replace_text_in_range(input, None, name, window, cx);
+                gpui::EntityInputHandler::replace_text_in_range(input, None, text, window, cx);
             });
         });
         self.suggest = None;
-        // Not re-opened for the name just accepted: `suggestions` returns nothing for a
-        // finished name, so there is nothing to dismiss.
+        // Not re-opened for what was just accepted: a finished entry offers nothing, so there
+        // is nothing to dismiss. (A value that is a prefix of others — `gzip` — does keep the
+        // longer ones on offer, which is the list being accurate rather than stuck.)
         cx.notify();
     }
 
@@ -6144,7 +6173,7 @@ impl Workspace {
 
     fn step_suggestion(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         // Stepping is also how a dismissed list is reopened — pressing `down` is asking for it.
-        let Some((row, _)) = self.suggest_target(window, cx) else {
+        let Some((cell, _)) = self.suggest_target(window, cx) else {
             return;
         };
         self.suggest_dismissed = None;
@@ -6158,7 +6187,7 @@ impl Workspace {
             None => items.len() - 1,
             Some(ix) => (ix as isize + delta).rem_euclid(items.len() as isize) as usize,
         };
-        self.suggest = Some((row, Some(next)));
+        self.suggest = Some((cell, Some(next)));
         cx.notify();
     }
 
@@ -6178,11 +6207,11 @@ impl Workspace {
     /// the global `escape`, so it *wins* whenever a header name has focus. Without forwarding,
     /// putting the cursor in a header cell would quietly disarm cancelling a request.
     fn suggest_dismiss(&mut self, _: &SuggestDismiss, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((row, _)) = self.suggest_target(window, cx)
+        if let Some((cell, _)) = self.suggest_target(window, cx)
             && self.suggest_items(window, cx).is_some()
         {
             self.suggest = None;
-            self.suggest_dismissed = Some(row);
+            self.suggest_dismissed = Some(cell);
             cx.notify();
             return;
         }

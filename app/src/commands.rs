@@ -218,10 +218,10 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::RunDismiss", "only valid while a run report is open"),
     // Only meaningful while the header-name list is on screen, where they are already bound —
     // and each acts on a cell the palette cannot show you.
-    ("zuno::SuggestNext", "only valid inside the header name list"),
-    ("zuno::SuggestPrev", "only valid inside the header name list"),
-    ("zuno::SuggestConfirm", "only valid inside the header name list"),
-    ("zuno::SuggestDismiss", "only valid inside the header name list"),
+    ("zuno::SuggestNext", "only valid inside the header suggestion list"),
+    ("zuno::SuggestPrev", "only valid inside the header suggestion list"),
+    ("zuno::SuggestConfirm", "only valid inside the header suggestion list"),
+    ("zuno::SuggestDismiss", "only valid inside the header suggestion list"),
     // Keys inside the GraphQL query editor, for the header list's reason — and opening the list
     // from the palette would move focus out of the editor it completes in.
     ("zuno::CompleteNext", "only valid inside the GraphQL completion list"),

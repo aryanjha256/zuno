@@ -13882,6 +13882,37 @@ async fn down_then_enter_accepts_a_suggestion(cx: &mut TestAppContext) {
     );
 }
 
+/// A value cell offers its own header's values, and accepting one writes the *value* — the two
+/// cells share a key context, so nothing but the row itself says which one is being typed in.
+#[gpui::test]
+async fn a_header_value_is_suggested_for_its_name_and_lands_in_the_value(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.press("ctrl-shift-h");
+    cx.run_until_parked();
+    cx.simulate_input("Content-Type");
+    cx.press("tab");
+    cx.run_until_parked();
+
+    let offered = window
+        .update(&mut cx, |w, window, cx| w.suggestions_for_test(window, cx))
+        .expect("window");
+    assert_eq!(
+        offered.as_ref().and_then(|items| items.first().copied()),
+        Some("application/json"),
+        "an empty value cell under Content-Type offers its values: {offered:?}"
+    );
+
+    cx.simulate_input("form");
+    cx.press("down");
+    cx.press("enter");
+    cx.run_until_parked();
+
+    let header = spec_of(&view, &mut cx).headers.last().cloned().expect("the row");
+    assert_eq!(header.name, "Content-Type", "the name must be left alone");
+    assert_eq!(header.value, "application/x-www-form-urlencoded");
+}
+
 /// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**
 /// whenever a header name has focus. Without the forward in `suggest_dismiss`, putting the
 /// cursor in a header cell would quietly disarm cancelling a request — invisible, and only
