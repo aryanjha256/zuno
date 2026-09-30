@@ -571,6 +571,26 @@ mod tests {
         assert_eq!(all("authorization"), vec!["Bearer x"], "the person's own metadata stays");
     }
 
+    /// **A typed `Sec-WebSocket-Protocol` still leaves when the field is filled.** The field used
+    /// to replace it, so the header silently never went out. Both are offered, the field's first.
+    #[test]
+    fn a_typed_subprotocol_header_joins_the_fields_offers() {
+        let mut spec = spec_with_url("ws://127.0.0.1:1/");
+        spec.headers = vec![Header::new("Sec-WebSocket-Protocol", "graphql-ws, chat")];
+        let socket = crate::request::WebSocketRequest {
+            subprotocols: vec!["chat".to_string(), "graphql-transport-ws".to_string()],
+            ..Default::default()
+        };
+        let request = build_websocket(&spec, &socket, "dGhlIHNhbXBsZSBub25jZQ==").expect("builds");
+        let offered: Vec<&str> = request
+            .headers()
+            .get_all("sec-websocket-protocol")
+            .iter()
+            .map(|value| value.to_str().unwrap_or_default())
+            .collect();
+        assert_eq!(offered, ["chat, graphql-transport-ws, graphql-ws"]);
+    }
+
     fn spec_with_url(url: &str) -> RequestSpec {
         RequestSpec {
             url: url.to_string(),
@@ -1103,12 +1123,24 @@ pub fn build_websocket(
         })?,
     );
 
-    let offered: Vec<&str> = socket
+    // **The field and a typed header are merged, not one replacing the other.** The header was
+    // overwritten by the field, so a `Sec-WebSocket-Protocol` typed into the headers table
+    // silently never left whenever the field was also filled. The field's come first, in its
+    // order — it is the dedicated control — then any the header adds.
+    let mut offered: Vec<String> = socket
         .subprotocols
         .iter()
-        .map(|protocol| protocol.trim())
+        .map(|protocol| protocol.trim().to_string())
         .filter(|protocol| !protocol.is_empty())
         .collect();
+    for value in headers.get_all(SEC_WEBSOCKET_PROTOCOL) {
+        for part in value.to_str().unwrap_or_default().split(',') {
+            let part = part.trim();
+            if !part.is_empty() && !offered.iter().any(|seen| seen == part) {
+                offered.push(part.to_string());
+            }
+        }
+    }
     if !offered.is_empty() {
         let joined = offered.join(", ");
         headers.insert(

@@ -197,10 +197,11 @@ browser should spare you. Under the query is the only place both can be read at 
 because the request and response panes already sit side by side and halving the width would leave
 quarter-width strips. Not saved with the session, so nothing on disk changed.
 
-**Subscriptions are out of scope and stay out**, not by oversight: a subscription is a session
-over WebSocket, which is the transport this file already files under *Named, not planned*. It
-needs no new kind — see §3.1 on why lifecycle is a property of a run rather than of a saved
-request — so nothing here blocks it later.
+**Subscriptions — done, over both transports.** This paragraph once put them out of scope, as
+a session over a WebSocket this file had not built yet. Both halves shipped since: graphql-sse
+and graphql-transport-ws, chosen by the request's transport (*Auto* reads the document) — see the
+SSE and WebSocket notes under *Named, not planned*. As predicted, it needed no new kind (§3.1:
+lifecycle is a property of a run, not of a saved request).
 
 > **Test counts, once and not repeated.** `CLAUDE.md` carries the live total. Where a number appears
 > below it describes that milestone as shipped and is deliberately not updated — the same rule
@@ -1170,10 +1171,14 @@ Reasons recorded so a future session can judge them, not commitments.
   expected, and the bidirectional test had been written to send before `Opened` — encoding the
   deadlock as the test's own ordering requirement.
 
-  That closes gRPC. What is named but not planned: per-call reflection, a hang-up verb for a
-  bidirectional call, copying a chosen `.proto` into the collection rather than storing an
-  unportable absolute path, reflection without a collection open, and the `.proto` route's
-  remaining rough edge — a schema whose imports live outside the file's own directory.
+  That closes gRPC. What is named but not planned: per-call reflection, reflection without a
+  collection open, and the `.proto` route's remaining rough edge — a schema whose imports live
+  outside the file's own directory. Two items once on this list are done: the bidirectional
+  **hang-up** (*Done sending* half-closes, *Disconnect* ends the call — §6q), and the
+  **unportable path** — a `.proto` chosen anywhere inside the collection is now written relative
+  to its root (`api/greeter.proto`) rather than as an absolute path, and relative paths resolve
+  against the root (`collection::resolve_in`). Copying the file into `protos/`, the fix first
+  named here, was not what shipped: it would strand a `.proto` that imports its siblings.
 
 - **gRPC, the original note.** Shipped WebSocket first, deliberately, and the ordering is the point: both need a
   request that stays open and a transcript instead of a response, and WebSocket forces that to
@@ -1205,9 +1210,8 @@ Reasons recorded so a future session can judge them, not commitments.
     Connect again, which works and loses the transcript. Auto-retry in particular wants a
     decision first: a client that silently reconnects is a client that hides a server problem.
   - **Loading a saved message by keyboard.** Click only. Every other verb has a shortcut.
-  - **The subprotocol field overrides a hand-typed `Sec-WebSocket-Protocol` header**, silently —
-    `build_websocket` uses `insert`, not `append`. Defensible (the field is the specific answer,
-    the header is the general one) but undocumented in the UI, so someone will hit it once.
+  - ~~**The subprotocol field overrides a hand-typed `Sec-WebSocket-Protocol` header**~~ —
+    **fixed**: the two are merged, the field's offers first, then any the header adds.
 
   - **The transcript cap — done.** A ring bounded by 16 MiB of retained payload and 10,000
     frames, whichever binds first, dropping oldest and saying how many it dropped. A `VecDeque`,
@@ -1243,7 +1247,9 @@ Reasons recorded so a future session can judge them, not commitments.
     (`protocol/mod.rs:672`) outside our `send` path, so the record shows an inbound Ping and no
     reply — which reads as ignoring it. A transcript's job is being a faithful record.
   - **The resolver is re-read from disk on every frame send.** Sized for once per request, not
-    once per message.
+    once per message. **Looked at again and kept**: frames are sent by hand, a few a second at
+    most, and a cache would need invalidating on every capture write, environment edit and
+    switch — getting that wrong sends a stale token, which is a bug, to save microseconds.
   - **A scheme-less URL becomes `wss://`.** Matches `resolve_url`'s https default, but local
     socket development is overwhelmingly plaintext, so `localhost:8080/ws` fails a TLS handshake
     against a plaintext server.
@@ -1252,9 +1258,9 @@ Reasons recorded so a future session can judge them, not commitments.
   *were* fixed are not listed — they are in the code. These are the rest, in full, so that
   "deferred" means written down rather than remembered:
 
-  - **`uses_websocket(cx)` clones the whole document per repaint.** `graphql_query_header` calls
-    it to label the transport; it goes through `to_spec`, which copies the query text, then runs
-    the sniffer. Every frame the Query tab is visible.
+  - ~~**`uses_websocket(cx)` clones the whole document per repaint.**~~ **Fixed**: it asks
+    `GraphQlTransport::opens_a_websocket` of the text in place, the same function the request's
+    own `uses_websocket` calls, so the label and the route still cannot disagree.
   - **`Parser::push` drains the pending buffer inside its line loop**, so a chunk holding many
     lines is quadratic in lines. Bounded by chunk size, which is why it is here and not fixed.
   - **The kind is asked about its socket twice per send** in `drive` — `Alpn::for_kind` and
@@ -1270,20 +1276,19 @@ Reasons recorded so a future session can judge them, not commitments.
   - **`step()` ignores the envelope `id`.** One subscription per socket today, so a `complete`
     for an id we never opened would still close the session. It matters the moment anything
     multiplexes.
-  - **Notice rows carry `cursor_pointer`, hover and a click handler** that `select_frame`
-    rejects. Clicking one does nothing.
-  - **A reconnect notice does not scroll into view.** The follow logic lives in the frame arm
-    only, so the most important row in the transcript is the one that does not scroll to.
-  - **The SSE parser does not strip a leading BOM**, which the spec asks for. A server sending
-    one turns the first field name into `\u{feff}event` and it is silently ignored.
+  - ~~**Notice rows carry `cursor_pointer`, hover and a click handler**~~ — **fixed**: only a
+    frame row has them now, since only a frame opens.
+  - ~~**A reconnect notice does not scroll into view.**~~ **Fixed**: `push_notice` follows the end
+    exactly as a frame does — only while you are already there.
+  - ~~**The SSE parser does not strip a leading BOM**~~ — **fixed**, at the start of each
+    connection's stream only, including a BOM split across chunks.
   - **`stream_events` carries `#[allow(clippy::too_many_arguments)]`** rather than grouping the
     four handshake parameters that travel together.
-  - **`Save the composed message` and `Choose the GraphQL transport` are unconditional palette
-    rows.** On an HTTP request both appear; the second sets a status, the first returns in
-    silence. `active_http`'s convention says the guard is the fix, and one guard says nothing.
-  - **`build::build` runs outside the head deadline.** For a binary body it reads the file from
-    disk, so a request whose body sits on a stalled mount blocks with no timeout and no event
-    after `Started`. Not a regression — nothing covered it before either.
+  - ~~**`Save the composed message` … returns in silence**~~ — **fixed**: off a WebSocket, or with
+    nothing composed, it says so. (The transport row already did.)
+  - ~~**`build::build` runs outside the head deadline.**~~ **Fixed**: the request is built on a
+    blocking thread under the same deadline as the answer, so a body file on a stalled mount
+    times out instead of hanging — pinned with a named pipe, which stalls a read exactly so.
   - **`Transcript::frame_count`'s decrement has no test.** The increment is exercised by the ring
     test; nothing checks the count after an eviction. A drift shows a wrong number on the strip.
 
@@ -1360,8 +1365,8 @@ Reasons recorded so a future session can judge them, not commitments.
   at 12.4s and came back at 15.9s is missing whatever happened between, and a count says that it
   happened without saying when — which is the only part you need in order to read what is gone.
   `TranscriptRow` carries a `TranscriptKind` for that reason; not everything in a conversation is
-  a message. SSE defines `retry:` and replay from `Last-Event-ID`, the parser reads
-  both, and nothing acts on them — a dropped stream stays dropped until you send again. And the
+  a message. SSE defines `retry:` and replay from `Last-Event-ID`, and the reconnect above acts
+  on both — the stream resumes from the last id after the delay the server asked for. And the
   transcript cap above applies here too, more sharply: a subscription is the likeliest thing in
   the app to run for hours.
 - **Code signing and notarization.** macOS and Windows ship now (see *Where we are*) unsigned —

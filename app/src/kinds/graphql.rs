@@ -197,11 +197,17 @@ impl GraphQlEditor {
 
     /// Whether this will open a socket, as the engine will decide it.
     ///
-    /// Asked of `to_spec` rather than reimplemented, so the label on screen and the route the
-    /// request actually takes cannot disagree — which they would the first time someone
-    /// adjusted one of them.
+    /// Through `GraphQlTransport::opens_a_websocket` rather than reimplemented, so the label on
+    /// screen and the route the request actually takes cannot disagree — which they would the
+    /// first time someone adjusted one of them.
     pub fn uses_websocket(&self, cx: &App) -> bool {
-        self.to_spec(cx).uses_websocket()
+        // Asked of the text in place: going through `to_spec` cloned the whole document on every
+        // repaint of the Query header.
+        let operation = self.operation.read(cx).text().trim();
+        self.transport.opens_a_websocket(
+            self.query.read(cx).text(),
+            (!operation.is_empty()).then_some(operation),
+        )
     }
 
     /// The document editor — this kind's main text surface, which is what `Ctrl+F` and the

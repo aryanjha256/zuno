@@ -103,10 +103,43 @@ async fn run(
 
     emit(Event::Started { job });
 
-    let request = match build::build(&client, &spec) {
-        Ok(request) => request,
-        Err(error) => {
+    // One deadline for the whole answer, building included — see the note on the response below.
+    let deadline = timeout.map(|limit| tokio::time::Instant::now() + limit);
+
+    // **Built on a blocking thread, under the deadline.** A binary or multipart body is read
+    // from disk here with a plain `std::fs::read`, and building used to run before the deadline
+    // started and on this async worker: a file on a stalled mount hung the send with no timeout
+    // and no event after `Started`, and held a worker the other jobs share while it did.
+    let building = {
+        let (client, spec) = (client.clone(), spec.clone());
+        tokio::task::spawn_blocking(move || build::build(&client, &spec))
+    };
+    let built = match (deadline, timeout) {
+        (Some(at), Some(limit)) => match tokio::time::timeout_at(at, building).await {
+            Ok(built) => built,
+            Err(_) => {
+                emit(Event::Failed {
+                    job,
+                    error: EngineError::Timeout { after: limit },
+                });
+                return;
+            }
+        },
+        _ => building.await,
+    };
+    let request = match built {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) => {
             emit(Event::Failed { job, error });
+            return;
+        }
+        Err(join) => {
+            emit(Event::Failed {
+                job,
+                error: EngineError::Other {
+                    reason: format!("building the request failed: {join}"),
+                },
+            });
             return;
         }
     };
@@ -117,8 +150,10 @@ async fn run(
     // `ClientKey::read_timeout` is the second, "do not go silent for N". A response that keeps
     // arriving is allowed to take as long as it takes, which is the only way a subscription
     // can work and is what most clients already mean by a timeout.
-    let response = match timeout {
-        Some(limit) => match tokio::time::timeout(limit, client.execute(request)).await {
+    //
+    // What is left of it, rather than the whole limit again: building already spent some.
+    let response = match (deadline, timeout) {
+        (Some(at), Some(limit)) => match tokio::time::timeout_at(at, client.execute(request)).await {
             Ok(Ok(response)) => response,
             Ok(Err(error)) => {
                 emit(Event::Failed {
@@ -137,7 +172,7 @@ async fn run(
                 return;
             }
         },
-        None => match client.execute(request).await {
+        _ => match client.execute(request).await {
             Ok(response) => response,
             Err(error) => {
                 emit(Event::Failed {

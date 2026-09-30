@@ -1877,12 +1877,23 @@ impl RequestView {
     /// different frame than the one highlighted — a bug this file has already had once, in the
     /// arm that had been written second.
     fn push_notice(&mut self, text: impl Into<SharedString>) {
+        // Followed like a frame is — only while the person is at the end. A notice used to land
+        // out of sight: a reconnect, the one row saying part of the stream is missing, arrived
+        // below the fold while the frames around it scrolled into view.
+        let following = self
+            .session
+            .as_ref()
+            .is_some_and(|session| self.at_transcript_end(session.rows.len()));
         let mut evicted = 0;
         if let Some(session) = self.session.as_mut() {
             evicted = session.push(TranscriptRow {
                 at: session.rows.back().map(|row| row.at).unwrap_or_default(),
                 kind: TranscriptKind::Notice(text.into()),
             });
+            if following {
+                let last = session.rows.len().saturating_sub(1);
+                self.session_scroll.scroll_to_item(last, gpui::ScrollStrategy::Top);
+            }
         }
         self.reindex_selection(evicted);
     }

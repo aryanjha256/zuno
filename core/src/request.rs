@@ -449,11 +449,21 @@ impl GraphQlRequest {
     /// The one place the decision is made, so the engine's routing, the UI's label and the
     /// handshake all agree — three readings of the same document would eventually disagree.
     pub fn uses_websocket(&self) -> bool {
-        match self.transport {
+        self.transport
+            .opens_a_websocket(&self.query, self.operation.as_deref())
+    }
+}
+
+impl GraphQlTransport {
+    /// Whether a document sent this way opens a socket — `GraphQlRequest::uses_websocket`'s
+    /// decision, over borrowed text, so the editor can ask it on every repaint without first
+    /// assembling a whole request. It cloned the document each frame to label the header.
+    pub fn opens_a_websocket(self, query: &str, operation: Option<&str>) -> bool {
+        match self {
             GraphQlTransport::WebSocket => true,
             GraphQlTransport::Http => false,
             GraphQlTransport::Auto => {
-                crate::graphql::operation_kind(&self.query, self.operation.as_deref())
+                crate::graphql::operation_kind(query, operation)
                     == Some(crate::graphql::OperationKind::Subscription)
             }
         }

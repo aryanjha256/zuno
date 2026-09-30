@@ -406,15 +406,10 @@ pub const DIRECTORY: &str = "protos";
 /// **A bare filename means the collection's `protos/`**, and that is what keeps a committed
 /// collection portable: an absolute path into one person's home directory is broken for every
 /// teammate who clones the repo — the same failure invariant 10 exists to prevent for secrets.
-/// Anything carrying a separator is used as written, so a scratch tab that has never been saved
-/// into a collection can still point at a file anywhere.
+/// A relative path is relative to the collection root, and a rooted one is used as written. The
+/// rule is `collection::resolve_in`, shared with GraphQL's schemas.
 pub fn resolve_proto(proto: &str, collection: Option<&Path>) -> PathBuf {
-    let proto = proto.trim();
-    let bare = !proto.contains(std::path::MAIN_SEPARATOR) && !proto.contains('/');
-    match collection.filter(|_| bare) {
-        Some(root) => root.join(DIRECTORY).join(proto),
-        None => PathBuf::from(proto),
-    }
+    crate::collection::resolve_in(DIRECTORY, proto, collection)
 }
 
 /// Compile the schema and find the method a request names.
@@ -612,14 +607,18 @@ mod tests {
             PathBuf::from("/home/someone/api/protos/greeter.proto")
         );
 
-        // **A path is honoured as written**, so a scratch tab works before it has a collection.
+        // **A rooted path is honoured as written** — a file outside the collection has nothing
+        // portable to shorten to.
         assert_eq!(
             resolve_proto("/tmp/elsewhere/g.proto", Some(root)),
             PathBuf::from("/tmp/elsewhere/g.proto")
         );
+        // **A relative one is relative to the collection root**, so `api/g.proto` inside the
+        // repo works for everyone who clones it — not relative to whatever directory the app
+        // happened to be started in.
         assert_eq!(
             resolve_proto("sub/g.proto", Some(root)),
-            PathBuf::from("sub/g.proto")
+            Path::new("/home/someone/api").join("sub/g.proto")
         );
 
         // No collection at all: nothing to resolve against, so it stays as typed.

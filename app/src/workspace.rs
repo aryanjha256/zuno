@@ -6702,7 +6702,7 @@ impl Workspace {
             return;
         };
 
-        let home = crate::collections::root(cx).map(|root| root.join(directory));
+        let root = crate::collections::root(cx).map(Path::to_path_buf);
 
         let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: true,
@@ -6722,16 +6722,12 @@ impl Workspace {
                 return;
             };
 
-            // Shortened only when it really is in that directory, and only to its file name —
-            // `resolve_proto` and `resolve_schema` treat anything with a separator as a literal
-            // path, so a nested `protos/a/b.proto` must stay a path rather than become a bare
-            // name that would then resolve to the wrong place.
-            let written = home
-                .as_deref()
-                .and_then(|home| path.parent().filter(|parent| *parent == home))
-                .and_then(|_| path.file_name())
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
+            // The most portable spelling that still reads back to this file: a bare name in the
+            // reserved directory, a path relative to the collection anywhere else inside it — so
+            // a `.proto` beside the code in the same repo works for every teammate — and the path
+            // as chosen only when it is outside the collection altogether.
+            let written =
+                zuno_core::collection::schema_reference(directory, &path, root.as_deref());
 
             let _ = target.update_in(cx, |_, window, cx| {
                 field.update(cx, |input, cx| {
@@ -7067,10 +7063,20 @@ impl Workspace {
 
     /// Keep the composed message with the socket.
     ///
-    /// A no-op off a WebSocket buffer rather than reaching for `active_http`'s twin: there is
-    /// nothing to reveal first, so the guard would only be stating what the setter already does.
+    /// **Says why when it does nothing.** It was a silent no-op off a WebSocket, on the grounds
+    /// that there was nothing to reveal first — but the palette offers it on every request, and a
+    /// command that answers nothing reads as a command that is broken.
     fn save_message(&mut self, _: &SaveMessage, _: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.active() else { return };
+        let Some(socket) = view.read(cx).kind.as_websocket() else {
+            let kind = view.read(cx).kind.choice().label();
+            self.set_status(&format!("Only a WebSocket keeps composed messages, not {kind}"), cx);
+            return;
+        };
+        if socket.compose.read(cx).text().trim().is_empty() {
+            self.set_status("Nothing composed to save", cx);
+            return;
+        }
         view.update(cx, |view, cx| view.save_message(cx));
     }
 

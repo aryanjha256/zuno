@@ -47,7 +47,13 @@ pub struct Parser {
     /// Set once something exceeded `limit`, carrying how far it got. Terminal: parsing stops
     /// and the caller tears the stream down.
     too_large: Option<usize>,
+    /// Nothing of this connection's stream has been read yet — the one place the spec strips a
+    /// UTF-8 byte-order mark. Left in, it glues onto the first field name, so a stream opening
+    /// `\u{feff}event: …` had its first field silently ignored as unknown.
+    at_start: bool,
 }
+
+const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// `Default` is the capped parser, not an unbounded one — a caller that forgets is the case
 /// this guard exists for.
@@ -67,6 +73,7 @@ impl Parser {
             retry: None,
             limit,
             too_large: None,
+            at_start: true,
         }
     }
 
@@ -87,6 +94,18 @@ impl Parser {
 
         self.pending.extend_from_slice(chunk);
         let mut events = Vec::new();
+
+        if self.at_start {
+            // A chunk can end partway through the three bytes, so wait until there are enough
+            // to tell a BOM from text that merely starts the same way.
+            if self.pending.len() < BOM.len() && BOM.starts_with(&self.pending) {
+                return events;
+            }
+            if self.pending.starts_with(BOM) {
+                self.pending.drain(..BOM.len());
+            }
+            self.at_start = false;
+        }
 
         while let Some((line, consumed)) = next_line(&self.pending) {
             let line = String::from_utf8_lossy(&line).into_owned();
@@ -122,6 +141,8 @@ impl Parser {
         self.pending.clear();
         self.data.clear();
         self.name = None;
+        // Each connection is its own stream, and may open with its own BOM.
+        self.at_start = true;
     }
 
     /// The last `id:` the stream sent, which a reconnect resumes from.
@@ -242,6 +263,23 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, "hello");
         assert_eq!(events[0].name, None, "an unnamed event stays unnamed");
+    }
+
+    /// **A leading byte-order mark is not part of the first field**, including one split across
+    /// chunks — the spec strips it, and left in it made `event:` an unknown field.
+    #[test]
+    fn a_leading_bom_is_stripped_and_nowhere_else() {
+        let mut parser = Parser::default();
+        let mut events = parser.push(b"\xEF");
+        events.extend(parser.push(b"\xBB\xBFevent: tick\ndata: 1\n\n"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].name.as_deref(), Some("tick"), "split across chunks");
+
+        let events = all(&["\u{feff}event: tick\ndata: 1\n\n"]);
+        assert_eq!(events[0].name.as_deref(), Some("tick"), "whole");
+        // Only at the start: later in a stream it is ordinary text.
+        let events = all(&["data: a\n\n", "data: \u{feff}b\n\n"]);
+        assert_eq!(events[1].data, "\u{feff}b");
     }
 
     /// **The rule that keeps a stream readable.** Servers send `:` comments every few seconds to

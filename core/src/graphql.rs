@@ -23,16 +23,11 @@ use std::path::{Path, PathBuf};
 /// directory of schemas is not a directory of requests.
 pub const DIRECTORY: &str = "schemas";
 
-/// Where a request's schema file actually lives — `grpc::resolve_proto`'s rule, for the same
-/// reason: a bare filename means the collection's `schemas/`, which keeps a committed collection
-/// portable; anything with a separator is used as written.
+/// Where a request's schema file actually lives — `grpc::resolve_proto`'s rule, the one
+/// `collection::resolve_in` holds for both: a bare filename means the collection's `schemas/`, a
+/// relative path is relative to the collection root, and a rooted one is used as written.
 pub fn resolve_schema(schema: &str, collection: Option<&Path>) -> PathBuf {
-    let schema = schema.trim();
-    let bare = !schema.contains(std::path::MAIN_SEPARATOR) && !schema.contains('/');
-    match collection.filter(|_| bare) {
-        Some(root) => root.join(DIRECTORY).join(schema),
-        None => PathBuf::from(schema),
-    }
+    crate::collection::resolve_in(DIRECTORY, schema, collection)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

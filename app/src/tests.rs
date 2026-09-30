@@ -14707,6 +14707,21 @@ async fn the_ping_button_sends_a_real_ping_frame(cx: &mut TestAppContext) {
     server.join().expect("server thread");
 }
 
+/// **"Save the composed message" says why when it can do nothing.** The palette offers it on every
+/// request, and off a WebSocket it used to return in silence — a command that answers nothing
+/// reads as a broken one.
+#[gpui::test]
+async fn saving_a_message_off_a_websocket_says_why(cx: &mut TestAppContext) {
+    let (view, mut cx) = open_workspace(cx);
+    cx.dispatch_action(crate::actions::SaveMessage);
+    cx.run_until_parked();
+    let status = cx.update(|_, cx| view.read(cx).status.as_ref().map(|s| s.to_string()));
+    assert!(
+        status.as_deref().is_some_and(|status| status.contains("Only a WebSocket")),
+        "{status:?}"
+    );
+}
+
 /// **A file goes down the socket as one binary frame, byte for byte.** Driven one layer below the
 /// dialog, which the test platform cannot open: the same `send_file_frame` the button reaches,
 /// against a real WebSocket server that records what arrived. The bytes are not valid UTF-8, so

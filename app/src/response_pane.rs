@@ -2571,16 +2571,24 @@ fn transcript(
                 let row = div()
                     .id(("transcript-row", ix))
                     .debug_selector(move || format!("transcript-row-{ix}"))
-                    .cursor_pointer()
                     .bg(if selected == Some(ix) {
                         row_theme.bg_hover
                     } else {
                         gpui::transparent_black()
-                    })
-                    .hover(|style| style.bg(row_theme.bg_hover))
-                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
-                        let _ = picking.update(cx, |view, cx| view.select_frame(ix, cx));
-                    })
+                    });
+                // **Only a frame can be opened**, so only a frame looks like it can. A notice
+                // carried the pointer, the hover and a click that `select_frame` then refused —
+                // a control that said it did something and did nothing.
+                let row = if direction.is_some() {
+                    row.cursor_pointer()
+                        .hover(|style| style.bg(row_theme.bg_hover))
+                        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                            let _ = picking.update(cx, |view, cx| view.select_frame(ix, cx));
+                        })
+                } else {
+                    row
+                };
+                let row = row
                     .flex()
                     // **Not optional.** A `.flex()` row inside a `uniform_list` sizes to its
                     // content rather than the list, so without this the row's background and

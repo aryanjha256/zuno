@@ -1175,3 +1175,49 @@ fn a_get_graphql_request_sends_no_body() {
         "a GET GraphQL request must carry no body:\n{request}"
     );
 }
+
+/// **A body file that never finishes reading still times out.** Building the request — which
+/// reads a binary body from disk — used to run before the deadline started and on an async
+/// worker, so a file on a stalled mount hung the send with no event after `Started`, forever. A
+/// named pipe with no writer is that stall, reliably: reading one blocks until someone opens it.
+#[cfg(unix)]
+#[test]
+fn a_body_file_that_never_finishes_reading_times_out() {
+    let dir = std::env::temp_dir().join(format!("zuno-engine-fifo-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let fifo = dir.join("stalled.bin");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
+    assert!(made.success(), "mkfifo failed");
+
+    let engine = Engine::new().expect("engine");
+    let mut spec = spec_for("http://127.0.0.1:9/never".to_string());
+    spec.settings.timeout = Some(Duration::from_millis(500));
+    spec.kind = zuno_core::RequestKind::Http(zuno_core::HttpRequest {
+        method: zuno_core::Method::Post,
+        body: zuno_core::Body::Binary(fifo.clone()),
+        ..Default::default()
+    });
+
+    let started = std::time::Instant::now();
+    let (_, events) = engine.send(spec);
+    // Bounded by hand: if the fix regresses, `drain` would block forever on a job that never ends.
+    let failure = std::thread::spawn(move || {
+        drain(&events).into_iter().find_map(|event| match event {
+            Event::Failed { error, .. } => Some(error),
+            _ => None,
+        })
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !failure.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Release the reader stuck on the pipe either way, so no thread outlives the test.
+    let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+    assert!(failure.is_finished(), "the send never ended — no timeout reached the body read");
+    let error = failure.join().expect("thread").expect("a Failed event");
+    assert!(matches!(error, EngineError::Timeout { .. }), "{error:?}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

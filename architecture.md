@@ -1358,9 +1358,9 @@ Decisions worth keeping:
 - **Not a tab stop**, unlike `response_focus`. `Tab` walks the active request's inputs, and a
   pane-level stop painted before all of them would turn the first `Tab` from "url → method" into
   "panel → url" for every existing user. It has a binding and a click target and loses nothing.
-- **Fixed width, no drag handle.** A resizable panel means a stored width, a minimum, and a
-  pointer mode, to serve a preference nobody has expressed. Recorded as a limitation rather than
-  an oversight.
+- ~~**Fixed width, no drag handle.**~~ **Superseded — the panel resizes**, by the seam described
+  above (`resize_handle`, a stored width, double-click to reset). This line predates it and was
+  left behind when it shipped.
 
 **The panel is a full-height column, and the tab strip belongs to the editor area beside it.**
 It shipped the other way for a slice — the strip spanning the whole window, above both — which
@@ -3012,10 +3012,18 @@ loop, fix the schema and press Send, silently use the old one.
 
 A request *names* its schema. A bare filename resolves inside the collection's reserved `protos/`
 (`grpc::resolve_proto`), which keeps a committed collection portable for invariant 10's reason; a
-path with a separator is used as written, so a scratch tab works before it has a collection.
-`protos/` is skipped by `collection::scan` and the folder list, like `environments/` and `flows/`.
-**Known gap:** a path chosen from outside `protos/` is stored verbatim, which is unportable — copying
-it in would fix that, and is not built.
+relative path resolves against the collection root, and a rooted one is used as written, so a
+scratch tab works before it has a collection. The rule is `collection::resolve_in`, shared with
+GraphQL's `schemas/`. `protos/` is skipped by `collection::scan` and the folder list, like
+`environments/` and `flows/`.
+
+**A chosen file is written in the most portable spelling that reads back to it**
+(`collection::schema_reference`): bare in `protos/`, relative to the root anywhere else inside the
+collection (`api/greeter.proto`, beside the code in the same repo), as chosen only outside it. It
+was stored verbatim once, which broke for every teammate who cloned the repo. Copying the file into
+`protos/` was the fix first proposed and was not taken: a `.proto` that imports its siblings would
+arrive without them. A file outside the collection is still absolute — there is nothing portable
+to shorten it to.
 
 ### One predicate was four questions
 
@@ -4097,9 +4105,10 @@ they match Postman and browsers, and the config file is the place to disagree).
 
 ~~**The cookie jar's visibility** (new). It's on and invisible.~~ **Answered, and it got the
 indicator *and* the toggle** — the `cookies on` badge in the status bar plus the `Ctrl+,` row,
-which is what §11's own entry describes. The third option, a jar viewer, stays unbuilt for a
-reason worth keeping: reqwest owns the store behind `cookie_store(true)` and exposes no way to
-enumerate it, so a viewer needs a lower-level client. The same badge argument was reused whole
+which is what §11's own entry describes. The third option, a jar viewer, was later built — and
+the obstacle recorded here turned out not to need a lower-level client: the engine now owns the
+jar (`reqwest_cookie_store` behind `ClientBuilder::cookie_provider`), so it can list, remove and
+clear cookies, and the `cookies on` badge opens the viewer. The same badge argument was reused whole
 for the proxy in §6i — the toggle says what will happen, the badge says what is happening.
 
 ---

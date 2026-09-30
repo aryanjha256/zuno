@@ -301,6 +301,51 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<Entry>, skipped: &m
 /// separator as the platform does, so a flow built on Windows recorded `users\02-create.json`,
 /// which on Linux or macOS is a single filename with a backslash in it and a step that is always
 /// missing. `/` reads back on all three, since Windows accepts it in a path.
+/// Where a schema file a request names actually lives — `grpc::resolve_proto` and
+/// `graphql::resolve_schema` both, so the two kinds cannot drift apart.
+///
+/// - **A bare filename** means the collection's reserved directory (`protos/`, `schemas/`) — the
+///   portable spelling a committed collection should carry.
+/// - **A relative path** is relative to the **collection root**, so `api/greeter.proto` works for
+///   every teammate who clones the repo. It used to be relative to the process's working
+///   directory, which for an app launched from a menu is nothing anyone chose.
+/// - **A rooted path** is used as written — a file outside the collection has nothing portable
+///   to shorten to. `has_root` rather than `is_absolute`, so `/tmp/x` on Windows (no drive, not
+///   "absolute") is still the path someone typed rather than a subdirectory of the collection.
+///
+/// With no collection open, everything stays as typed: there is nothing to resolve against.
+pub fn resolve_in(reserved: &str, text: &str, collection: Option<&Path>) -> PathBuf {
+    let text = text.trim();
+    let path = Path::new(text);
+    let Some(root) = collection.filter(|_| !path.has_root()) else {
+        return path.to_path_buf();
+    };
+    let bare = !text.contains(std::path::MAIN_SEPARATOR) && !text.contains('/');
+    if bare {
+        root.join(reserved).join(text)
+    } else {
+        root.join(text)
+    }
+}
+
+/// How a schema file chosen in a dialog is written into a request: bare when it sits in the
+/// reserved directory, relative to the collection root when it is anywhere inside it, and as
+/// chosen otherwise — the spellings `resolve_in` reads back, most portable first.
+pub fn schema_reference(reserved: &str, path: &Path, collection: Option<&Path>) -> String {
+    let Some(root) = collection else {
+        return path.display().to_string();
+    };
+    if path.parent() == Some(root.join(reserved).as_path())
+        && let Some(name) = path.file_name()
+    {
+        return name.to_string_lossy().into_owned();
+    }
+    if path.starts_with(root) {
+        return relative_label(root, path);
+    }
+    path.display().to_string()
+}
+
 pub fn relative_label(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -797,6 +842,28 @@ mod tests {
         let root = Path::new("collection");
         let nested = root.join("users").join("02-create.json");
         assert_eq!(relative_label(root, &nested), "users/02-create.json");
+    }
+
+    /// **A chosen schema file is written in the most portable spelling that still reads back to
+    /// it**: bare in `protos/`, collection-relative elsewhere inside the collection, as chosen
+    /// outside it. The round trip is the assertion, since the spelling is only right if
+    /// `resolve_in` finds the same file from it.
+    #[test]
+    fn a_chosen_schema_is_written_portably_and_reads_back() {
+        let root = std::env::temp_dir().join("zuno-collection-root");
+        let cases = [
+            (root.join("protos").join("greeter.proto"), "greeter.proto".to_string()),
+            (root.join("api").join("v1").join("greeter.proto"), "api/v1/greeter.proto".to_string()),
+            (
+                std::env::temp_dir().join("elsewhere").join("greeter.proto"),
+                std::env::temp_dir().join("elsewhere").join("greeter.proto").display().to_string(),
+            ),
+        ];
+        for (file, spelling) in cases {
+            let written = schema_reference("protos", &file, Some(&root));
+            assert_eq!(written, spelling, "{file:?}");
+            assert_eq!(resolve_in("protos", &written, Some(&root)), file, "{written} reads back");
+        }
     }
 
     /// A scratch directory under the system temp dir, unique per test and process.
