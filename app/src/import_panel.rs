@@ -184,7 +184,7 @@ impl Render for ImportPanel {
                         div()
                             .text_sm()
                             .text_color(theme.text)
-                            .child("Import from OpenAPI"),
+                            .child("Import"),
                     )
                     // Field and browse button on one row, the shape `WorkspacePanel` already
                     // uses for its location: the path is editable either way, and the dialog is
@@ -217,7 +217,9 @@ impl Render for ImportPanel {
                                 SharedString::from("Reading…")
                             } else {
                                 SharedString::from(
-                                    "Reads OpenAPI 3.x in JSON. Enter to import, Escape to close.",
+                                    "A file or URL: OpenAPI 3.x (JSON or YAML), a Postman collection \
+                                     or environment, or a Zuno bundle. Enter to import, Escape to \
+                                     close.",
                                 )
                             }),
                     )
