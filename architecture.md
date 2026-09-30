@@ -1725,9 +1725,13 @@ Two details in it:
   panel's own `ImportPanel` context never holds focus, because the input does. Registered after
   their global twins, for the sixth time.
 
-*Deliberately absent:* YAML, which most published specs use — the crate landscape is a graveyard
-(`serde_yaml` is versioned `0.9.34+deprecated`, `serde_yml` is `0.0.13` and self-tagged the same),
-and JSON-only is a real limitation recorded rather than hidden. Also absent: OpenAPI 2.0/Swagger,
+*YAML* is read when a document fails as JSON and does not open with `{`/`[` (`import::read`),
+converted into the same `serde_json::Value`, so no parser knows the difference. **Through
+`yaml-rust2`'s own value type, not a serde deserializer:** `responses: 200:` is an *integer* key
+and `serde_json::Value` refuses non-string keys, so every serde route — `serde-saphyr`, and
+`serde_yaml`, which is `0.9.34+deprecated` anyway — rejects nearly every real spec. The hand
+conversion stringifies such keys; aliases are resolved by the loader; an unquoted `openapi: 3.0`
+arrives as a number and `openapi::parse` accepts that. *Deliberately absent:* OpenAPI 2.0/Swagger,
 a different document shape rather than an older version of this one, and refused with a message
 that says so.
 

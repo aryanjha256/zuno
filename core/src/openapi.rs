@@ -14,9 +14,10 @@
 //! tools; refusing to import ninety requests because one of them uses a feature we don't read
 //! would break the feature exactly where it is most useful.
 //!
-//! Deliberately absent: YAML (most published specs use it — this reads JSON only for now, and
-//! the YAML crate landscape is a graveyard), remote `$ref`s, and OpenAPI 2.0 / Swagger, which is
-//! a different document shape rather than an older version of this one.
+//! YAML arrives here already converted to the same `Value` — see `import::read`.
+//!
+//! Deliberately absent: remote `$ref`s, and OpenAPI 2.0 / Swagger, which is a different document
+//! shape rather than an older version of this one.
 
 use serde_json::Value;
 
@@ -49,10 +50,12 @@ pub enum OpenApiError {
 /// Takes the parsed document rather than bytes: `import::parse` has already read the JSON in
 /// order to decide which parser to call, and a megabyte spec should not be parsed twice.
 pub fn parse(root: &Value) -> Result<Import, OpenApiError> {
-    let version = root
-        .get("openapi")
-        .and_then(Value::as_str)
-        .ok_or(OpenApiError::NotOpenApi)?;
+    // A number as well as a string: YAML reads an unquoted `openapi: 3.0` as a float.
+    let version = match root.get("openapi") {
+        Some(Value::String(version)) => version.clone(),
+        Some(Value::Number(version)) => version.to_string(),
+        _ => return Err(OpenApiError::NotOpenApi),
+    };
     if !version.starts_with("3.") {
         return Err(OpenApiError::UnsupportedVersion(version.to_string()));
     }

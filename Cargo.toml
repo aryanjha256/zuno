@@ -98,6 +98,11 @@ prost = "0.14"
 # spec-complete validation with positions. The alternative was extending `graphql.rs`'s scanner,
 # which is the right size for routing and the wrong one for validating against a schema.
 apollo-compiler = "1.33"
+# YAML OpenAPI specs. A loader into its own value type rather than a serde deserializer, on
+# purpose: `responses: 200:` is an *integer* key, which `serde_json::Value` refuses, so every
+# serde route (`serde-saphyr`, the deprecated `serde_yaml`) rejects nearly every real spec.
+# Converting ourselves turns such keys into strings. YAML 1.2, so `yes` stays a string.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Reading HTTP/2 **trailers**, which is where gRPC puts its status and which reqwest names

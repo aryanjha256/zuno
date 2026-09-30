@@ -19,6 +19,8 @@ use crate::RequestSpec;
 pub enum ImportError {
     #[error("not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("not valid YAML: {0}")]
+    Yaml(#[from] yaml_rust2::ScanError),
     #[error(transparent)]
     OpenApi(#[from] crate::openapi::OpenApiError),
     #[error(transparent)]
@@ -123,7 +125,7 @@ pub struct Import {
 /// sniffing on bytes and letting the parser start over. A Postman export of a real workspace
 /// runs to megabytes, and this runs on the UI thread's caller.
 pub fn parse(bytes: &[u8]) -> Result<Parsed, ImportError> {
-    let root: Value = serde_json::from_slice(bytes)?;
+    let root = read(bytes)?;
 
     // **The Postman API wraps what the Postman app exports.** A share link
     // (`api.postman.com/collections/<uid>?access_key=…`) answers `{"collection": {…}}`, while a
@@ -171,6 +173,61 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, ImportError> {
     Err(ImportError::Unrecognised)
 }
 
+/// JSON, or failing that YAML — which is how most OpenAPI specs are published.
+///
+/// **A document that opens with `{` or `[` keeps its JSON error.** YAML is a superset of JSON, so
+/// a JSON file with a stray comma would otherwise be reported in YAML's terms, about a format its
+/// author never wrote.
+fn read(bytes: &[u8]) -> Result<Value, ImportError> {
+    let json = match serde_json::from_slice(bytes) {
+        Ok(root) => return Ok(root),
+        Err(error) => error,
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Err(json.into());
+    };
+    if text.trim_start_matches('\u{feff}').trim_start().starts_with(['{', '[']) {
+        return Err(json.into());
+    }
+    let documents = yaml_rust2::YamlLoader::load_from_str(text)?;
+    Ok(documents.into_iter().next().map(from_yaml).unwrap_or(Value::Null))
+}
+
+fn from_yaml(yaml: yaml_rust2::Yaml) -> Value {
+    use yaml_rust2::Yaml;
+    match yaml {
+        Yaml::Real(text) => text
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map_or(Value::String(text), Value::Number),
+        Yaml::Integer(n) => Value::from(n),
+        Yaml::String(text) => Value::String(text),
+        Yaml::Boolean(b) => Value::Bool(b),
+        Yaml::Array(items) => Value::Array(items.into_iter().map(from_yaml).collect()),
+        // Keys are stringified rather than refused: `responses: 200:` is an integer key in YAML
+        // and a string in the equivalent JSON, and that is in nearly every real spec. A key that
+        // is itself a list or a map has no JSON spelling and is dropped.
+        Yaml::Hash(entries) => Value::Object(
+            entries
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    let key = match key {
+                        Yaml::String(text) | Yaml::Real(text) => text,
+                        Yaml::Integer(n) => n.to_string(),
+                        Yaml::Boolean(b) => b.to_string(),
+                        Yaml::Null => "null".to_string(),
+                        _ => return None,
+                    };
+                    Some((key, from_yaml(value)))
+                })
+                .collect(),
+        ),
+        // The loader resolves aliases itself; one naming an unknown anchor arrives as either.
+        Yaml::Null | Yaml::Alias(_) | Yaml::BadValue => Value::Null,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,7 +250,65 @@ mod tests {
             );
         }
 
-        assert!(matches!(parse(b"not json"), Err(ImportError::Json(_))));
+        assert!(matches!(parse(br#"{"a":1,}"#), Err(ImportError::Json(_))));
+        assert!(matches!(parse(b"a: [1, 2"), Err(ImportError::Yaml(_))));
+    }
+
+    /// The same spec in both spellings imports identically — with the three things YAML does
+    /// that JSON cannot: an integer key (`200:`, in nearly every real spec), an unquoted version
+    /// that reads as a number, and an anchor reused by alias.
+    #[test]
+    fn a_yaml_spec_imports_exactly_as_its_json_does() {
+        let yaml = br#"
+openapi: 3.0
+info:
+  title: Pets
+servers:
+  - url: https://pets.test
+x-tenant: &tenant
+  name: X-Tenant
+  in: header
+  required: true
+  example: acme
+paths:
+  /pets/{id}:
+    get:
+      operationId: getPet
+      tags: [pets]
+      parameters:
+        - *tenant
+        - name: verbose
+          in: query
+          required: true
+          example: yes
+      responses:
+        200:
+          description: ok
+"#;
+        let json = br#"{
+          "openapi": "3.0",
+          "info": { "title": "Pets" },
+          "servers": [{ "url": "https://pets.test" }],
+          "paths": { "/pets/{id}": { "get": {
+            "operationId": "getPet",
+            "tags": ["pets"],
+            "parameters": [
+              { "name": "X-Tenant", "in": "header", "required": true, "example": "acme" },
+              { "name": "verbose", "in": "query", "required": true, "example": "yes" }
+            ],
+            "responses": { "200": { "description": "ok" } }
+          } } }
+        }"#;
+
+        let from_yaml = collection(yaml);
+        assert_eq!(from_yaml, collection(json));
+        assert_eq!(from_yaml.requests.len(), 1);
+        let spec = &from_yaml.requests[0].spec;
+        let crate::RequestKind::Http(http) = &spec.kind else {
+            panic!("wanted an HTTP request");
+        };
+        assert!(spec.headers.iter().any(|h| h.name == "X-Tenant" && h.value == "acme"));
+        assert!(http.query.iter().any(|q| q.name == "verbose" && q.value == "yes"));
     }
 
     fn collection(document: &[u8]) -> Import {

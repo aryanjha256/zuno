@@ -818,8 +818,8 @@ cursors stayed separate, because a match and where you are standing are differen
   §6b — that section is also where the first **form modal** is recorded, built concrete for one
   consumer the way the picker was.
 
-  JSON only. Most published specs are YAML and the YAML crate landscape is a graveyard, so that
-  is a limitation written down rather than hidden.
+  YAML too, since most published specs are YAML — done later through `yaml-rust2`; see
+  architecture.md §6b for why not a serde crate.
 
 - **Postman import — done, and it was the one that mattered most.** `Ctrl+Shift+I` is now
   `ImportDocument` rather than `ImportOpenApi`: the document decides which parser reads it, so
