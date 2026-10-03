@@ -606,6 +606,7 @@ fn method_chip(view: &RequestView, theme: &Theme) -> Option<impl IntoElement + u
 
 fn url_bar(view: &RequestView, theme: &Theme) -> Div {
     div()
+        .debug_selector(|| "url-bar".to_string())
         .flex_1()
         .min_w(px(0.))
         // `truncate()` styles text overflow; it does not clip a custom-painted element.

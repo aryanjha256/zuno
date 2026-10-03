@@ -1189,11 +1189,27 @@ impl Element for EditorElement {
 
             // Colour, and the IME pre-edit underline, in one split. The placeholder is not JSON
             // and must not be lexed as it — it is prose standing in for an empty buffer.
-            let spans = if highlight && !is_empty {
-                token_colours(&text, &theme)
-            } else {
+            // `{{variables}}` first: `split_spans` takes the first colour that covers a segment,
+            // so a variable inside a JSON string wins over the string's colour. Every editor is a
+            // surface that is substituted at send, so none opts out.
+            let mut spans = if is_empty {
                 Vec::new()
+            } else {
+                zuno_core::environment::variable_spans(&text)
+                    .into_iter()
+                    .map(|(range, name)| {
+                        let colour = match crate::auth::is_defined(name, cx) {
+                            Some(true) => theme.status_success,
+                            Some(false) => theme.status_server_error,
+                            None => theme.accent,
+                        };
+                        (range, colour)
+                    })
+                    .collect()
             };
+            if highlight && !is_empty {
+                spans.extend(token_colours(&text, &theme));
+            }
             let marked = editor.marked_range.as_ref().and_then(|marked| {
                 (marked.start < line_end && marked.end > line_start && !is_empty).then(|| {
                     let from = marked.start.max(line_start) - line_start;

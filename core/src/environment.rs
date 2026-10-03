@@ -198,6 +198,12 @@ impl Resolver {
         self.secret.contains(name)
     }
 
+    /// Whether `name`'s value comes from the globals rather than the selected environment —
+    /// for saying where a value came from, not for resolving it.
+    pub fn from_globals(&self, name: &str) -> bool {
+        !self.active.contains_key(name) && self.globals.contains_key(name)
+    }
+
     /// The selected environment wins over globals — that's the whole point of selecting one.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.active
@@ -478,18 +484,30 @@ impl Resolver {
 /// `{{`, so `{{}}` cannot find its own opener's tail — because a name this reports and `resolve`
 /// misses (or vice versa) is a placeholder the UI describes wrongly.
 fn placeholders(text: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut rest = text;
+    variable_spans(text)
+        .into_iter()
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
 
-    while let Some(start) = rest.find("{{") {
-        let Some(end) = rest[start + 2..].find("}}") else {
+/// Every `{{name}}` in `text`: its byte range, braces included, and the trimmed name.
+///
+/// Scanned exactly as `Resolver::resolve` scans, so what is highlighted on screen is what a send
+/// substitutes — `{{a}}}` is `a` followed by a literal `}`, and an unclosed `{{` is plain text.
+pub fn variable_spans(text: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let mut spans = Vec::new();
+    let mut at = 0;
+
+    while let Some(start) = text[at..].find("{{").map(|offset| at + offset) {
+        let Some(end) = text[start + 2..].find("}}") else {
             break;
         };
-        names.push(rest[start + 2..start + 2 + end].trim().to_string());
-        rest = &rest[start + 2 + end + 2..];
+        let after = start + 2 + end + 2;
+        spans.push((start..after, text[start + 2..start + 2 + end].trim()));
+        at = after;
     }
 
-    names
+    spans
 }
 
 /// The environments directory inside a collection.
@@ -926,6 +944,21 @@ mod tests {
             resolver.resolve("no placeholders here"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// The spans are the ones `resolve` substitutes — byte ranges with braces, names trimmed —
+    /// so what is highlighted on screen is exactly what a send replaces.
+    #[test]
+    fn variable_spans_match_what_resolve_substitutes() {
+        let text = "https://{{ host }}/v1?k={{key}}}&x={{open";
+        let spans = variable_spans(text);
+        assert_eq!(
+            spans,
+            vec![(8..18, "host"), (24..31, "key")],
+            "a trailing `}}` is literal and an unclosed `{{{{` is plain text"
+        );
+        let resolver = Resolver::new(None, Some(&env("dev", &[("host", "h"), ("key", "k")])));
+        assert_eq!(resolver.resolve(text), "https://h/v1?k=k}&x={{open");
     }
 
     /// Basic auth is resolved *before* it is encoded — the encoding of `alice:{{pass}}` is a

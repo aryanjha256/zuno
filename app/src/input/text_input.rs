@@ -116,7 +116,15 @@ pub struct TextInput {
     /// the same offset into the content and the cursor, selection and click mapping need no
     /// translation. The cost is that a multi-byte character shows as two to four stars.
     masked: bool,
+    /// Whether `{{variables}}` are coloured and explained on hover — only for fields whose text
+    /// is sent, where a variable means something. A find bar or a rename box is not one.
+    variables: bool,
+    /// The `{{variable}}` under the pointer, by byte range, while it is there.
+    hovered_variable: Option<Range<usize>>,
 }
+
+/// The inputs whose text reaches the wire and so is substituted at send time.
+const SENT_FIELDS: &[&str] = &["UrlBar", "HeaderCell", "QueryCell", "FormCell", "PartCell", "AuthField"];
 
 impl TextInput {
     pub fn new(
@@ -146,7 +154,18 @@ impl TextInput {
             scroll_offset: px(0.),
             is_selecting: false,
             masked: false,
+            variables: SENT_FIELDS.contains(&extra_context),
+            hovered_variable: None,
         }
+    }
+
+    /// The variable under the pointer, as `(name, byte range)`. Read by tests, and by the popover.
+    pub fn hovered_variable(&self) -> Option<(&str, Range<usize>)> {
+        let range = self.hovered_variable.clone()?;
+        zuno_core::environment::variable_spans(&self.content)
+            .into_iter()
+            .find(|(span, _)| *span == range)
+            .map(|(span, name)| (name, span))
     }
 
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
@@ -409,6 +428,40 @@ impl TextInput {
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
             self.select_to(self.index_for_mouse_position(event.position), cx);
+        }
+        self.hover_variable_at(event.position, cx);
+    }
+
+    /// Track which `{{variable}}` the pointer is over. Per move rather than once per hover —
+    /// the reason this is not a gpui `tooltip`, which is built once when it appears and so
+    /// would keep naming the first variable after the pointer slid onto the next.
+    fn hover_variable_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.variables || self.masked || self.is_selecting {
+            return self.set_hovered_variable(None, cx);
+        }
+        // The glyph *under* the pointer, not the nearest caret gap: `index_for_mouse_position`
+        // rounds, which would light up a variable from the half-character beside it.
+        let index = self
+            .last_layout
+            .as_ref()
+            .zip(self.last_bounds.as_ref())
+            .filter(|(_, bounds)| bounds.contains(&position))
+            .and_then(|(line, bounds)| {
+                line.index_for_x(position.x - bounds.left() + self.scroll_offset)
+            });
+        let span = index.and_then(|index| {
+            zuno_core::environment::variable_spans(&self.content)
+                .into_iter()
+                .map(|(range, _)| range)
+                .find(|range| range.start <= index && index < range.end)
+        });
+        self.set_hovered_variable(span, cx);
+    }
+
+    fn set_hovered_variable(&mut self, span: Option<Range<usize>>, cx: &mut Context<Self>) {
+        if self.hovered_variable != span {
+            self.hovered_variable = span;
+            cx.notify();
         }
     }
 
@@ -752,10 +805,101 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            // An id is what `on_hover` needs, and it is safe to repeat: a view scopes the ids
+            // inside it by its own entity.
+            .id("text-input")
+            // `on_mouse_move` only fires while the pointer is inside, so leaving needs this or
+            // the popover would stay up after the pointer had gone.
+            .on_hover(cx.listener(|input, hovered: &bool, _, cx| {
+                if !*hovered {
+                    input.set_hovered_variable(None, cx);
+                }
+            }))
             .w_full()
             .child(TextElement {
                 input: cx.entity(),
             })
+            .children(self.variable_popover(cx))
+    }
+}
+
+impl TextInput {
+    /// What the hovered `{{variable}}` resolves to, and from where, under its first brace.
+    ///
+    /// **`deferred`, which is what lets it escape.** Every cell sits inside `overflow_hidden`
+    /// ancestors, and an `anchored` child is still masked by them; a deferred draw is painted
+    /// after the whole tree with no clip of its own. Positioned from `last_bounds`, a frame
+    /// behind, which is harmless for the reason the header suggestions give: the text does not
+    /// move while the pointer rests on it.
+    fn variable_popover(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (name, range) = self.hovered_variable()?;
+        let (line, bounds) = self.last_layout.as_ref().zip(self.last_bounds.as_ref())?;
+        let theme = cx.theme().clone();
+        let info = crate::auth::describe(name, cx);
+        let at = point(
+            bounds.left() + line.x_for_index(range.start) - self.scroll_offset,
+            bounds.bottom() + px(4.),
+        );
+
+        // A value runs to a JWT's length; the popover is for recognising it, not reading it all.
+        const SHOWN: usize = 120;
+        let value = info.value.map(|value| {
+            if value.chars().count() > SHOWN {
+                format!("{}…", value.chars().take(SHOWN).collect::<String>())
+            } else if value.is_empty() {
+                "(empty)".to_string()
+            } else {
+                value
+            }
+        });
+        let defined = value.is_some();
+
+        Some(gpui::deferred(
+            gpui::anchored()
+                .position(at)
+                .position_mode(gpui::AnchoredPositionMode::Window)
+                .child(
+                    div()
+                        .debug_selector(|| "variable-popover".to_string())
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .max_w(px(420.))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .bg(theme.bg_elevated)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_md()
+                        .text_xs()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_family(theme.mono.clone())
+                                        .text_color(theme.text)
+                                        .child(name.to_string()),
+                                )
+                                .child(div().text_color(theme.text_faint).child(info.origin)),
+                        )
+                        .child(
+                            div()
+                                .font_family(theme.mono.clone())
+                                .text_color(if defined {
+                                    theme.text_muted
+                                } else {
+                                    theme.status_server_error
+                                })
+                                // Not "will not send": true of the URL and headers, which are
+                                // checked, and false of a form body, which is sent as typed.
+                                .child(value.unwrap_or_else(|| "unresolved".to_string())),
+                        ),
+                ),
+        ))
     }
 }
 
@@ -845,34 +989,47 @@ impl Element for TextElement {
             strikethrough: None,
         };
 
-        // While composing (IME), underline the pre-edit region.
-        let runs = if let Some(marked) = marked_range.as_ref().filter(|_| !display_text.is_empty())
-        {
-            vec![
+        // `{{variables}}`, coloured by whether they resolve — green or red, the convention every
+        // API client shares. Not on a masked field (the stars would give away where one is) and
+        // not over the placeholder text.
+        let variables: Vec<(Range<usize>, gpui::Hsla)> =
+            if input.variables && !input.masked && !input.content.is_empty() {
+                zuno_core::environment::variable_spans(&input.content)
+                    .into_iter()
+                    .map(|(range, name)| {
+                        let colour = match crate::auth::is_defined(name, cx) {
+                            Some(true) => theme.status_success,
+                            Some(false) => theme.status_server_error,
+                            None => theme.accent,
+                        };
+                        (range, colour)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let marked = marked_range.filter(|_| !display_text.is_empty());
+
+        // `ui::split_spans` cuts at every boundary, since a pre-edit region can start inside a
+        // variable; while composing (IME), the pre-edit region is underlined.
+        let runs: Vec<TextRun> = crate::ui::split_spans(display_text.len(), &variables, marked)
+            .into_iter()
+            .map(|(range, colour, composing)| {
+                let color = colour.unwrap_or(run.color);
                 TextRun {
-                    len: marked.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: marked.end - marked.start,
-                    underline: Some(UnderlineStyle {
-                        color: Some(run.color),
+                    len: range.len(),
+                    color,
+                    underline: composing.then_some(UnderlineStyle {
+                        color: Some(color),
                         thickness: px(1.0),
                         wavy: false,
                     }),
                     ..run.clone()
-                },
-                TextRun {
-                    len: display_text.len().saturating_sub(marked.end),
-                    ..run
-                },
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect()
-        } else {
-            vec![run]
-        };
+                }
+            })
+            .collect();
+        // An empty display (no content, no placeholder) still gets the one run it always had.
+        let runs = if runs.is_empty() { vec![run] } else { runs };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window

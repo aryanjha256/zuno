@@ -13987,6 +13987,60 @@ async fn the_auth_chip_opens_a_menu_that_chooses_the_auth(cx: &mut TestAppContex
     );
 }
 
+/// Hovering a `{{variable}}` explains *that* variable — tracked per move, so sliding from one to
+/// the next follows — and leaving the text closes it. A popover stuck open, or naming the wrong
+/// variable, would look plausible in every screenshot.
+#[gpui::test]
+async fn hovering_a_variable_names_the_one_under_the_pointer(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+    type_url(&mut cx, "https://{{host}}/v1/{{version}}");
+    cx.run_until_parked();
+
+    let bar = cx.debug_bounds("url-bar").expect("the URL bar");
+    let hovered = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .url
+                .read(cx)
+                .hovered_variable()
+                .map(|(name, _)| name.to_string())
+        })
+    };
+
+    // Sweep across the bar and record each variable as the pointer reaches it. Character widths
+    // belong to the platform's font, so positions are found rather than computed.
+    let mut seen: Vec<String> = Vec::new();
+    let mut on_a_variable = None;
+    let mut x = bar.left();
+    while x < bar.right() {
+        cx.simulate_mouse_move(
+            gpui::point(x, bar.center().y),
+            None,
+            gpui::Modifiers::default(),
+        );
+        if let Some(name) = hovered(&mut cx) {
+            on_a_variable = Some(x);
+            if seen.last() != Some(&name) {
+                seen.push(name);
+            }
+        }
+        x += gpui::px(2.);
+    }
+    assert_eq!(seen, ["host", "version"], "each variable in turn, and nothing else");
+
+    // Straight from *on* a variable to off the input: the sweep above ends over blank text,
+    // which clears the hover by itself, so leaving has to start from a hovered variable.
+    let x = on_a_variable.expect("a hovered position");
+    cx.simulate_mouse_move(gpui::point(x, bar.center().y), None, gpui::Modifiers::default());
+    assert_eq!(hovered(&mut cx).as_deref(), Some("version"));
+    cx.simulate_mouse_move(
+        gpui::point(bar.center().x, bar.bottom() + gpui::px(200.)),
+        None,
+        gpui::Modifiers::default(),
+    );
+    assert_eq!(hovered(&mut cx), None);
+}
+
 /// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**
 /// whenever a header name has focus. Without the forward in `suggest_dismiss`, putting the
 /// cursor in a header cell would quietly disarm cancelling a request — invisible, and only

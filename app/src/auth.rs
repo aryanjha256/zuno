@@ -1,4 +1,5 @@
-//! The resolver the request pane shows the derived `Authorization` header with.
+//! The resolver the screen shows values with — the derived `Authorization` header, and every
+//! `{{variable}}`'s colour and hover in the inputs and editors.
 //!
 //! **Cached, and refreshed at the points it can change**, for `Workspace::globals_active`'s
 //! reason: resolving means opening and parsing the environment files, which invariant 3 forbids
@@ -109,6 +110,51 @@ pub fn reload(cx: &mut App) {
     };
     let environment = shown.environment.clone();
     refresh(environment, cx);
+}
+
+/// What a `{{name}}` resolves to on screen, and where the value comes from.
+pub struct VariableInfo {
+    pub value: Option<String>,
+    /// `dev`, `dev.local`, `globals` — or, when undefined, where it was looked for.
+    pub origin: String,
+}
+
+/// Whether `name` resolves right now. `None` before any resolver has loaded — a test harness, or
+/// the first frame — so nothing is painted as broken that has not been checked.
+pub fn is_defined(name: &str, cx: &App) -> Option<bool> {
+    cx.try_global::<ShownResolver>()
+        .map(|shown| shown.resolver.get(name).is_some())
+}
+
+pub fn describe(name: &str, cx: &App) -> VariableInfo {
+    let Some(shown) = cx.try_global::<ShownResolver>() else {
+        return VariableInfo {
+            value: None,
+            origin: "no environment loaded".to_string(),
+        };
+    };
+    let layer = if shown.resolver.from_globals(name) {
+        "globals".to_string()
+    } else {
+        shown.environment.clone().unwrap_or_else(|| "globals".to_string())
+    };
+    match shown.resolver.get(name) {
+        Some(value) => VariableInfo {
+            value: Some(value.to_string()),
+            origin: if shown.resolver.is_secret(name) {
+                format!("{layer}.local")
+            } else {
+                layer
+            },
+        },
+        None => VariableInfo {
+            value: None,
+            origin: match &shown.environment {
+                Some(env) => format!("not defined in {env} or globals"),
+                None => "not defined — no environment selected".to_string(),
+            },
+        },
+    }
 }
 
 /// The header `auth` produces, resolved the way a send resolves it.
