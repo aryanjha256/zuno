@@ -387,19 +387,22 @@ tab, because a rule you cannot see is the thing the consumer-side design was rej
 The cost, stated plainly: an expired token means re-sending the producer yourself. Re-running it
 automatically is a later slice, and one that now has somewhere to live.
 
-**Auth helpers — dropped, not deferred.** Recorded so nobody rebuilds it because the roadmap once
-said to. Environments made it redundant, and a dedicated auth tab would now be actively *worse*:
+**Auth tab — built, reversing an earlier "dropped".** This entry used to say an auth tab would be
+*worse*, on two grounds, and the shape that was built answers both:
 
-- **Bearer and API keys** are `Authorization: Bearer {{token}}` with the token in `dev.local.json` —
-  per-environment and gitignored by construction. A Postman-style auth tab adds a mode with no new
-  capability, and it writes the credential into the *committed* request file, which is precisely the
-  leak the environment split exists to prevent.
-- **Basic** is the one genuine gap, and it points somewhere else. `core/src/curl.rs` has a tested
-  `base64` — now shared with the Postman importer, which lowers `basic` auth into the same header —
-  so *importing* `-u user:pass` works; authoring it from scratch doesn't, because nothing
-  in the UI can encode. But the encoded value belongs in a `.local` file, not in a request header —
-  so the useful thing is "hand me the credential to paste", not an auth tab. ~30 lines as a palette
-  command over the picker's fallback row, whenever it's wanted.
+- *"It writes the credential into the committed file."* It writes the **fields as typed** —
+  `{{user}}`/`{{pass}}` stay placeholders, resolved from `dev.local.json` at send time — and a
+  literal secret gets a note under the field saying so. The encoded header is **never stored**:
+  it is derived (`RequestSpec::auth_header`) for the wire, for copy-as-code and for a read-only
+  row on the Headers tab, which is how you see the token without it reaching disk.
+- *"Basic's encoded value belongs in a `.local` file."* Encoding happens *after* resolution, so the
+  password can live in `.local` as plain text and the header is still right — which a pasted
+  base64 string could never do across environments.
+
+  Three modes — none, Basic, Bearer — on every kind, since every kind sends headers through
+  `build_headers`. A typed, enabled `Authorization` row wins, and the derived row is struck through
+  to say so. Per request, not per folder: folder-level auth with an inherit default was discussed
+  and deferred, and `curl -u` / Postman `basic` still import as a header rather than into the tab.
 - **OAuth is not an auth helper.** Client-credentials flow is: send a token request, extract a value
   from the response, use it in the next request. That's **request chaining** below, and it's the
   motivating case for it.

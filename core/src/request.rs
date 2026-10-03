@@ -679,6 +679,62 @@ pub struct RequestSpec {
     /// What a run checks in the response body. Defaulted per field, for `captures`' reason.
     #[serde(default)]
     pub assertions: Vec<crate::assertion::Assertion>,
+    /// How the request authenticates. On the spine because every kind sends headers through
+    /// `build_headers`, so HTTP, GraphQL, a WebSocket handshake and gRPC metadata all get it.
+    #[serde(default)]
+    pub auth: Auth,
+}
+
+/// A request's authentication, **as typed** — `{{pass}}` stays a placeholder on disk.
+///
+/// The `Authorization` header it produces is *derived* (`RequestSpec::auth_header`) and never
+/// stored: storing it would put base64 — which is the password, readable — into a committed
+/// file, and it would have to be kept in step with these fields by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Auth {
+    #[default]
+    None,
+    Basic {
+        username: String,
+        password: String,
+    },
+    Bearer {
+        token: String,
+    },
+}
+
+impl Auth {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Auth::None)
+    }
+
+    /// The `Authorization` value these fields produce, or `None` when there is nothing to send.
+    ///
+    /// **A field still holding a placeholder is not encoded.** base64 of `alice:{{pass}}` would
+    /// hide the placeholder inside an opaque string, so the engine could no longer report it as
+    /// unresolved and a copied snippet would carry a credential that is silently wrong. Left
+    /// readable instead, the value still contains `{{pass}}`, which every existing check finds.
+    pub fn header_value(&self) -> Option<String> {
+        match self {
+            Auth::None => None,
+            Auth::Basic { username, password } => {
+                if username.is_empty() && password.is_empty() {
+                    return None;
+                }
+                let pair = format!("{username}:{password}");
+                Some(if pair.contains("{{") {
+                    format!("Basic <base64 of {pair}>")
+                } else {
+                    format!("Basic {}", crate::curl::base64(pair.as_bytes()))
+                })
+            }
+            Auth::Bearer { token } => {
+                let token = token.trim();
+                (!token.is_empty()).then(|| format!("Bearer {token}"))
+            }
+        }
+    }
 }
 
 impl Default for RequestSpec {
@@ -693,6 +749,7 @@ impl Default for RequestSpec {
             captures: Vec::new(),
             expect_status: None,
             assertions: Vec::new(),
+            auth: Auth::None,
         }
     }
 }
@@ -725,6 +782,8 @@ struct StoredSpec {
     expect_status: Option<u16>,
     #[serde(default)]
     assertions: Vec<crate::assertion::Assertion>,
+    #[serde(default)]
+    auth: Auth,
 
     /// Present in files written by this build and later.
     #[serde(default)]
@@ -783,6 +842,11 @@ struct StoredSpecRef<'a> {
     captures: &'a Vec<crate::capture::Capture>,
     expect_status: Option<u16>,
     assertions: &'a Vec<crate::assertion::Assertion>,
+    /// Last, and absent when there is none — so every request without auth still writes the
+    /// bytes it always did. An older Zuno ignores the field: it opens the request without auth,
+    /// and drops it only if that request is saved there.
+    #[serde(skip_serializing_if = "Auth::is_none")]
+    auth: &'a Auth,
 }
 
 impl Serialize for RequestSpec {
@@ -819,6 +883,7 @@ impl Serialize for RequestSpec {
             captures: &self.captures,
             expect_status: self.expect_status,
             assertions: &self.assertions,
+            auth: &self.auth,
         }
         .serialize(serializer)
     }
@@ -858,6 +923,7 @@ impl TryFrom<StoredSpec> for RequestSpec {
             captures: stored.captures,
             expect_status: stored.expect_status,
             assertions: stored.assertions,
+            auth: stored.auth,
         })
     }
 }
@@ -866,6 +932,35 @@ impl RequestSpec {
     /// Only the rows that will actually go on the wire.
     pub fn enabled_headers(&self) -> impl Iterator<Item = &Header> {
         self.headers.iter().filter(|header| header.enabled)
+    }
+
+    /// Whether an enabled, typed `Authorization` row is present — which wins over `auth`.
+    pub fn auth_overridden(&self) -> bool {
+        self.enabled_headers()
+            .any(|header| header.name.trim().eq_ignore_ascii_case("authorization"))
+    }
+
+    /// The header `auth` produces, unless a typed `Authorization` row overrides it.
+    ///
+    /// Typed wins because it is the more specific statement: someone who wrote the header by
+    /// hand on this request meant that one.
+    pub fn auth_header(&self) -> Option<Header> {
+        if self.auth_overridden() {
+            return None;
+        }
+        self.auth
+            .header_value()
+            .map(|value| Header::new("Authorization", value))
+    }
+
+    /// Every header that goes on the wire: the enabled rows, then the one `auth` produces.
+    ///
+    /// **The one list the engine, copy-as-code and grpcurl all read**, so a copied snippet
+    /// cannot leave out a header the request actually sends.
+    pub fn sent_headers(&self) -> Vec<Header> {
+        let mut headers: Vec<Header> = self.enabled_headers().cloned().collect();
+        headers.extend(self.auth_header());
+        headers
     }
 
     /// The HTTP half, when this is an HTTP request.
@@ -978,6 +1073,7 @@ impl RequestSpec {
             captures: Vec::new(),
             expect_status: None,
             assertions: Vec::new(),
+            auth: Auth::None,
         }
     }
 }
@@ -1456,6 +1552,57 @@ mod tests {
             "`kind` must not reach disk for an HTTP request — an older Zuno cannot read it, \
              and responds by discarding the file and overwriting it"
         );
+    }
+
+    /// Auth is written as the fields typed — placeholders intact — and **appended**, so
+    /// everything before it is the shape an older Zuno reads; and the encoded header is never
+    /// written at all, since base64 of a password is the password.
+    #[test]
+    fn auth_is_written_as_typed_after_everything_else_and_reads_back() {
+        let mut spec = RequestSpec::default();
+        spec.auth = Auth::Basic {
+            username: "{{user}}".into(),
+            password: "{{pass}}".into(),
+        };
+
+        let written = serde_json::to_string(&spec).expect("serialize");
+        assert!(
+            written.ends_with(
+                r#""assertions":[],"auth":{"type":"basic","username":"{{user}}","password":"{{pass}}"}}"#
+            ),
+            "{written}"
+        );
+        assert!(!written.contains("Basic "), "the derived header must not reach disk");
+
+        let read: RequestSpec = serde_json::from_str(&written).expect("parse");
+        assert_eq!(read.auth, spec.auth);
+    }
+
+    /// A typed `Authorization` row is the more specific statement and wins; a disabled one
+    /// does not count, or muting your own row would silently mute the Auth tab too.
+    #[test]
+    fn a_typed_authorization_row_overrides_auth_only_while_enabled() {
+        let mut spec = RequestSpec::default();
+        spec.auth = Auth::Bearer { token: "abc".into() };
+        spec.headers = vec![Header::disabled("authorization", "Bearer typed")];
+        let sent = spec.sent_headers();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].value, "Bearer abc");
+
+        spec.headers[0].enabled = true;
+        let sent = spec.sent_headers();
+        assert_eq!(sent.len(), 1, "never both");
+        assert_eq!(sent[0].value, "Bearer typed");
+    }
+
+    #[test]
+    fn empty_auth_fields_send_nothing() {
+        assert_eq!(Auth::Bearer { token: "  ".into() }.header_value(), None);
+        let basic = Auth::Basic {
+            username: String::new(),
+            password: String::new(),
+        };
+        assert_eq!(basic.header_value(), None);
     }
 
     /// And the round trip through those legacy bytes is lossless, so "readable by an older

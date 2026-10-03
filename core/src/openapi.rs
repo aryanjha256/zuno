@@ -225,9 +225,7 @@ fn operation_to_request(
                 query,
                 body,
             }),
-            captures: Vec::new(),
-            expect_status: None,
-            assertions: Vec::new(),
+            ..RequestSpec::default()
         },
     }
 }

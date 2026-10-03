@@ -18,7 +18,8 @@ use crate::actions::{
     ChooseSchemaFile, OpenGrpcMethod, ReflectSchema,
     BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCode, ImportCurl,
     OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
-    SendRequest, ShowAssertTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowParamsTab,
+    SendRequest, ShowAssertTab, ShowAuthTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab,
+    ShowParamsTab, TogglePasswordShown, UseBasicAuth, UseBearerAuth, UseNoAuth,
 };
 use crate::ui::{Icon, icon_button};
 use crate::kinds::{GraphQlEditor, KindEditor};
@@ -67,7 +68,9 @@ pub fn render(
                 RowKind::Header,
                 theme,
             ))
-            .child(rows_table(&view.headers, RowKind::Header, theme, window, cx)),
+            .child(rows_table(&view.headers, RowKind::Header, theme, window, cx))
+            .children(derived_auth_row(view, theme, cx)),
+        RequestTab::Auth => pane.child(auth_tab(view, theme, cx)),
         // **The kind's own tabs.** Which content a slot holds is the kind's business, not this
         // match's — that is what keeps adding gRPC to one module instead of to every site that
         // renders a tab.
@@ -280,6 +283,16 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
                 if slot == 0 { "request-tab-kind-0" } else { "request-tab-kind-1" },
                 view.kind.tab_label(slot),
                 if slot == 0 { Box::new(ShowParamsTab) } else { Box::new(ShowBodyTab) },
+            ),
+            // Names the choice when there is one, as `Headers 3` names a count: what a hidden tab
+            // costs is not knowing whether anything is in it.
+            RequestTab::Auth => (
+                "request-tab-auth",
+                SharedString::from(match view.auth_kind {
+                    crate::auth::AuthKind::None => "Auth".to_string(),
+                    kind => format!("Auth {}", kind.label()),
+                }),
+                Box::new(ShowAuthTab),
             ),
             RequestTab::Capture => (
                 "request-tab-capture",
@@ -786,6 +799,209 @@ fn editor_header(title: &str, note: &str, theme: &Theme) -> Div {
         .text_color(theme.text_muted)
         .child(title.to_string())
         .child(div().text_color(theme.text_faint).child(note.to_string()))
+}
+
+/// The Auth tab: the choice, then the fields that choice reads.
+///
+/// Only the fields are saved — the header they produce is shown on the Headers tab and built
+/// again at send time (`RequestSpec::auth_header`), so the file never holds the encoded value.
+fn auth_tab(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<RequestView>) -> Div {
+    use crate::auth::AuthKind;
+
+    let mut choices = div().flex().flex_row().items_center().gap_1();
+    for kind in AuthKind::ALL {
+        let (id, action): (&'static str, Box<dyn gpui::Action>) = match kind {
+            AuthKind::None => ("auth-none", Box::new(UseNoAuth)),
+            AuthKind::Basic => ("auth-basic", Box::new(UseBasicAuth)),
+            AuthKind::Bearer => ("auth-bearer", Box::new(UseBearerAuth)),
+        };
+        choices = choices.child(section_tab_boxed(
+            id,
+            SharedString::from(kind.label()),
+            view.auth_kind == kind,
+            action,
+            theme,
+            cx,
+        ));
+    }
+
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .px_3()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .text_xs()
+        .text_color(theme.text_muted)
+        .child("Auth")
+        .child(choices);
+
+    let field = |id: &'static str, label: &'static str, input: gpui::Entity<crate::input::TextInput>| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(80.))
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .debug_selector(move || id.to_string())
+                    .flex_1()
+                    .min_w(px(0.))
+                    .child(crate::ui::field_box(input, theme)),
+            )
+    };
+
+    // Option 1 of the design: saved as typed, and said so when what is typed is a real secret.
+    let literal_note = |text: &str, variable: &str| {
+        crate::auth::is_literal_secret(text).then(|| {
+            div()
+                .pl(px(88.))
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child(format!(
+                    "Saved in the request file as typed. Use {{{{{variable}}}}} to keep it in \
+                     a .local environment file instead."
+                ))
+        })
+    };
+
+    let body = div().flex().flex_col().gap_2().px_3().py_2();
+    let body = match view.auth_kind {
+        AuthKind::None => body.child(
+            div()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child("This request sends no Authorization header of its own."),
+        ),
+        AuthKind::Basic => {
+            let password = view.auth_password.read(cx).text().to_string();
+            let shown = !view.auth_password.read(cx).is_masked();
+            body.child(field("auth-username", "Username", view.auth_username.clone()))
+                .child(
+                    field("auth-password", "Password", view.auth_password.clone()).child(icon_button(
+                        "auth-password-shown",
+                        Icon::Eye,
+                        if shown { "Hide the password" } else { "Show the password" },
+                        TogglePasswordShown,
+                        theme,
+                    )),
+                )
+                .children(literal_note(&password, "password"))
+        }
+        AuthKind::Bearer => {
+            let token = view.auth_token.read(cx).text().to_string();
+            body.child(field("auth-token", "Token", view.auth_token.clone()))
+                .children(literal_note(&token, "token"))
+        }
+    };
+
+    // Said here as well as shown on the Headers tab: someone filling in these fields is the
+    // person who needs to know they will not be sent.
+    let overridden = view.auth_kind != AuthKind::None && typed_authorization(view, cx);
+    let body = body.children(overridden.then(|| {
+        div()
+            .text_xs()
+            .text_color(theme.text_muted)
+            .child("A typed Authorization header on the Headers tab is sent instead of this.")
+    }));
+
+    div().flex().flex_col().child(header).child(body)
+}
+
+/// Whether an enabled header row is named `Authorization` — `RequestSpec::auth_overridden`,
+/// asked of the rows directly so a repaint does not assemble the whole spec.
+fn typed_authorization(view: &RequestView, cx: &gpui::App) -> bool {
+    view.headers.iter().any(|row| {
+        row.enabled
+            && row
+                .name
+                .read(cx)
+                .text()
+                .trim()
+                .eq_ignore_ascii_case("authorization")
+    })
+}
+
+/// The `Authorization` header the Auth tab produces, under the typed rows — read-only.
+///
+/// **Shown, never stored.** Resolved with the selected environment the way a send resolves it
+/// (`auth::shown_header`), so `{{token}}` appears as the token. Click copies the value, since a
+/// row with no input cannot be selected. Struck through when a typed row overrides it, so the
+/// table never shows two headers as though both were sent.
+fn derived_auth_row(
+    view: &RequestView,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> Option<impl IntoElement + use<>> {
+    let value = crate::auth::shown_header(&view.auth(cx), cx)?;
+    let overridden = typed_authorization(view, cx);
+    let copied = value.clone();
+
+    let text = |s: String| {
+        let cell = div().child(s);
+        if overridden { cell.line_through() } else { cell }
+    };
+
+    Some(
+        div()
+            .id("hdr-auth-derived")
+            .debug_selector(|| "hdr-auth-derived".to_string())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .font_family(theme.mono.clone())
+            .text_xs()
+            .text_color(theme.text_faint)
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.bg_hover))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copied.clone()));
+                    view.status = Some("Copied the Authorization header".into());
+                    cx.notify();
+                }),
+            )
+            // Where the marker sits on a typed row: hollow, because this one cannot be toggled.
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(10.))
+                    .h(px(10.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.text_faint),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(160.))
+                    .child(text("Authorization".to_string())),
+            )
+            .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(text(value)))
+            .child(
+                div()
+                    .flex_none()
+                    .child(if overridden { "overridden" } else { "from Auth" }),
+            ),
+    )
 }
 
 fn section_header(title: &str, detail: SharedString, kind: RowKind, theme: &Theme) -> Div {

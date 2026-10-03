@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     ShowResponseTrailers,
     ShowResponseTiming, ToggleHtmlView,
@@ -517,6 +517,7 @@ impl Workspace {
         // the panel opens empty and fills in, the same bargain the picker's scan makes.
         workspace.refresh_tree(cx);
         workspace.reread_baselines(cx);
+        crate::auth::refresh(workspace.environment.clone(), cx);
         workspace
     }
 
@@ -622,6 +623,7 @@ impl Workspace {
             .collect();
         self.environment = session.environment;
         self.globals_active = globals_has_values(cx);
+        crate::auth::refresh(self.environment.clone(), cx);
         self.panel_visible = session.collection_panel;
         self.panel_width = session.panel_width;
         // Switching workspaces is not a toggle, so there is nothing to reveal: a slide here
@@ -2634,6 +2636,7 @@ impl Workspace {
         let Some(state) = self.environment_panel.take() else { return };
         state.panel.update(cx, |panel, cx| panel.commit(cx));
         self.globals_active = globals_has_values(cx);
+        crate::auth::refresh(self.environment.clone(), cx);
         if let Some(focus) = state.panel.read(cx).restore_focus() {
             window.focus(&focus);
         }
@@ -2993,6 +2996,7 @@ impl Workspace {
         // Persisted here for `Target::Environment`'s reason: choosing an environment and then
         // closing the window should not forget which one.
         crate::session::save(&self.session(cx), cx);
+        crate::auth::refresh(self.environment.clone(), cx);
         // An import can bring secrets across, and they must not be committable before the next
         // send happens to notice.
         self.protect_secrets(cx);
@@ -3061,6 +3065,7 @@ impl Workspace {
 
         // A file read, so it belongs at a state change: an import is one.
         self.globals_active = globals_has_values(cx);
+        crate::auth::refresh(self.environment.clone(), cx);
         self.import = None;
         self.set_status(&message, cx);
         cx.notify();
@@ -3495,20 +3500,7 @@ impl Workspace {
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
             return Resolver::default();
         };
-
-        let globals = environment::load(&root, environment::GLOBALS).ok();
-        let active = self
-            .environment
-            .as_deref()
-            .and_then(|name| match environment::load(&root, name) {
-                Ok(env) => Some(env),
-                Err(error) => {
-                    eprintln!("[zuno] {error}");
-                    None
-                }
-            });
-
-        Resolver::new(globals.as_ref(), active.as_ref())
+        crate::auth::load(&root, self.environment.as_deref())
     }
 
     /// Make sure the collection ignores `*.local.json`, if the selected environment has any
@@ -3761,6 +3753,7 @@ impl Workspace {
                 // and then closing the window should not silently forget which one you chose.
                 crate::session::save(&self.session(cx), cx);
                 self.protect_secrets(cx);
+                crate::auth::refresh(self.environment.clone(), cx);
                 cx.notify();
             }
             picker::Target::Proxy(mode) => {
@@ -4807,6 +4800,41 @@ impl Workspace {
 
     fn show_headers_tab(&mut self, _: &ShowHeadersTab, _: &mut Window, cx: &mut Context<Self>) {
         self.show_request_tab(RequestTab::Headers, cx);
+    }
+
+    fn show_auth_tab(&mut self, _: &ShowAuthTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_request_tab(RequestTab::Auth, cx);
+    }
+
+    /// Choose the active request's auth, revealing the tab so the fields it needs are in view.
+    fn use_auth(&mut self, kind: crate::auth::AuthKind, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        view.update(cx, |view, cx| {
+            view.set_auth_kind(kind, cx);
+            view.show_request_tab(RequestTab::Auth, cx);
+        });
+    }
+
+    fn use_no_auth(&mut self, _: &UseNoAuth, _: &mut Window, cx: &mut Context<Self>) {
+        self.use_auth(crate::auth::AuthKind::None, cx);
+    }
+
+    fn use_basic_auth(&mut self, _: &UseBasicAuth, _: &mut Window, cx: &mut Context<Self>) {
+        self.use_auth(crate::auth::AuthKind::Basic, cx);
+    }
+
+    fn use_bearer_auth(&mut self, _: &UseBearerAuth, _: &mut Window, cx: &mut Context<Self>) {
+        self.use_auth(crate::auth::AuthKind::Bearer, cx);
+    }
+
+    fn toggle_password_shown(
+        &mut self,
+        _: &TogglePasswordShown,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        view.update(cx, |view, cx| view.toggle_password_shown(cx));
     }
 
     fn show_params_tab(&mut self, _: &ShowParamsTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -7542,6 +7570,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_request_tab))
             .on_action(cx.listener(Self::prev_request_tab))
             .on_action(cx.listener(Self::show_headers_tab))
+            .on_action(cx.listener(Self::show_auth_tab))
+            .on_action(cx.listener(Self::use_no_auth))
+            .on_action(cx.listener(Self::use_basic_auth))
+            .on_action(cx.listener(Self::use_bearer_auth))
+            .on_action(cx.listener(Self::toggle_password_shown))
             .on_action(cx.listener(Self::show_params_tab))
             .on_action(cx.listener(Self::show_body_tab))
             .size_full()

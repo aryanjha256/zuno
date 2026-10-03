@@ -358,6 +358,8 @@ impl CaptureRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestTab {
     Headers,
+    /// How the request authenticates. On every kind, since every kind sends headers.
+    Auth,
     /// One of the **active kind's own** tabs, by index into `KindEditor::tabs()`.
     ///
     /// **The strip is composed, not fixed.** HTTP contributes Params and Body; GraphQL
@@ -390,7 +392,7 @@ impl RequestTab {
     /// That order happens to reproduce HTTP's original `Headers, Params, Body, Capture, Assert`
     /// exactly, so the composed strip costs existing muscle memory nothing.
     pub fn for_kind(kind: &KindEditor) -> Vec<RequestTab> {
-        let mut tabs = vec![RequestTab::Headers];
+        let mut tabs = vec![RequestTab::Headers, RequestTab::Auth];
         tabs.extend((0..kind.tabs().len() as u8).map(RequestTab::Kind));
         // Not unconditional: see `KindEditor::checks_a_response`. A socket has no single
         // response to capture from or assert on, and drawing the tabs anyway was two controls
@@ -572,6 +574,12 @@ pub struct RequestView {
     /// unparseable box simply means "this request states no expectation".
     pub expect_status: Entity<TextInput>,
     pub settings: RequestSettings,
+    /// Which auth the Auth tab has selected. The fields below are all kept whichever it is, so
+    /// switching Basic → Bearer → Basic loses nothing — `set_body_type`'s rule.
+    pub auth_kind: crate::auth::AuthKind,
+    pub auth_username: Entity<TextInput>,
+    pub auth_password: Entity<TextInput>,
+    pub auth_token: Entity<TextInput>,
 
     pub response: Option<ResponseData>,
     /// How the current response differs from the one before it. `None` on the first run.
@@ -700,6 +708,10 @@ impl RequestView {
             capture_target: None,
             capture_task: None,
             settings: RequestSettings::default(),
+            auth_kind: crate::auth::AuthKind::None,
+            auth_username: cx.new(|cx| TextInput::new("", "", "AuthField", cx)),
+            auth_password: cx.new(|cx| TextInput::new("", "", "AuthField", cx)),
+            auth_token: cx.new(|cx| TextInput::new("", "", "AuthField", cx)),
             response: None,
             diff: None,
             body_diff: None,
@@ -858,6 +870,7 @@ impl RequestView {
             TextInput::new(text, "200", "ExpectStatus", cx)
         });
         self.settings = spec.settings;
+        self.load_auth(&spec.auth, cx);
 
         // A different request has no relationship to the last one's response.
         self.response = None;
@@ -1064,7 +1077,72 @@ impl RequestView {
                 })
                 .collect(),
             settings: self.settings.clone(),
+            auth: self.auth(cx),
         }
+    }
+
+    /// The auth the tab describes, as typed — placeholders and all.
+    pub fn auth(&self, cx: &App) -> zuno_core::Auth {
+        let text = |input: &Entity<TextInput>| input.read(cx).text().to_string();
+        match self.auth_kind {
+            crate::auth::AuthKind::None => zuno_core::Auth::None,
+            crate::auth::AuthKind::Basic => zuno_core::Auth::Basic {
+                username: text(&self.auth_username),
+                password: text(&self.auth_password),
+            },
+            crate::auth::AuthKind::Bearer => zuno_core::Auth::Bearer {
+                token: text(&self.auth_token),
+            },
+        }
+    }
+
+    /// Fill the Auth tab from a request. The fields the request does not use are emptied rather
+    /// than left from the previous one, so a loaded request never carries another's password.
+    fn load_auth(&mut self, auth: &zuno_core::Auth, cx: &mut Context<Self>) {
+        let (username, password, token) = match auth {
+            zuno_core::Auth::None => ("", "", ""),
+            zuno_core::Auth::Basic { username, password } => {
+                (username.as_str(), password.as_str(), "")
+            }
+            zuno_core::Auth::Bearer { token } => ("", "", token.as_str()),
+        };
+        self.auth_kind = crate::auth::AuthKind::of(auth);
+        self.auth_username = cx.new(|cx| TextInput::new(username.to_string(), "username", "AuthField", cx));
+        // Masked from the start: the password is what should not be on a shared screen.
+        self.auth_password = cx.new(|cx| {
+            let mut input = TextInput::new(password.to_string(), "password", "AuthField", cx);
+            input.set_masked(true, cx);
+            input
+        });
+        self.auth_token = cx.new(|cx| TextInput::new(token.to_string(), "token", "AuthField", cx));
+    }
+
+    /// `auth(cx) == *base`, without building the `Auth` — `is_dirty` runs every frame.
+    fn auth_matches(&self, base: &zuno_core::Auth, cx: &App) -> bool {
+        let text = |input: &Entity<TextInput>| input.read(cx).text();
+        match (self.auth_kind, base) {
+            (crate::auth::AuthKind::None, zuno_core::Auth::None) => true,
+            (crate::auth::AuthKind::Basic, zuno_core::Auth::Basic { username, password }) => {
+                text(&self.auth_username) == username && text(&self.auth_password) == password
+            }
+            (crate::auth::AuthKind::Bearer, zuno_core::Auth::Bearer { token }) => {
+                text(&self.auth_token) == token
+            }
+            _ => false,
+        }
+    }
+
+    pub fn set_auth_kind(&mut self, kind: crate::auth::AuthKind, cx: &mut Context<Self>) {
+        self.auth_kind = kind;
+        cx.notify();
+    }
+
+    pub fn toggle_password_shown(&mut self, cx: &mut Context<Self>) {
+        self.auth_password.update(cx, |input, cx| {
+            let masked = input.is_masked();
+            input.set_masked(!masked, cx);
+        });
+        cx.notify();
     }
 
     /// Whether this buffer differs from the file it came from.
@@ -1092,6 +1170,7 @@ impl RequestView {
             captures,
             expect_status,
             assertions,
+            auth,
         } = &self.baseline;
 
         // Destructured with no `..` for the same reason the spec is: a field added to the
@@ -1103,7 +1182,8 @@ impl RequestView {
             || !rows_match(&self.headers, headers, |h| (h.enabled, &h.name, &h.value), cx)
             || !self.captures_match(captures, cx)
             || self.expect_status_value(cx) != *expect_status
-            || !self.assertions_match(assertions, cx);
+            || !self.assertions_match(assertions, cx)
+            || !self.auth_matches(auth, cx);
 
         if spine_changed {
             return true;
@@ -2238,6 +2318,11 @@ impl RequestView {
 
         self.capture_task = Some(cx.spawn(async move |this, cx| {
             let outcome = work.await;
+            // A capture is the most common way a `{{token}}` changes value, so the auth header
+            // on screen has to follow it.
+            if outcome.is_ok() {
+                let _ = cx.update(crate::auth::reload);
+            }
             let _ = this.update(cx, |this, cx| {
                 this.status = Some(SharedString::from(match outcome {
                     Err(error) => error,

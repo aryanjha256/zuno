@@ -298,7 +298,9 @@ impl Resolver {
             // rather than carry a value — so a token would not be typed into one.
             RequestKind::Grpc(grpc) => scan(&grpc.message),
         }
-        for header in spec.enabled_headers() {
+        // `sent_headers`, so the auth header is scanned too: an unresolved field leaves it
+        // unencoded, with the placeholder still readable in it.
+        for header in &spec.sent_headers() {
             scan(&header.name);
             scan(&header.value);
         }
@@ -326,6 +328,24 @@ impl Resolver {
         }
 
         found
+    }
+
+    /// `auth` with its fields substituted.
+    ///
+    /// Resolved *before* encoding, which is the reason auth is fields and not a header: the
+    /// base64 of `{{user}}:{{pass}}` is a credential nobody has. Its own method because the
+    /// request pane shows the header this produces, and must produce it the way a send does.
+    pub fn resolve_auth(&self, auth: &crate::Auth) -> crate::Auth {
+        match auth {
+            crate::Auth::None => crate::Auth::None,
+            crate::Auth::Basic { username, password } => crate::Auth::Basic {
+                username: self.resolve(username).into_owned(),
+                password: self.resolve(password).into_owned(),
+            },
+            crate::Auth::Bearer { token } => crate::Auth::Bearer {
+                token: self.resolve(token).into_owned(),
+            },
+        }
     }
 
     /// A copy of `spec` with variables substituted, ready to send.
@@ -393,6 +413,8 @@ impl Resolver {
             header.name = name;
             header.value = value;
         }
+
+        resolved.auth = self.resolve_auth(&spec.auth);
 
         // Exhaustive with no catch-all, for the reason `RequestView::load` is: a new `Body`
         // variant must fail the build until someone decides whether a variable belongs in it.
@@ -904,6 +926,30 @@ mod tests {
             resolver.resolve("no placeholders here"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    /// Basic auth is resolved *before* it is encoded — the encoding of `alice:{{pass}}` is a
+    /// credential nobody has — and a field left unresolved stays readable, so the engine still
+    /// names the missing variable instead of sending opaque base64.
+    #[test]
+    fn auth_is_resolved_before_it_is_encoded() {
+        let spec = RequestSpec {
+            auth: crate::Auth::Basic {
+                username: "{{user}}".into(),
+                password: "{{pass}}".into(),
+            },
+            ..RequestSpec::default()
+        };
+
+        let resolver = Resolver::new(None, Some(&env("dev", &[("user", "alice"), ("pass", "s3cret")])));
+        let sent = resolver.apply(&spec).sent_headers();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].name, "Authorization");
+        assert_eq!(sent[0].value, "Basic YWxpY2U6czNjcmV0", "base64 of alice:s3cret");
+
+        let unresolved = Resolver::new(None, Some(&env("dev", &[("user", "alice")])));
+        let sent = unresolved.apply(&spec).sent_headers();
+        assert!(sent[0].value.contains("{{pass}}"), "{:?}", sent[0].value);
     }
 
     #[test]

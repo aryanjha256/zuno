@@ -5480,12 +5480,16 @@ async fn alt_q_cycles_the_request_tabs_both_ways(cx: &mut TestAppContext) {
     cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers, "forward wraps past the end");
     cx.press("alt-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Auth);
+    cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(0));
     cx.press("alt-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(1));
 
     cx.press("alt-shift-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Kind(0), "and back the other way");
+    cx.press("alt-shift-q");
+    assert_eq!(request_tab(&view, &mut cx), RequestTab::Auth);
     cx.press("alt-shift-q");
     assert_eq!(request_tab(&view, &mut cx), RequestTab::Headers);
 }
@@ -13911,6 +13915,50 @@ async fn a_header_value_is_suggested_for_its_name_and_lands_in_the_value(cx: &mu
     let header = spec_of(&view, &mut cx).headers.last().cloned().expect("the row");
     assert_eq!(header.name, "Content-Type", "the name must be left alone");
     assert_eq!(header.value, "application/x-www-form-urlencoded");
+}
+
+/// Basic auth typed on the Auth tab reaches the request as fields, and the header it produces is
+/// shown on the Headers tab without becoming a saved row — the whole bargain of the design.
+#[gpui::test]
+async fn basic_auth_typed_on_the_tab_is_sent_but_never_saved_as_a_header(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+
+    cx.dispatch_action(crate::actions::UseBasicAuth);
+    cx.run_until_parked();
+    let username = cx.debug_bounds("auth-username").expect("the username field");
+    cx.simulate_click(username.center(), gpui::Modifiers::default());
+    cx.simulate_input("alice");
+    let password = cx.debug_bounds("auth-password").expect("the password field");
+    cx.simulate_click(password.center(), gpui::Modifiers::default());
+    cx.simulate_input("s3cret");
+    cx.run_until_parked();
+
+    let spec = spec_of(&view, &mut cx);
+    assert_eq!(
+        spec.auth,
+        zuno_core::Auth::Basic {
+            username: "alice".into(),
+            password: "s3cret".into()
+        }
+    );
+    // The sample request carries its own *disabled* `Authorization: Bearer {{token}}` row, so
+    // the check is on the derived value rather than on the name.
+    assert!(
+        !spec.headers.iter().any(|h| h.value.starts_with("Basic")),
+        "the derived header must not become a saved row: {:?}",
+        spec.headers
+    );
+    assert_eq!(
+        spec.sent_headers().last().map(|h| h.value.clone()),
+        Some("Basic YWxpY2U6czNjcmV0".to_string())
+    );
+
+    cx.dispatch_action(crate::actions::ShowHeadersTab);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("hdr-auth-derived").is_some(),
+        "the Headers tab shows the header the Auth tab produces"
+    );
 }
 
 /// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**

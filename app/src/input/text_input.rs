@@ -110,6 +110,12 @@ pub struct TextInput {
     /// it feel like an input rather than a viewport you have to drive.
     scroll_offset: Pixels,
     is_selecting: bool,
+    /// Draw `*` in place of the content — a password field.
+    ///
+    /// **One `*` per byte, not per character**, so every byte offset into the display text is
+    /// the same offset into the content and the cursor, selection and click mapping need no
+    /// translation. The cost is that a multi-byte character shows as two to four stars.
+    masked: bool,
 }
 
 impl TextInput {
@@ -139,7 +145,19 @@ impl TextInput {
             last_bounds: None,
             scroll_offset: px(0.),
             is_selecting: false,
+            masked: false,
         }
+    }
+
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        if self.masked != masked {
+            self.masked = masked;
+            cx.notify();
+        }
+    }
+
+    pub fn is_masked(&self) -> bool {
+        self.masked
     }
 
     /// Where this input last painted, in **window** coordinates.
@@ -338,7 +356,9 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        // A hidden password is not copied out from under its mask; show it first. Cut still
+        // deletes — it just does not hand the text to the clipboard either.
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -347,9 +367,11 @@ impl TextInput {
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+            if !self.masked {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    self.content[self.selected_range.clone()].to_string(),
+                ));
+            }
             self.replace_text_in_range(None, "", window, cx);
         }
     }
@@ -675,7 +697,9 @@ impl EntityInputHandler for TextInput {
         // panics whenever the placeholder is showing, since an empty input lays out
         // placeholder text. Bailing out is the correct response: there is no
         // character under the point.
-        if last_layout.text != self.content {
+        // By length rather than by text, so a masked field — laid out as `*`s of the same byte
+        // length — still answers.
+        if self.content.is_empty() || last_layout.text.len() != self.content.len() {
             return None;
         }
 
@@ -806,6 +830,8 @@ impl Element for TextElement {
 
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), theme.text_muted)
+        } else if input.masked {
+            (SharedString::from("*".repeat(content.len())), style.color)
         } else {
             (content, style.color)
         };

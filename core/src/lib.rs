@@ -54,7 +54,7 @@ pub use highlight::{Token, TokenKind};
 pub use json::{JsonError, JsonOutline, Row, RowKind, ScalarKind, Span};
 pub use lines::LineIndex;
 pub use request::{
-    Body, FormField, GraphQlRequest, Header, HttpRequest, Method, MultipartField, MultipartValue,
+    Auth, Body, FormField, GraphQlRequest, Header, HttpRequest, Method, MultipartField, MultipartValue,
     GraphQlTransport, QueryParam, RawKind, RequestId, RequestKind, RequestSettings, RequestSpec,
     SavedMessage, WebSocketRequest, label_for,
 };

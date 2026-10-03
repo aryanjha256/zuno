@@ -197,8 +197,14 @@ actions!(
         NextRequestTab,
         PrevRequestTab,
         ShowHeadersTab,
+        ShowAuthTab,
         ShowParamsTab,
         ShowBodyTab,
+        // The Auth tab's choice, one action per option so the palette can offer each.
+        UseNoAuth,
+        UseBasicAuth,
+        UseBearerAuth,
+        TogglePasswordShown,
         // Response sections. Three tabs now, so the same rule the request pane's comment
         // above states applies here — `ToggleResponseView` was renamed rather than kept,
         // because an action named "toggle" that cycles three ways is the stale-confident-name

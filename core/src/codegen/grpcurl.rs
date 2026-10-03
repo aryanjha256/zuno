@@ -56,7 +56,7 @@ pub(super) fn render(spec: &RequestSpec, collection: Option<&Path>, shell: Shell
         }
     }
 
-    for header in spec.enabled_headers() {
+    for header in &spec.sent_headers() {
         if header.name.trim().is_empty() {
             continue;
         }

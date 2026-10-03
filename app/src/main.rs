@@ -12,6 +12,7 @@
 mod timing;
 
 mod actions;
+mod auth;
 mod body_view;
 mod cert_panel;
 mod chrome;

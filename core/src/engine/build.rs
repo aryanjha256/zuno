@@ -169,7 +169,7 @@ pub fn build_method(method: &Method) -> Result<http::Method, EngineError> {
 pub fn build_headers(spec: &RequestSpec) -> Result<HeaderMap, EngineError> {
     let mut headers = HeaderMap::new();
 
-    for header in spec.enabled_headers() {
+    for header in &spec.sent_headers() {
         let name = header.name.trim();
         if name.is_empty() {
             continue;
@@ -677,6 +677,25 @@ mod tests {
                 location: "header Authorization".to_string(),
             })
         );
+    }
+
+    /// Auth reaches every kind through `build_headers` — gRPC metadata included — and an
+    /// unresolved field is refused like any header, rather than sent as opaque base64.
+    #[test]
+    fn auth_reaches_grpc_metadata_and_an_unresolved_field_is_refused() {
+        let mut spec = RequestSpec::default();
+        spec.auth = crate::Auth::Bearer { token: "abc".into() };
+        let headers = grpc_headers(&spec).expect("headers");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer abc");
+
+        spec.auth = crate::Auth::Basic {
+            username: "alice".into(),
+            password: "{{pass}}".into(),
+        };
+        assert!(matches!(
+            build_headers(&spec),
+            Err(EngineError::UnresolvedVariable { name, .. }) if name == "pass"
+        ));
     }
 
     #[test]
