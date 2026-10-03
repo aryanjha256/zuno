@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     ShowResponseTrailers,
     ShowResponseTiming, ToggleHtmlView,
@@ -4815,6 +4815,38 @@ impl Workspace {
         });
     }
 
+    /// The Auth tab's dropdown, at the chip that opened it, with the current choice ticked.
+    fn open_auth_menu(&mut self, _: &OpenAuthMenu, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        // Consumed either way, for `open_row_menu`'s reason.
+        let at = view.update(cx, |view, _| view.take_auth_menu_anchor());
+        if self.modal_open() {
+            return;
+        }
+        let Some(at) = at else { return };
+
+        use crate::auth::AuthKind;
+        use context_menu::{MenuCommand, MenuItem, MenuRow};
+        let current = view.read(cx).auth_kind;
+        let rows = AuthKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let action: Box<dyn gpui::Action> = match kind {
+                    AuthKind::None => Box::new(UseNoAuth),
+                    AuthKind::Basic => Box::new(UseBasicAuth),
+                    AuthKind::Bearer => Box::new(UseBearerAuth),
+                };
+                MenuRow::Item(MenuItem {
+                    label: SharedString::from(kind.label()),
+                    detail: SharedString::from(if kind == current { "✓" } else { "" }),
+                    command: MenuCommand::Dispatch(action),
+                })
+            })
+            .collect();
+        let restore = window.focused(cx);
+        self.show_menu(rows, at, restore, window, cx);
+    }
+
     fn use_no_auth(&mut self, _: &UseNoAuth, _: &mut Window, cx: &mut Context<Self>) {
         self.use_auth(crate::auth::AuthKind::None, cx);
     }
@@ -7571,6 +7603,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_request_tab))
             .on_action(cx.listener(Self::show_headers_tab))
             .on_action(cx.listener(Self::show_auth_tab))
+            .on_action(cx.listener(Self::open_auth_menu))
             .on_action(cx.listener(Self::use_no_auth))
             .on_action(cx.listener(Self::use_basic_auth))
             .on_action(cx.listener(Self::use_bearer_auth))

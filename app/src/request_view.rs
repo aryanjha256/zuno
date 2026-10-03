@@ -666,6 +666,8 @@ pub struct RequestView {
     /// needed when a item is finally chosen — a dismissed menu just leaves it to be overwritten
     /// by the next chip click, and nothing else can dispatch those two actions.
     part_kind_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    /// Where the Auth tab's chip was clicked, consumed by `OpenAuthMenu`.
+    auth_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     /// Holding the diff task is what keeps it alive, and replacing it is what makes a
     /// superseded diff harmless — see `diff_against`.
     diff_task: Option<Task<()>>,
@@ -731,6 +733,7 @@ impl RequestView {
             headers_scroll: gpui::ScrollHandle::new(),
             menu_anchor: None,
             part_kind_menu: None,
+            auth_menu_anchor: None,
             diff_task: None,
             inflight: None,
             session: None,
@@ -1130,6 +1133,16 @@ impl RequestView {
             }
             _ => false,
         }
+    }
+
+    /// Park where the Auth chip was clicked, for `OpenAuthMenu` — an action carries no payload;
+    /// see `menu_anchor`.
+    pub fn set_auth_menu_anchor(&mut self, at: gpui::Point<gpui::Pixels>) {
+        self.auth_menu_anchor = Some(at);
+    }
+
+    pub fn take_auth_menu_anchor(&mut self) -> Option<gpui::Point<gpui::Pixels>> {
+        self.auth_menu_anchor.take()
     }
 
     pub fn set_auth_kind(&mut self, kind: crate::auth::AuthKind, cx: &mut Context<Self>) {

@@ -13961,6 +13961,32 @@ async fn basic_auth_typed_on_the_tab_is_sent_but_never_saved_as_a_header(cx: &mu
     );
 }
 
+/// The Auth chip is a dropdown: clicking it opens the menu, and choosing a row changes the auth.
+/// A chip that dispatched nothing would look exactly the same, which is why this is a test.
+#[gpui::test]
+async fn the_auth_chip_opens_a_menu_that_chooses_the_auth(cx: &mut TestAppContext) {
+    let (window, view, mut cx) = boot(cx, None, None);
+
+    cx.dispatch_action(crate::actions::ShowAuthTab);
+    cx.run_until_parked();
+    let chip = cx.debug_bounds("auth-kind").expect("the auth chip");
+    cx.simulate_click(chip.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        window.update(&mut cx, |w, _, _| w.menu_open()).expect("window"),
+        "clicking the chip opens the menu"
+    );
+
+    // Rows are No auth, Basic, Bearer, with the first selected.
+    cx.press("down");
+    cx.press("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(&cx, |view, _| view.auth_kind),
+        crate::auth::AuthKind::Basic
+    );
+}
+
 /// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**
 /// whenever a header name has focus. Without the forward in `suggest_dismiss`, putting the
 /// cursor in a header cell would quietly disarm cancelling a request — invisible, and only

@@ -204,6 +204,7 @@ actions!(
         UseNoAuth,
         UseBasicAuth,
         UseBearerAuth,
+        OpenAuthMenu,
         TogglePasswordShown,
         // Response sections. Three tabs now, so the same rule the request pane's comment
         // above states applies here — `ToggleResponseView` was renamed rather than kept,

@@ -19,7 +19,7 @@ use crate::actions::{
     BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCode, ImportCurl,
     OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
     SendRequest, ShowAssertTab, ShowAuthTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab,
-    ShowParamsTab, TogglePasswordShown, UseBasicAuth, UseBearerAuth, UseNoAuth,
+    ShowParamsTab, TogglePasswordShown,
 };
 use crate::ui::{Icon, icon_button};
 use crate::kinds::{GraphQlEditor, KindEditor};
@@ -808,22 +808,38 @@ fn editor_header(title: &str, note: &str, theme: &Theme) -> Div {
 fn auth_tab(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<RequestView>) -> Div {
     use crate::auth::AuthKind;
 
-    let mut choices = div().flex().flex_row().items_center().gap_1();
-    for kind in AuthKind::ALL {
-        let (id, action): (&'static str, Box<dyn gpui::Action>) = match kind {
-            AuthKind::None => ("auth-none", Box::new(UseNoAuth)),
-            AuthKind::Basic => ("auth-basic", Box::new(UseBasicAuth)),
-            AuthKind::Bearer => ("auth-bearer", Box::new(UseBearerAuth)),
-        };
-        choices = choices.child(section_tab_boxed(
-            id,
-            SharedString::from(kind.label()),
-            view.auth_kind == kind,
-            action,
-            theme,
-            cx,
+    // A dropdown, shaped like the multipart type chip: the word says what is in force, the
+    // chevron says it opens. The click position is parked because an action carries no payload.
+    let choices = div()
+        .id("auth-kind")
+        .debug_selector(|| "auth-kind".to_string())
+        .group(crate::ui::ICON_GROUP)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .text_color(theme.text)
+        .hover(|style| style.bg(theme.bg_hover))
+        .tooltip(|_, cx| crate::ui::Tooltip::text("Choose how this request authenticates", cx))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|view, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                view.set_auth_menu_anchor(event.position);
+                window.dispatch_action(Box::new(crate::actions::OpenAuthMenu), cx);
+            }),
+        )
+        .child(view.auth_kind.label())
+        .child(crate::ui::glyph(
+            Icon::ChevronDown,
+            theme.text_muted,
+            theme.text,
+            crate::ui::GLYPH_INLINE,
         ));
-    }
 
     let header = div()
         .flex()
@@ -890,9 +906,10 @@ fn auth_tab(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<RequestVie
             let shown = !view.auth_password.read(cx).is_masked();
             body.child(field("auth-username", "Username", view.auth_username.clone()))
                 .child(
+                    // The icon names what a click does: an open eye reveals, a struck one hides.
                     field("auth-password", "Password", view.auth_password.clone()).child(icon_button(
                         "auth-password-shown",
-                        Icon::Eye,
+                        if shown { Icon::EyeOff } else { Icon::Eye },
                         if shown { "Hide the password" } else { "Show the password" },
                         TogglePasswordShown,
                         theme,
