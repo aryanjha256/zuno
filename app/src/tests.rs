@@ -12052,7 +12052,7 @@ fn the_badge_separates_nothing_selected_from_nothing_substituting() {
     // layer whether or not an environment is chosen, so with values in it a `{{var}}` still
     // resolves and the badge has to say so.
     assert_eq!(environment_badge(None, true).0.as_ref(), "globals");
-    assert_eq!(environment_badge(None, false).0.as_ref(), "none");
+    assert_eq!(environment_badge(None, false).0.as_ref(), "No environment");
 
     // The tint follows the same distinction, so the two read differently at a glance and not
     // only on a careful read of the word.
@@ -12093,7 +12093,7 @@ async fn writing_a_global_from_the_editor_updates_the_badge(cx: &mut TestAppCont
             .update(cx, |workspace, _, _| workspace.badge_for_test())
             .expect("window")
     };
-    assert_eq!(badge(&mut cx).as_ref(), "none", "nothing to substitute yet");
+    assert_eq!(badge(&mut cx).as_ref(), "No environment", "nothing to substitute yet");
 
     // `globals` is what the editor opens on when no environment is selected.
     cx.press("ctrl-alt-e");

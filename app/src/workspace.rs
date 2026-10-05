@@ -8601,7 +8601,7 @@ pub fn environment_badge(environment: Option<&str>, globals_active: bool) -> (Sh
     match (environment, globals_active) {
         (Some(name), _) => (SharedString::from(name.to_string()), true),
         (None, true) => (SharedString::from(environment::GLOBALS), true),
-        (None, false) => (SharedString::from("none"), false),
+        (None, false) => (SharedString::from("No environment"), false),
     }
 }
 
