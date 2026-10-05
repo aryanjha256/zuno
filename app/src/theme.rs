@@ -84,7 +84,7 @@ pub struct Theme {
     /// gone now that M1.3 shipped and every field is used.
     pub syntax: SyntaxTheme,
 
-    /// Segment colours for the response pane's Timing tab.
+    /// Segment colours for the timeline in the response pane's Network tab.
     ///
     /// Its own group rather than four loose fields, following `SyntaxTheme`'s precedent: one
     /// module reads them and they are decided together, because what matters is that the four

@@ -159,6 +159,8 @@ mod tests {
                 declared: Some(body.len() as u64),
                 decoded: body.len() as u64,
             },
+            sent: None,
+            network: None,
         }
     }
 

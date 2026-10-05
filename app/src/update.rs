@@ -146,6 +146,8 @@ mod tests {
                 total: std::time::Duration::ZERO,
             },
             size: SizeInfo::default(),
+            sent: None,
+            network: None,
         }
     }
 

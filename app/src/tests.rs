@@ -5576,8 +5576,8 @@ async fn the_response_pane_opens_on_the_body_and_alt_r_cycles(cx: &mut TestAppCo
     cx.press("alt-r");
     assert_eq!(
         response_view(&view, &mut cx),
-        ResponseView::Timing,
-        "the Timing tab is the third stop, not a replacement for one of the first two"
+        ResponseView::Network,
+        "the Network tab is the third stop, not a replacement for one of the first two"
     );
 
     cx.press("alt-r");
@@ -5651,7 +5651,7 @@ async fn trailers_are_reachable_only_where_they_are_drawn(cx: &mut TestAppContex
     cx.press("alt-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Trailers);
     cx.press("alt-r");
-    assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Network);
     cx.press("alt-shift-r");
     assert_eq!(response_view(&view, &mut cx), ResponseView::Trailers);
 
@@ -6308,13 +6308,13 @@ async fn clicking_the_headers_tab_switches_the_response_view(cx: &mut TestAppCon
     assert_eq!(response_view(&view, &mut cx), ResponseView::Body);
 
     // The discriminating half: two steps away, so cycling cannot fake it.
-    let timing_tab = cx
-        .debug_bounds("response-tab-timing")
-        .expect("the Timing tab should be painted once a response has landed");
-    cx.simulate_click(timing_tab.center(), gpui::Modifiers::default());
+    let network_tab = cx
+        .debug_bounds("response-tab-network")
+        .expect("the Network tab should be painted once a response has landed");
+    cx.simulate_click(network_tab.center(), gpui::Modifiers::default());
     assert_eq!(
         response_view(&view, &mut cx),
-        ResponseView::Timing,
+        ResponseView::Network,
         "clicking a tab two steps away must land on it, not one step along the cycle"
     );
 }
@@ -6375,7 +6375,7 @@ async fn the_timing_tab_draws_a_row_for_each_phase(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     cx.press("alt-r alt-r");
-    assert_eq!(response_view(&view, &mut cx), ResponseView::Timing);
+    assert_eq!(response_view(&view, &mut cx), ResponseView::Network);
     cx.run_until_parked();
 
     assert!(
@@ -14079,6 +14079,46 @@ async fn typing_braces_completes_a_variable_name(cx: &mut TestAppContext) {
         view.primary_editor().expect("a body editor").read(cx).text().to_string()
     });
     assert_eq!(body, "{\"t\":\"{{token}}\n", "Enter accepts, then is a newline once closed");
+}
+
+/// After a send, the Network tab shows the request that went out — Auth's header included — its
+/// sections fold from their headings, and Copy hands over connection and request as text. Each of
+/// those is a mouse path that could dispatch nothing and still look exactly right.
+#[gpui::test]
+async fn the_network_tab_shows_and_copies_the_request_that_went_out(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+    let base = serve_once(OK_JSON);
+    type_url(&mut cx, &format!("{base}/me"));
+
+    cx.dispatch_action(crate::actions::UseBearerAuth);
+    cx.run_until_parked();
+    let token = cx.debug_bounds("auth-token").expect("the token field");
+    cx.simulate_click(token.center(), gpui::Modifiers::default());
+    cx.simulate_input("abc");
+    send_and_wait(&mut cx, &view, 200);
+
+    let tab = cx.debug_bounds("response-tab-network").expect("the Network tab");
+    cx.simulate_click(tab.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sent-request").is_some(), "the request sent is drawn");
+
+    let heading = cx.debug_bounds("network-section-2").expect("its heading");
+    cx.simulate_click(heading.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        view.read_with(&cx, |view, _| view.network_folded[2]),
+        "clicking the heading folds the section"
+    );
+
+    cx.dispatch_action(crate::actions::CopyNetworkDetails);
+    cx.run_until_parked();
+    let copied = cx
+        .update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        .expect("copied text");
+    // Connection first, then the request — the sample is a POST carrying a query row.
+    assert!(copied.starts_with("remote: 127.0.0.1:"), "{copied}");
+    assert!(copied.contains(&format!("POST {base}/me?per_page=50")), "{copied}");
+    assert!(copied.contains("authorization: Bearer abc"), "{copied}");
 }
 
 /// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**

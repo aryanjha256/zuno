@@ -26,7 +26,8 @@ use zuno_core::{
 use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
     ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTrailers, ShowResponseDiff,
-    ShowResponseTiming, ToggleFold, ToggleHtmlView, UnfoldAll,
+    CopyNetworkDetails,
+    ShowResponseNetwork, ToggleFold, ToggleHtmlView, UnfoldAll,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
@@ -117,7 +118,7 @@ pub fn render(
                 ResponseView::Trailers => {
                     pane.child(headers_region(&response.trailers, &view.headers_scroll, theme))
                 }
-                ResponseView::Timing => pane.child(timing_region(response.timing, theme)),
+                ResponseView::Network => pane.child(network_region(view, response, theme, cx)),
                 ResponseView::Diff => pane.child(diff_region(view, theme, window)),
             }
         }
@@ -135,7 +136,7 @@ pub fn render(
 /// the palette row run one path — the "actions, not direct calls" convention.
 ///
 /// **The third tab is why these are per-tab actions.** This comment used to end "a third tab
-/// would have to split this into per-tab actions", and the Timing tab is that third: one
+/// would have to split this into per-tab actions", and the Timing tab (now Network) was that third: one
 /// cycling handler works for two tabs because the single inactive one is always a step away,
 /// but clicking Timing while on Body is two steps and a cycling click lands on Headers. Same
 /// correction `section_tabs` already made for the request pane, predicted in the same words.
@@ -204,10 +205,10 @@ fn view_tabs(
         // status line above the strip — repeating it here would be the only tab label that
         // duplicates something two rows up.
         .child(view_tab(
-            "response-tab-timing",
-            "Timing".to_string(),
-            active == ResponseView::Timing,
-            ShowResponseTiming,
+            "response-tab-network",
+            "Network".to_string(),
+            active == ResponseView::Network,
+            ShowResponseNetwork,
             theme,
             cx,
         ))
@@ -468,6 +469,130 @@ fn headers_region(
         .into_any_element()
 }
 
+/// The request as it went out: the request line, every header with where it came from, and the
+/// body folded underneath. See `engine::sent` for how much of this is captured and how much
+/// follows the client's rules.
+fn sent_content(
+    view: &RequestView,
+    sent: Option<&zuno_core::SentRequest>,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> Div {
+    let Some(sent) = sent else {
+        return div()
+            .px_3()
+            .py_1()
+            .text_xs()
+            .text_color(theme.text_faint)
+            .child("Not recorded for this kind of request.");
+    };
+
+    let request_line = div()
+        .flex()
+        .flex_row()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .font_family(theme.mono.clone())
+        .text_xs()
+        .child(
+            div()
+                .flex_none()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child(sent.method.clone()),
+        )
+        .child(div().flex_1().min_w(px(0.)).text_color(theme.text).child(sent.url.clone()));
+
+    let redirected = sent.redirected.then(|| {
+        div()
+            .px_3()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.text_faint)
+            .child("Redirected — this is the first request; each later hop sent its own.")
+    });
+
+    let rows = sent.headers.iter().map(|header| {
+        header_row(&Header::new(header.name.clone(), header.value.clone()), theme).child(
+            div()
+                .flex_none()
+                .text_color(theme.text_faint)
+                .child(header.source.label()),
+        )
+    });
+
+    let body = match (&sent.body, sent.body_streamed) {
+        (Some(bytes), _) if !bytes.is_empty() => {
+            let open = view.sent_body_open;
+            let len = sent.body_len.unwrap_or(bytes.len());
+            let toggle = div()
+                .id("sent-body-toggle")
+                .debug_selector(|| "sent-body-toggle".to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(theme.text_muted)
+                .hover(|style| style.bg(theme.bg_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|view, _: &MouseDownEvent, _, cx| {
+                        view.sent_body_open = !view.sent_body_open;
+                        cx.notify();
+                    }),
+                )
+                .child(crate::ui::glyph(
+                    if open { Icon::ChevronDown } else { Icon::ChevronRight },
+                    theme.text_muted,
+                    theme.text,
+                    crate::ui::GLYPH_INLINE,
+                ))
+                .child(format!("Body · {}", format_bytes(len as u64)));
+            let text = open.then(|| {
+                let mut shown = String::from_utf8_lossy(bytes).into_owned();
+                if len > bytes.len() {
+                    shown.push_str(&format!("\n… first {} shown", format_bytes(bytes.len() as u64)));
+                }
+                div()
+                    .px_3()
+                    .pb_2()
+                    .font_family(theme.mono.clone())
+                    .text_xs()
+                    .text_color(theme.text_muted)
+                    .child(shown)
+            });
+            Some(div().flex().flex_col().child(toggle).children(text))
+        }
+        (_, true) => Some(
+            div()
+                .px_3()
+                .py_1()
+                .text_xs()
+                .text_color(theme.text_faint)
+                .child("Body streamed from disk (multipart) — not kept for showing."),
+        ),
+        _ => None,
+    };
+
+    div()
+        .debug_selector(|| "sent-request".to_string())
+        .flex()
+        .flex_col()
+        .child(request_line)
+        .children(redirected)
+        .child(div().flex().flex_col().children(rows))
+        .children(body)
+}
+
 // ---------------------------------------------------------------------------
 // Timing: the timeline
 // ---------------------------------------------------------------------------
@@ -517,7 +642,8 @@ const LEGEND_SHARE_WIDTH: Pixels = px(46.);
 /// offset and already summing to `total`, and `axis_ticks` decides the scale; this function only
 /// turns durations into fractions. Both are pure functions with unit tests, which is the only
 /// kind of check available — nothing headless can observe a paint.
-fn timing_region(timing: Timing, theme: &Theme) -> AnyElement {
+/// The timeline: summary, axis, track, legend. The first of the Network tab's sections.
+fn timing_content(timing: Timing, theme: &Theme) -> Div {
     let phases = timing.phases();
     let total = timing.total;
 
@@ -534,27 +660,177 @@ fn timing_region(timing: Timing, theme: &Theme) -> AnyElement {
     let ticks = zuno_core::axis_ticks(total);
 
     div()
-        .id("response-timing")
         .debug_selector(|| "response-timing".to_string())
-        .flex_1()
-        .min_h(px(0.))
-        // Vertical only. There are at most four segments and four legend rows, but the
-        // connection note wraps on a narrow pane, so the content can still exceed the height.
-        .overflow_y_scroll()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .px_3()
-                .py_2()
-                .child(timing_summary(timing, theme))
-                .child(axis_labels(&ticks, theme, &at))
-                .child(axis_rule(&ticks, theme, &at))
-                .child(timeline_track(&phases, &ticks, timing.ttfb, theme, &at))
-                .child(first_byte_label(timing, theme, &at))
-                .child(legend(&phases, total, theme)),
+        .flex()
+        .flex_col()
+        .px_3()
+        .py_2()
+        .child(timing_summary(timing, theme))
+        .child(axis_labels(&ticks, theme, &at))
+        .child(axis_rule(&ticks, theme, &at))
+        .child(timeline_track(&phases, &ticks, timing.ttfb, theme, &at))
+        .child(first_byte_label(timing, theme, &at))
+        .child(legend(&phases, total, theme))
+}
+
+/// The Network tab: how this one exchange travelled. Three sections, each foldable — the
+/// timeline that used to be the whole tab, the connection, and the request as it went out.
+///
+/// One scroll for all three rather than one each: they are read top to bottom as a single
+/// account, and nested scroll regions in one pane fight over the wheel.
+fn network_region(
+    view: &RequestView,
+    response: &ResponseData,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> AnyElement {
+    let recorded = response.network.is_some() || response.sent.is_some();
+    let copy = recorded.then(|| {
+        icon_button(
+            "copy-network",
+            Icon::Copy,
+            "Copy the network details",
+            CopyNetworkDetails,
+            theme,
         )
         .into_any_element()
+    });
+
+    let mut column = div()
+        .id("response-network")
+        .debug_selector(|| "response-network".to_string())
+        .track_scroll(&view.headers_scroll)
+        .flex_1()
+        .min_h(px(0.))
+        .overflow_y_scroll()
+        .child(section_heading(view, 0, "Timing", None, theme, cx));
+    if !view.network_folded[0] {
+        column = column.child(timing_content(response.timing, theme));
+    }
+
+    if let Some(network) = &response.network {
+        column = column.child(section_heading(view, 1, "Connection", None, theme, cx));
+        if !view.network_folded[1] {
+            column = column.child(connection_rows(network, response, theme));
+        }
+    }
+
+    column = column.child(section_heading(view, 2, "Request sent", copy, theme, cx));
+    if !view.network_folded[2] {
+        column = column.child(sent_content(view, response.sent.as_ref(), theme, cx));
+    }
+    column.into_any_element()
+}
+
+/// A section's title row: a chevron and a name that fold it, and an optional control at the end.
+fn section_heading(
+    view: &RequestView,
+    ix: usize,
+    title: &'static str,
+    trailing: Option<AnyElement>,
+    theme: &Theme,
+    cx: &mut Context<RequestView>,
+) -> impl IntoElement + use<> {
+    let folded = view.network_folded[ix];
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .px_2()
+        .py_1()
+        .bg(theme.bg_panel)
+        .border_y_1()
+        .border_color(theme.border)
+        .text_xs()
+        .child(
+            div()
+                .id(SharedString::from(format!("network-section-{ix}")))
+                .debug_selector(move || format!("network-section-{ix}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .flex_1()
+                .cursor_pointer()
+                .text_color(theme.text_muted)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _: &MouseDownEvent, _, cx| {
+                        view.network_folded[ix] = !view.network_folded[ix];
+                        cx.notify();
+                    }),
+                )
+                .child(crate::ui::glyph(
+                    if folded { Icon::ChevronRight } else { Icon::ChevronDown },
+                    theme.text_muted,
+                    theme.text,
+                    crate::ui::GLYPH_INLINE,
+                ))
+                .child(title),
+        )
+        .children(trailing)
+}
+
+/// Both ends of the connection, how it was used, and the certificate — Postman's "Network".
+fn connection_rows(network: &zuno_core::NetworkInfo, response: &ResponseData, theme: &Theme) -> Div {
+    let row = |label: &'static str, value: String| {
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .px_3()
+            .py_0p5()
+            .font_family(theme.mono.clone())
+            .text_xs()
+            .child(div().flex_none().w(px(110.)).text_color(theme.text_faint).child(label))
+            .child(div().flex_1().min_w(px(0.)).text_color(theme.text_muted).child(value))
+    };
+    let reuse = match response.timing.connection {
+        Connection::Pooled => "reused",
+        Connection::Unknown => "unknown",
+        _ => "new",
+    };
+
+    let mut rows = div().flex().flex_col().py_1();
+    if let Some(remote) = network.remote {
+        rows = rows.child(row("remote", format!("{remote}")));
+    }
+    if let Some(local) = network.local {
+        rows = rows.child(row("local", format!("{local}")));
+    }
+    rows = rows.child(row(
+        "connection",
+        format!("{} · {reuse}", response.version.as_str()),
+    ));
+
+    match &network.certificate {
+        Some(cert) => {
+            let name = if cert.subject.is_empty() {
+                cert.alt_names.first().cloned().unwrap_or_default()
+            } else {
+                cert.subject.clone()
+            };
+            rows = rows.child(row("certificate", name));
+            if !cert.alt_names.is_empty() {
+                rows = rows.child(row("alt names", cert.alt_names.join(", ")));
+            }
+            rows = rows
+                .child(row("issuer", cert.issuer.clone()))
+                .child(row("valid", format!("{} → {}", cert.not_before, cert.not_after)))
+                .child(row("serial", cert.serial.clone()))
+                .child(row("SHA-1", cert.sha1_fingerprint.clone()));
+        }
+        // Said rather than left blank — and "plain HTTP" only when it was, so a certificate the
+        // client did not report is not passed off as no TLS at all.
+        None => {
+            let https = response.sent.as_ref().is_some_and(|sent| sent.url.starts_with("https:"));
+            rows = rows.child(row(
+                "TLS",
+                if https { "certificate not reported" } else { "none — plain HTTP" }.to_string(),
+            ));
+        }
+    }
+    rows
 }
 
 /// The line above the axis: the total, and what the connection did.

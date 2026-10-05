@@ -215,8 +215,10 @@ actions!(
         PrevResponseTab,
         ShowResponseBody,
         ShowResponseHeaders,
+        // The Network tab's whole entry — connection and the request as it went out — as text.
+        CopyNetworkDetails,
         ShowResponseTrailers,
-        ShowResponseTiming,
+        ShowResponseNetwork,
         ShowResponseDiff,
         ToggleHtmlView,
         FindInResponse,

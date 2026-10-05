@@ -103,6 +103,13 @@ apollo-compiler = "1.33"
 # serde route (`serde-saphyr`, the deprecated `serde_yaml`) rejects nearly every real spec.
 # Converting ourselves turns such keys into strings. YAML 1.2, so `yes` stays a string.
 yaml-rust2 = { version = "0.13", default-features = false }
+# The Network tab's certificate: reqwest's `TlsInfo` hands over only the peer's DER bytes, and
+# this reads subject, issuer, validity and serial out of them. Default features only — `verify`
+# would pull in a signature stack to check what rustls has already checked.
+x509-parser = "0.18"
+# Its fingerprint. SHA-1 because that is the fingerprint Postman shows, so the two can be compared
+# side by side; already compiled in, through tungstenite.
+sha1 = "0.11"
 
 hyper-util = { version = "0.1", features = ["tokio"] }
 # Reading HTTP/2 **trailers**, which is where gRPC puts its status and which reqwest names

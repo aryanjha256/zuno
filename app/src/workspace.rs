@@ -54,8 +54,9 @@ use crate::actions::{
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
     CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
+    CopyNetworkDetails,
     ShowResponseTrailers,
-    ShowResponseTiming, ToggleHtmlView,
+    ShowResponseNetwork, ToggleHtmlView,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
@@ -5572,6 +5573,39 @@ impl Workspace {
         self.show_response_view(ResponseView::Headers, cx);
     }
 
+    /// The Network tab's entry for the displayed run, as text — the run on screen, so browsing
+    /// history copies what *that* run did. Connection first, then the request, the order a bug
+    /// report reads in.
+    fn copy_network_details(
+        &mut self,
+        _: &CopyNetworkDetails,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.active() else { return };
+        let text = view.read(cx).displayed().and_then(|response| {
+            let network = response.network.as_ref().map(zuno_core::NetworkInfo::to_text);
+            let sent = response.sent.as_ref().map(zuno_core::SentRequest::to_text);
+            match (network, sent) {
+                (None, None) => None,
+                (network, sent) => Some(
+                    [network, sent]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+            }
+        });
+        match text {
+            Some(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.set_status("Copied the network details", cx);
+            }
+            None => self.set_status("No network details recorded for this response", cx),
+        }
+    }
+
     fn show_response_trailers(
         &mut self,
         _: &ShowResponseTrailers,
@@ -5581,13 +5615,13 @@ impl Workspace {
         self.show_response_view(ResponseView::Trailers, cx);
     }
 
-    fn show_response_timing(
+    fn show_response_network(
         &mut self,
-        _: &ShowResponseTiming,
+        _: &ShowResponseNetwork,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.show_response_view(ResponseView::Timing, cx);
+        self.show_response_view(ResponseView::Network, cx);
     }
 
     fn show_response_diff(&mut self, _: &ShowResponseDiff, _: &mut Window, cx: &mut Context<Self>) {
@@ -7540,8 +7574,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::prev_response_tab))
             .on_action(cx.listener(Self::show_response_body))
             .on_action(cx.listener(Self::show_response_headers))
+            .on_action(cx.listener(Self::copy_network_details))
             .on_action(cx.listener(Self::show_response_trailers))
-            .on_action(cx.listener(Self::show_response_timing))
+            .on_action(cx.listener(Self::show_response_network))
             .on_action(cx.listener(Self::show_response_diff))
             .on_action(cx.listener(Self::toggle_html_view))
             .on_action(cx.listener(Self::find_in_body))

@@ -459,6 +459,8 @@ async fn run_call(
                 declared: Some(body.len() as u64),
                 decoded: decoded_len as u64,
             },
+            sent: None,
+            network: None,
         }),
     });
 }

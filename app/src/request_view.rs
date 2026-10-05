@@ -430,10 +430,12 @@ pub enum ResponseView {
     /// and essentially nobody sends them, so on every other kind this would be a tab that is
     /// permanently empty.
     Trailers,
-    /// Where the time went, on one time axis. Third, so the two answers you came for keep
-    /// their positions — this is the tab you visit when one of them was slow.
-    Timing,
-    /// What changed since the run before. Last for the same reason Timing is third: it is a
+    /// How this one exchange travelled: where the time went, the connection it used, and the
+    /// request exactly as it went out. Was `Timing`; the connection and the sent request joined
+    /// it rather than becoming tabs of their own, since all three answer "what happened on the
+    /// way". Third, so the two answers you came for keep their positions.
+    Network,
+    /// What changed since the run before. Last for the same reason Network is third: it is a
     /// question you ask *about* an answer, not one of the answers.
     Diff,
 }
@@ -449,7 +451,7 @@ impl ResponseView {
         ResponseView::Body,
         ResponseView::Headers,
         ResponseView::Trailers,
-        ResponseView::Timing,
+        ResponseView::Network,
         ResponseView::Diff,
     ];
 
@@ -609,6 +611,12 @@ pub struct RequestView {
     pub response_view: ResponseView,
     /// Sticky per buffer, like `response_view`: two requests are open for different reasons.
     pub request_tab: RequestTab,
+    /// Whether the Network tab's sent body is unfolded. Folded by default: the headers are what
+    /// that section is usually read for, and a body pushes them off screen.
+    pub sent_body_open: bool,
+    /// Which of the Network tab's three sections — timing, connection, request sent — are folded.
+    /// All open by default; sticky per buffer like the tab itself.
+    pub network_folded: [bool; 3],
     /// Which half of an HTML body to show, for as long as this buffer is open.
     ///
     /// Here rather than on `BodyView` because `BodyView` is rebuilt on every response, so a
@@ -721,6 +729,8 @@ impl RequestView {
             viewing: 0,
             response_view: ResponseView::default(),
             request_tab: RequestTab::default(),
+            sent_body_open: false,
+            network_folded: [false; 3],
             html_view: crate::body_view::HtmlView::default(),
             body_view: None,
             body_task: None,

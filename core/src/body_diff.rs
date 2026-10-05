@@ -337,6 +337,8 @@ mod tests {
                 ttfb: Duration::from_millis(1),
                 total: Duration::from_millis(2),
             },
+            sent: None,
+            network: None,
         }
     }
 

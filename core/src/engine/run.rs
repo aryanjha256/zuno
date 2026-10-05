@@ -68,6 +68,7 @@ pub async fn execute(
     events: Sender<Event>,
     max_body_bytes: usize,
     outbound: tokio::sync::mpsc::UnboundedReceiver<super::Outbound>,
+    jar: super::cookies::Jar,
 ) {
     // Install this job's connection probe for the duration of the task. The client — and with
     // it the resolver and the connector layer — is shared across jobs, so a task-local is what
@@ -75,11 +76,12 @@ pub async fn execute(
     let probe = Probe::new();
     Probe::scope(
         probe.clone(),
-        run(job, client, spec, events, max_body_bytes, probe.clone(), outbound),
+        run(job, client, spec, events, max_body_bytes, probe.clone(), outbound, jar),
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     job: JobId,
     client: Client,
@@ -90,6 +92,8 @@ async fn run(
     // Read only if this response turns out to be a stream. A request that stays a request
     // simply drops it, which is why it costs nothing to hand one to every job.
     outbound: tokio::sync::mpsc::UnboundedReceiver<super::Outbound>,
+    // Read for the Sent view's `cookie` row — the same jar the client sends from.
+    jar: super::cookies::Jar,
 ) {
     let started = Instant::now();
     let timeout = spec.settings.timeout;
@@ -127,7 +131,7 @@ async fn run(
         },
         _ => building.await,
     };
-    let request = match built {
+    let request: reqwest::Request = match built {
         Ok(Ok(request)) => request,
         Ok(Err(error)) => {
             emit(Event::Failed { job, error });
@@ -152,6 +156,10 @@ async fn run(
     // can work and is what most clients already mean by a timeout.
     //
     // What is left of it, rather than the whole limit again: building already spent some.
+    //
+    // Described now, before `execute` consumes the request — and before the jar learns this
+    // response's `set-cookie`, which the request itself never carried.
+    let mut sent = super::sent::describe(&request, &spec, Some(&jar));
     let response = match (deadline, timeout) {
         (Some(at), Some(limit)) => match tokio::time::timeout_at(at, client.execute(request)).await {
             Ok(Ok(response)) => response,
@@ -185,6 +193,8 @@ async fn run(
     };
 
     let ttfb = started.elapsed();
+    sent.redirected = response.url().as_str() != sent.url;
+    let network = network_of(&response);
     // Read before `bytes_stream` consumes the response. This one header is the whole of SSE
     // detection, and it is why the decision belongs to the *response* rather than the request:
     // an ordinary HTTP request and a GraphQL subscription both become streams here, and
@@ -321,8 +331,27 @@ async fn run(
                 declared: declared_length,
                 decoded,
             },
+            sent: Some(sent),
+            network: Some(network),
         }),
     });
+}
+
+/// Both ends of the connection and the server's certificate, read off the response's extensions
+/// — hyper-util's `HttpInfo` for the addresses, reqwest's `TlsInfo` for the certificate.
+fn network_of(response: &reqwest::Response) -> crate::response::NetworkInfo {
+    let info = response
+        .extensions()
+        .get::<hyper_util::client::legacy::connect::HttpInfo>();
+    crate::response::NetworkInfo {
+        remote: info.map(|info| info.remote_addr()),
+        local: info.map(|info| info.local_addr()),
+        certificate: response
+            .extensions()
+            .get::<reqwest::tls::TlsInfo>()
+            .and_then(reqwest::tls::TlsInfo::peer_certificate)
+            .and_then(crate::certificate::read),
+    }
 }
 
 /// How a connection's pump ended.
@@ -693,7 +722,7 @@ mod tests {
         };
 
         let (_close, closes) = tokio::sync::mpsc::unbounded_channel();
-        runtime.block_on(execute(JobId(1), Client::new(), spec, sender, LIMIT, closes));
+        runtime.block_on(execute(JobId(1), Client::new(), spec, sender, LIMIT, closes, super::super::cookies::new_jar()));
 
         let collected: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         let failure = collected

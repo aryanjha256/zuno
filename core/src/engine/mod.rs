@@ -22,6 +22,7 @@ pub mod error;
 pub(crate) mod grpc;
 mod probe;
 mod run;
+mod sent;
 mod session;
 
 use std::collections::HashMap;
@@ -614,7 +615,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>, jar: cookies::Jar) {
     };
 
     runtime.block_on(async move {
-        let mut clients = ClientCache::new(jar);
+        let mut clients = ClientCache::new(jar.clone());
         let mut jobs: HashMap<JobId, Job> = HashMap::new();
         let mut proxy = ProxyMode::default();
         let mut tls = TlsFiles::default();
@@ -673,6 +674,7 @@ fn drive(mut commands: mpsc::UnboundedReceiver<Command>, jar: cookies::Jar) {
                                     events,
                                     run::MAX_BODY_BYTES,
                                     receiver,
+                                    jar.clone(),
                                 ))
                             };
                             jobs.insert(
@@ -899,6 +901,9 @@ fn build_client(key: &ClientKey, jar: &cookies::Jar) -> Result<Client, EngineErr
         // to one job.
         .dns_resolver(probe::TimedResolver)
         .connector_layer(probe::TimedConnect)
+        // The server's certificate, for the Network tab. One copy of the leaf's DER per
+        // connection, which is the whole cost.
+        .tls_info(true)
         .gzip(key.accept_encodings)
         .brotli(key.accept_encodings)
         .deflate(key.accept_encodings)

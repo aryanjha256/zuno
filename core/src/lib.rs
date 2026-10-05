@@ -14,6 +14,7 @@ pub mod assertion;
 pub mod body_diff;
 pub mod bundle;
 pub mod capture;
+pub mod certificate;
 pub mod codegen;
 pub mod collection;
 pub mod curl;
@@ -59,7 +60,8 @@ pub use request::{
     SavedMessage, WebSocketRequest, label_for,
 };
 pub use response::{
-    Connection, HttpVersion, Phase, PhaseKind, ResponseData, SizeInfo, StatusClass, Timing,
-    axis_ticks,
+    Connection, HttpVersion, NetworkInfo, Phase, PhaseKind, ResponseData, SentHeader, SentRequest,
+    SentSource,
+    SizeInfo, StatusClass, Timing, axis_ticks,
 };
 pub use search::Hits;

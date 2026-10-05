@@ -328,6 +328,127 @@ pub struct ResponseData {
     pub body: Bytes,
     pub timing: Timing,
     pub size: SizeInfo,
+    /// The request this answered, as it went out — `None` where nothing records one (a stream, a
+    /// socket, a gRPC call), never an empty request standing in for "unknown".
+    pub sent: Option<SentRequest>,
+    /// Who was on each end of the connection, and the server's certificate. `None` where nothing
+    /// records it, for `sent`'s reason.
+    pub network: Option<NetworkInfo>,
+}
+
+impl NetworkInfo {
+    /// The connection as text, for a bug report — what `CopyNetworkDetails` puts first.
+    pub fn to_text(&self) -> String {
+        let mut text = String::new();
+        if let Some(remote) = self.remote {
+            text.push_str(&format!("remote: {remote}\n"));
+        }
+        if let Some(local) = self.local {
+            text.push_str(&format!("local: {local}\n"));
+        }
+        if let Some(cert) = &self.certificate {
+            text.push_str(&format!("certificate: {}\n", cert.subject));
+            if !cert.alt_names.is_empty() {
+                text.push_str(&format!("  alternative names: {}\n", cert.alt_names.join(", ")));
+            }
+            text.push_str(&format!("  issuer: {}\n", cert.issuer));
+            text.push_str(&format!("  valid: {} – {}\n", cert.not_before, cert.not_after));
+            text.push_str(&format!("  serial: {}\n", cert.serial));
+            text.push_str(&format!("  SHA-1: {}\n", cert.sha1_fingerprint));
+        }
+        text
+    }
+}
+
+/// The connection a response arrived on, as far as reqwest can say — see `certificate` for what
+/// it cannot (the TLS version and cipher).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NetworkInfo {
+    pub remote: Option<std::net::SocketAddr>,
+    pub local: Option<std::net::SocketAddr>,
+    /// The server's leaf certificate. `None` over plain HTTP. Present on a pooled connection too:
+    /// hyper-util copies a connection's details onto *every* response it carries
+    /// (`legacy/client.rs`, `extra.set`), not just the first.
+    pub certificate: Option<crate::certificate::CertificateInfo>,
+}
+
+/// A request as it went out: what Zuno built, plus what the HTTP client added by its own fixed
+/// rules. See `engine::sent` for why it is reconstructed rather than captured off the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentRequest {
+    pub method: String,
+    /// Resolved — every `{{variable}}` already substituted.
+    pub url: String,
+    pub headers: Vec<SentHeader>,
+    /// The body's bytes when they were known up front, at most `SentRequest::BODY_KEPT` of them.
+    /// `None` for a body streamed from disk — a multipart upload or a binary file.
+    pub body: Option<Bytes>,
+    /// The whole body's length when known, which can exceed what `body` keeps.
+    pub body_len: Option<usize>,
+    /// There was a body, but it was streamed rather than held — a multipart upload — so there
+    /// are no bytes to show. Distinct from no body at all, which a GET has.
+    pub body_streamed: bool,
+    /// The final response came from another URL. Only the first hop is shown — reqwest hands
+    /// back the last response alone, and each hop sends its own cookies.
+    pub redirected: bool,
+}
+
+impl SentRequest {
+    /// How much of a body is kept for showing. A multi-megabyte upload is not worth holding twice
+    /// to display its first screen.
+    pub const BODY_KEPT: usize = 256 * 1024;
+
+    /// The request as text — a request line, the headers, a blank line, the body — for pasting
+    /// into a bug report. Not raw HTTP/1.1: the line carries the whole URL, since that is what a
+    /// reader wants and what HTTP/2 has no request line for anyway.
+    pub fn to_text(&self) -> String {
+        let mut text = format!("{} {}\n", self.method, self.url);
+        for header in &self.headers {
+            text.push_str(&format!("{}: {}\n", header.name, header.value));
+        }
+        if let Some(body) = &self.body {
+            text.push('\n');
+            text.push_str(&String::from_utf8_lossy(body));
+            if self.body_len.is_some_and(|len| len > body.len()) {
+                text.push_str("\n… (truncated)");
+            }
+        }
+        text
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentHeader {
+    pub name: String,
+    pub value: String,
+    pub source: SentSource,
+}
+
+/// Why a header was on the request — what the Sent view labels each row with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentSource {
+    /// A row on the Headers tab.
+    Typed,
+    /// The Auth tab.
+    Auth,
+    /// Zuno, from the body or the kind — a derived `content-type`.
+    Zuno,
+    /// The cookie jar.
+    CookieJar,
+    /// The HTTP client itself: `user-agent`, `accept-encoding`, `host`, `content-length`.
+    Client,
+}
+
+impl SentSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            SentSource::Typed => "",
+            SentSource::Auth => "from Auth",
+            SentSource::Zuno => "added by Zuno",
+            SentSource::CookieJar => "from cookie jar",
+            SentSource::Client => "added by client",
+        }
+    }
 }
 
 impl ResponseData {
@@ -386,6 +507,8 @@ impl ResponseData {
                 declared: Some(96),
                 decoded,
             },
+            sent: None,
+            network: None,
         }
     }
 }

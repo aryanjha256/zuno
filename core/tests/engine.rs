@@ -538,6 +538,19 @@ fn a_real_https_request_works_end_to_end() {
         response.timing.ttfb > Duration::ZERO,
         "TTFB should be measurable over a real network"
     );
+    // The certificate is the half of the Network tab no offline test can reach: reqwest only
+    // reports one over a real TLS handshake.
+    let cert = response
+        .network
+        .as_ref()
+        .and_then(|network| network.certificate.as_ref())
+        .expect("a certificate over HTTPS");
+    assert!(
+        cert.alt_names.iter().any(|name| name.contains("example.com"))
+            || cert.subject.contains("example.com"),
+        "{cert:?}"
+    );
+    eprintln!("live cert: {} · {} · until {}", cert.subject, cert.issuer, cert.not_after);
     eprintln!(
         "live: {} {} · {} · ttfb {:?} · total {:?} · {} bytes decoded",
         response.status,
@@ -670,6 +683,76 @@ fn a_cookie_from_one_response_is_replayed_on_the_next_request() {
         "the second request should carry the first's cookie, got:\n{}",
         seen[1]
     );
+}
+
+/// **The Sent view is reconstructed, so it is checked against the wire.** Every header it claims
+/// must be in what the server received, and every header the server received must be in it — a
+/// typed row, the Auth tab's, Zuno's content type, the jar's cookie, and everything the client
+/// adds by its own rules. A missing or invented row is the one way this view could lie.
+#[test]
+fn the_sent_request_is_exactly_what_the_server_received() {
+    let engine = Engine::new().expect("engine");
+    let (base, server) = serve_twice_setting_a_cookie();
+
+    let (_, first) = engine.send(spec_for(format!("{base}/login")));
+    drain(&first);
+
+    let mut spec = spec_for(format!("{base}/me"));
+    spec.headers = vec![zuno_core::Header::new("X-Trace", "t-1")];
+    spec.auth = zuno_core::Auth::Bearer { token: "abc".into() };
+    if let Some(http) = spec.http_mut() {
+        http.method = zuno_core::Method::Post;
+        http.body = zuno_core::Body::Raw {
+            text: r#"{"a":1}"#.into(),
+            kind: zuno_core::RawKind::Json,
+        };
+    }
+    let (_, second) = engine.send(spec);
+    let events = drain(&second);
+    let sent = done_response(&events).sent.clone().expect("an HTTP response records what it sent");
+
+    let seen = server.join().expect("server thread");
+    let received = seen[1].to_lowercase();
+    let received: Vec<(String, String)> = received
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .collect();
+    let claimed: Vec<(String, String)> = sent
+        .headers
+        .iter()
+        .map(|h| (h.name.to_lowercase(), h.value.to_lowercase()))
+        .collect();
+
+    for row in &claimed {
+        assert!(received.contains(row), "Sent claims {row:?}, the server got {received:?}");
+    }
+    for row in &received {
+        assert!(claimed.contains(row), "the server got {row:?}, Sent omits it: {claimed:?}");
+    }
+
+    let source = |name: &str| sent.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| h.source);
+    assert_eq!(source("authorization"), Some(zuno_core::SentSource::Auth));
+    assert_eq!(source("x-trace"), Some(zuno_core::SentSource::Typed));
+    assert_eq!(source("cookie"), Some(zuno_core::SentSource::CookieJar));
+    assert_eq!(sent.method, "POST");
+    assert_eq!(sent.body.as_deref(), Some(&br#"{"a":1}"#[..]));
+    assert!(!sent.redirected);
+
+    // And the connection it travelled on: the server's own address, ours, and — over plain
+    // HTTP — no certificate rather than an empty one.
+    let network = done_response(&events).network.clone().expect("network info");
+    assert_eq!(
+        network.remote.map(|addr| format!("http://{addr}")),
+        Some(base.clone()),
+        "the remote end is the test server"
+    );
+    assert!(network.local.is_some_and(|addr| addr.ip().is_loopback()));
+    assert_eq!(network.certificate, None);
 }
 
 #[test]
