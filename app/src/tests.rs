@@ -14041,6 +14041,46 @@ async fn hovering_a_variable_names_the_one_under_the_pointer(cx: &mut TestAppCon
     assert_eq!(hovered(&mut cx), None);
 }
 
+/// `{{` completion inserts the chosen name with its closing braces, in a one-line field and in
+/// the body — and once the list closes, the keys are what they were: Enter is a newline again.
+/// The keys only reach the list through a key context the input adds while it is open, so a
+/// list that drew but never received them would look right in every screenshot.
+#[gpui::test]
+async fn typing_braces_completes_a_variable_name(cx: &mut TestAppContext) {
+    let (_window, view, mut cx) = boot(cx, None, None);
+    cx.update(|_, cx| {
+        let dev = zuno_core::Environment {
+            name: "dev".into(),
+            values: [("base_url", "https://api.test"), ("token", "abc")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            secret: Default::default(),
+        };
+        crate::auth::set_for_test(zuno_core::Resolver::new(None, Some(&dev)), cx);
+    });
+
+    type_url(&mut cx, "{{ba");
+    cx.run_until_parked();
+    cx.press("tab");
+    cx.run_until_parked();
+    assert_eq!(spec_of(&view, &mut cx).url, "{{base_url}}");
+    cx.simulate_input("/users");
+    assert_eq!(spec_of(&view, &mut cx).url, "{{base_url}}/users", "the cursor lands after `}}`");
+
+    clear_body(&mut cx);
+    cx.simulate_input("{\"t\":\"{{to");
+    cx.run_until_parked();
+    cx.press("enter");
+    cx.run_until_parked();
+    cx.press("enter");
+    cx.run_until_parked();
+    let body = view.read_with(&cx, |view, cx| {
+        view.primary_editor().expect("a body editor").read(cx).text().to_string()
+    });
+    assert_eq!(body, "{\"t\":\"{{token}}\n", "Enter accepts, then is a newline once closed");
+}
+
 /// `escape` is scoped to `HeaderCell` and registered after the global one, so it **wins**
 /// whenever a header name has focus. Without the forward in `suggest_dismiss`, putting the
 /// cursor in a header cell would quietly disarm cancelling a request — invisible, and only

@@ -102,6 +102,14 @@ pub fn refresh(environment: Option<String>, cx: &mut App) {
     .detach();
 }
 
+/// Install a resolver directly — a test has no environment files to load one from.
+#[cfg(test)]
+pub fn set_for_test(resolver: Resolver, cx: &mut App) {
+    let shown = cx.default_global::<ShownResolver>();
+    shown.generation += 1;
+    shown.resolver = resolver;
+}
+
 /// Re-read whatever the last refresh read — for a capture, which changes an environment's
 /// values without knowing which one is selected.
 pub fn reload(cx: &mut App) {

@@ -69,6 +69,12 @@ actions!(
         Paste,
         Cut,
         Copy,
+        // `{{` completion. Bound only under `VarComplete`, which an input adds to its own key
+        // context while its list is open — so these never shadow an arrow or Enter otherwise.
+        VarCompleteNext,
+        VarCompletePrev,
+        VarCompleteAccept,
+        VarCompleteDismiss,
     ]
 );
 
@@ -121,6 +127,11 @@ pub struct TextInput {
     variables: bool,
     /// The `{{variable}}` under the pointer, by byte range, while it is there.
     hovered_variable: Option<Range<usize>>,
+    /// The completion list's highlighted row, keyed by where the name being completed begins so
+    /// a new `{{` starts from the top. The list itself is derived from the text and cursor.
+    var_highlight: Option<(usize, usize)>,
+    /// Where `Escape` closed the list — see `variables::completion`.
+    var_dismissed: Option<usize>,
 }
 
 /// The inputs whose text reaches the wire and so is substituted at send time.
@@ -156,7 +167,91 @@ impl TextInput {
             masked: false,
             variables: SENT_FIELDS.contains(&extra_context),
             hovered_variable: None,
+            var_highlight: None,
+            var_dismissed: None,
         }
+    }
+
+    /// The `{{` completion as things stand — only while this input has focus and nothing is
+    /// selected, since a list under a field you are not typing in is noise.
+    pub fn var_completion(&self, window: &Window, cx: &App) -> Option<crate::variables::Completion> {
+        if !self.variables
+            || self.masked
+            || !self.selected_range.is_empty()
+            || !self.focus_handle.is_focused(window)
+        {
+            return None;
+        }
+        crate::variables::completion(&self.content, self.cursor_offset(), self.var_dismissed, cx)
+    }
+
+    fn var_highlighted(&self, completion: &crate::variables::Completion) -> usize {
+        match self.var_highlight {
+            Some((start, ix)) if start == completion.replace.start => {
+                ix.min(completion.items.len() - 1)
+            }
+            _ => 0,
+        }
+    }
+
+    fn var_step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(completion) = self.var_completion(window, cx) else { return };
+        let len = completion.items.len() as isize;
+        let next = (self.var_highlighted(&completion) as isize + delta).rem_euclid(len) as usize;
+        self.var_highlight = Some((completion.replace.start, next));
+        cx.notify();
+    }
+
+    fn var_complete_next(&mut self, _: &VarCompleteNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.var_step(1, window, cx);
+    }
+
+    fn var_complete_prev(&mut self, _: &VarCompletePrev, window: &mut Window, cx: &mut Context<Self>) {
+        self.var_step(-1, window, cx);
+    }
+
+    fn var_complete_accept(
+        &mut self,
+        _: &VarCompleteAccept,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(completion) = self.var_completion(window, cx) else { return };
+        let ix = self.var_highlighted(&completion);
+        self.accept_variable(&completion, ix, window, cx);
+    }
+
+    fn var_complete_dismiss(
+        &mut self,
+        _: &VarCompleteDismiss,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(completion) = self.var_completion(window, cx) {
+            self.var_dismissed = Some(completion.replace.start);
+            cx.notify();
+        }
+    }
+
+    /// Write the chosen name through the ordinary edit path, so `Ctrl+Z` undoes it, and leave the
+    /// cursor after the closing braces — the next thing typed belongs outside the placeholder.
+    fn accept_variable(
+        &mut self,
+        completion: &crate::variables::Completion,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = completion.items.get(ix) else { return };
+        let text = crate::variables::inserted(name, completion.closed);
+        self.selected_range = completion.replace.clone();
+        self.replace_text_in_range(None, &text, window, cx);
+        let after = completion.replace.start + name.len() + 2;
+        if after <= self.content.len() {
+            self.selected_range = after..after;
+        }
+        self.var_highlight = None;
+        cx.notify();
     }
 
     /// The variable under the pointer, as `(name, byte range)`. Read by tests, and by the popover.
@@ -770,9 +865,20 @@ impl Focusable for TextInput {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let completion = self.var_completion(window, cx);
+        // `VarComplete` joins the leaf context only while the list is open, which is what lets
+        // its bindings win then and stay out of the way otherwise.
+        let key_context = match completion {
+            Some(_) => format!("{} VarComplete", self.key_context),
+            None => self.key_context.to_string(),
+        };
         div()
-            .key_context(self.key_context.as_ref())
+            .key_context(key_context.as_str())
+            .on_action(cx.listener(Self::var_complete_next))
+            .on_action(cx.listener(Self::var_complete_prev))
+            .on_action(cx.listener(Self::var_complete_accept))
+            .on_action(cx.listener(Self::var_complete_dismiss))
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
@@ -820,85 +926,46 @@ impl Render for TextInput {
                 input: cx.entity(),
             })
             .children(self.variable_popover(cx))
+            .children(completion.and_then(|completion| self.completion_list(completion, cx)))
     }
 }
 
 impl TextInput {
-    /// What the hovered `{{variable}}` resolves to, and from where, under its first brace.
-    ///
-    /// **`deferred`, which is what lets it escape.** Every cell sits inside `overflow_hidden`
-    /// ancestors, and an `anchored` child is still masked by them; a deferred draw is painted
-    /// after the whole tree with no clip of its own. Positioned from `last_bounds`, a frame
-    /// behind, which is harmless for the reason the header suggestions give: the text does not
-    /// move while the pointer rests on it.
+    /// What the hovered `{{variable}}` resolves to, under its first brace. Positioned from
+    /// `last_bounds`, a frame behind — harmless for the reason the header suggestions give: the
+    /// text does not move while the pointer rests on it.
     fn variable_popover(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let (name, range) = self.hovered_variable()?;
         let (line, bounds) = self.last_layout.as_ref().zip(self.last_bounds.as_ref())?;
-        let theme = cx.theme().clone();
-        let info = crate::auth::describe(name, cx);
         let at = point(
             bounds.left() + line.x_for_index(range.start) - self.scroll_offset,
             bounds.bottom() + px(4.),
         );
+        Some(crate::variables::popover(name, at, cx))
+    }
 
-        // A value runs to a JWT's length; the popover is for recognising it, not reading it all.
-        const SHOWN: usize = 120;
-        let value = info.value.map(|value| {
-            if value.chars().count() > SHOWN {
-                format!("{}…", value.chars().take(SHOWN).collect::<String>())
-            } else if value.is_empty() {
-                "(empty)".to_string()
-            } else {
-                value
-            }
-        });
-        let defined = value.is_some();
-
-        Some(gpui::deferred(
-            gpui::anchored()
-                .position(at)
-                .position_mode(gpui::AnchoredPositionMode::Window)
-                .child(
-                    div()
-                        .debug_selector(|| "variable-popover".to_string())
-                        .flex()
-                        .flex_col()
-                        .gap_0p5()
-                        .max_w(px(420.))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .bg(theme.bg_elevated)
-                        .border_1()
-                        .border_color(theme.border)
-                        .shadow_md()
-                        .text_xs()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .font_family(theme.mono.clone())
-                                        .text_color(theme.text)
-                                        .child(name.to_string()),
-                                )
-                                .child(div().text_color(theme.text_faint).child(info.origin)),
-                        )
-                        .child(
-                            div()
-                                .font_family(theme.mono.clone())
-                                .text_color(if defined {
-                                    theme.text_muted
-                                } else {
-                                    theme.status_server_error
-                                })
-                                // Not "will not send": true of the URL and headers, which are
-                                // checked, and false of a form body, which is sent as typed.
-                                .child(value.unwrap_or_else(|| "unresolved".to_string())),
-                        ),
-                ),
+    /// The `{{` completion list, under the opening braces.
+    fn completion_list(
+        &self,
+        completion: crate::variables::Completion,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let (line, bounds) = self.last_layout.as_ref().zip(self.last_bounds.as_ref())?;
+        let braces = completion.replace.start.saturating_sub(2);
+        let at = point(
+            bounds.left() + line.x_for_index(braces) - self.scroll_offset,
+            bounds.bottom() + px(4.),
+        );
+        let highlighted = self.var_highlighted(&completion);
+        let items = completion.items.clone();
+        Some(crate::variables::completion_list(
+            at,
+            &items,
+            highlighted,
+            cx,
+            move |input: &mut TextInput, ix, window, cx| {
+                input.accept_variable(&completion, ix, window, cx)
+            },
         ))
     }
 }

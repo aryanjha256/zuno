@@ -90,6 +90,11 @@ pub struct Editor {
     /// and meaningful only for the text they were computed against, so the owner clears them
     /// the moment that text changes.
     problems: Vec<Range<usize>>,
+    /// The `{{variable}}` under the pointer, and the `{{` completion's state — `TextInput`'s
+    /// three fields, for the same reasons.
+    hovered_variable: Option<Range<usize>>,
+    var_highlight: Option<(usize, usize)>,
+    var_dismissed: Option<usize>,
 }
 
 impl Editor {
@@ -117,7 +122,177 @@ impl Editor {
             is_selecting: false,
             key_context: "TextInput BodyEditor",
             problems: Vec::new(),
+            hovered_variable: None,
+            var_highlight: None,
+            var_dismissed: None,
         }
+    }
+
+    // ---- `{{variables}}`: hover and completion ------------------------------
+
+    /// The window point just under `offset`'s glyph, as last painted — where an overlay about
+    /// that text is anchored. `None` while its line is scrolled out of the painted window.
+    fn point_under(&self, offset: usize) -> Option<Point<Pixels>> {
+        let bounds = self.last_bounds?;
+        let line = self.line_of(offset);
+        let (_, layout) = self.last_layouts.iter().find(|(ix, _)| *ix == line)?;
+        let x = bounds.left() - self.h_offset + layout.x_for_index(offset - self.line_start(line));
+        let y = bounds.top() + self.last_line_height * ((line + 1) as f32);
+        Some(point(x, y + px(2.)))
+    }
+
+    /// The byte offset of the glyph *under* `position` — not the nearest caret gap, which
+    /// `offset_for_position` gives and which would light a variable up from beside it.
+    fn glyph_at(&self, position: Point<Pixels>) -> Option<usize> {
+        let bounds = self.last_bounds?;
+        if position.y < bounds.top() {
+            return None;
+        }
+        let line = ((position.y - bounds.top()) / self.last_line_height.max(px(1.))) as usize;
+        if line >= self.line_count() {
+            return None;
+        }
+        let (_, layout) = self.last_layouts.iter().find(|(ix, _)| *ix == line)?;
+        let column = layout.index_for_x(position.x - bounds.left() + self.h_offset)?;
+        Some(self.line_start(line) + column)
+    }
+
+    fn hover_variable_at(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let span = if self.is_selecting {
+            None
+        } else {
+            self.glyph_at(position).and_then(|at| {
+                zuno_core::environment::variable_spans(&self.content)
+                    .into_iter()
+                    .map(|(range, _)| range)
+                    .find(|range| range.start <= at && at < range.end)
+            })
+        };
+        self.set_hovered_variable(span, cx);
+    }
+
+    fn set_hovered_variable(&mut self, span: Option<Range<usize>>, cx: &mut Context<Self>) {
+        if self.hovered_variable != span {
+            self.hovered_variable = span;
+            cx.notify();
+        }
+    }
+
+    /// The variable under the pointer, as `(name, byte range)`.
+    pub fn hovered_variable(&self) -> Option<(&str, Range<usize>)> {
+        let range = self.hovered_variable.clone()?;
+        zuno_core::environment::variable_spans(&self.content)
+            .into_iter()
+            .find(|(span, _)| *span == range)
+            .map(|(span, name)| (name, span))
+    }
+
+    pub fn var_completion(&self, window: &Window, cx: &App) -> Option<crate::variables::Completion> {
+        if !self.selection.is_empty() || !self.focus_handle.is_focused(window) {
+            return None;
+        }
+        crate::variables::completion(&self.content, self.cursor(), self.var_dismissed, cx)
+    }
+
+    fn var_highlighted(&self, completion: &crate::variables::Completion) -> usize {
+        match self.var_highlight {
+            Some((start, ix)) if start == completion.replace.start => {
+                ix.min(completion.items.len() - 1)
+            }
+            _ => 0,
+        }
+    }
+
+    fn var_step(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(completion) = self.var_completion(window, cx) else { return };
+        let len = completion.items.len() as isize;
+        let next = (self.var_highlighted(&completion) as isize + delta).rem_euclid(len) as usize;
+        self.var_highlight = Some((completion.replace.start, next));
+        cx.notify();
+    }
+
+    fn var_complete_next(
+        &mut self,
+        _: &text_input::VarCompleteNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.var_step(1, window, cx);
+    }
+
+    fn var_complete_prev(
+        &mut self,
+        _: &text_input::VarCompletePrev,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.var_step(-1, window, cx);
+    }
+
+    fn var_complete_accept(
+        &mut self,
+        _: &text_input::VarCompleteAccept,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(completion) = self.var_completion(window, cx) else { return };
+        let ix = self.var_highlighted(&completion);
+        self.accept_variable(&completion, ix, window, cx);
+    }
+
+    fn var_complete_dismiss(
+        &mut self,
+        _: &text_input::VarCompleteDismiss,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(completion) = self.var_completion(window, cx) {
+            self.var_dismissed = Some(completion.replace.start);
+            cx.notify();
+        }
+    }
+
+    /// Through `replace_range`, so it is one undo step, with the cursor left after `}}`.
+    fn accept_variable(
+        &mut self,
+        completion: &crate::variables::Completion,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(name) = completion.items.get(ix) else { return };
+        let text = crate::variables::inserted(name, completion.closed);
+        self.replace_range(completion.replace.clone(), &text, window, cx);
+        let after = completion.replace.start + name.len() + 2;
+        if after <= self.content.len() {
+            self.move_to(after, cx);
+        }
+        self.var_highlight = None;
+    }
+
+    fn variable_popover(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let (name, range) = self.hovered_variable()?;
+        let at = self.point_under(range.start)?;
+        Some(crate::variables::popover(name, at, cx))
+    }
+
+    fn completion_list(
+        &self,
+        completion: crate::variables::Completion,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let at = self.point_under(completion.replace.start.saturating_sub(2))?;
+        let highlighted = self.var_highlighted(&completion);
+        let items = completion.items.clone();
+        Some(crate::variables::completion_list(
+            at,
+            &items,
+            highlighted,
+            cx,
+            move |editor: &mut Editor, ix, window, cx| {
+                editor.accept_variable(&completion, ix, window, cx)
+            },
+        ))
     }
 
     /// The container's vertical scroll offset, for the test that a sideways swipe does not
@@ -743,6 +918,7 @@ impl Editor {
             let offset = self.offset_for_position(event.position);
             self.select_to(offset, cx);
         }
+        self.hover_variable_at(event.position, cx);
     }
 
     fn offset_for_position(&self, position: Point<Pixels>) -> usize {
@@ -1018,14 +1194,36 @@ impl Focusable for Editor {
 }
 
 impl Render for Editor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let completion = self.var_completion(window, cx);
+        // `VarComplete` only while the list is open — see `TextInput::render`.
+        let key_context = match completion {
+            Some(_) => format!("{} VarComplete", self.key_context),
+            None => self.key_context.to_string(),
+        };
+        let overlays = (
+            self.variable_popover(cx),
+            completion.and_then(|completion| self.completion_list(completion, cx)),
+        );
         div()
             .id("body-editor")
             .debug_selector(|| "body-editor".to_string())
             // Both identifiers: the shared text bindings match on `TextInput`, the
             // line-aware ones on `BodyEditor`. GPUI matches only the leaf context, so
             // they have to live in one string.
-            .key_context(self.key_context)
+            .key_context(key_context.as_str())
+            .on_action(cx.listener(Self::var_complete_next))
+            .on_action(cx.listener(Self::var_complete_prev))
+            .on_action(cx.listener(Self::var_complete_accept))
+            .on_action(cx.listener(Self::var_complete_dismiss))
+            // Leaving needs this: `on_mouse_move` only fires inside, so the popover would stay.
+            .on_hover(cx.listener(|editor, hovered: &bool, _, cx| {
+                if !*hovered {
+                    editor.set_hovered_variable(None, cx);
+                }
+            }))
+            .children(overlays.0)
+            .children(overlays.1)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))

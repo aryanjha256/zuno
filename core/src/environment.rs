@@ -198,6 +198,19 @@ impl Resolver {
         self.secret.contains(name)
     }
 
+    /// Every name that resolves, once each, alphabetical — what `{{` completion offers.
+    pub fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .active
+            .keys()
+            .chain(self.globals.keys())
+            .map(String::as_str)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Whether `name`'s value comes from the globals rather than the selected environment —
     /// for saying where a value came from, not for resolving it.
     pub fn from_globals(&self, name: &str) -> bool {
@@ -488,6 +501,64 @@ fn placeholders(text: &str) -> Vec<String> {
         .into_iter()
         .map(|(_, name)| name.to_string())
         .collect()
+}
+
+/// An unfinished `{{name` the cursor is in, for completing the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariablePrefix<'a> {
+    /// What a chosen name replaces: from just after `{{` to the end of the name characters
+    /// at and after the cursor, so completing in the middle of `{{to|ken` swallows `ken`.
+    pub replace: std::ops::Range<usize>,
+    /// What is typed between `{{` and the cursor.
+    pub typed: &'a str,
+    /// Whether `}}` already follows, so a completion does not add a second pair.
+    pub closed: bool,
+}
+
+fn is_name_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+}
+
+/// The `{{name` the cursor is completing, if any.
+///
+/// Only right after a `{{` and name characters — a space, a `}}` or any punctuation in between
+/// means the cursor has left the placeholder, and a list there would be noise.
+pub fn completion_at(text: &str, cursor: usize) -> Option<VariablePrefix<'_>> {
+    let before = text.get(..cursor)?;
+    let open = before.rfind("{{")? + 2;
+    let typed = &before[open..];
+    if !typed.chars().all(is_name_char) {
+        return None;
+    }
+    let after = &text[cursor..];
+    let name_tail = after
+        .char_indices()
+        .find(|(_, c)| !is_name_char(*c))
+        .map_or(after.len(), |(at, _)| at);
+    let end = cursor + name_tail;
+    Some(VariablePrefix {
+        replace: open..end,
+        typed,
+        closed: text[end..].starts_with("}}"),
+    })
+}
+
+/// The names that fit what is typed: those starting with it, then those containing it, each
+/// alphabetical — `headers::suggestions`' rule, for the same reason.
+pub fn rank_names<'a>(names: &[&'a str], typed: &str) -> Vec<&'a str> {
+    let needle = typed.to_lowercase();
+    let mut starts = Vec::new();
+    let mut contains = Vec::new();
+    for name in names {
+        let lower = name.to_lowercase();
+        if lower.starts_with(&needle) {
+            starts.push(*name);
+        } else if lower.contains(&needle) {
+            contains.push(*name);
+        }
+    }
+    starts.extend(contains);
+    starts
 }
 
 /// Every `{{name}}` in `text`: its byte range, braces included, and the trimmed name.
@@ -959,6 +1030,27 @@ mod tests {
         );
         let resolver = Resolver::new(None, Some(&env("dev", &[("host", "h"), ("key", "k")])));
         assert_eq!(resolver.resolve(text), "https://h/v1?k=k}&x={{open");
+    }
+
+    /// Completion opens only inside an unfinished `{{name`, replaces the whole name around the
+    /// cursor, and knows when `}}` is already there.
+    #[test]
+    fn completion_is_found_only_inside_an_unfinished_placeholder() {
+        // `|` marks the cursor and is removed before asking.
+        let at = |marked: &str| {
+            let cursor = marked.find('|').unwrap();
+            let text = marked.replace('|', "");
+            completion_at(&text, cursor).map(|p| (p.replace, p.typed.to_string(), p.closed))
+        };
+
+        assert_eq!(at("https://{{ba|"), Some((10..12, "ba".into(), false)));
+        assert_eq!(at("{{to|ken}}/x"), Some((2..7, "to".into(), true)), "swallows the tail");
+        assert_eq!(at("{{|"), Some((2..2, "".into(), false)), "right after the braces");
+        assert_eq!(at("{{a b|"), None, "a space ends the name");
+        assert_eq!(at("{{a}}/|"), None, "past a closed placeholder");
+        assert_eq!(at("no braces|"), None);
+
+        assert_eq!(rank_names(&["base_url", "token", "user_base"], "base"), ["base_url", "user_base"]);
     }
 
     /// Basic auth is resolved *before* it is encoded — the encoding of `alice:{{pass}}` is a

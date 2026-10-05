@@ -13,6 +13,7 @@ mod timing;
 
 mod actions;
 mod auth;
+mod variables;
 mod body_view;
 mod cert_panel;
 mod chrome;
@@ -565,5 +566,15 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         bind!(mac, "enter", CompleteConfirm, Some("GraphQlQuery")),
         bind!(mac, "escape", CompleteDismiss, Some("GraphQlQuery")),
         bind!(mac, "ctrl-space", TriggerCompletion, Some("GraphQlQuery")),
+        // `{{` completion — **last of all, and that is the mechanism.** `VarComplete` is in an
+        // input's leaf context only while its list is open, so these tie with whatever else the
+        // key means there (the GraphQL list above, a header cell's dropdown, the editor's own
+        // arrows) and win by registering later — then vanish the moment the list closes, so
+        // none of them needs to forward to "what the key did before".
+        bind!(mac, "down", text_input::VarCompleteNext, Some("VarComplete")),
+        bind!(mac, "up", text_input::VarCompletePrev, Some("VarComplete")),
+        bind!(mac, "tab", text_input::VarCompleteAccept, Some("VarComplete")),
+        bind!(mac, "enter", text_input::VarCompleteAccept, Some("VarComplete")),
+        bind!(mac, "escape", text_input::VarCompleteDismiss, Some("VarComplete")),
     ]
 }
