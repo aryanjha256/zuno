@@ -34,23 +34,31 @@ use crate::ui::{Icon, glyph, icon_button};
 use crate::workspace::Workspace;
 
 /// Fixed, as `uniform_list` requires: it measures one item and assumes the rest agree.
-const ROW_HEIGHT: f32 = 25.0;
-/// One level of nesting. Deliberately small — a collection nested four deep should still
-/// leave most of a narrow panel for the name.
-const INDENT: f32 = 12.0;
+const ROW_HEIGHT: f32 = 26.0;
+/// One level of nesting. 16 rather than the 12 it was: with guide lines drawn at each level,
+/// 12 put them so close that a nested folder read as a smudge. A collection four deep still
+/// leaves most of a narrow panel for the name.
+const INDENT: f32 = 16.0;
 /// The chevron's column, reserved on *every* row including requests, so names at one depth
 /// line up whether or not their neighbour is a directory.
 const CHEVRON: f32 = 14.0;
 /// The glyph column, reserved on both kinds so names line up.
 const GLYPH_WIDTH: f32 = 16.0;
 
-/// The method label's column, where the pictograph's used to sit — before the name, so a
-/// request and a sibling folder still start their names at the same x. Sized for `PATCH` in
-/// mono at `text_xs`: 5 chars at a 0.6em advance, plus slack.
-const METHOD_WIDTH: f32 = 38.0;
+/// The method pill's width — every pill the same, so names start in one straight line. Sized for
+/// `PATCH` in mono at `PILL_TEXT`, with room either side for the tint to read as a pill.
+const METHOD_WIDTH: f32 = 40.0;
+
+/// The pill's height and text: smaller than the name beside it, so the verb is a tag on the row
+/// rather than its first word.
+const PILL_HEIGHT: f32 = 16.0;
+const PILL_TEXT: f32 = 9.0;
+
+/// The space between the method column and the name.
+const NAME_GAP: f32 = 4.0;
 
 /// The title strip's height. Named because the workspace menu anchors just below it.
-pub const HEADER_HEIGHT: f32 = 28.0;
+pub const HEADER_HEIGHT: f32 = 32.0;
 
 /// The panel's width when nothing has resized it, and where a double-click on the handle
 /// returns it to. Also what a pre-v5 session adopts — `session.rs` imports this one rather
@@ -107,6 +115,10 @@ pub fn render(
     let nodes = workspace.tree.clone();
     let collapsed = workspace.collapsed.clone();
     let selection = workspace.panel_selection;
+    // The file behind the active tab, resolved once per frame for every row to compare against.
+    let open_path = workspace
+        .active()
+        .and_then(|view| view.read(cx).path.clone());
     // Resolved once per frame rather than per row: `rename_input_for` would be a lookup on
     // every one of them to answer "no" for all but a single row.
     let renaming = workspace.renaming_row();
@@ -150,6 +162,7 @@ pub fn render(
                     row_ix,
                     expanded,
                     selection == Some(row_ix),
+                    open_path.as_deref() == Some(node.path.as_path()),
                     renaming.as_ref().filter(|(ix, _)| *ix == row_ix).map(|(_, i)| i.clone()),
                     width,
                     &row_theme,
@@ -348,7 +361,8 @@ fn header(
             name,
             "Workspace",
             OpenWorkspaceMenu,
-            theme.text_muted,
+            // Full text colour: it names where you are, and muted it read as a disabled label.
+            theme.text,
             theme,
         ))
         .child(
@@ -377,6 +391,8 @@ fn header(
                     NewFolder,
                     theme,
                 ))
+                // Two pairs, making things and folding things, told apart by a rule.
+                .child(div().flex_none().w(px(1.)).h(px(14.)).mx(px(3.)).bg(theme.border))
                 // Two controls rather than one that toggles, matching the response pane's
                 // `fold all` / `expand` pair. A single button would have to read the tree's
                 // state to decide its meaning, and a half-collapsed tree has no honest answer —
@@ -508,8 +524,8 @@ pub(crate) fn name_budget(panel_width: f32, depth: u16, is_directory: bool) -> u
     // 6 left pad, the chevron column, two 4px gaps, the kind column, 8 right pad. A folder's
     // kind column is the glyph's own width, so a folder name has more room than a request's —
     // which is the trade for the glyph sitting beside its name instead of a column away.
-    let kind = if is_directory { GLYPH_WIDTH } else { METHOD_WIDTH };
-    let chrome = 6. + CHEVRON + 4. + kind + 4. + 8. + f32::from(depth) * INDENT;
+    let (kind, gap) = if is_directory { (GLYPH_WIDTH, 0.) } else { (METHOD_WIDTH, NAME_GAP) };
+    let chrome = 6. + CHEVRON + 4. + kind + 4. + gap + 8. + f32::from(depth) * INDENT;
     (((panel_width - chrome) / 5.95).max(0.)) as usize
 }
 
@@ -539,17 +555,57 @@ pub(crate) fn method_label(method: &Method) -> String {
 /// borrowed from the verb palette, which means something — red for DELETE — and would invent a
 /// meaning the tag does not have. Grey, which the kinds used to share, made a column of them
 /// read as disabled rows.
+///
+/// **A verb is a tinted pill; a kind is a mark.** They used to share one column of coloured
+/// words — `GET`, `GQL`, `WS` — so a request's verb and its protocol read as the same sort of
+/// thing. Now HTTP shows its verb in a pill of its own colour, and GraphQL, WebSocket and gRPC
+/// show an icon in theirs, centred in the same width so names still start in one line.
 fn badge_cell(badge: &Badge, theme: &Theme) -> Div {
-    let (text, color) = match badge {
-        Badge::Method(method) => (method_label(method), theme.method_color(method)),
-        Badge::Kind(kind) => (kind.label().to_string(), theme.kind_color(*kind)),
-    };
-    div()
+    let cell = div()
         .flex_none()
         .w(px(METHOD_WIDTH))
-        .font_family(theme.mono.clone())
-        .text_color(color)
-        .child(text)
+        .h(px(PILL_HEIGHT))
+        .mr(px(NAME_GAP))
+        .flex()
+        .items_center()
+        .justify_center();
+    match badge {
+        Badge::Method(method) => {
+            let color = theme.method_color(method);
+            cell.rounded(px(3.))
+                .bg(color.alpha(0.14))
+                .font_family(theme.mono.clone())
+                .text_size(px(PILL_TEXT))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(color)
+                .child(method_label(method))
+        }
+        Badge::Kind(kind) => {
+            let icon = match kind {
+                zuno_core::request::KindBadge::GraphQl => Icon::KindGraphQl,
+                zuno_core::request::KindBadge::WebSocket => Icon::KindWebSocket,
+                zuno_core::request::KindBadge::Grpc => Icon::KindGrpc,
+            };
+            let color = theme.kind_color(*kind);
+            cell.child(glyph(icon, color, color, 13.))
+        }
+    }
+}
+
+/// Faint vertical lines, one per ancestor level, through the middle of each ancestor's chevron —
+/// so where a folder's contents end is visible without counting indents. Drawn per row and
+/// stacked by the list, which is what joins them into continuous lines.
+fn indent_guides(depth: u16, theme: &Theme) -> impl Iterator<Item = Div> + use<> {
+    let color = theme.border;
+    (0..depth).map(move |level| {
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(6. + f32::from(level) * INDENT + CHEVRON / 2.))
+            .w(px(1.))
+            .bg(color)
+    })
 }
 
 /// The folder glyph's slot: its own narrow width, so the icon sits beside its name. Sharing the
@@ -601,6 +657,9 @@ fn row(
     row_ix: usize,
     expanded: bool,
     selected: bool,
+    // The request open in the active tab — where you are, as opposed to `selected`, which is
+    // where the panel's keyboard cursor is. Both can be true; they are different questions.
+    open: bool,
     renaming: Option<Entity<crate::input::TextInput>>,
     panel_width: f32,
     theme: &Theme,
@@ -656,8 +715,25 @@ fn row(
     if selected {
         row = row.bg(theme.bg_hover);
     } else {
+        if open {
+            row = row.bg(theme.bg_elevated);
+        }
         row = row.hover(|style| style.bg(theme.bg_hover));
     }
+    // Absolute children, so they draw over the padding without moving the cells.
+    row = row.relative().children(indent_guides(node.depth, theme));
+    if open {
+        row = row.child(
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left_0()
+                .w(px(2.))
+                .bg(theme.accent),
+        );
+    }
+    let name_colour = theme.text;
 
     match &node.kind {
         NodeKind::Directory => row
@@ -714,15 +790,17 @@ fn row(
                     .overflow_hidden()
                     .child(input)
                     .into_any_element(),
-                None => name_cell(
-                    &node.name,
-                    panel_width,
-                    node.depth,
-                    false,
-                    theme.text_muted,
-                    row_ix,
-                )
-                .into_any_element(),
+                // `text`, not `text_muted`: muted names made the whole tree read as disabled, and
+                // the pills beside them already carry the colour. The open one is also weighted.
+                None => {
+                    let cell =
+                        name_cell(&node.name, panel_width, node.depth, false, name_colour, row_ix);
+                    if open {
+                        cell.font_weight(gpui::FontWeight::MEDIUM).into_any_element()
+                    } else {
+                        cell.into_any_element()
+                    }
+                }
             }),
     }
 }
