@@ -468,30 +468,63 @@ pub(crate) fn toolbar(
     url_focused: bool,
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
+    // **One field, inset, with Send beside it** — the shape every API client uses, so it reads as
+    // "type here" without a focus line to prove it. Before this the URL was drawn straight onto
+    // the strip and the only sign of an input was a 2px accent line under the *whole row*, kind
+    // and method included, which said "this toolbar is selected" rather than "you are typing".
+    // Focus now lights the field's own border.
     div()
         .flex()
         .flex_row()
         .items_center()
+        .gap(px(6.))
         .flex_none()
-        .h(px(crate::ui::BAR_HEIGHT))
+        .h(px(URL_ROW_HEIGHT))
+        .px(px(6.))
+        .py(px(5.))
         .bg(theme.bg_elevated)
-        .border_b_2()
-        .border_color(if url_focused { theme.accent } else { theme.border })
-        .child(kind_chip(view, theme))
-        .child(div().w(px(1.)).h(px(16.)).flex_none().bg(theme.border))
-        .children(method_chip(view, theme))
-        // Conditional with the chip it follows. Left unconditional, a kind with no verb drew
-        // this rule straight after the one above it — two dividers with nothing between them,
-        // which reads as a 2px seam rather than as an absent control.
-        .children(view.method().is_some().then(|| segment_divider(theme)))
-        .child(url_bar(view, theme))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .rounded_md()
+                .overflow_hidden()
+                .bg(theme.bg)
+                .border_1()
+                .border_color(if url_focused { theme.accent } else { theme.border })
+                .child(kind_chip(view, theme))
+                .child(segment_divider(theme))
+                .children(method_chip(view, theme))
+                // Conditional with the chip it follows. Left unconditional, a kind with no verb
+                // drew this rule straight after the one above it — two dividers with nothing
+                // between them, which reads as a 2px seam rather than as an absent control.
+                .children(view.method().is_some().then(|| segment_divider(theme)))
+                .child(url_bar(view, theme)),
+        )
         .child(send_button(theme, view, cx))
 }
+
+/// The URL row's own height, taller than `ui::BAR_HEIGHT`: it holds an inset field and a button
+/// rather than flat labels, and at 30px they would be 20px tall. Nothing lines up against this
+/// row, so it need not share the other bars' height.
+const URL_ROW_HEIGHT: f32 = 38.;
 
 /// The rule between two segments. A filled 1px child rather than a border on either neighbour,
 /// because a div carries one `border_color` for all four sides and the row's already spoken for.
 fn segment_divider(theme: &Theme) -> impl IntoElement + use<> {
-    div().flex_none().w(px(1.)).h_full().bg(theme.border)
+    div().flex_none().w(px(1.)).h(px(14.)).bg(theme.border)
+}
+
+/// The small chevron that says a chip opens a picker — without one, `HTTP` and `POST` read as
+/// labels rather than as the two controls they are.
+fn chip_chevron(colour: gpui::Hsla, theme: &Theme) -> impl IntoElement + use<> {
+    crate::ui::glyph(Icon::ChevronDown, colour, theme.text, crate::ui::GLYPH_INLINE)
 }
 
 /// The verbs that act on the request, at the far end of the section tabs.
@@ -551,8 +584,10 @@ fn request_actions(theme: &Theme) -> Div {
 fn kind_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
     div()
         .id("kind-chip")
+        .group(crate::ui::ICON_GROUP)
         .flex()
         .items_center()
+        .gap_1()
         .flex_none()
         .h_full()
         .px(px(10.))
@@ -565,6 +600,7 @@ fn kind_chip(view: &RequestView, theme: &Theme) -> impl IntoElement {
             window.dispatch_action(Box::new(crate::actions::OpenRequestKind), cx);
         })
         .child(view.kind.choice().label())
+        .child(chip_chevron(theme.text_faint, theme))
 }
 
 /// The verb, for the kinds that have one.
@@ -581,8 +617,10 @@ fn method_chip(view: &RequestView, theme: &Theme) -> Option<impl IntoElement + u
         div()
         .id("method-chip")
         .debug_selector(|| "method-chip".to_string())
+        .group(crate::ui::ICON_GROUP)
         .flex()
         .items_center()
+        .gap_1()
         .flex_none()
         .h_full()
         .px(px(10.))
@@ -600,7 +638,8 @@ fn method_chip(view: &RequestView, theme: &Theme) -> Option<impl IntoElement + u
                 window.dispatch_action(Box::new(crate::actions::OpenMethod), cx);
             },
         )
-        .child(method.as_str().to_string()),
+        .child(method.as_str().to_string())
+        .child(chip_chevron(theme.text_faint, theme)),
     )
 }
 
@@ -614,7 +653,9 @@ fn url_bar(view: &RequestView, theme: &Theme) -> Div {
         .overflow_hidden()
         .px_2()
         .font_family(theme.mono.clone())
-        .text_sm()
+        // `text_xs`, the chips' size — at `text_sm` the URL was the largest text in the window,
+        // a size jump inside one field.
+        .text_xs()
         .text_color(theme.text)
         .child(view.url.clone())
 }
@@ -637,12 +678,15 @@ fn send_button(
     let connected = view.is_connected();
     let sending = view.is_sending();
     let session = view.kind.as_websocket().is_some();
+    // A button beside the field, the field's height and corners, rather than a flush block at
+    // the window's edge — it stays the one accent control in the row without outweighing it.
     let base = div()
         .id("send-button")
         .flex()
         .items_center()
         .flex_none()
         .h_full()
+        .rounded_md()
         .px_4()
         .text_xs()
         .font_weight(FontWeight::MEDIUM)
