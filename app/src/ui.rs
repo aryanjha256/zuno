@@ -53,6 +53,7 @@ pub enum Icon {
     Globe,
     Eye,
     EyeOff,
+    EllipsisVertical,
     // The request kinds' marks in the collection panel. Samples until the final artwork lands —
     // replacing the three files is the whole job.
     KindGraphQl,
@@ -113,6 +114,7 @@ impl Icon {
             Icon::FileBadge => "icons/file-badge.svg",
             Icon::Eye => "icons/eye.svg",
             Icon::EyeOff => "icons/eye-off.svg",
+            Icon::EllipsisVertical => "icons/ellipsis-vertical.svg",
             Icon::KindGraphQl => "icons/kind-graphql.svg",
             Icon::KindWebSocket => "icons/kind-websocket.svg",
             Icon::KindGrpc => "icons/kind-grpc.svg",
@@ -169,6 +171,7 @@ impl Icon {
         Icon::FileBadge,
         Icon::Eye,
         Icon::EyeOff,
+        Icon::EllipsisVertical,
         Icon::KindGraphQl,
         Icon::KindWebSocket,
         Icon::KindGrpc,
@@ -225,6 +228,7 @@ impl AssetSource for Assets {
             "icons/file-badge.svg" => include_bytes!("../assets/icons/file-badge.svg"),
             "icons/eye.svg" => include_bytes!("../assets/icons/eye.svg"),
             "icons/eye-off.svg" => include_bytes!("../assets/icons/eye-off.svg"),
+            "icons/ellipsis-vertical.svg" => include_bytes!("../assets/icons/ellipsis-vertical.svg"),
             "icons/kind-graphql.svg" => include_bytes!("../assets/icons/kind-graphql.svg"),
             "icons/kind-websocket.svg" => include_bytes!("../assets/icons/kind-websocket.svg"),
             "icons/kind-grpc.svg" => include_bytes!("../assets/icons/kind-grpc.svg"),

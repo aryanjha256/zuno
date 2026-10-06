@@ -280,6 +280,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     // to act on. The two choices it offers are rows in the select, not actions.
     ("zuno::OpenPartKindMenu", "opened by a multipart row's type chip"),
     ("zuno::OpenAuthMenu", "opened by the Auth tab's chip; the palette offers each choice itself"),
+    ("zuno::OpenRequestMenu", "opened by the request's `⋯` button; each of its rows has a palette row of its own"),
     ("zuno::ConfirmClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CancelClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CloseChoiceNext", "only valid inside the unsaved-changes prompt"),

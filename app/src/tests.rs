@@ -6923,9 +6923,9 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("action-save-body", "zuno::SaveResponse"),
         ("action-history", "zuno::ShowHistory"),
         ("action-save-request", "zuno::SaveRequest"),
-        ("action-import-curl", "zuno::ImportCurl"),
-        ("action-copy-code", "zuno::CopyAsCode"),
-        ("action-settings", "zuno::OpenSettings"),
+        // Copy as code, Import from curl and Request settings live behind this one — their mouse
+        // path is a menu row, walked end to end by `clicking_an_icon_button_dispatches_its_action`.
+        ("action-more", "zuno::OpenRequestMenu"),
         ("action-new-tab", "zuno::NewTab"),
         ("collection-new-request", "zuno::NewRequest"),
         ("environment-badge", "zuno::SwitchEnvironment"),
@@ -6933,8 +6933,8 @@ fn affordances() -> Vec<(&'static str, &'static str)> {
         ("hint-commands", "zuno::OpenPalette"),
         ("hint-env", "zuno::SwitchEnvironment"),
         ("hint-send", "zuno::SendRequest"),
-        // App-level, so it lives in the titlebar rather than in the request pane, whose own gear
-        // is `action-settings` above and edits the request in front of you.
+        // App-level, so it lives in the titlebar rather than in the request pane, whose own
+        // settings are a row of the `⋯` menu above and edit the request in front of you.
         ("defaults-settings", "zuno::OpenDefaults"),
         ("theme-toggle", "zuno::ToggleTheme"),
         ("fold-all", "zuno::FoldAll"),
@@ -7022,15 +7022,18 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
         "the find icon must open the find bar"
     );
 
-    // Copy as code: opens the language picker, and its first row is curl.
-    let copy = cx.debug_bounds("action-copy-code").expect("copy-as-code button");
-    cx.simulate_click(copy.center(), gpui::Modifiers::default());
+    // Copy as code, through the `⋯` menu: its first row opens the language picker, whose first
+    // row is curl. Two Enters — one chooses the menu row, one the language.
+    let more = cx.debug_bounds("action-more").expect("the ⋯ button");
+    cx.simulate_click(more.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.press("enter");
     cx.run_until_parked();
     cx.press("enter");
     cx.run_until_parked();
     assert!(
         clipboard_text(&mut cx).unwrap_or_default().starts_with("curl "),
-        "the terminal icon must offer curl first, and copy it"
+        "the ⋯ menu's Copy as code must offer curl first, and copy it"
     );
 
     // Fold all: was calling the view directly instead of dispatching, so this is the regression

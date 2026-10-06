@@ -201,6 +201,8 @@ actions!(
         ShowParamsTab,
         ShowBodyTab,
         // The Auth tab's choice, one action per option so the palette can offer each.
+        // The `⋯` beside Save: the request's rarer verbs, by name.
+        OpenRequestMenu,
         UseNoAuth,
         UseBasicAuth,
         UseBearerAuth,

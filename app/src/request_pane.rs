@@ -16,8 +16,8 @@ use gpui::{
 use crate::actions::{
     AddAssertion, AddCapture, AddFormField, AddHeader, AddMultipartField, AddQuery, BodyFindNext,
     ChooseSchemaFile, OpenGrpcMethod, ReflectSchema,
-    BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind, CopyAsCode, ImportCurl,
-    OpenBodyType, OpenSettings, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
+    BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind,
+    OpenBodyType, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
     SendRequest, ShowAssertTab, ShowAuthTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab,
     ShowParamsTab, TogglePasswordShown,
 };
@@ -532,6 +532,11 @@ fn chip_chevron(colour: gpui::Hsla, theme: &Theme) -> impl IntoElement + use<> {
 /// They sat beside Send until the tabs landed, where four grey icons touching the one accent
 /// button made Send read as button 1 of 5. They belong with the request's sections, not with
 /// the thing that sends it.
+///
+/// **Save, and a `⋯` for the rest.** Four unlabelled icons in a row read as four equal verbs and
+/// as a second set of tabs, when Save is constant and the others rare — and Import from curl
+/// wore a clipboard, so it and Copy as code looked like two copy buttons. The rare three now
+/// sit in a menu that names them and shows their keys. A rule sets the pair apart from the tabs.
 fn request_actions(theme: &Theme) -> Div {
     div()
         .flex()
@@ -539,6 +544,7 @@ fn request_actions(theme: &Theme) -> Div {
         .items_center()
         .gap_1()
         .flex_none()
+        .child(div().flex_none().w(px(1.)).h(px(14.)).mx_1().bg(theme.border))
         .child(icon_button(
             "action-save-request",
             Icon::Save,
@@ -547,24 +553,10 @@ fn request_actions(theme: &Theme) -> Div {
             theme,
         ))
         .child(icon_button(
-            "action-import-curl",
-            Icon::Clipboard,
-            "Import request from curl on the clipboard",
-            ImportCurl,
-            theme,
-        ))
-        .child(icon_button(
-            "action-copy-code",
-            Icon::Terminal,
-            "Copy request as code",
-            CopyAsCode,
-            theme,
-        ))
-        .child(icon_button(
-            "action-settings",
-            Icon::Settings,
-            "Request settings",
-            OpenSettings,
+            "action-more",
+            Icon::EllipsisVertical,
+            "More — copy as code, import from curl, request settings",
+            crate::actions::OpenRequestMenu,
             theme,
         ))
 }

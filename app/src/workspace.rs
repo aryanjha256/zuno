@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -4848,6 +4848,32 @@ impl Workspace {
         self.show_menu(rows, at, restore, window, cx);
     }
 
+    /// The `⋯` beside Save: the request's rarer verbs, named, with their keys.
+    ///
+    /// Opened where the pointer is — only the button dispatches this, and it is under the
+    /// pointer — rather than threading the button's bounds through an action that has no payload.
+    fn open_request_menu(
+        &mut self,
+        _: &OpenRequestMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+        use context_menu::{MenuItem, MenuRow};
+        let focus = view.read(cx).url_focus(cx);
+        let rows = vec![
+            MenuItem::new("Copy as code…", CopyAsCode, &focus, window).into(),
+            MenuItem::new("Import from curl on the clipboard", ImportCurl, &focus, window).into(),
+            MenuRow::Separator,
+            MenuItem::new("Request settings", OpenSettings, &focus, window).into(),
+        ];
+        let at = window.mouse_position();
+        self.show_menu(rows, at, Some(focus), window, cx);
+    }
+
     fn use_no_auth(&mut self, _: &UseNoAuth, _: &mut Window, cx: &mut Context<Self>) {
         self.use_auth(crate::auth::AuthKind::None, cx);
     }
@@ -7639,6 +7665,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_headers_tab))
             .on_action(cx.listener(Self::show_auth_tab))
             .on_action(cx.listener(Self::open_auth_menu))
+            .on_action(cx.listener(Self::open_request_menu))
             .on_action(cx.listener(Self::use_no_auth))
             .on_action(cx.listener(Self::use_basic_auth))
             .on_action(cx.listener(Self::use_bearer_auth))
