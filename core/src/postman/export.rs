@@ -17,7 +17,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::collection::Entry;
-use crate::request::{Body, MultipartValue, RequestKind, RequestSpec};
+use crate::request::{Auth, Body, MultipartValue, RequestKind, RequestSpec};
 
 /// A collection ready to write, plus everything that did not fit.
 pub struct Export {
@@ -111,6 +111,9 @@ fn item_for(label: &str, spec: &RequestSpec, skipped: &mut Vec<String>) -> Value
         spec.method().map_or_else(|| "GET".into(), |method| json!(method.as_str())),
     );
     request.insert("header".to_string(), headers_for(spec));
+    if let Some(auth) = auth_for(spec) {
+        request.insert("auth".to_string(), auth);
+    }
     request.insert("url".to_string(), url_for(spec));
 
     if let Some(body) = body_for(spec) {
@@ -164,6 +167,29 @@ fn report_unmappable(label: &str, spec: &RequestSpec, skipped: &mut Vec<String>)
     }
     if !spec.assertions.is_empty() || spec.expect_status.is_some() {
         skipped.push(format!("{label}: assertions and the expected status"));
+    }
+}
+
+/// The Auth tab as Postman's own `auth` block, which has both modes under the same names.
+///
+/// Written as the fields rather than as the derived `Authorization` header, so Postman shows them
+/// in its Authorization tab and a `{{token}}` stays a variable there too. Nothing when a typed
+/// `Authorization` row overrides it — that row is what Zuno sends, and it is exported already.
+fn auth_for(spec: &RequestSpec) -> Option<Value> {
+    if spec.auth_overridden() {
+        return None;
+    }
+    let row = |key: &str, value: &str| json!({ "key": key, "value": value, "type": "string" });
+    match &spec.auth {
+        Auth::None => None,
+        Auth::Basic { username, password } => Some(json!({
+            "type": "basic",
+            "basic": [row("username", username), row("password", password)],
+        })),
+        Auth::Bearer { token } => Some(json!({
+            "type": "bearer",
+            "bearer": [row("token", token)],
+        })),
     }
 }
 
@@ -445,6 +471,53 @@ mod tests {
         let graphql = me.spec.graphql().expect("must re-import as a GraphQL request");
         assert_eq!(graphql.query, "query Me { me { id } }");
         assert_eq!(graphql.variables, r#"{"n": 1}"#);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The Auth tab is not a header, so `headers_for` alone exported a request with no
+    /// credentials at all — and no line in the report saying so.
+    #[test]
+    fn the_auth_tab_survives_the_trip_to_postman() {
+        let root = root();
+
+        let mut bearer = RequestSpec::default();
+        bearer.url = "https://api.test/bearer".into();
+        bearer.auth = Auth::Bearer { token: "{{token}}".into() };
+        write(&root.join("bearer.json"), &bearer).expect("write");
+
+        let mut basic = RequestSpec::default();
+        basic.url = "https://api.test/basic".into();
+        basic.auth = Auth::Basic { username: "alice".into(), password: "pw".into() };
+        write(&root.join("basic.json"), &basic).expect("write");
+
+        // A typed row wins on the wire, so it is the one that has to arrive.
+        let mut overridden = bearer.clone();
+        overridden.url = "https://api.test/typed".into();
+        overridden.headers = vec![Header::new("Authorization", "Bearer typed")];
+        write(&root.join("typed.json"), &overridden).expect("write");
+
+        let export = to_collection("x", &scan(&root));
+        let value: serde_json::Value = serde_json::from_str(&export.json).expect("JSON");
+        let back = crate::postman::parse(&value).expect("re-import");
+
+        let authorization = |path: &str| -> Vec<String> {
+            let request = back
+                .requests
+                .iter()
+                .find(|r| r.spec.url.ends_with(path))
+                .expect("request");
+            request
+                .spec
+                .headers
+                .iter()
+                .filter(|h| h.name.eq_ignore_ascii_case("authorization"))
+                .map(|h| h.value.clone())
+                .collect()
+        };
+        assert_eq!(authorization("/bearer"), vec!["Bearer {{token}}".to_string()]);
+        assert_eq!(authorization("/basic"), vec![format!("Basic {}", crate::curl::base64(b"alice:pw"))]);
+        assert_eq!(authorization("/typed"), vec!["Bearer typed".to_string()]);
 
         std::fs::remove_dir_all(&root).ok();
     }

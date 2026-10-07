@@ -34,7 +34,8 @@ was finished; rewritten rather than patched, per the note at the top of this fil
   outline; and find-and-replace in the request body, which is what made `Ctrl+F` mean something
   everywhere rather than everywhere except the surface you type into; the **collection panel** —
   a browsable tree of what you have saved, which until then nothing in the app could show you.
-  The **timing timeline**, a third response tab breaking a request into DNS, connect + TLS,
+  The **timing timeline**, a third response tab (since widened and renamed **Network**)
+  breaking a request into DNS, connect + TLS,
   waiting and download along one time axis — the first item on that audit where the engine, not
   the UI, was the half that was missing. Then the **proxy** and **certificates**, which between
   them are what makes Zuno usable on a corporate network at all; and a **tab context menu**,
@@ -144,11 +145,11 @@ beside its own requests is read back as one and fails on every scan afterwards.
 **Known and deliberately left, because GraphQL is not yet used much.** Written down rather than
 carried in someone's head — the failure this file's own header predicts:
 
-- **A `subscription` gets no guidance.** Against a **graphql-sse** server it works, badly: the
-  whole stream is buffered and shown as flat text only once it ends, and an unbounded one dies at
-  the request timeout instead. Against a server that does not speak SSE it errors obscurely. A
-  leading-keyword check could say "subscriptions need a streaming transport" — see the SSE note
-  under *Named, not planned*, which is the cheaper half of the WebSocket work.
+- ~~**A `subscription` gets no guidance.**~~ — **closed** by the subscriptions work below: *Auto*
+  routes a subscription over graphql-transport-ws, a graphql-sse answer streams as a session, and
+  the timeout is an idle one rather than a deadline on the whole exchange. What remains is small:
+  an HTTP-transport subscription sends no `Accept: text/event-stream`, so a server that
+  negotiates on it may answer once in JSON unless the header is typed.
 - **`graphql_envelope` is built twice on a GET** — once in `build_graphql`, once inside
   `graphql_url`. Threading a prebuilt envelope through a function curl export also calls, to save
   one small JSON build on GET-only requests, was not worth the churn.
@@ -229,7 +230,8 @@ These decide phase order, and they're the durable part of this document.
    original nine in one modal and the method picker closed a sixth as a side effect, which is the
    ratio this principle is about — one modal for five features.
 
-   **§11 is now empty, and this text said "Three remain" long after all three landed.** The
+   **§11 emptied, and this text said "Three remain" long after all three landed.** (It has one
+   entry again, kept open by decision: live gRPC reflection — see *Where we are*.) The
    principle outlives its list: prefer the work where the engine already does the thing and only
    the UI is missing, because that ratio is unbeatable. §11 is also the wrong place to *look* for
    such work now — by construction it can only name gaps where the engine was involved, and the
@@ -266,7 +268,9 @@ persistence was single-buffer and that switching needs focus to travel with it �
 belongs to its creating entity, so a switch that only moves `active_ix` leaves the keymap dead.
 
 *Left over, deliberately:* no reordering, no rename (tab labels derive from the URL — see
-`label_for`), and `dirty` still unanswered until collections give it a baseline.
+`label_for`), and `dirty` still unanswered until collections give it a baseline. (`dirty` has
+been answered since — `RequestView::is_dirty`, against the last save; reorder and rename are still
+absent.)
 
 **Collections — the format is done.** §12's persistence decision is settled: a directory of
 one-request-per-file JSON (`core/src/collection.rs`), because a collection you can commit and
@@ -278,14 +282,16 @@ second save overwrite its own file instead of breeding `posts-2.json`.
 *What's missing is reach, not format:* **nothing opens a saved request back into a buffer.** That's
 the picker's job by principle 2, so it waits rather than getting a throwaway list UI. Until then a
 saved request is only reachable while its tab is open — worth knowing, since it makes the picker
-the next thing that has to land. Folder authoring is also absent; `mkdir` works.
+the next thing that has to land. Folder authoring is also absent; `mkdir` works. (Both landed:
+the picker opens saved requests, and the collection panel creates and moves folders.)
 
 **The picker primitive — done.** Principle 2's one build: `app/src/picker.rs` is a centred modal
 with a filter input, a fuzzy-ranked `uniform_list`, and a `Target` it hands back without
 interpreting. Deliberately *not* a `PickerDelegate` trait — a new consumer is a new `Target`
 variant, not a rewrite. (This said "one consumer" for a long time after there were seven. The
 count was never the trigger: the trait earns its keep at a consumer wanting different *rendering*,
-and all seven render identically. See architecture.md §12.)
+and all seven render identically. Rows have since gained badges, keycaps and section headings —
+as data on the row, still with no trait. See architecture.md §12.)
 
 Matching is hand-rolled in `core/src/fuzzy.rs` rather than taking `nucleo`: hundreds of requests and
 a couple of dozen actions is not a scale where a real matcher earns its complexity, and pure code in
@@ -811,6 +817,12 @@ cursors stayed separate, because a match and where you are standing are differen
   instant when the truth is it never ran. `Connection` is an enum for that reason, and the pane
   says which. See architecture.md §6h.
 
+  **Since renamed Network, and widened past timing.** The tab now has three foldable sections:
+  the timeline, the **connection** (both socket addresses, and the server's certificate — subject,
+  issuer, validity, serial and the SHA-1 fingerprint Postman shows), and the **request as sent** —
+  every header the client added beside the ones typed, each labelled with what put it there.
+  architecture.md §6h has the mechanism.
+
 - **OpenAPI import — done.** `Ctrl+Shift+I` takes a spec URL or a file path and fills the
   collection: one folder named for the spec, each operation's tag a folder inside it. This is
   the answer to a first run that feels empty, and it is why it came before the project root —
@@ -1201,18 +1213,18 @@ Reasons recorded so a future session can judge them, not commitments.
   saved messages, clean close. What is not built, and why each is a fair deferral rather than an
   oversight:
 
-  - **Sending a binary, ping or pong frame.** The engine sends whichever `Frame` variant it is
-    handed and the transcript labels all four on the way in; only the *composer* is text-only.
-    Recorded in architecture.md §11, because it is engine capability with no UI path rather than
-    something unbuilt. A manual ping is the one worth reaching first — it answers "is this quiet
-    socket still alive", which nothing else on screen can.
+  - ~~**Sending a binary, ping or pong frame.**~~ — **done** for ping and binary: the composer's
+    Ping and File buttons, and palette rows (`SendPing`, `SendBinaryFile`). A manual pong stays
+    out on purpose; architecture.md §11 records both as reachable.
   - **A close code and reason.** Disconnect always sends `close(None)`. Servers that care about
     *why* a client left — and some log it — get no answer. Needs a control on the disconnect
     path rather than any engine work.
-  - **Reconnect.** No button, no automatic retry, no backoff. Reconnecting today means pressing
-    Connect again, which works and loses the transcript. Auto-retry in particular wants a
-    decision first: a client that silently reconnects is a client that hides a server problem.
-  - **Loading a saved message by keyboard.** Click only. Every other verb has a shortcut.
+  - **Reconnect — a button now, nothing automatic.** A closed socket's strip offers Reconnect,
+    which sends again and starts a fresh transcript. Still no automatic retry and no backoff,
+    and that still wants a decision first: a client that silently reconnects is a client that
+    hides a server problem. (SSE does resume on its own — see below.)
+  - **Loading a saved message by keyboard.** Click only, and so is forgetting one. Ping, File and
+    Save are palette-only, with no keybinding of their own.
   - ~~**The subprotocol field overrides a hand-typed `Sec-WebSocket-Protocol` header**~~ —
     **fixed**: the two are merged, the field's offers first, then any the header adds.
 
@@ -1324,7 +1336,7 @@ Reasons recorded so a future session can judge them, not commitments.
   split is that it will not stay that way. The status line and the response headers now live on
   the `Transcript` rather than on `inflight`, which is cleared at the close: a finished stream
   used to keep its frames and silently lose everything about the response that carried them.
-  A session's tab strip offers Frames and Headers and not Timing or Diff, which have nothing to
+  A session's tab strip offers Frames and Headers and not Network or Diff, which have nothing to
   draw for a stream.
 
   **graphql-transport-ws — done**, which is what makes GraphQL subscriptions work against real

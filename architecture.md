@@ -232,13 +232,16 @@ pub struct RequestSpec {            // the spine — true for every protocol
     pub settings: RequestSettings,
     pub kind: RequestKind,         // everything that differs by protocol
     // .. captures, expect_status, assertions
+    pub auth: Auth,                // None | Basic | Bearer, as typed; written last, and only
+                                   // when not None (invariant 11)
 }
 
 pub enum RequestKind {
     Http(HttpRequest),
     GraphQl(GraphQlRequest),
     WebSocket(WebSocketRequest),
-    // Grpc, Mqtt … each a compile error until someone decides
+    Grpc(GrpcRequest),
+    // Mqtt … each a compile error until someone decides
 }
 
 pub struct HttpRequest {
@@ -268,6 +271,7 @@ pub struct RequestSettings {
     pub max_redirects: u8,
     pub verify_tls: bool,
     pub accept_encodings: bool,
+    pub cookie_store: bool,
 }
 ```
 
@@ -687,7 +691,7 @@ request to get. Four decisions:
   exactly two. A third tab has to split this into per-tab actions.
 
   **There are three now, and that last sentence was the whole cost of adding one.** The Timing
-  tab (§6h) split `ToggleResponseView` into `NextResponseTab`/`PrevResponseTab` plus a
+  tab (§6h, since renamed Network) split `ToggleResponseView` into `NextResponseTab`/`PrevResponseTab` plus a
   `ShowResponse*` verb per tab, exactly as the request pane's strip already had to. The active
   tab stays inert, now for the weaker of the two reasons: a click dispatching its own tab is
   harmless, it merely advertises a change that never comes.
@@ -707,8 +711,9 @@ constraint for values that ought eventually to wrap.
 query and body used to stack, so the two sections you weren't editing still cost a header row and
 an empty-state row apiece — about 130px to say "nothing here" — while the body editor got whatever
 was left. `Headers │ Params │ Body` (`Alt+Q` forward, `Alt+Shift+Q` back), each with the slim
-control row that used to be its section header, and the four request verbs at the far end of the
-strip where the response pane keeps its own.
+control row that used to be its section header, and the request verbs at the far end of the
+strip where the response pane keeps its own — four buttons at first, now Save plus a ⋯ menu
+holding copy as code, import from curl and request settings.
 
 Four decisions, and the first is the one that matters:
 
@@ -2047,9 +2052,11 @@ than approximate, and it is luck rather than design.
   folder that fits and named in `skipped`. A request written below the depth `scan` walks is on
   disk and invisible — the tree cannot show it and the picker cannot find it — which is worse
   than a folder in the wrong place.
-- **Auth is lowered into a header.** Zuno has no auth model on purpose (ROADMAP records auth
-  helpers as *dropped, not deferred*), and a header is what actually goes on the wire, so bearer,
-  basic and API-key all become one. `basic` shares `curl.rs`'s `base64`, which had been sitting
+- **Auth is lowered into a header.** Written when Zuno had no auth model; it has an Auth tab now
+  (None / Basic / Bearer, ROADMAP under M3), but importing `basic` and `bearer` into it rather
+  than into a header is a decision not yet taken. A header is still what goes on the wire, so
+  bearer, basic and API-key all become one. **Export does use the tab:** `postman::export` writes
+  it as Postman's own `auth` block, unless a typed `Authorization` row overrides it. `basic` shares `curl.rs`'s `base64`, which had been sitting
   there tested with one caller. OAuth 2, SigV4, Digest, NTLM and Hawk are signing *procedures*
   with no value to copy, so they are named in `skipped` rather than half-imported — a request
   that looks complete and 401s is the worse outcome.
@@ -2455,6 +2462,25 @@ instrument for it.
 One thing came free: the tab reads `view.displayed()` like every other region in the pane, so
 browsing the history shows that run's timing rather than the live one, with no rule of its own.
 
+### The Network tab — timing, connection, and the request as sent
+
+The tab was renamed **Network** when two sections joined the timeline, each foldable:
+
+- **Connection.** `run.rs::network_of` reads both socket addresses from hyper-util's `HttpInfo`
+  and the peer certificate's DER from reqwest's `TlsInfo` (`tls_info(true)` on every client).
+  `core/src/certificate.rs` reads subject, issuer, validity and serial with `x509-parser`, and
+  takes a **SHA-1** fingerprint because that is the one Postman shows, so the two can be compared
+  side by side. Both extensions are set on every response, pooled connections included, so a
+  reused socket still names its ends.
+- **Request sent.** `engine/sent.rs` **reconstructs** rather than captures, because reqwest 0.13
+  adds its headers inside a fixed tower stack (cookies → redirects → decompression → hyper) with
+  no hook at that level. It reads the `reqwest::Request` Zuno built, then adds what the client
+  adds by the same rules — `accept`/`user-agent` and `accept-encoding` only where vacant, `cookie`
+  from our jar only where none is typed, `host`/`content-length` from hyper — and labels each row
+  with its `SentSource`. `the_sent_request_is_exactly_what_the_server_received` in
+  `core/tests/engine.rs` compares the reconstruction with what a server actually read; it is what
+  caught the missing `accept: */*`.
+
 ---
 
 ## 6i. The proxy — a default nobody chose
@@ -2790,7 +2816,7 @@ they are the API's vocabulary, not HTTP's.
 ## 6m. The inline body diff — normalize, then borrow
 
 `ResponseDiff` (§6, the diff bar) answers *whether* the body changed. `BodyDiff` answers *what*
-changed, and lives on a fourth response tab beside Body, Headers and Timing.
+changed, and lives on a fourth response tab beside Body, Headers and Network.
 
 **The normalization is the feature; the diff algorithm is a dependency.** A JSON API answers on
 one line — `{"id":1,"name":"ada"}` — so a line diff over the raw bytes has exactly one line to
@@ -3699,7 +3725,10 @@ Two things the settings panel turned up that are worth knowing before touching e
   returns the original jar intact. So a toggle on its own would have created the confusion it was
   added to remove, and `Engine::clear_cookies` (drop the cached clients; the next request builds a
   fresh jar) shipped with it. reqwest owns the store behind `cookie_store(true)` and exposes no way
-  to empty it, which is why eviction rather than clearing.
+  to empty it, which is why eviction rather than clearing. **Superseded by the cookie viewer:** the
+  jar is Zuno's own `CookieStoreMutex` now, one store handed to every client through
+  `cookie_provider`, so `clear_cookies` empties it in place and keeps the pooled connections — §12
+  has the change.
 - **A clicked setting did not reach the request, and only the mouse path was wrong.** The row's
   click handler called `panel.confirm` directly and dropped the `bool` it returns — and that `bool`
   is the whole mechanism: only `Workspace::setting_confirm` reads it, and only it calls
@@ -3720,8 +3749,8 @@ Two things the settings panel turned up that are worth knowing before touching e
   varying it by request — environments carry values, not policy. Dropping the layer that was
   never wanted is what turned this from a blocked design into one panel row.
 
-  **Two triggers, not a scope row.** `Ctrl+,` and the request pane's gear edit the buffer in
-  front of you; `Ctrl+Shift+,` and a gear in the titlebar edit the defaults. The first build put
+  **Two triggers, not a scope row.** `Ctrl+,` and the request pane's gear (now the ⋯ menu's
+  *Request settings*) edit the buffer in front of you; `Ctrl+Shift+,` and a gear in the titlebar edit the defaults. The first build put
   a scope row inside one panel, and it needed the header *and* that row to both spell out which
   set was live — a design arguing with itself. Where a gear lives says what it changes, so the
   titlebar's sits in the app's own furniture and the pane's stays with the request. The panel is
@@ -3962,6 +3991,13 @@ Three decisions in `picker.rs` worth recording:
   differ only in the data they carry, which is what `Target` exists to absorb, and all seven draw
   as label plus dimmed detail. Reconsider on a row shape that doesn't fit — a preview pane, an
   icon column — not on the eighth variant.
+
+  **The icon column arrived, and still did not need the trait.** Rows now carry an optional
+  `Decor` — a badge (method pill or kind icon), a trailing column, keycaps — and the list can hold
+  section headings (`Line::Heading`). All of it is *data* the one renderer draws when present, so
+  the variety lives in what a `Target` producer attaches rather than in per-consumer rendering
+  code. The trigger above still stands for a row that is a different *layout*, like a preview
+  pane.
 - **Modal, not `anchored()`.** A palette is centred over the window, so it's a full-size `absolute`
   overlay. `anchored()` positions relative to a point; both exist in 0.2.2 and this needed the
   simpler one.

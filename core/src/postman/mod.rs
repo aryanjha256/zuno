@@ -626,8 +626,9 @@ fn raw_kind(body: &Value, text: &str) -> RawKind {
     }
 }
 
-/// What an auth block becomes. Zuno has no auth model, deliberately — a header is what goes on
-/// the wire, and lowering auth to one keeps a single answer to "what will be sent".
+/// What an auth block becomes. Lowered to a header even for `basic` and `bearer`, which the Auth
+/// tab could hold since it landed: importing into the tab is a separate decision not yet taken
+/// (ROADMAP, under the Auth tab), and a header is still exactly what goes on the wire.
 enum AuthEffect {
     Header(Header),
     Query(QueryParam),

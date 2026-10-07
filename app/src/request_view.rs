@@ -1954,8 +1954,8 @@ impl RequestView {
     /// The selected frame's payload as text, when there is one and it is text.
     ///
     /// `None` for a binary frame rather than lossy bytes: the clipboard is for things you can
-    /// paste, and `SaveResponse` is the counterpart that handles the rest — the same split the
-    /// response body already makes.
+    /// paste. Unlike the response body, a binary frame has no way out yet — `SaveResponse` saves
+    /// the HTTP response, not a frame.
     pub fn selected_frame_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
         let frame = session.rows.get(self.session_selected?)?.kind.frame()?;

@@ -2977,7 +2977,7 @@ fn transcript(
 
 /// A session's own tab strip: the transcript, and the handshake's headers.
 ///
-/// **Two tabs, not four.** `view_tabs` also offers Timing and Diff, and neither means anything
+/// **Two tabs, not four.** `view_tabs` also offers Network and Diff, and neither means anything
 /// here — a stream has no phase breakdown to draw and nothing to compare against, so both would
 /// be controls that open an empty pane. Same reasoning as `KindEditor::checks_a_response` on the
 /// request side, one axis over.
