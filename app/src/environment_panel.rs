@@ -434,6 +434,7 @@ impl Render for EnvironmentPanel {
                     .border_1()
                     .border_color(theme.border)
                     .bg(theme.bg_elevated)
+                    .shadow_lg()
                     .child(
                         div()
                             .px_3()

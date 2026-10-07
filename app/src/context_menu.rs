@@ -32,6 +32,9 @@ pub struct MenuItem {
     /// Empty draws as no column rather than as a gap.
     pub detail: SharedString,
     pub command: MenuCommand,
+    /// `detail` is a keystroke, drawn as keycaps — false for the free text a link row or a
+    /// check mark puts there.
+    pub keys: bool,
 }
 
 /// What choosing a row does.
@@ -87,6 +90,7 @@ impl MenuItem {
             label: label.into(),
             detail: SharedString::from(detail),
             command: MenuCommand::Dispatch(action.boxed_clone()),
+            keys: true,
         }
     }
 
@@ -101,6 +105,7 @@ impl MenuItem {
             label: label.into(),
             detail: detail.into(),
             command: MenuCommand::OpenUrl(url.into()),
+            keys: false,
         }
     }
 
@@ -110,6 +115,7 @@ impl MenuItem {
             label: label.into(),
             detail: SharedString::new_static(""),
             command: MenuCommand::Dismiss,
+            keys: false,
         }
     }
 
@@ -122,6 +128,7 @@ impl MenuItem {
             label: label.into(),
             detail: SharedString::new_static(""),
             command: MenuCommand::Dispatch(action.boxed_clone()),
+            keys: false,
         }
     }
 }
@@ -314,12 +321,14 @@ impl Render for ContextMenu {
                     // `text_faint`, never `theme.border`: in the dark theme `border` equals
                     // `bg_hover`, so on the selected row this column would vanish — the exact
                     // bug the palette's keybinding column shipped with.
-                    .child(
+                    .child(if item.keys {
+                        crate::ui::keycaps(&keystroke, &theme)
+                    } else {
                         div()
                             .flex_none()
                             .text_color(theme.text_faint)
-                            .child(keystroke),
-                    )
+                            .child(keystroke)
+                    })
                     .into_any_element()
             })
             .collect();
@@ -369,7 +378,7 @@ impl Render for ContextMenu {
                             .bg(theme.bg_elevated)
                             .border_1()
                             .border_color(theme.border)
-                            .shadow_md()
+                            .shadow_lg()
                             // Swallow clicks, or choosing a row also hits the catcher behind
                             // it and the menu dismisses before the choice is read.
                             .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {

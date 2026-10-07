@@ -173,6 +173,7 @@ impl Render for ImportPanel {
                     .p_4()
                     .rounded_sm()
                     .bg(theme.bg_elevated)
+                    .shadow_lg()
                     .border_1()
                     .border_color(theme.border)
                     // Or clicking inside the dialog dismisses it, through the scrim behind.

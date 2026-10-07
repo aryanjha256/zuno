@@ -123,6 +123,7 @@ pub fn render(state: &CloseConfirm, theme: &Theme, cx: &mut gpui::Context<Worksp
                 .border_1()
                 .border_color(theme.border)
                 .bg(theme.bg_elevated)
+                .shadow_lg()
                 .child(
                     div()
                         .text_sm()

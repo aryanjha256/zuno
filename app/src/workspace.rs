@@ -1307,6 +1307,7 @@ impl Workspace {
                 badge: Some(zuno_core::collection::Badge::of(&view.read(cx).spec(cx))),
                 trailing: Some(SharedString::from(format!("tab {}", ix + 1))),
                 section: Some(SharedString::from("Open tabs")),
+                keys: None,
             })
             .collect();
 
@@ -1362,6 +1363,7 @@ impl Workspace {
                                     badge: Some(badge),
                                     trailing: None,
                                     section: Some(SharedString::from("Saved")),
+                                    keys: None,
                                 },
                             )
                         }),
@@ -3479,7 +3481,7 @@ impl Workspace {
                             target: picker::Target::Action(command.action),
                         },
                         picker::Decor {
-                            trailing: (!key.is_empty()).then(|| SharedString::from(key)),
+                            keys: (!key.is_empty()).then(|| SharedString::from(key)),
                             ..picker::Decor::default()
                         },
                     )
@@ -4894,6 +4896,7 @@ impl Workspace {
                     label: SharedString::from(kind.label()),
                     detail: SharedString::from(if kind == current { "✓" } else { "" }),
                     command: MenuCommand::Dispatch(action),
+                    keys: false,
                 })
             })
             .collect();
@@ -8809,7 +8812,31 @@ fn status_bar(
     ) -> Option<gpui::AnyElement> {
         let key = keybinding_label(&action, window);
         (!key.is_empty()).then(|| {
-            crate::ui::text_action(id, format!("{key} {what}").into(), label, action, theme)
+            // `text_action`'s shape — id, hover, tooltip, dispatch — with keycaps before the word
+            // instead of a `Ctrl+P` spelled out in text.
+            let tooltip_action = action.clone();
+            div()
+                .id(id)
+                .debug_selector(move || id.to_string())
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .flex_none()
+                .px_1()
+                .rounded_sm()
+                .text_color(theme.text_muted)
+                .cursor_pointer()
+                .hover(|style| style.bg(theme.bg_hover).text_color(theme.text))
+                .tooltip(move |window, cx| {
+                    crate::ui::Tooltip::for_action(label, &tooltip_action, window, cx)
+                })
+                .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.dispatch_action(action.boxed_clone(), cx);
+                })
+                .child(crate::ui::keycaps(&key, theme))
+                .child(what)
                 .into_any_element()
         })
     }

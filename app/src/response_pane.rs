@@ -2192,15 +2192,21 @@ fn empty_state(theme: &Theme, window: &Window) -> Div {
         .text_sm()
         .text_color(theme.text_muted)
         .child("No response yet".to_string())
-        .child(
-            div()
+        .child(match crate::workspace::keybinding_label(&SendRequest, window) {
+            key if key.is_empty() => div()
                 .text_xs()
                 .text_color(theme.text_muted)
-                .child(match crate::workspace::keybinding_label(&SendRequest, window) {
-                    key if key.is_empty() => "no send key is bound".to_string(),
-                    key => format!("{key} to send"),
-                }),
-        )
+                .child("no send key is bound"),
+            key => div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .text_xs()
+                .text_color(theme.text_muted)
+                .child(crate::ui::keycaps(&key, theme))
+                .child("to send"),
+        })
 }
 
 // ---------------------------------------------------------------------------

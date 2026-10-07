@@ -10,7 +10,7 @@
 //! rather than replacing it. That is also why a rebinding can never leave a tooltip lying.
 
 use gpui::{
-    AnyView, App, AppContext, AssetSource, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
+    AnyView, App, AppContext, AssetSource, Div, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, Render, Result, SharedString, StatefulInteractiveElement, Styled,
     Svg, Window, div, px, svg,
 };
@@ -344,6 +344,7 @@ impl Render for Tooltip {
             .flex()
             .flex_col()
             .bg(theme.bg_elevated)
+            .shadow_md()
             .border_1()
             .border_color(theme.border)
             .text_xs()
@@ -638,6 +639,60 @@ pub fn syntax_colour(kind: zuno_core::TokenKind, syntax: &crate::theme::SyntaxTh
 
 /// A vertical rule drawn as a glyph, for separating items inside a single row.
 ///
+/// A shortcut drawn as keycaps — `[Ctrl] [Enter]` — from the label `workspace::keybinding_label`
+/// spells.
+///
+/// One chip per key. Off macOS the label is `Ctrl+Shift+H`, split on `+`; on macOS it is
+/// `⌘⇧H`, modifier symbols run together before the key, so each symbol is its own chip. A
+/// chord's strokes are separated by a space in either spelling and keep a wider gap here.
+/// Empty for an empty label, so an unbound action draws nothing rather than an empty cap.
+pub fn keycaps(label: &str, theme: &Theme) -> Div {
+    let mut row = div().flex().flex_row().items_center().gap(px(6.)).flex_none();
+    for stroke in label.split(' ').filter(|stroke| !stroke.is_empty()) {
+        let keys: Vec<String> = if stroke.contains('+') {
+            stroke.split('+').map(str::to_string).collect()
+        } else {
+            let modifiers: Vec<String> = stroke
+                .chars()
+                .take_while(|c| "⌃⌥⇧⌘".contains(*c))
+                .map(|c| c.to_string())
+                .collect();
+            let key: String = stroke.chars().skip(modifiers.len()).collect();
+            modifiers.into_iter().chain((!key.is_empty()).then_some(key)).collect()
+        };
+        row = row.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.))
+                .children(keys.into_iter().map(|key| keycap(key, theme))),
+        );
+    }
+    row
+}
+
+/// One key: a small raised chip, its label in the faint text colour so a row's own text stays
+/// what reads first.
+fn keycap(key: String, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .min_w(px(16.))
+        .h(px(16.))
+        .px(px(4.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(3.))
+        .bg(theme.bg_panel)
+        .border_1()
+        .border_color(theme.border)
+        .text_size(px(10.))
+        .text_color(theme.text_muted)
+        .whitespace_nowrap()
+        .child(key)
+}
+
 /// `theme.border` and not a text colour: this is a rule that happens to be a character, so being
 /// barely-there is the point. It is the one place `border` is legitimately used to paint text —
 /// `theme::tests::border_is_too_dim_to_read_as_text` names this function as that exception.
@@ -789,7 +844,7 @@ where
                 .bg(theme.bg_elevated)
                 .border_1()
                 .border_color(theme.border)
-                .shadow_md()
+                .shadow_lg()
                 .font_family(theme.mono.clone())
                 .text_xs()
                 .children(rows),

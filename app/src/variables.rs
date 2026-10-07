@@ -42,7 +42,7 @@ pub fn popover(name: &str, at: Point<Pixels>, cx: &App) -> impl IntoElement + us
                     .bg(theme.bg_elevated)
                     .border_1()
                     .border_color(theme.border)
-                    .shadow_md()
+                    .shadow_lg()
                     .text_xs()
                     .child(
                         div()

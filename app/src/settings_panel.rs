@@ -334,6 +334,7 @@ impl Render for SettingsPanel {
                     .overflow_hidden()
                     .rounded_md()
                     .bg(theme.bg_elevated)
+                    .shadow_lg()
                     .border_1()
                     .border_color(theme.border)
                     .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, _, cx| {

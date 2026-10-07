@@ -83,10 +83,12 @@ fn split_budget_within(total: usize, label: usize, detail: usize) -> (usize, usi
 
 /// What a row's decoration costs in `ROW_CHARS` units: the badge column with its gap, and the
 /// trailing text with its padding and gap. At the same ~5.95px per character `ROW_CHARS` uses.
-fn decor_chars(badges: bool, trailing: Option<&SharedString>) -> usize {
+fn decor_chars(badges: bool, trailing: Option<&SharedString>, keys: Option<&SharedString>) -> usize {
     let badge = if badges { 10 } else { 0 };
     let trailing = trailing.map_or(0, |text| text.chars().count() + 4);
-    badge + trailing
+    // Keycaps are wider than their text: each key adds its chip's padding and the gap after it.
+    let keys = keys.map_or(0, |text| text.chars().count() + 3 * text.split(['+', ' ']).count() + 4);
+    badge + trailing + keys
 }
 /// How many rows are visible before the list scrolls.
 const VISIBLE_ROWS: f32 = 12.;
@@ -213,8 +215,10 @@ pub struct Item {
 pub struct Decor {
     /// The request's method pill or kind icon, as the collection panel draws it.
     pub badge: Option<zuno_core::collection::Badge>,
-    /// Right-aligned and faint: a keybinding in the palette, `tab 3` on an open request.
+    /// Right-aligned and faint: `tab 3` on an open request.
     pub trailing: Option<SharedString>,
+    /// Right-aligned keycaps — a palette command's shortcut, as `keybinding_label` spells it.
+    pub keys: Option<SharedString>,
     /// Groups rows under a heading while the filter is empty — "Open tabs", "Saved". Dropped
     /// while filtering, when rows are ranked across groups and headings would split them.
     pub section: Option<SharedString>,
@@ -463,7 +467,8 @@ impl Picker {
             .filter_map(|visible| {
                 let item = self.item_at(visible)?;
                 let mut row = format!("{} — {}", item.label, item.detail);
-                if let Some(trailing) = self.decor_at(visible).trailing {
+                let decor = self.decor_at(visible);
+                if let Some(trailing) = decor.trailing.or(decor.keys) {
                     row.push_str(&format!(" · {trailing}"));
                 }
                 Some(row)
@@ -580,6 +585,7 @@ impl Render for Picker {
                     .overflow_hidden()
                     .rounded_md()
                     .bg(theme.bg_elevated)
+                    .shadow_lg()
                     .border_1()
                     .border_color(theme.border)
                     // Swallow clicks so choosing a row doesn't hit the scrim behind it.
@@ -691,7 +697,11 @@ fn result_list(
                 // **At render, never in `Item::label`.** `refilter` ranks the stored string, so
                 // shortening at construction would mean typing the part that was dropped stops
                 // finding the row — searching against an ellipsis.
-                let total = ROW_CHARS.saturating_sub(decor_chars(badges, decor.trailing.as_ref()));
+                let total = ROW_CHARS.saturating_sub(decor_chars(
+                    badges,
+                    decor.trailing.as_ref(),
+                    decor.keys.as_ref(),
+                ));
                 let (label_budget, detail_budget) =
                     split_budget_within(total, label.chars().count(), detail.chars().count());
                 let shown_label = zuno_core::request::elide(&label, label_budget);
@@ -790,20 +800,25 @@ fn result_list(
                     // label sat flush on the badge and `graphql` ran into its URL — while rows
                     // that overflowed kept it. A `flex_1` spacer is how every other strip here
                     // pushes a control right, and it leaves the gaps alone.
-                    .children(decor.trailing.map(|trailing| {
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .justify_end()
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .whitespace_nowrap()
-                                    .text_color(theme.text_faint)
-                                    .child(trailing),
-                            )
-                    }))
+                    .children(
+                        (decor.trailing.is_some() || decor.keys.is_some()).then(|| {
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .justify_end()
+                                .children(decor.trailing.clone().map(|trailing| {
+                                    div()
+                                        .flex_none()
+                                        .whitespace_nowrap()
+                                        .text_color(theme.text_faint)
+                                        .child(trailing)
+                                }))
+                                .children(
+                                    decor.keys.as_ref().map(|keys| crate::ui::keycaps(keys, &theme)),
+                                )
+                        }),
+                    )
             })
             .collect()
     })
