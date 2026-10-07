@@ -2191,6 +2191,13 @@ fn empty_state(theme: &Theme, window: &Window) -> Div {
         .gap_2()
         .text_sm()
         .text_color(theme.text_muted)
+        // A quiet mark above the text, in the hint's own colour so it does not compete with it.
+        .child(div().mb_1().child(crate::ui::glyph(
+            Icon::Ghost,
+            theme.text_faint,
+            theme.text_faint,
+            40.,
+        )))
         .child("No response yet".to_string())
         .child(match crate::workspace::keybinding_label(&SendRequest, window) {
             key if key.is_empty() => div()
