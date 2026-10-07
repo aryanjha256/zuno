@@ -37,6 +37,35 @@ fn command(label: impl Into<String>, action: impl Action) -> Command {
     }
 }
 
+/// Whether the palette should offer `action` while a request of `kind` is active.
+///
+/// **Only the verbs that belong to some kinds are listed; everything else is offered always.**
+/// The palette used to show a socket's "Send a ping frame" and gRPC's "Done sending" on an HTTP
+/// request — commands that refuse when run, pushing the ones that work down the list. Their
+/// handlers still refuse off their kind, so a keystroke reaching one is no worse than before;
+/// this only stops the palette advertising them. `palette()` itself stays complete, which is
+/// what the drift test checks.
+pub fn offered(action: &dyn Action, kind: &crate::kinds::KindEditor) -> bool {
+    use crate::kinds::KindEditor::*;
+    let http = matches!(kind, Http(_));
+    let graphql = matches!(kind, GraphQl(_));
+    let socket = matches!(kind, WebSocket(_));
+    let grpc = matches!(kind, Grpc(_));
+    match action.name() {
+        "zuno::SaveMessage" | "zuno::SendPing" | "zuno::SendBinaryFile" => socket,
+        "zuno::DoneSending" | "zuno::OpenGrpcMethod" | "zuno::ShowResponseTrailers" => grpc,
+        "zuno::ToggleSchemaBrowser" | "zuno::OpenGraphQlTransport" => graphql,
+        "zuno::ChooseSchemaFile" | "zuno::ReflectSchema" => graphql || grpc,
+        "zuno::OpenMethod" => http || graphql,
+        "zuno::AddQuery"
+        | "zuno::OpenBodyType"
+        | "zuno::AddFormField"
+        | "zuno::AddMultipartField"
+        | "zuno::ChooseBodyFile" => http,
+        _ => true,
+    }
+}
+
 /// Every command the palette offers, in the order it offers them.
 ///
 /// Ordered by how often you'd reach for it, not alphabetically — the fuzzy filter handles
@@ -281,6 +310,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::OpenPartKindMenu", "opened by a multipart row's type chip"),
     ("zuno::OpenAuthMenu", "opened by the Auth tab's chip; the palette offers each choice itself"),
     ("zuno::OpenRequestMenu", "opened by the request's `⋯` button; each of its rows has a palette row of its own"),
+    ("zuno::OpenResponseMenu", "opened by the response's `⋯` button; each of its rows has a palette row of its own"),
     ("zuno::ConfirmClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CancelClose", "only valid inside the unsaved-changes prompt"),
     ("zuno::CloseChoiceNext", "only valid inside the unsaved-changes prompt"),

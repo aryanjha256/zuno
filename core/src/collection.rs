@@ -736,6 +736,17 @@ pub enum Badge {
     Kind(crate::request::KindBadge),
 }
 
+impl Badge {
+    /// The badge a request wears — one rule for the collection panel and the request picker, so
+    /// the same request looks the same in both.
+    pub fn of(spec: &RequestSpec) -> Self {
+        match spec.kind.badge() {
+            Some(tag) => Badge::Kind(tag),
+            None => Badge::Method(spec.method().cloned().unwrap_or_default()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeKind {
     Directory,
@@ -819,10 +830,7 @@ fn flatten_branch(branch: &Branch<'_>, parent: &Path, depth: u16, out: &mut Vec<
                 .to_string(),
             path: entry.path.clone(),
             kind: NodeKind::Request {
-                badge: match entry.spec.kind.badge() {
-                    Some(tag) => Badge::Kind(tag),
-                    None => Badge::Method(entry.spec.method().cloned().unwrap_or_default()),
-                },
+                badge: Badge::of(&entry.spec),
                 url: entry.spec.url.clone(),
             },
         });

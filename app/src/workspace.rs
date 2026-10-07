@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -1297,6 +1297,18 @@ impl Workspace {
                 }
             })
             .collect();
+        // The same pill or icon the panel draws, the tab's position so two `Untitled` tabs can be
+        // told apart, and a heading that separates open tabs from saved files.
+        let buffer_decor: Vec<picker::Decor> = self
+            .views
+            .iter()
+            .enumerate()
+            .map(|(ix, view)| picker::Decor {
+                badge: Some(zuno_core::collection::Badge::of(&view.read(cx).spec(cx))),
+                trailing: Some(SharedString::from(format!("tab {}", ix + 1))),
+                section: Some(SharedString::from("Open tabs")),
+            })
+            .collect();
 
         // The hint names a keystroke, so it is built rather than written. `keybinding_label`
         // returns empty for an unbound action, and a sentence with a hole in it is worse than a
@@ -1306,6 +1318,10 @@ impl Workspace {
             key => format!("No saved requests yet — press {key} to save the one you're editing"),
         };
         let picker = self.show_picker(buffer_items, save_hint, window, cx);
+        picker.update(cx, |picker, cx| {
+            picker.set_placeholder("Search open and saved requests…", cx);
+            picker.decorate(buffer_decor, cx);
+        });
 
         // Fill in the saved requests as they arrive. The picker is already usable.
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
@@ -1314,22 +1330,40 @@ impl Workspace {
         let scan = cx.background_executor().spawn(async move {
             zuno_core::collection::scan(&root)
                 .into_iter()
-                .map(|entry| (entry.relative, entry.path, entry.spec.url))
+                .map(|entry| {
+                    let badge = zuno_core::collection::Badge::of(&entry.spec);
+                    (entry.relative, entry.path, entry.spec.url, badge)
+                })
                 .collect::<Vec<_>>()
         });
 
         self.picker_scan = Some(cx.spawn(async move |_this, cx| {
             let found = scan.await;
             let _ = picker.update(cx, |picker, cx| {
-                picker.extend(
+                picker.extend_decorated(
                     found
                         .into_iter()
                         // A request already open as a buffer is not listed twice.
-                        .filter(|(_, path, _)| !open_paths.contains(&Some(path.clone())))
-                        .map(|(relative, path, url)| picker::Item {
-                            label: SharedString::from(relative),
-                            detail: SharedString::from(url),
-                            target: picker::Target::File(path),
+                        .filter(|(_, path, _, _)| !open_paths.contains(&Some(path.clone())))
+                        .map(|(relative, path, url, badge)| {
+                            // Without `.json`: every saved request has it, so it told rows
+                            // apart from open tabs and nothing else — the heading does that now.
+                            let label = relative
+                                .strip_suffix(".json")
+                                .unwrap_or(&relative)
+                                .to_string();
+                            (
+                                picker::Item {
+                                    label: SharedString::from(label),
+                                    detail: SharedString::from(url),
+                                    target: picker::Target::File(path),
+                                },
+                                picker::Decor {
+                                    badge: Some(badge),
+                                    trailing: None,
+                                    section: Some(SharedString::from("Saved")),
+                                },
+                            )
                         }),
                     cx,
                 );
@@ -3426,20 +3460,39 @@ impl Workspace {
         // The active buffer's kind names the two tab rows, so the palette offers them by the
         // words on screen rather than by HTTP's.
         let editor = self.active().map(|view| view.read(cx));
-        let items = crate::commands::palette(editor.as_ref().map(|view| &view.kind))
-            .into_iter()
-            .map(|command| picker::Item {
-                label: SharedString::from(command.label),
-                // The keybinding, so the palette teaches the shortcut rather than
-                // replacing it. Blank for commands that have none.
-                detail: SharedString::from(keybinding_hint(command.action.as_ref(), window)),
-                target: picker::Target::Action(command.action),
-            })
-            .collect();
+        let kind = editor.as_ref().map(|view| &view.kind);
+        let (items, decor): (Vec<picker::Item>, Vec<picker::Decor>) =
+            crate::commands::palette(kind)
+                .into_iter()
+                .filter(|command| {
+                    kind.is_none_or(|kind| crate::commands::offered(command.action.as_ref(), kind))
+                })
+                .map(|command| {
+                    // The keybinding, right-aligned and spelled as the status bar spells it
+                    // (`Ctrl+Enter`, not gpui's `ctrl-enter`), so the palette teaches the
+                    // shortcut rather than replacing it. None for commands that have none.
+                    let key = keybinding_label(command.action.as_ref(), window);
+                    (
+                        picker::Item {
+                            label: SharedString::from(command.label),
+                            detail: SharedString::default(),
+                            target: picker::Target::Action(command.action),
+                        },
+                        picker::Decor {
+                            trailing: (!key.is_empty()).then(|| SharedString::from(key)),
+                            ..picker::Decor::default()
+                        },
+                    )
+                })
+                .unzip();
 
         // `palette()` is a non-empty literal, so an empty list means the filter matched
         // nothing, never that there was nothing to show.
-        self.show_picker(items, "No commands", window, cx);
+        let picker = self.show_picker(items, "No commands", window, cx);
+        picker.update(cx, |picker, cx| {
+            picker.set_placeholder("Type a command…", cx);
+            picker.decorate(decor, cx);
+        });
     }
 
     /// Put a picker on screen, focused, with the subscription that lets it close.
@@ -4869,6 +4922,29 @@ impl Workspace {
             MenuItem::new("Import from curl on the clipboard", ImportCurl, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Request settings", OpenSettings, &focus, window).into(),
+        ];
+        let at = window.mouse_position();
+        self.show_menu(rows, at, Some(focus), window, cx);
+    }
+
+    /// The response pane's `⋯`: find, save, history — named, with the keys they have in the
+    /// response pane, which is where focus goes back to.
+    fn open_response_menu(
+        &mut self,
+        _: &OpenResponseMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+        use context_menu::MenuItem;
+        let focus = view.read(cx).response_focus.clone();
+        let rows = vec![
+            MenuItem::new("Find in response", FindInResponse, &focus, window).into(),
+            MenuItem::new("Save response body to a file…", SaveResponse, &focus, window).into(),
+            MenuItem::new("Show response history", ShowHistory, &focus, window).into(),
         ];
         let at = window.mouse_position();
         self.show_menu(rows, at, Some(focus), window, cx);
@@ -7666,6 +7742,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_auth_tab))
             .on_action(cx.listener(Self::open_auth_menu))
             .on_action(cx.listener(Self::open_request_menu))
+            .on_action(cx.listener(Self::open_response_menu))
             .on_action(cx.listener(Self::use_no_auth))
             .on_action(cx.listener(Self::use_basic_auth))
             .on_action(cx.listener(Self::use_bearer_auth))

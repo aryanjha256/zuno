@@ -24,7 +24,7 @@ use zuno_core::{
 };
 
 use crate::actions::{
-    CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SaveResponse, SendRequest,
+    CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SendRequest,
     ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTrailers, ShowResponseDiff,
     CopyNetworkDetails,
     ShowResponseNetwork, ToggleFold, ToggleHtmlView, UnfoldAll,
@@ -242,19 +242,17 @@ fn response_actions(theme: &Theme) -> Div {
     // gap the discoverability audit was about. They also made this row shift as the selection
     // changed. Right-clicking a row is the discoverable gesture, and it needs no standing
     // control; these four are whole-response verbs and are always applicable.
+    //
+    // **Copy, and a `⋯` for the rest** — the request side's shape, for its reason: four
+    // unlabelled icons read as four equal verbs and as more tabs. Copy is what you do after
+    // nearly every send; find, save and history are named in the menu with their keys.
     div()
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
         .flex_none()
-        .child(icon_button(
-            "action-find",
-            Icon::Search,
-            "Find in response",
-            FindInResponse,
-            theme,
-        ))
+        .child(div().flex_none().w(px(1.)).h(px(14.)).mx_1().bg(theme.border))
         .child(icon_button(
             "action-copy-body",
             Icon::Copy,
@@ -263,17 +261,10 @@ fn response_actions(theme: &Theme) -> Div {
             theme,
         ))
         .child(icon_button(
-            "action-save-body",
-            Icon::Download,
-            "Save response body to a file",
-            SaveResponse,
-            theme,
-        ))
-        .child(icon_button(
-            "action-history",
-            Icon::History,
-            "Show response history",
-            ShowHistory,
+            "action-response-more",
+            Icon::EllipsisVertical,
+            "More — find, save to a file, history",
+            crate::actions::OpenResponseMenu,
             theme,
         ))
 }

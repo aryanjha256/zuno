@@ -203,6 +203,8 @@ actions!(
         // The Auth tab's choice, one action per option so the palette can offer each.
         // The `⋯` beside Save: the request's rarer verbs, by name.
         OpenRequestMenu,
+        // The response pane's `⋯` beside Copy.
+        OpenResponseMenu,
         UseNoAuth,
         UseBasicAuth,
         UseBearerAuth,

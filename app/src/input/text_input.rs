@@ -274,6 +274,11 @@ impl TextInput {
         self.masked
     }
 
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = sanitize(placeholder.into());
+        cx.notify();
+    }
+
     /// Where this input last painted, in **window** coordinates.
     ///
     /// Already recorded for hit-testing and the IME rectangle; exposed so an overlay can be

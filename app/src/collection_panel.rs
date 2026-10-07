@@ -47,7 +47,7 @@ const GLYPH_WIDTH: f32 = 16.0;
 
 /// The method pill's width — every pill the same, so names start in one straight line. Sized for
 /// `PATCH` in mono at `PILL_TEXT`, with room either side for the tint to read as a pill.
-const METHOD_WIDTH: f32 = 40.0;
+pub(crate) const METHOD_WIDTH: f32 = 40.0;
 
 /// The pill's height and text: smaller than the name beside it, so the verb is a tag on the row
 /// rather than its first word.
@@ -560,7 +560,7 @@ pub(crate) fn method_label(method: &Method) -> String {
 /// words — `GET`, `GQL`, `WS` — so a request's verb and its protocol read as the same sort of
 /// thing. Now HTTP shows its verb in a pill of its own colour, and GraphQL, WebSocket and gRPC
 /// show an icon in theirs, centred in the same width so names still start in one line.
-fn badge_cell(badge: &Badge, theme: &Theme) -> Div {
+pub(crate) fn badge_cell(badge: &Badge, theme: &Theme) -> Div {
     let cell = div()
         .flex_none()
         .w(px(METHOD_WIDTH))

@@ -4258,7 +4258,8 @@ async fn a_saved_request_can_be_reopened_from_the_picker(cx: &mut TestAppContext
         let rows = picker_rows(&window, cx);
         rows.iter().any(|r| r.contains("invoices")).then_some(rows)
     });
-    assert!(rows.iter().any(|r| r.contains("invoices.json")), "{rows:?}");
+    // Listed by name, without the `.json` every saved request carries.
+    assert!(rows.iter().any(|r| r.starts_with("invoices —")), "{rows:?}");
 
     cx.simulate_input("invoices");
     cx.press("enter");
@@ -4442,11 +4443,11 @@ async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
         .iter()
         .find(|row| row.starts_with("Send request"))
         .expect("Send request should be listed");
-    // As the platform displays it — `ctrl-enter` on Linux, `⌘↩` on macOS — so the check is that
-    // the row carries the live binding, not one spelling of it.
+    // As UI copy spells it — `Ctrl+Enter`, `⌘↩` on macOS — the status bar's spelling, so the check
+    // is that the row carries the live binding, not one spelling of it.
     let shown = window
         .update(&mut cx, |_, window, _| {
-            crate::workspace::keybinding_hint(&crate::actions::SendRequest, window)
+            crate::workspace::keybinding_label(&crate::actions::SendRequest, window)
         })
         .expect("window");
     assert!(!shown.is_empty(), "Send request must be bound");
@@ -4461,6 +4462,13 @@ async fn ctrl_k_lists_commands_with_their_keybindings(cx: &mut TestAppContext) {
         assert!(!row.contains("Backspace"), "{row:?}");
         assert!(!row.contains("SelectLeft"), "{row:?}");
     }
+
+    // The sample is an HTTP request, so another kind's verbs are not offered — and HTTP's are.
+    assert!(
+        !rows.iter().any(|row| row.starts_with("Send a ping frame")),
+        "a socket's command offered on an HTTP request: {rows:?}"
+    );
+    assert!(rows.iter().any(|row| row.starts_with("Add query parameter")));
 }
 
 #[gpui::test]
@@ -6918,10 +6926,10 @@ fn the_asset_list_matches_the_icon_enum() {
 /// `clicking_an_icon_button_dispatches_its_action` below, at four representative buttons.
 fn affordances() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("action-find", "zuno::FindInResponse"),
         ("action-copy-body", "zuno::CopyResponse"),
-        ("action-save-body", "zuno::SaveResponse"),
-        ("action-history", "zuno::ShowHistory"),
+        // Find, save-to-file and history are rows of this one — find is walked through it by
+        // `clicking_an_icon_button_dispatches_its_action`.
+        ("action-response-more", "zuno::OpenResponseMenu"),
         ("action-save-request", "zuno::SaveRequest"),
         // Copy as code, Import from curl and Request settings live behind this one — their mouse
         // path is a menu row, walked end to end by `clicking_an_icon_button_dispatches_its_action`.
@@ -7013,13 +7021,15 @@ async fn clicking_an_icon_button_dispatches_its_action(cx: &mut TestAppContext) 
     let (view, mut cx) = respond_with_json(cx, r#"{"a":{"b":1},"c":2}"#);
     cx.run_until_parked();
 
-    // Find: opens the find bar.
-    let find = cx.debug_bounds("action-find").expect("find button");
-    cx.simulate_click(find.center(), gpui::Modifiers::default());
+    // Find, through the response's `⋯` menu, whose first row it is: opens the find bar.
+    let more = cx.debug_bounds("action-response-more").expect("the response ⋯ button");
+    cx.simulate_click(more.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.press("enter");
     cx.run_until_parked();
     assert!(
         cx.update(|_, cx| view.read(cx).is_searching()),
-        "the find icon must open the find bar"
+        "the ⋯ menu's Find must open the find bar"
     );
 
     // Copy as code, through the `⋯` menu: its first row opens the language picker, whose first

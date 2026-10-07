@@ -59,18 +59,34 @@ const ROW_CHARS: usize = 94;
 /// going spare beside it.
 ///
 /// Pure, so the rule is a unit test rather than something you check by looking at a screenshot.
+#[cfg(test)]
 fn split_budget(label: usize, detail: usize) -> (usize, usize) {
-    if label + detail <= ROW_CHARS {
+    split_budget_within(ROW_CHARS, label, detail)
+}
+
+/// `split_budget` over `total` characters rather than the whole row — what is left once a row's
+/// badge and trailing column have taken their share. Without that the budget was the full width
+/// beside a pill and a `tab 3`, so a long row overflowed and was hard-clipped instead of elided.
+fn split_budget_within(total: usize, label: usize, detail: usize) -> (usize, usize) {
+    if label + detail <= total {
         return (label, detail);
     }
-    let half = ROW_CHARS / 2;
+    let half = total / 2;
     if label <= half {
-        (label, ROW_CHARS - label)
+        (label, total - label)
     } else if detail <= half {
-        (ROW_CHARS - detail, detail)
+        (total - detail, detail)
     } else {
-        (half, ROW_CHARS - half)
+        (half, total - half)
     }
+}
+
+/// What a row's decoration costs in `ROW_CHARS` units: the badge column with its gap, and the
+/// trailing text with its padding and gap. At the same ~5.95px per character `ROW_CHARS` uses.
+fn decor_chars(badges: bool, trailing: Option<&SharedString>) -> usize {
+    let badge = if badges { 10 } else { 0 };
+    let trailing = trailing.map_or(0, |text| text.chars().count() + 4);
+    badge + trailing
 }
 /// How many rows are visible before the list scrolls.
 const VISIBLE_ROWS: f32 = 12.;
@@ -190,9 +206,33 @@ pub struct Item {
     pub target: Target,
 }
 
+/// What a row wears beyond its label and detail — only the request picker and the palette set
+/// any of it, so it travels beside `Item` rather than in it, and the other twenty-odd pickers
+/// build their items exactly as before.
+#[derive(Default, Clone)]
+pub struct Decor {
+    /// The request's method pill or kind icon, as the collection panel draws it.
+    pub badge: Option<zuno_core::collection::Badge>,
+    /// Right-aligned and faint: a keybinding in the palette, `tab 3` on an open request.
+    pub trailing: Option<SharedString>,
+    /// Groups rows under a heading while the filter is empty — "Open tabs", "Saved". Dropped
+    /// while filtering, when rows are ranked across groups and headings would split them.
+    pub section: Option<SharedString>,
+}
+
+/// One line of the list: a heading, or a result by its visible index.
+#[derive(Clone)]
+enum Line {
+    Heading(SharedString),
+    Row(usize),
+}
+
 pub struct Picker {
     filter: Entity<TextInput>,
     items: Vec<Item>,
+    /// `items`' decorations, index for index. Kept the same length by every path that adds an
+    /// item, which is `new`, `decorate` and `extend*`.
+    decor: Vec<Decor>,
     /// Indices into `items`, best match first. Rebuilt whenever the query changes.
     matches: Vec<usize>,
     selected: usize,
@@ -233,9 +273,13 @@ impl Picker {
     ) -> Self {
         // `SharedString`, not `&'static str`, because the empty hint now names a keystroke read
         // from the live keymap — see `Workspace::keybinding_label`. A literal cannot do that.
-        let placeholder: SharedString = placeholder.into();
-        let filter = cx.new(|cx| TextInput::new(String::new(), placeholder.clone(), "Picker", cx));
-        let empty_hint = placeholder;
+        //
+        // **The input's placeholder is not the empty hint.** It used to be the same string, so an
+        // empty filter read "No commands" above a full list of commands. The box says what to
+        // type; the hint says why there is nothing to choose — `set_placeholder` names the box.
+        let empty_hint: SharedString = placeholder.into();
+        let filter = cx.new(|cx| TextInput::new(String::new(), "Type to filter…", "Picker", cx));
+        let decor = vec![Decor::default(); items.len()];
 
         // Re-rank on every edit. This used to be a string compare against a stored
         // `last_query` in `render`, with a comment explaining that `TextInput` emitted nothing
@@ -248,6 +292,7 @@ impl Picker {
         let mut picker = Self {
             filter,
             items,
+            decor,
             matches: Vec::new(),
             selected: 0,
             scroll: UniformListScrollHandle::new(),
@@ -259,6 +304,67 @@ impl Picker {
         };
         picker.refilter(cx);
         picker
+    }
+
+    /// What the filter box says while empty.
+    pub fn set_placeholder(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let text = text.into();
+        self.filter
+            .update(cx, |input, cx| input.set_placeholder(text, cx));
+    }
+
+    /// Decorate the items given to `new`, index for index.
+    pub fn decorate(&mut self, decor: Vec<Decor>, cx: &mut Context<Self>) {
+        debug_assert_eq!(decor.len(), self.items.len());
+        self.decor = decor;
+        self.decor.resize(self.items.len(), Decor::default());
+        cx.notify();
+    }
+
+    /// `extend`, with each item's decoration beside it.
+    pub fn extend_decorated(
+        &mut self,
+        items: impl IntoIterator<Item = (Item, Decor)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (items, decor): (Vec<Item>, Vec<Decor>) = items.into_iter().unzip();
+        self.decor.extend(decor);
+        self.extend(items, cx);
+    }
+
+    /// The decoration at a visible row; the derived row has none.
+    fn decor_at(&self, visible: usize) -> Decor {
+        self.matches
+            .get(visible)
+            .and_then(|&ix| self.decor.get(ix))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The list as drawn: headings between groups while the filter is empty, rows otherwise.
+    fn lines(&self, cx: &App) -> Vec<Line> {
+        let grouped = self.query(cx).is_empty();
+        let mut lines = Vec::new();
+        let mut last: Option<SharedString> = None;
+        for visible in 0..self.visible_count() {
+            if grouped
+                && let Some(section) = self.decor_at(visible).section
+                && last.as_ref() != Some(&section)
+            {
+                lines.push(Line::Heading(section.clone()));
+                last = Some(section);
+            }
+            lines.push(Line::Row(visible));
+        }
+        lines
+    }
+
+    /// Where a visible row sits among the drawn lines — what the scroll handle addresses.
+    fn line_of(&self, visible: usize, cx: &App) -> usize {
+        self.lines(cx)
+            .iter()
+            .position(|line| matches!(line, Line::Row(row) if *row == visible))
+            .unwrap_or(visible)
     }
 
     /// Offer the query itself as a candidate when `build` yields one. See `fallback`.
@@ -314,8 +420,9 @@ impl Picker {
         // `rem_euclid` so a negative step from row 0 wraps to the end rather than panicking
         // on an underflowing usize.
         self.selected = (self.selected as isize + delta).rem_euclid(count) as usize;
-        self.scroll
-            .scroll_to_item(self.selected, ScrollStrategy::Center);
+        // By drawn line, not by row: headings sit between rows and the list counts them.
+        let line = self.line_of(self.selected, cx);
+        self.scroll.scroll_to_item(line, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -329,6 +436,8 @@ impl Picker {
     pub fn extend(&mut self, items: impl IntoIterator<Item = Item>, cx: &mut Context<Self>) {
         let before = self.selected_item_index();
         self.items.extend(items);
+        // Undecorated unless `extend_decorated` already pushed theirs.
+        self.decor.resize(self.items.len(), Decor::default());
         self.refilter(cx);
         // Keep the highlight on whatever row the user had chosen, rather than yanking it
         // back to the top underneath them.
@@ -351,8 +460,14 @@ impl Picker {
     #[cfg(test)]
     pub fn visible_rows(&self) -> Vec<String> {
         (0..self.visible_count())
-            .filter_map(|visible| self.item_at(visible))
-            .map(|item| format!("{} — {}", item.label, item.detail))
+            .filter_map(|visible| {
+                let item = self.item_at(visible)?;
+                let mut row = format!("{} — {}", item.label, item.detail);
+                if let Some(trailing) = self.decor_at(visible).trailing {
+                    row.push_str(&format!(" · {trailing}"));
+                }
+                Some(row)
+            })
             .collect()
     }
 
@@ -413,10 +528,17 @@ impl Render for Picker {
         let selected = self.selected;
 
         // Owned clones, so the row closure borrows nothing from `self`.
-        let rows: Vec<(SharedString, SharedString)> = (0..count)
-            .filter_map(|visible| self.item_at(visible))
-            .map(|item| (item.label.clone(), item.detail.clone()))
+        let rows: Vec<Row> = (0..count)
+            .filter_map(|visible| {
+                let item = self.item_at(visible)?;
+                Some(Row {
+                    label: item.label.clone(),
+                    detail: item.detail.clone(),
+                    decor: self.decor_at(visible),
+                })
+            })
             .collect();
+        let lines = self.lines(cx);
 
         // Full-window scrim. Clicking it dismisses, which is the one mouse affordance a
         // modal has to have.
@@ -476,7 +598,7 @@ impl Render for Picker {
                     .child(if count == 0 {
                         empty_state(&query, &self.empty_hint, &theme).into_any_element()
                     } else {
-                        result_list(rows, selected, self.scroll.clone(), &theme, cx)
+                        result_list(rows, lines, selected, self.scroll.clone(), &theme, cx)
                             .into_any_element()
                     }),
             )
@@ -512,15 +634,26 @@ fn empty_state(query: &str, empty_hint: &str, theme: &Theme) -> impl IntoElement
         .child(message)
 }
 
+/// One result as drawn, cloned out of the picker so the list closure borrows nothing.
+#[derive(Clone)]
+struct Row {
+    label: SharedString,
+    detail: SharedString,
+    decor: Decor,
+}
+
 fn result_list(
-    rows: Vec<(SharedString, SharedString)>,
+    rows: Vec<Row>,
+    lines: Vec<Line>,
     selected: usize,
     scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<Picker>,
 ) -> impl IntoElement {
-    let count = rows.len();
+    let count = lines.len();
     let theme = theme.clone();
+    // Reserved on every row when any row has one, so labels start in one line.
+    let badges = rows.iter().any(|row| row.decor.badge.is_some());
     // `uniform_list`'s closure gets `&mut App`, not `Context<Picker>`, so `cx.listener`
     // isn't available inside it. A weak handle is how `response_pane`'s fold chevrons
     // solve the same problem; weak so a row element can't keep the picker alive.
@@ -529,8 +662,26 @@ fn result_list(
     uniform_list("picker-results", count, move |range, _window, _cx| {
         let picker = picker.clone();
         range
-            .map(|ix| {
-                let (label, detail) = rows[ix].clone();
+            .map(|line| {
+                let ix = match &lines[line] {
+                    Line::Row(ix) => *ix,
+                    // A group's name, quiet and unselectable — it is not a result.
+                    Line::Heading(name) => {
+                        return div()
+                            .id(("picker-heading", line))
+                            .w_full()
+                            .h(px(ROW_HEIGHT))
+                            .px_3()
+                            .flex()
+                            .items_end()
+                            .pb(px(3.))
+                            .text_size(px(10.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_faint)
+                            .child(name.clone());
+                    }
+                };
+                let Row { label, detail, decor } = rows[ix].clone();
                 // **The two columns elide in opposite directions**, because their information
                 // sits at opposite ends. A path's head names the collection and its tail is one
                 // more request; a URL's head is the `http://host:port` every row repeats and its
@@ -540,8 +691,9 @@ fn result_list(
                 // **At render, never in `Item::label`.** `refilter` ranks the stored string, so
                 // shortening at construction would mean typing the part that was dropped stops
                 // finding the row — searching against an ellipsis.
+                let total = ROW_CHARS.saturating_sub(decor_chars(badges, decor.trailing.as_ref()));
                 let (label_budget, detail_budget) =
-                    split_budget(label.chars().count(), detail.chars().count());
+                    split_budget_within(total, label.chars().count(), detail.chars().count());
                 let shown_label = zuno_core::request::elide(&label, label_budget);
                 let shown_detail = zuno_core::request::elide_front(&detail, detail_budget);
                 let elided = matches!(shown_label, std::borrow::Cow::Owned(_))
@@ -579,7 +731,21 @@ fn result_list(
                     } else {
                         theme.bg_elevated
                     })
-                    .hover(|style| style.bg(theme.bg_hover))
+                    // **Hover moves the selection; it does not paint a second highlight.** With
+                    // a hover colour of its own, the keyboard's row and the pointer's row were
+                    // both lit and nothing said which Enter would take — `ui::select_list`'s
+                    // rule, now here too.
+                    .on_mouse_move({
+                        let picker = picker.clone();
+                        move |_: &gpui::MouseMoveEvent, _, cx| {
+                            let _ = picker.update(cx, |picker, cx| {
+                                if picker.selected != ix {
+                                    picker.selected = ix;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
                     // Clicking a row selects *that* row and confirms it, rather than
                     // confirming whatever the keyboard had selected.
                     .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _, cx| {
@@ -588,6 +754,10 @@ fn result_list(
                             cx.emit(PickerEvent::Confirmed);
                         });
                     })
+                    .children(badges.then(|| match &decor.badge {
+                        Some(badge) => crate::collection_panel::badge_cell(badge, &theme),
+                        None => div().flex_none().w(px(crate::collection_panel::METHOD_WIDTH)),
+                    }))
 
                     // **`whitespace_nowrap` on both, and `flex_none` gone from the label.** Two
                     // faults, one symptom. gpui's default is `WhiteSpace::Normal`, so a long
@@ -613,6 +783,27 @@ fn result_list(
                         // `Theme::text_faint`.
                         theme.text_faint,
                     ))
+                    // Right-aligned: a keybinding in the palette, `tab 3` on an open request.
+                    //
+                    // **Pushed by a spacer, not `ml_auto`.** With an auto margin taking the free
+                    // space, rows that did not fill the width lost the row's `gap` entirely — the
+                    // label sat flush on the badge and `graphql` ran into its URL — while rows
+                    // that overflowed kept it. A `flex_1` spacer is how every other strip here
+                    // pushes a control right, and it leaves the gaps alone.
+                    .children(decor.trailing.map(|trailing| {
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .justify_end()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .text_color(theme.text_faint)
+                                    .child(trailing),
+                            )
+                    }))
             })
             .collect()
     })
