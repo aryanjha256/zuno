@@ -11374,6 +11374,36 @@ async fn a_new_folder_is_created_where_the_selection_points(cx: &mut TestAppCont
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// New folder is reachable from the palette and the app menu while the panel shows History, and
+/// its name box is a row of the tree — which History does not draw. The box was focused and never
+/// painted, so the name typed into it went nowhere.
+#[gpui::test]
+async fn a_new_folder_started_from_history_takes_its_name(cx: &mut TestAppContext) {
+    let dir = scratch_dir("panel-new-folder-from-history");
+    let root = dir.join("collections");
+    seed_request(&root, "posts.json", "https://a.test/posts");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    wait_for(&mut cx, "the collection scan", |cx| {
+        (!tree_rows(&window, cx).is_empty()).then_some(())
+    });
+
+    cx.press("alt-h");
+    window
+        .update(&mut cx, |_, window, cx| {
+            window.dispatch_action(Box::new(crate::actions::NewFolder), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    cx.simulate_input("drafts");
+    cx.press("enter");
+    cx.run_until_parked();
+
+    assert!(root.join("drafts").is_dir(), "the name typed must land in the box");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 #[gpui::test]
 async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
     let dir = scratch_dir("panel-new-folder-escape");

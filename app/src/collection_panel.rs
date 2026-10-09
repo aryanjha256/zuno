@@ -504,17 +504,32 @@ fn view_toggle<A: gpui::Action + Clone + 'static>(
     button
 }
 
-/// The tree's own buttons, under the workspace row: making things, then folding things.
+/// The tree's toolbar: what this view is, then its buttons at the right — making things, then
+/// folding things. The label is what keeps it from reading as a stray row of icons beside
+/// History's full-width filter.
 fn collections_toolbar(theme: &Theme) -> impl IntoElement + use<> {
     div()
         .flex()
         .flex_row()
         .items_center()
+        .justify_between()
         .flex_none()
         .h(px(TOOLBAR_HEIGHT))
-        .px(px(6.))
+        .pl_2()
+        .pr(px(6.))
         .border_b_1()
         .border_color(theme.border)
+        .child(
+            div()
+                .flex_shrink()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_xs()
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child("Collections"),
+        )
         .child(
             div()
                 .flex()

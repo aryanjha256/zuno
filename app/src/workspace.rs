@@ -1659,20 +1659,12 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.panel_visible {
-            self.panel_visible = true;
-            self.reveal_panel(cx);
-            // Cheap, and a collection edited outside Zuno is the normal case — it is a git
-            // directory, so it changes under us on every pull.
-            self.refresh_tree(cx);
-            window.focus(&self.panel_focus);
-            cx.notify();
-            return;
-        }
-
-        if !self.panel_focus.is_focused(window) {
-            window.focus(&self.panel_focus);
-            cx.notify();
+        // `contains`, not `is`: in History the keyboard sits in the filter, inside the panel, and
+        // asking `is_focused` there took one extra press to hide it.
+        if !self.panel_visible || !self.panel_focus.contains_focused(window, cx) {
+            // Shows it if hidden — the tree re-scanned, since a collection edited outside Zuno is
+            // the normal case — and puts the keyboard where the current view reads it.
+            self.show_panel_view(self.panel_view, window, cx);
             return;
         }
 
@@ -2348,6 +2340,10 @@ impl Workspace {
 
     fn begin_new_node(&mut self, kind: NewNode, window: &mut Window, cx: &mut Context<Self>) {
         self.close_row_menu(window, cx);
+        // **The name box is a row of the tree**, so the tree has to be the view on screen. From
+        // History — the palette and the app menu both reach this — the box was focused but never
+        // painted, and everything typed into it vanished.
+        self.panel_view = crate::collection_panel::PanelView::Collections;
 
         let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
             self.set_status("No collection directory — nowhere to put it", cx);
