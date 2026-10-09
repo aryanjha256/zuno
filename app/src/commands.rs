@@ -189,6 +189,8 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Copy the Zuno install command", CopyInstallCommand),
         command("Show response history", ShowHistory),
         command("Show history — every request sent in this workspace", ShowAllHistory),
+        command("Show collections", ShowCollections),
+        command("Clear this workspace's history", ClearHistory),
         command("Show response body", ShowResponseBody),
         command("Show response headers", ShowResponseHeaders),
         command("Copy the network details — connection and the request as sent", CopyNetworkDetails),
@@ -227,6 +229,9 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::PickerPrev", "only valid inside the picker"),
     ("zuno::PickerConfirm", "only valid inside the picker"),
     ("zuno::PickerDismiss", "only valid inside the picker"),
+    ("zuno::HistoryNext", "only valid in the panel's History view"),
+    ("zuno::HistoryPrev", "only valid in the panel's History view"),
+    ("zuno::HistoryOpen", "only valid in the panel's History view"),
     // A palette that lists itself is noise; Ctrl+K is how you got here.
     ("zuno::OpenPalette", "this is the palette"),
     // The application menu is a *discovery* surface for people who don't know the palette

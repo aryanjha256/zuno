@@ -1956,31 +1956,45 @@ async fn ctrl_enter_sends_and_the_response_lands_in_the_view(cx: &mut TestAppCon
     });
 }
 
-/// The whole loop of the global history: a send is recorded, `Alt+H` lists it, and choosing it
-/// opens a *new* tab holding the request and the response it got — read back from disk.
+/// The whole loop of the global history: two sends are recorded, `Alt+H` opens the panel's
+/// History view with the keyboard in its filter, typing part of a URL narrows it to one, and
+/// Enter opens a *new* tab holding that request and the response it got — read back from disk.
 #[gpui::test]
 async fn a_sent_request_comes_back_from_history_with_its_response(cx: &mut TestAppContext) {
-    let base = serve_once(OK_JSON);
+    let orders = serve_once(OK_JSON);
+    let users = serve_once(OK_JSON);
     let dir = scratch_dir("global-history");
     let (window, view, mut cx) = boot(cx, None, None);
     cx.update(|_, cx| crate::history::install_at(cx, Some(dir.clone())));
 
-    type_url(&mut cx, &format!("{base}/orders"));
-    cx.press("ctrl-enter");
+    let store = zuno_core::history::Store::new(dir.clone());
+    for (n, url) in [format!("{orders}/orders"), format!("{users}/users")].iter().enumerate() {
+        type_url(&mut cx, url);
+        cx.press("ctrl-enter");
+        wait_for(&mut cx, "the send to be recorded", |_| {
+            (store.load().len() == n + 1).then_some(())
+        });
+    }
     wait_for(&mut cx, "a response", |cx| cx.update(|_, cx| view.read(cx).response.clone()));
 
-    let store = zuno_core::history::Store::new(dir.clone());
-    wait_for(&mut cx, "the send to be recorded", |_| store.load().first().cloned());
-
-    // Away from it, so the reopened tab cannot be mistaken for the one that sent.
-    type_url(&mut cx, "https://elsewhere.test/");
     cx.press("alt-h");
-    let rows = wait_for(&mut cx, "the history row", |cx| {
-        let rows = picker_rows(&window, cx);
-        (!rows.is_empty()).then_some(rows)
+    wait_for(&mut cx, "both entries in the History view", |cx| {
+        window
+            .update(cx, |workspace, _, cx| {
+                (workspace.panel_view == crate::collection_panel::PanelView::History
+                    && workspace.history_matches(cx).1.len() == 2)
+                    .then_some(())
+            })
+            .expect("window")
     });
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(rows[0].starts_with(&format!("{base}/orders — 200 OK")), "{rows:?}");
+
+    // Typed into the filter, which is where `Alt+H` must have put the keyboard.
+    cx.simulate_input("orders");
+    let (entries, rows) = window
+        .update(&mut cx, |workspace, _, cx| workspace.history_matches(cx))
+        .expect("window");
+    assert_eq!(rows.len(), 1, "the filter narrows to the one URL");
+    assert!(entries[rows[0]].spec.url.ends_with("/orders"));
     cx.press("enter");
 
     let reopened = wait_for(&mut cx, "a reopened tab with its response", |cx| {
@@ -1994,7 +2008,7 @@ async fn a_sent_request_comes_back_from_history_with_its_response(cx: &mut TestA
     });
     cx.update(|_, cx| {
         let reopened = reopened.read(cx);
-        assert_eq!(reopened.url.read(cx).text(), format!("{base}/orders"));
+        assert_eq!(reopened.url.read(cx).text(), format!("{orders}/orders"));
         let response = reopened.response.as_ref().unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body_as_str(), Some("{\"ok\":true}"));

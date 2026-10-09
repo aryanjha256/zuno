@@ -32,6 +32,13 @@ url.workspace = true
 # Known Folder API on Windows — which is the half not worth writing by hand. See `paths.rs`.
 dirs = "7"
 
+# The local timezone, for the history's day headings (Today / Yesterday / Mon 6 Oct). Already
+# compiled for `zuno-core` through x509-parser; the feature adds only `num_threads` (libc alone),
+# which is how `time` knows the process is still single-threaded. `local-offset` reads the zone; on
+# Unix it refuses once there is more than one thread, so `main` reads it before gpui starts any.
+# Chosen over chrono, which would be a new crate tree for one heading.
+time = { version = "0.3.55", features = ["local-offset"] }
+
 # `build.rs` draws `assets/icons/zuno.svg` into an `.ico` and embeds it in `zuno.exe`, where gpui
 # reads the window icon from. Windows only, so Linux and macOS builds compile none of these.
 # `resvg` is gpui's version for the dev-dependency's reason below; `embed-resource` 3 is the one

@@ -3811,6 +3811,14 @@ purpose:
   survives an older one trimming the log; re-serializing would drop it (invariant 11's forward
   direction). Recorded at the first event that settles a send — `Done`, `Opened` or `Failed` —
   so a session is one entry; a cancelled send is none. Forgetting a workspace deletes its history.
+  **Loaded once and then kept in memory** (`app/src/history.rs`): the first time the History view
+  shows, the log is read off-thread; every later send is prepended to that list as well as
+  appended on disk, and `Workspace` observes the global — so the view updates live without reading
+  the log back. **Day headings need the local zone**, which the standard library cannot give:
+  `time`'s `local-offset` (already compiled through x509-parser) reads it once in `main`, before
+  gpui starts a thread, because on Unix it refuses afterwards. A DST change mid-session shows at
+  the next start. The day arithmetic itself is pure (`history::local_day`, `day_heading`) and takes
+  the offset as an argument.
 
 Two consequences worth knowing before touching either:
 

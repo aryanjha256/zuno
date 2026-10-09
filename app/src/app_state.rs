@@ -142,6 +142,25 @@ pub fn label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// What a workspace is called on screen: its directory's name, except the built-in one.
+///
+/// **The built-in workspace's directory is `…/zuno/collections`**, so `label` called it
+/// "collections" — which read as a mistake once the panel grew a *Collections* tab right under it.
+/// Renamed on screen only: moving the directory would strand every request in it, and an older
+/// installed Zuno would go on looking in the old place.
+pub fn display_name(entry: &WorkspaceEntry) -> String {
+    if entry.id == DEFAULT_ID {
+        "Personal".to_string()
+    } else {
+        label(&entry.path)
+    }
+}
+
+/// The active workspace's on-screen name, when the registry is installed.
+pub fn active_name(cx: &App) -> Option<String> {
+    cx.try_global::<AppState>()?.active().map(display_name)
+}
+
 /// Every registered workspace, in registration order.
 pub fn workspaces(cx: &App) -> Vec<WorkspaceEntry> {
     cx.try_global::<AppState>()

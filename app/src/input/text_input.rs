@@ -138,6 +138,12 @@ pub struct TextInput {
 const SENT_FIELDS: &[&str] = &["UrlBar", "HeaderCell", "QueryCell", "FormCell", "PartCell", "AuthField"];
 
 impl TextInput {
+    /// Take this input out of `Tab` order — for one painted in the side panel, which would
+    /// otherwise become the first stop before the request's own fields.
+    pub fn leave_tab_order(&mut self) {
+        self.focus_handle = self.focus_handle.clone().tab_stop(false);
+    }
+
     pub fn new(
         text: impl Into<SharedString>,
         placeholder: impl Into<SharedString>,

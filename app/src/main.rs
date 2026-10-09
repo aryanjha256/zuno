@@ -66,6 +66,7 @@ use crate::actions::{
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev, CompleteNext, CompletePrev,
     CompleteAccept, CompleteConfirm, CompleteDismiss, TriggerCompletion,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, ShowAllHistory,
+    HistoryNext, HistoryPrev, HistoryOpen,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     ClearCookies, CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
@@ -109,6 +110,8 @@ impl Boot {
 
 fn main() {
     let boot = Boot::new();
+    // First, while the process still has one thread — see `read_local_offset`.
+    history::read_local_offset();
 
     // The asset source is what makes `svg()` able to load anything at all — without it every
     // icon renders as nothing, silently, because `paint_svg` swallows a miss with `log_err`.
@@ -385,6 +388,11 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         bind!(mac, "up", PickerPrev, Some("Picker")),
         bind!(mac, "enter", PickerConfirm, Some("Picker")),
         bind!(mac, "escape", PickerDismiss, Some("Picker")),
+        // The panel's History view, from its filter or the panel itself — one context names both,
+        // the picker's arrangement. After the text-input keys so the tie goes to these.
+        bind!(mac, "down", HistoryNext, Some("HistoryPanel")),
+        bind!(mac, "up", HistoryPrev, Some("HistoryPanel")),
+        bind!(mac, "enter", HistoryOpen, Some("HistoryPanel")),
         // --- Find in the response ---
         //
         // Below the globals for the third time and the same reason: `escape` here has to be

@@ -1486,7 +1486,12 @@ impl RequestView {
     }
 
     /// Record the in-flight send into the global history, once.
-    fn record(&mut self, outcome: zuno_core::history::Outcome, body: Option<bytes::Bytes>, cx: &App) {
+    fn record(
+        &mut self,
+        outcome: zuno_core::history::Outcome,
+        body: Option<bytes::Bytes>,
+        cx: &mut App,
+    ) {
         let Some(pending) = self.inflight.as_mut().and_then(|inflight| inflight.record.take()) else {
             return;
         };

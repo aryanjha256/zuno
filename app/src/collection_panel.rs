@@ -26,7 +26,8 @@ use zuno_core::Method;
 use zuno_core::collection::{Badge, Node, NodeKind};
 
 use crate::actions::{
-    CollectionCollapseAll, CollectionExpandAll, NewFolder, NewRequest, OpenCollectionMenu, OpenWorkspaceMenu,
+    ClearHistory, CollectionCollapseAll, CollectionExpandAll, NewFolder, NewRequest,
+    OpenCollectionMenu, OpenWorkspaceMenu, ShowAllHistory, ShowCollections,
 };
 use gpui::Action as _;
 use crate::theme::Theme;
@@ -58,7 +59,7 @@ const PILL_TEXT: f32 = 9.0;
 const NAME_GAP: f32 = 4.0;
 
 /// The title strip's height. Named because the workspace menu anchors just below it.
-pub const HEADER_HEIGHT: f32 = 32.0;
+pub const HEADER_HEIGHT: f32 = 36.0;
 
 /// The panel's width when nothing has resized it, and where a double-click on the handle
 /// returns it to. Also what a pre-v5 session adopts — `session.rs` imports this one rather
@@ -110,7 +111,8 @@ pub fn render(
     window: &Window,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let focused = workspace.panel_focus.is_focused(window);
+    // `contains`, not `is`: in History the keyboard sits in the filter, inside the panel.
+    let focused = workspace.panel_focus.contains_focused(window, cx);
     let visible = workspace.tree_visible.clone();
     let nodes = workspace.tree.clone();
     let collapsed = workspace.collapsed.clone();
@@ -192,6 +194,24 @@ pub fn render(
     // twitching rather than as the panel arriving.
     let revealed = workspace.revealed_panel_width(window);
 
+    let history = workspace.panel_view == PanelView::History;
+    // Each view brings its own key context, so the tree's arrows, Enter, Delete and F2 cannot fire
+    // against a tree that is not on screen.
+    let context = if history { "HistoryPanel" } else { "CollectionPanel" };
+    let body: Vec<gpui::AnyElement> = if history {
+        vec![
+            history_toolbar(workspace, theme).into_any_element(),
+            history_list(workspace, theme, cx).into_any_element(),
+        ]
+    } else {
+        let mut body = vec![
+            collections_toolbar(theme).into_any_element(),
+            list.into_any_element(),
+        ];
+        body.extend(empty_notice(workspace, theme).map(IntoElement::into_any_element));
+        body
+    };
+
     div()
         .flex()
         .flex_none()
@@ -202,7 +222,7 @@ pub fn render(
             div()
                 .id("collection-panel")
                 .debug_selector(|| "collection-panel".to_string())
-                .key_context("CollectionPanel")
+                .key_context(context)
                 .track_focus(&workspace.panel_focus)
                 .flex()
                 .flex_col()
@@ -216,8 +236,7 @@ pub fn render(
                 .border_r_1()
                 .border_color(theme.focus_border(focused))
                 .child(header(workspace, theme, cx))
-                .child(list)
-                .children(empty_notice(workspace, theme)),
+                .children(body),
         )
 }
 
@@ -332,9 +351,20 @@ pub fn resize_handle(
         )
 }
 
-/// The title strip. Names the collection's own directory rather than saying "Collection",
-/// because once project switching exists this is the line that says *which* one you are in —
-/// and a label that never changes is a label nobody reads.
+/// Which of the panel's two views is showing. Both belong to the workspace named above them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelView {
+    Collections,
+    History,
+}
+
+/// Height of the toolbar under the header: the tree's buttons, or History's filter.
+const TOOLBAR_HEIGHT: f32 = 30.0;
+
+/// The workspace row: whose collection and history these are, and the switch between the two.
+///
+/// **The workspace on top because it governs both views.** Under a Collections tab it read as
+/// belonging to the tree alone, and History would have had nothing saying whose it was.
 fn header(
     workspace: &Workspace,
     theme: &Theme,
@@ -343,28 +373,148 @@ fn header(
     let name = workspace
         .collection_name(cx)
         .unwrap_or_else(|| SharedString::from("No collection"));
+    let view = workspace.panel_view;
 
     div()
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
+        .gap_2()
         .flex_none()
         .h(px(HEADER_HEIGHT))
-        .px_2()
+        .pl_2()
+        .pr(px(6.))
         .border_b_1()
         .border_color(theme.border)
-        // The line that says *which* workspace you are in, so it is also the way to change it —
-        // this header's own comment predicted that before switching existed.
-        .child(crate::ui::menu_button(
-            "workspace-name",
-            name,
-            "Workspace",
-            OpenWorkspaceMenu,
-            // Full text colour: it names where you are, and muted it read as a disabled label.
-            theme.text,
-            theme,
-        ))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .flex_shrink()
+                .min_w(px(0.))
+                .child(workspace_tile(&name))
+                // The line that says *which* workspace you are in, so it is also the way to
+                // change it.
+                .child(crate::ui::menu_button(
+                    "workspace-name",
+                    name,
+                    "Workspace",
+                    OpenWorkspaceMenu,
+                    // Full text colour: it names where you are, and muted it read as a disabled
+                    // label.
+                    theme.text,
+                    theme,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_none()
+                .gap(px(1.))
+                .p(px(2.))
+                .rounded(px(5.))
+                .bg(theme.bg)
+                .border_1()
+                .border_color(theme.border)
+                .child(view_toggle(
+                    "panel-show-collections",
+                    Icon::Folder,
+                    "Collections",
+                    ShowCollections,
+                    view == PanelView::Collections,
+                    theme,
+                ))
+                .child(view_toggle(
+                    "panel-show-history",
+                    Icon::History,
+                    "History",
+                    ShowAllHistory,
+                    view == PanelView::History,
+                    theme,
+                )),
+        )
+}
+
+/// A square of colour with the workspace's initial — the same name always gets the same colour,
+/// so two workspaces are told apart at a glance before their names are read.
+fn workspace_tile(name: &str) -> Div {
+    // Mid-tone, so white reads on every one of them in either theme.
+    const TILES: [u32; 6] = [0x2f6f62, 0x3f5fa8, 0x7d4f9e, 0x9a5b32, 0x3f7a3a, 0x9a4a5e];
+    let hash = name
+        .bytes()
+        .fold(0u32, |hash, byte| hash.wrapping_mul(31).wrapping_add(u32::from(byte)));
+    let initial = name
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "·".to_string());
+    div()
+        .flex_none()
+        .size(px(20.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.))
+        .bg(gpui::rgb(TILES[hash as usize % TILES.len()]))
+        .text_color(gpui::rgb(0xf4f4f5))
+        .text_size(px(11.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .child(initial)
+}
+
+/// One half of the Collections / History switch. The selected half is filled.
+fn view_toggle<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    action: A,
+    selected: bool,
+    theme: &Theme,
+) -> impl IntoElement + use<A> {
+    let tooltip_action = action.clone();
+    let colour = if selected { theme.text } else { theme.text_muted };
+    let mut button = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(24.))
+        .h(px(20.))
+        .rounded(px(3.))
+        .cursor_pointer()
+        .tooltip(move |window, cx| {
+            crate::ui::Tooltip::for_action(label, &tooltip_action, window, cx)
+        })
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            window.dispatch_action(action.boxed_clone(), cx);
+        })
+        .child(glyph(icon, colour, theme.text, 13.));
+    if selected {
+        button = button.bg(theme.bg_hover);
+    } else {
+        button = button.hover(|style| style.bg(theme.bg_hover));
+    }
+    button
+}
+
+/// The tree's own buttons, under the workspace row: making things, then folding things.
+fn collections_toolbar(theme: &Theme) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_none()
+        .h(px(TOOLBAR_HEIGHT))
+        .px(px(6.))
+        .border_b_1()
+        .border_color(theme.border)
         .child(
             div()
                 .flex()
@@ -412,6 +562,254 @@ fn header(
                     theme,
                 )),
         )
+}
+
+/// History's toolbar: the URL filter, and Clear.
+fn history_toolbar(workspace: &Workspace, theme: &Theme) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .h(px(TOOLBAR_HEIGHT))
+        .pl_2()
+        .pr(px(6.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.))
+                .flex_1()
+                .min_w(px(0.))
+                .h(px(22.))
+                .px(px(6.))
+                .rounded(px(4.))
+                .bg(theme.bg)
+                .border_1()
+                .border_color(theme.border)
+                .text_xs()
+                .child(glyph(Icon::Search, theme.text_faint, theme.text_faint, 12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .child(workspace.history_filter.clone()),
+                ),
+        )
+        .child(icon_button("history-clear", Icon::Trash, "Clear history", ClearHistory, theme))
+}
+
+/// One line of the History list: a day's heading, or an entry by its index in the loaded list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HistoryLine {
+    Heading(String),
+    Row(usize),
+}
+
+/// The entries `filter` lets through, newest first — matched against the URL, lower-cased.
+pub(crate) fn history_rows(entries: &[zuno_core::history::Entry], filter: &str) -> Vec<usize> {
+    (0..entries.len())
+        .filter(|&ix| filter.is_empty() || entries[ix].spec.url.to_lowercase().contains(filter))
+        .collect()
+}
+
+/// `rows`, with a heading wherever the local day changes.
+///
+/// **A heading is a line of the same height as a row**, so the list stays a `uniform_list` and
+/// keyboard scrolling can address a row by its line.
+pub(crate) fn history_lines(
+    entries: &[zuno_core::history::Entry],
+    rows: &[usize],
+    now_ms: u64,
+    offset_secs: i32,
+) -> Vec<HistoryLine> {
+    let today = zuno_core::history::local_day(now_ms, offset_secs);
+    let mut lines = Vec::with_capacity(rows.len() + 8);
+    let mut current = None;
+    for &ix in rows {
+        let day = zuno_core::history::local_day(entries[ix].at, offset_secs);
+        if current != Some(day) {
+            current = Some(day);
+            lines.push(HistoryLine::Heading(zuno_core::history::day_heading(day, today)));
+        }
+        lines.push(HistoryLine::Row(ix));
+    }
+    lines
+}
+
+fn history_list(
+    workspace: &Workspace,
+    theme: &Theme,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let (entries, rows) = workspace.history_matches(cx);
+    let now = zuno_core::history::now_ms();
+    let offset = crate::history::local_offset();
+    let lines = history_lines(&entries, &rows, now, offset);
+    let selected = workspace.history_selected;
+    let open_url = workspace.active().map(|view| view.read(cx).url.read(cx).text().to_string());
+    let filtering = !workspace.history_filter.read(cx).text().trim().is_empty();
+    let loaded = crate::history::entries(cx).is_some();
+    let entity = cx.entity();
+    let row_theme = theme.clone();
+
+    let empty = lines.is_empty().then(|| {
+        div()
+            .px_3()
+            .pt_3()
+            .text_xs()
+            .text_color(theme.text_faint)
+            .child(match (loaded, filtering) {
+                (false, _) if crate::history::enabled(cx) => "Reading history…",
+                (_, true) => "Nothing sent to a matching URL.",
+                _ => "Nothing sent from this workspace yet.",
+            })
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .children(empty)
+        .child(
+            uniform_list("history-list", lines.len(), move |range, _window, _cx| {
+                range
+                    .map(|line_ix| match &lines[line_ix] {
+                        HistoryLine::Heading(text) => history_heading(text, &row_theme),
+                        HistoryLine::Row(ix) => {
+                            let entry = &entries[*ix];
+                            history_row(
+                                entry,
+                                selected == Some(entry.id),
+                                open_url.as_deref() == Some(entry.spec.url.as_str()),
+                                now,
+                                offset,
+                                &row_theme,
+                                entity.clone(),
+                            )
+                        }
+                    })
+                    .collect()
+            })
+            .track_scroll(workspace.history_scroll.clone())
+            .debug_selector(|| "history-list".to_string())
+            .pt_1()
+            .pb_2()
+            .flex_1(),
+        )
+}
+
+fn history_heading(text: &str, theme: &Theme) -> Div {
+    div()
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .flex()
+        .items_end()
+        .px_3()
+        .pb(px(5.))
+        .text_size(px(10.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.text_faint)
+        .child(text.to_uppercase())
+}
+
+/// One sent request: what it was, how it ended, when.
+fn history_row(
+    entry: &zuno_core::history::Entry,
+    selected: bool,
+    // The active tab is at this URL — the History view's version of the tree's open-row bar.
+    open: bool,
+    now: u64,
+    offset: i32,
+    theme: &Theme,
+    workspace: Entity<Workspace>,
+) -> Div {
+    use zuno_core::history::Outcome;
+    let id = entry.id;
+    let (status, colour) = match &entry.outcome {
+        Outcome::Response(recorded) => (
+            recorded.status.to_string(),
+            theme.status_color(zuno_core::StatusClass::of(recorded.status)),
+        ),
+        Outcome::Opened { status: Some(code), .. } => {
+            (code.to_string(), theme.status_color(zuno_core::StatusClass::of(*code)))
+        }
+        Outcome::Opened { status: None, .. } => ("open".to_string(), theme.text_muted),
+        Outcome::Failed { .. } => ("ERR".to_string(), theme.status_server_error),
+    };
+
+    let mut row = div()
+        .debug_selector(move || format!("history-row-{id}"))
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        // `w_full`, for the reason the tree's rows give: without it the row is a label-wide hitbox.
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .pl(px(8.))
+        .pr_2()
+        .gap(px(8.))
+        .cursor_pointer()
+        .text_xs()
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            workspace.update(cx, |workspace, cx| workspace.choose_history_row(id, window, cx));
+        });
+    if selected {
+        row = row.bg(theme.bg_hover);
+    } else {
+        row = row.hover(|style| style.bg(theme.bg_hover));
+    }
+    if open {
+        row = row.child(div().absolute().top_0().bottom_0().left_0().w(px(2.)).bg(theme.accent));
+    }
+
+    row.child(badge_cell(&Badge::of(&entry.spec), theme).mr(px(0.)))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(if selected { theme.text } else { theme.text_muted })
+                .child(url_path(&entry.spec.url)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .font_family(theme.mono.clone())
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(colour)
+                .child(status),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(30.))
+                .flex()
+                .justify_end()
+                .text_size(px(10.5))
+                .text_color(theme.text_faint)
+                .child(zuno_core::history::row_time(entry.at, now, offset)),
+        )
+}
+
+/// What a row shows of a URL: the path and query, without the scheme and host — at panel width
+/// the host is the part every row shares. The whole URL when there is no path to show.
+pub(crate) fn url_path(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    match rest.find('/') {
+        Some(slash) if slash + 1 < rest.len() => rest[slash..].to_string(),
+        _ if url.trim().is_empty() => "(no URL)".to_string(),
+        _ => url.to_string(),
+    }
 }
 
 /// The name box for a folder being created, drawn as a row *in* the tree.
@@ -484,7 +882,7 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
     Some(
         div()
             .absolute()
-            .top(px(40.))
+            .top(px(HEADER_HEIGHT + TOOLBAR_HEIGHT + 8.))
             .left_0()
             .right_0()
             .px_3()
@@ -811,6 +1209,49 @@ mod tests {
 
     /// A wide window, so `MAX_FRACTION` is not the binding constraint.
     const WIDE: f32 = 1600.0;
+
+    #[test]
+    fn a_history_row_shows_the_path_and_drops_the_host() {
+        assert_eq!(url_path("https://api.shop.test/orders?limit=5"), "/orders?limit=5");
+        assert_eq!(url_path("{{base}}/users/42"), "/users/42");
+        assert_eq!(url_path("https://api.shop.test/"), "https://api.shop.test/");
+        assert_eq!(url_path("localhost:8080"), "localhost:8080");
+        assert_eq!(url_path(""), "(no URL)");
+    }
+
+    #[test]
+    fn history_is_headed_once_per_local_day_and_filtered_by_url() {
+        let at = |url: &str, at: u64| zuno_core::history::Entry {
+            id: at,
+            at,
+            spec: zuno_core::RequestSpec { url: url.into(), ..Default::default() },
+            path: None,
+            outcome: zuno_core::history::Outcome::Failed { error: String::new() },
+        };
+        let noon: u64 = 1_791_374_400_000;
+        let hour = 3_600_000;
+        let entries = vec![
+            at("https://a.test/orders", noon),
+            at("https://a.test/users", noon - hour),
+            at("https://a.test/orders/1", noon - 26 * hour),
+        ];
+
+        let all = history_rows(&entries, "");
+        let lines = history_lines(&entries, &all, noon, 0);
+        assert_eq!(
+            lines,
+            vec![
+                HistoryLine::Heading("Today".into()),
+                HistoryLine::Row(0),
+                HistoryLine::Row(1),
+                HistoryLine::Heading("Yesterday".into()),
+                HistoryLine::Row(2),
+            ]
+        );
+
+        let orders = history_rows(&entries, "orders");
+        assert_eq!(orders, vec![0, 2]);
+    }
 
     /// Pins the mapping, **not** the flicker.
     ///

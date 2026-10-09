@@ -186,15 +186,65 @@ pub fn next_id() -> u64 {
     }
 }
 
-/// "just now", "5m ago", "3h ago", "2d ago" — for a row, where a timestamp would be read as noise.
-pub fn ago(now_ms: u64, at_ms: u64) -> String {
-    let seconds = now_ms.saturating_sub(at_ms) / 1000;
-    match seconds {
-        0..60 => "just now".to_string(),
-        60..3600 => format!("{}m ago", seconds / 60),
-        3600..86_400 => format!("{}h ago", seconds / 3600),
-        _ => format!("{}d ago", seconds / 86_400),
+const DAY_MS: i64 = 86_400_000;
+
+/// The local day `at_ms` falls on, as days since 1970-01-01, for a zone `offset_secs` east of UTC.
+pub fn local_day(at_ms: u64, offset_secs: i32) -> i64 {
+    (at_ms as i64 + i64::from(offset_secs) * 1000).div_euclid(DAY_MS)
+}
+
+/// A day's heading: `Today`, `Yesterday`, else `Mon 6 Oct`.
+///
+/// The zone is an argument rather than read here, so this stays a pure function a test can pin —
+/// the app reads it once at startup (see `app/src/history.rs`).
+pub fn day_heading(day: i64, today: i64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    match today - day {
+        0 => "Today".to_string(),
+        1 => "Yesterday".to_string(),
+        _ => {
+            let (year, month, date) = civil_from_days(day);
+            let weekday = WEEKDAYS[day.rem_euclid(7) as usize];
+            let month = MONTHS[(month - 1) as usize];
+            let (current, ..) = civil_from_days(today);
+            if year == current {
+                format!("{weekday} {date} {month}")
+            } else {
+                format!("{weekday} {date} {month} {year}")
+            }
+        }
     }
+}
+
+/// A row's time: how long ago within today (`2m`, `3h`), the clock time on any earlier day.
+pub fn row_time(at_ms: u64, now_ms: u64, offset_secs: i32) -> String {
+    if local_day(at_ms, offset_secs) != local_day(now_ms, offset_secs) {
+        let local = (at_ms as i64 + i64::from(offset_secs) * 1000).rem_euclid(DAY_MS) / 60_000;
+        return format!("{:02}:{:02}", local / 60, local % 60);
+    }
+    let minutes = now_ms.saturating_sub(at_ms) / 60_000;
+    match minutes {
+        0 => "now".to_string(),
+        1..60 => format!("{minutes}m"),
+        _ => format!("{}h", minutes / 60),
+    }
+}
+
+/// Days since 1970-01-01 to `(year, month, day)` in the proleptic Gregorian calendar — Howard
+/// Hinnant's `civil_from_days`, which is exact for every date this will ever see.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// One workspace's history directory.
@@ -255,6 +305,14 @@ impl Store {
             .collect();
         entries.reverse();
         entries
+    }
+
+    /// Forget everything: the log and every kept body. The directory goes with them.
+    pub fn clear(&self) -> io::Result<()> {
+        match fs::remove_dir_all(&self.dir) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
 
     /// The stored body of `id`, or `None` when it was never kept or has since been pruned.
@@ -462,12 +520,32 @@ mod tests {
         let _ = fs::remove_dir_all(store.dir());
     }
 
+    /// Expected values from `date -u -d @1791374400` (Wed 7 Oct 2026, 12:00 UTC) and its year-ago
+    /// twin, not worked out by hand — the first version of this test had the weekday wrong.
     #[test]
-    fn ages_read_at_a_glance() {
-        let now = 10 * 86_400_000;
-        assert_eq!(ago(now, now - 5_000), "just now");
-        assert_eq!(ago(now, now - 5 * 60_000), "5m ago");
-        assert_eq!(ago(now, now - 3 * 3_600_000), "3h ago");
-        assert_eq!(ago(now, now - 2 * 86_400_000), "2d ago");
+    fn days_are_headed_in_the_local_zone() {
+        let wednesday_utc_noon: u64 = 1_791_331_200_000 + 12 * 3_600_000;
+        let ist = 5 * 3600 + 1800;
+        let today = local_day(wednesday_utc_noon, ist);
+        assert_eq!(day_heading(today, today), "Today");
+        assert_eq!(day_heading(today - 1, today), "Yesterday");
+        assert_eq!(day_heading(today, today + 2), "Wed 7 Oct");
+        assert_eq!(day_heading(today - 365, today), "Tue 7 Oct 2025");
+
+        // 20:00 UTC is 01:30 the next day in India: the zone decides the day.
+        let late: u64 = 1_791_331_200_000 + 20 * 3_600_000;
+        assert_eq!(local_day(late, 0), local_day(wednesday_utc_noon, 0));
+        assert_eq!(local_day(late, ist), local_day(wednesday_utc_noon, ist) + 1);
     }
+
+    #[test]
+    fn a_row_says_minutes_today_and_a_clock_time_before() {
+        let ist = 5 * 3600 + 1800;
+        let now: u64 = 1_791_331_200_000 + 12 * 3_600_000; // 17:30 IST
+        assert_eq!(row_time(now - 30_000, now, ist), "now");
+        assert_eq!(row_time(now - 14 * 60_000, now, ist), "14m");
+        assert_eq!(row_time(now - 3 * 3_600_000, now, ist), "3h");
+        assert_eq!(row_time(now - 24 * 3_600_000, now, ist), "17:30");
+    }
+
 }

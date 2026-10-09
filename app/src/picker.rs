@@ -137,8 +137,8 @@ pub enum Target {
     Environment(Option<String>),
     /// Show a retained response: `0` is live, `1` the run before it.
     Run(usize),
-    /// Open a send from the workspace's history in a new tab, with its response.
-    Recorded(Box<zuno_core::history::Entry>),
+    /// Forget the workspace's history — the confirmed half of `ClearHistory`.
+    ClearHistory,
     /// Run a flow, by name.
     Flow(String),
     /// Append the collection panel's selection to a flow, by name.
@@ -185,7 +185,7 @@ impl Clone for Target {
             Self::RemoveProxy(url) => Self::RemoveProxy(url.clone()),
             Self::Environment(name) => Self::Environment(name.clone()),
             Self::Run(offset) => Self::Run(*offset),
-            Self::Recorded(entry) => Self::Recorded(entry.clone()),
+            Self::ClearHistory => Self::ClearHistory,
             Self::Flow(name) => Self::Flow(name.clone()),
             Self::AddToFlow(name) => Self::AddToFlow(name.clone()),
             Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),

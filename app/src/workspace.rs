@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -187,6 +187,16 @@ pub struct Workspace {
     /// (architecture.md §6). Translation happens at render and scroll, nowhere else.
     pub(crate) panel_selection: Option<usize>,
     pub(crate) panel_scroll: UniformListScrollHandle,
+    /// Which of the panel's two views is showing.
+    pub(crate) panel_view: crate::collection_panel::PanelView,
+    /// The History view's filter, matched against each entry's URL.
+    pub(crate) history_filter: Entity<crate::input::TextInput>,
+    /// **The selected entry's id, not a row index**, since a send prepends an entry and would
+    /// otherwise slide the selection onto the row below.
+    pub(crate) history_selected: Option<u64>,
+    pub(crate) history_scroll: UniformListScrollHandle,
+    /// The filter's `Changed` and the history global's observer. Dropping either unsubscribes.
+    _history_subscriptions: [Subscription; 2],
     /// The tab strip's horizontal scroll, held so the chevrons can drive it.
     ///
     /// The strip has scrolled since it was built, but only by wheel — with nothing on screen
@@ -444,6 +454,22 @@ impl Workspace {
             async {}
         });
 
+        let history_filter = cx.new(|cx| {
+            let mut input =
+                crate::input::TextInput::new(String::new(), "Filter by URL…", "HistoryPanel", cx);
+            input.leave_tab_order();
+            input
+        });
+        let history_subscriptions = [
+            // A new filter is a new list, so the old selection means nothing in it.
+            cx.subscribe(&history_filter, |workspace, _, _: &crate::input::text_input::Changed, cx| {
+                workspace.history_selected = None;
+                workspace.history_scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                cx.notify();
+            }),
+            cx.observe_global::<crate::history::HistoryDir>(|_, cx| cx.notify()),
+        ];
+
         let mut workspace = Self {
             focus_handle: cx.focus_handle(),
             window_title: String::new(),
@@ -473,6 +499,11 @@ impl Workspace {
             panel_reveal_anim: None,
             panel_selection: None,
             panel_scroll: UniformListScrollHandle::new(),
+            panel_view: crate::collection_panel::PanelView::Collections,
+            history_filter,
+            history_selected: None,
+            history_scroll: UniformListScrollHandle::new(),
+            _history_subscriptions: history_subscriptions,
             cert_prompt: None,
             certs: None,
             cookie_viewer: None,
@@ -1522,8 +1553,12 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The collection root's own directory name, for the panel's title strip.
+    /// The workspace's name for the panel's title strip — the registry's, so the built-in one
+    /// reads "Personal"; the root's directory name where no registry is installed (the tests).
     pub(crate) fn collection_name(&self, cx: &App) -> Option<SharedString> {
+        if let Some(name) = crate::app_state::active_name(cx) {
+            return Some(SharedString::from(name));
+        }
         let root = crate::collections::root(cx)?;
         root.file_name()
             .map(|name| SharedString::from(name.to_string_lossy().to_string()))
@@ -3642,28 +3677,140 @@ impl Workspace {
         self.show_picker(items, "Nothing sent yet from this request", window, cx);
     }
 
-    /// Every request this workspace has sent, newest first, searchable by URL.
-    ///
-    /// Opens at once and fills when the log has been read off-thread, the way `Ctrl+P` fills in
-    /// saved requests.
+    /// The panel's History view: every request this workspace has sent, filtered by URL.
     fn show_all_history(&mut self, _: &ShowAllHistory, window: &mut Window, cx: &mut Context<Self>) {
         if self.modal_open() {
             return;
         }
-        let picker = self.show_picker(Vec::new(), "Nothing sent from this workspace yet", window, cx);
-        picker.update(cx, |picker, cx| picker.set_placeholder("Search sent requests by URL…", cx));
+        self.show_panel_view(crate::collection_panel::PanelView::History, window, cx);
+    }
 
-        let Some(load) = crate::history::load(cx) else { return };
-        self.picker_scan = Some(cx.spawn(async move |_this, cx| {
-            let entries = load.await;
-            let now = zuno_core::history::now_ms();
-            let _ = picker.update(cx, |picker, cx| {
-                picker.extend_decorated(
-                    entries.iter().map(|entry| history_row(entry, now)),
-                    cx,
-                );
-            });
-        }));
+    fn show_collections(&mut self, _: &ShowCollections, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.show_panel_view(crate::collection_panel::PanelView::Collections, window, cx);
+    }
+
+    /// Switch the panel's view, opening the panel if it is hidden, and put the keyboard where that
+    /// view reads it: the filter for History, the tree for Collections.
+    pub(crate) fn show_panel_view(
+        &mut self,
+        view: crate::collection_panel::PanelView,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.panel_view = view;
+        if !self.panel_visible {
+            self.panel_visible = true;
+            self.reveal_panel(cx);
+            self.refresh_tree(cx);
+        }
+        match view {
+            crate::collection_panel::PanelView::History => {
+                crate::history::ensure_loaded(cx);
+                let filter = self.history_filter.read(cx).focus_handle(cx);
+                window.focus(&filter);
+            }
+            crate::collection_panel::PanelView::Collections => window.focus(&self.panel_focus),
+        }
+        cx.notify();
+    }
+
+    /// The loaded entries and, in order, the indices of those the filter lets through.
+    pub(crate) fn history_matches(
+        &self,
+        cx: &App,
+    ) -> (std::sync::Arc<Vec<zuno_core::history::Entry>>, Vec<usize>) {
+        let entries = crate::history::entries(cx).unwrap_or_default();
+        let filter = self.history_filter.read(cx).text().to_lowercase();
+        let rows = crate::collection_panel::history_rows(&entries, filter.trim());
+        (entries, rows)
+    }
+
+    fn step_history(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let (entries, rows) = self.history_matches(cx);
+        if rows.is_empty() {
+            return;
+        }
+        let current = self
+            .history_selected
+            .and_then(|id| rows.iter().position(|&ix| entries[ix].id == id));
+        let next = match current {
+            None if delta > 0 => 0,
+            None => rows.len() - 1,
+            Some(pos) => pos.saturating_add_signed(delta).min(rows.len() - 1),
+        };
+        let id = entries[rows[next]].id;
+        self.history_selected = Some(id);
+        // The list holds day headings too, so a row's place in it is not its place in `rows`.
+        let lines = crate::collection_panel::history_lines(
+            &entries,
+            &rows,
+            zuno_core::history::now_ms(),
+            crate::history::local_offset(),
+        );
+        if let Some(line) = lines.iter().position(|line| {
+            matches!(line, crate::collection_panel::HistoryLine::Row(ix) if entries[*ix].id == id)
+        }) {
+            self.history_scroll.scroll_to_item(line, gpui::ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn history_next(&mut self, _: &HistoryNext, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_history(1, cx);
+    }
+
+    fn history_prev(&mut self, _: &HistoryPrev, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_history(-1, cx);
+    }
+
+    /// Open the selected entry — or, with nothing selected, the first match, so typing part of a
+    /// URL and pressing Enter is enough.
+    fn history_open(&mut self, _: &HistoryOpen, window: &mut Window, cx: &mut Context<Self>) {
+        let (entries, rows) = self.history_matches(cx);
+        let chosen = self
+            .history_selected
+            .and_then(|id| rows.iter().find(|&&ix| entries[ix].id == id))
+            .or(rows.first())
+            .map(|&ix| entries[ix].clone());
+        if let Some(entry) = chosen {
+            self.history_selected = Some(entry.id);
+            self.open_recorded(entry, window, cx);
+        }
+    }
+
+    /// A click on a history row: select it and open it.
+    pub(crate) fn choose_history_row(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = crate::history::entries(cx)
+            .and_then(|entries| entries.iter().find(|entry| entry.id == id).cloned());
+        if let Some(entry) = entry {
+            self.history_selected = Some(id);
+            self.open_recorded(entry, window, cx);
+        }
+    }
+
+    /// Clearing cannot be undone, so it asks first — the picker's two-row confirm, as for a kind
+    /// change that discards a body.
+    fn clear_history(&mut self, _: &ClearHistory, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() || !crate::history::enabled(cx) {
+            return;
+        }
+        let name = self.collection_name(cx).unwrap_or_default();
+        let items = vec![
+            picker::Item {
+                label: SharedString::from(format!("Clear all history in {name}")),
+                detail: SharedString::from("every request and response kept — cannot be undone"),
+                target: picker::Target::ClearHistory,
+            },
+            picker::Item {
+                label: SharedString::from("Keep it"),
+                detail: SharedString::default(),
+                target: picker::Target::Dismiss,
+            },
+        ];
+        self.show_picker(items, "", window, cx);
     }
 
     /// Open a history entry as a new, unsaved tab — never over the file it came from, which may
@@ -3786,7 +3933,7 @@ impl Workspace {
                     (false, _) => entry.path.display().to_string(),
                 };
                 picker::Item {
-                    label: SharedString::from(crate::app_state::label(&entry.path)),
+                    label: SharedString::from(crate::app_state::display_name(&entry)),
                     detail: SharedString::from(detail),
                     target: if forget {
                         picker::Target::ForgetWorkspace(entry.id)
@@ -3859,7 +4006,11 @@ impl Workspace {
                     view.update(cx, |view, cx| view.view_run(offset, cx));
                 }
             }
-            picker::Target::Recorded(entry) => self.open_recorded(*entry, window, cx),
+            picker::Target::ClearHistory => {
+                crate::history::clear(cx);
+                self.history_selected = None;
+                self.set_status("History cleared", cx);
+            }
             picker::Target::Environment(name) => {
                 self.environment = name;
                 // Persisted immediately rather than at the next send: switching environment
@@ -3962,7 +4113,7 @@ impl Workspace {
                 let name = crate::app_state::workspaces(cx)
                     .into_iter()
                     .find(|entry| entry.id == id)
-                    .map(|entry| crate::app_state::label(&entry.path))
+                    .map(|entry| crate::app_state::display_name(&entry))
                     .unwrap_or_else(|| id.clone());
 
                 if crate::app_state::forget_workspace(cx, &id) {
@@ -4980,7 +5131,6 @@ impl Workspace {
         let rows = vec![
             MenuItem::new("Copy as code…", CopyAsCode, &focus, window).into(),
             MenuItem::new("Import from curl on the clipboard", ImportCurl, &focus, window).into(),
-            MenuItem::new("History…", ShowAllHistory, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Request settings", OpenSettings, &focus, window).into(),
         ];
@@ -7684,6 +7834,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::switch_environment))
             .on_action(cx.listener(Self::show_history))
             .on_action(cx.listener(Self::show_all_history))
+            .on_action(cx.listener(Self::show_collections))
+            .on_action(cx.listener(Self::history_next))
+            .on_action(cx.listener(Self::history_prev))
+            .on_action(cx.listener(Self::history_open))
+            .on_action(cx.listener(Self::clear_history))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_defaults))
@@ -8515,50 +8670,7 @@ fn extension_for(base: &str) -> String {
 
 /// Bytes at human scale. The history picker shows sizes side by side, and `184320` next to
 /// `179` reads as noise where `180 KB` next to `179 B` reads as a difference.
-/// One history entry as a picker row: the URL to search by, how it ended, and when.
-fn history_row(entry: &zuno_core::history::Entry, now: u64) -> (picker::Item, picker::Decor) {
-    use zuno_core::history::{Kept, Outcome};
-    let detail = match &entry.outcome {
-        Outcome::Response(recorded) => {
-            let mut detail = format!(
-                "{} {} · {} · {}",
-                recorded.status,
-                recorded.status_text,
-                format_bytes(recorded.size),
-                crate::response_pane::format_duration(std::time::Duration::from_micros(
-                    recorded.total_us
-                )),
-            );
-            if recorded.body == Kept::TooLarge {
-                detail.push_str(" · body not kept");
-            }
-            detail
-        }
-        Outcome::Opened { status: Some(code), status_text } => format!("{code} {status_text} · opened"),
-        Outcome::Opened { status: None, .. } => "opened".to_string(),
-        Outcome::Failed { error } => format!("failed — {error}"),
-    };
-    let label = if entry.spec.url.trim().is_empty() {
-        "(no URL)".to_string()
-    } else {
-        entry.spec.url.clone()
-    };
-    (
-        picker::Item {
-            label: SharedString::from(label),
-            detail: SharedString::from(detail),
-            target: picker::Target::Recorded(Box::new(entry.clone())),
-        },
-        picker::Decor {
-            badge: Some(zuno_core::collection::Badge::of(&entry.spec)),
-            trailing: Some(SharedString::from(zuno_core::history::ago(now, entry.at))),
-            section: None,
-            keys: None,
-        },
-    )
-}
-
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     match bytes {
