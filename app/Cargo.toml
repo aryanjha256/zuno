@@ -44,7 +44,7 @@ time = { version = "0.3.55", features = ["local-offset"] }
 # `resvg` is gpui's version for the dev-dependency's reason below; `embed-resource` 3 is the one
 # gpui already builds with on Windows.
 [target.'cfg(target_os = "windows")'.build-dependencies]
-resvg = "0.45"
+resvg = "0.48"
 ico = "0.5"
 embed-resource = "3"
 
@@ -56,7 +56,7 @@ embed-resource = "3"
 # icon test rasterizes the way gpui does, so matching its renderer is the whole point. A newer
 # resvg could parse an icon that gpui's cannot, and the test would pass while the button is blank.
 # It also reuses the already-resolved copy instead of compiling a second one.
-resvg = "0.45"
+resvg = "0.48"
 
 gpui = { workspace = true, features = ["test-support"] }
 
