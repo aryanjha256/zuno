@@ -1956,6 +1956,55 @@ async fn ctrl_enter_sends_and_the_response_lands_in_the_view(cx: &mut TestAppCon
     });
 }
 
+/// The whole loop of the global history: a send is recorded, `Alt+H` lists it, and choosing it
+/// opens a *new* tab holding the request and the response it got — read back from disk.
+#[gpui::test]
+async fn a_sent_request_comes_back_from_history_with_its_response(cx: &mut TestAppContext) {
+    let base = serve_once(OK_JSON);
+    let dir = scratch_dir("global-history");
+    let (window, view, mut cx) = boot(cx, None, None);
+    cx.update(|_, cx| crate::history::install_at(cx, Some(dir.clone())));
+
+    type_url(&mut cx, &format!("{base}/orders"));
+    cx.press("ctrl-enter");
+    wait_for(&mut cx, "a response", |cx| cx.update(|_, cx| view.read(cx).response.clone()));
+
+    let store = zuno_core::history::Store::new(dir.clone());
+    wait_for(&mut cx, "the send to be recorded", |_| store.load().first().cloned());
+
+    // Away from it, so the reopened tab cannot be mistaken for the one that sent.
+    type_url(&mut cx, "https://elsewhere.test/");
+    cx.press("alt-h");
+    let rows = wait_for(&mut cx, "the history row", |cx| {
+        let rows = picker_rows(&window, cx);
+        (!rows.is_empty()).then_some(rows)
+    });
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].starts_with(&format!("{base}/orders — 200 OK")), "{rows:?}");
+    cx.press("enter");
+
+    let reopened = wait_for(&mut cx, "a reopened tab with its response", |cx| {
+        window
+            .update(cx, |workspace, _, cx| {
+                let active = workspace.active()?;
+                (workspace.tab_count() == 2 && active.read(cx).response.is_some())
+                    .then_some(active)
+            })
+            .expect("window")
+    });
+    cx.update(|_, cx| {
+        let reopened = reopened.read(cx);
+        assert_eq!(reopened.url.read(cx).text(), format!("{base}/orders"));
+        let response = reopened.response.as_ref().unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body_as_str(), Some("{\"ok\":true}"));
+        assert!(reopened.path.is_none(), "opened as a new tab, never over a saved file");
+    });
+
+    cx.update(|_, cx| crate::history::install_at(cx, None));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[gpui::test]
 async fn the_url_bar_enter_key_also_sends(cx: &mut TestAppContext) {
     let base = serve_once(OK_JSON);

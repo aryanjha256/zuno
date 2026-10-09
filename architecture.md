@@ -3802,6 +3802,15 @@ purpose:
   window state, not part of the request model a future CLI shares. JSON rather than SQLite because
   it is one file and one write; nothing forecloses moving history and the response cache into
   SQLite later, which is where that dependency would start to pay for itself.
+- **Global history: a JSON-lines log, still not SQLite** (`zuno_core::history`, under
+  `<config>/history/<workspace id>/`, never in the collection). One line per send, appended off
+  the UI thread; bodies ≤1 MB in `bodies/<id>`, the oldest dropped past 50 MB; the log trimmed to
+  500 entries in batches of 50 so a send is an append, not a rewrite. Listing and filtering a few
+  hundred entries by URL is milliseconds in memory — SQLite pays once history is searched *inside*
+  bodies. **The trim works on raw lines and parses only `id`**, so an entry from a newer build
+  survives an older one trimming the log; re-serializing would drop it (invariant 11's forward
+  direction). Recorded at the first event that settles a send — `Done`, `Opened` or `Failed` —
+  so a session is one entry; a cancelled send is none. Forgetting a workspace deletes its history.
 
 Two consequences worth knowing before touching either:
 

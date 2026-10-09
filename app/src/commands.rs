@@ -188,6 +188,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         // stops being read.
         command("Copy the Zuno install command", CopyInstallCommand),
         command("Show response history", ShowHistory),
+        command("Show history — every request sent in this workspace", ShowAllHistory),
         command("Show response body", ShowResponseBody),
         command("Show response headers", ShowResponseHeaders),
         command("Copy the network details — connection and the request as sent", CopyNetworkDetails),

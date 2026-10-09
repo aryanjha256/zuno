@@ -23,6 +23,7 @@ mod close_panel;
 mod collection_panel;
 mod environment_panel;
 mod flow_panel;
+mod history;
 mod import_panel;
 mod collections;
 mod commands;
@@ -64,7 +65,7 @@ use crate::actions::{
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev, CompleteNext, CompletePrev,
     CompleteAccept, CompleteConfirm, CompleteDismiss, TriggerCompletion,
-    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory,
+    SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, ShowAllHistory,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     ClearCookies, CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
@@ -378,6 +379,8 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         // and two unrelated response tests were what noticed.
         bind!(mac, "ctrl-alt-r", RunFlow, None),
         bind!(mac, "ctrl-h", ShowHistory, None),
+        // `Ctrl+H` stays the tab's own runs; the workspace's is the same letter one modifier over.
+        bind!(mac, "alt-h", ShowAllHistory, None),
         bind!(mac, "down", PickerNext, Some("Picker")),
         bind!(mac, "up", PickerPrev, Some("Picker")),
         bind!(mac, "enter", PickerConfirm, Some("Picker")),

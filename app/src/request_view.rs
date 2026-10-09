@@ -77,6 +77,9 @@ pub struct InFlight {
     pub ttfb: Option<Duration>,
     pub received: usize,
     pub total: Option<usize>,
+    /// What this send goes into the global history as, taken by the first event that settles
+    /// it — the response, the open, or the failure — so a send is recorded exactly once.
+    record: Option<PendingRecord>,
     /// Holding the task is what keeps the event loop alive; dropping it stops
     /// consumption. Never read — that's the whole contract.
     ///
@@ -88,6 +91,14 @@ pub struct InFlight {
     /// return `true` instead, or add work after the `while` loop in `send`, and that work silently
     /// never happens: the future would go back to awaiting a channel nothing will poll again.
     _task: Task<()>,
+}
+
+/// A send's history entry, minus how it ended.
+struct PendingRecord {
+    /// As typed, before the resolver — see `zuno_core::history`.
+    spec: RequestSpec,
+    path: Option<std::path::PathBuf>,
+    at: u64,
 }
 
 /// One line of a conversation.
@@ -1430,8 +1441,14 @@ impl RequestView {
         // land behind a stale one.
         self.cancel(engine, cx);
 
-        let spec = resolver.apply(&self.spec(cx));
+        let typed = self.spec(cx);
+        let spec = resolver.apply(&typed);
         let (job, events) = engine.send(spec);
+        let record = PendingRecord {
+            spec: typed,
+            path: self.path.clone(),
+            at: zuno_core::history::now_ms(),
+        };
 
         self.error = None;
         self.body_view = None;
@@ -1462,8 +1479,32 @@ impl RequestView {
             ttfb: None,
             received: 0,
             total: None,
+            record: Some(record),
             _task: task,
         });
+        cx.notify();
+    }
+
+    /// Record the in-flight send into the global history, once.
+    fn record(&mut self, outcome: zuno_core::history::Outcome, body: Option<bytes::Bytes>, cx: &App) {
+        let Some(pending) = self.inflight.as_mut().and_then(|inflight| inflight.record.take()) else {
+            return;
+        };
+        let entry = zuno_core::history::Entry {
+            id: zuno_core::history::next_id(),
+            at: pending.at,
+            spec: pending.spec,
+            path: pending.path,
+            outcome,
+        };
+        crate::history::record(entry, body, cx);
+    }
+
+    /// Show a response read back from the global history, as this buffer's live one.
+    pub fn show_recorded(&mut self, response: ResponseData, cx: &mut Context<Self>) {
+        self.response = Some(response);
+        self.viewing = 0;
+        self.index_body(false, cx);
         cx.notify();
     }
 
@@ -1499,6 +1540,12 @@ impl RequestView {
                     inflight.headers = headers.clone();
                     inflight.ttfb = Some(elapsed);
                 }
+                let (code, text) = status.clone().map_or((None, String::new()), |(code, text)| (Some(code), text));
+                self.record(
+                    zuno_core::history::Outcome::Opened { status: code, status_text: text },
+                    None,
+                    cx,
+                );
                 self.session = Some(Transcript {
                     job: current,
                     transport,
@@ -1616,6 +1663,8 @@ impl RequestView {
                     response.timing.total,
                     response.size.decoded
                 );
+                let (recorded, body) = zuno_core::history::Recorded::of(&response);
+                self.record(zuno_core::history::Outcome::Response(recorded), body, cx);
                 self.inflight = None;
 
                 // **A finished session is a closed one**, and this arm is where that was
@@ -1660,6 +1709,11 @@ impl RequestView {
                 false
             }
             Event::Failed { error, .. } => {
+                self.record(
+                    zuno_core::history::Outcome::Failed { error: error.to_string() },
+                    None,
+                    cx,
+                );
                 self.report_undelivered();
                 // **A failed session is a closed one.** Without this the transcript kept
                 // `closed: None` while `inflight` went away, so a socket killed by a network

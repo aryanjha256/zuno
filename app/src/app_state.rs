@@ -220,6 +220,7 @@ pub fn forget_workspace(cx: &mut App, id: &str) -> bool {
     // again — leaving it behind accumulates files nothing can reach.
     if let Some(dir) = state.dir.clone() {
         let _ = std::fs::remove_file(session_path(&dir, id));
+        let _ = std::fs::remove_dir_all(history_dir(&dir, id));
     }
 
     save(cx);
@@ -254,6 +255,12 @@ fn config_dir() -> Option<PathBuf> {
 /// can never point at a session belonging to another workspace.
 pub fn session_path(dir: &Path, id: &str) -> PathBuf {
     dir.join("sessions").join(format!("{id}.json"))
+}
+
+/// `history/<id>/`, for `session_path`'s reason. Beside the sessions rather than in the collection
+/// root, so it is never committed.
+pub fn history_dir(dir: &Path, id: &str) -> PathBuf {
+    dir.join("history").join(id)
 }
 
 fn read(dir: &Path) -> Option<AppFile> {
@@ -385,9 +392,15 @@ fn resolve(cx: &mut App) {
         .as_deref()
         .zip(state.active())
         .map(|(dir, entry)| session_path(dir, &entry.id));
+    let history = state
+        .dir
+        .as_deref()
+        .zip(state.active())
+        .map(|(dir, entry)| history_dir(dir, &entry.id));
 
     crate::collections::install_at(cx, root);
     crate::session::install_at(cx, session);
+    crate::history::install_at(cx, history);
 }
 
 pub fn theme(cx: &App) -> Appearance {

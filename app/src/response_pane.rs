@@ -2221,7 +2221,7 @@ fn empty_state(theme: &Theme, window: &Window) -> Div {
 // ---------------------------------------------------------------------------
 
 /// Sub-millisecond responses are real (localhost), so don't round them to "0 ms".
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     let ms = duration.as_secs_f64() * 1000.0;
     if ms < 1.0 {
         format!("{ms:.2} ms")

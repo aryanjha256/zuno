@@ -42,6 +42,7 @@ actions!(
         CloseTabsToTheRight,
         CloseAllTabs,
         ShowHistory,
+        ShowAllHistory,
         OpenPalette,
         OpenAppMenu,
         PickerNext,

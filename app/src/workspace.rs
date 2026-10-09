@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -3642,6 +3642,62 @@ impl Workspace {
         self.show_picker(items, "Nothing sent yet from this request", window, cx);
     }
 
+    /// Every request this workspace has sent, newest first, searchable by URL.
+    ///
+    /// Opens at once and fills when the log has been read off-thread, the way `Ctrl+P` fills in
+    /// saved requests.
+    fn show_all_history(&mut self, _: &ShowAllHistory, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let picker = self.show_picker(Vec::new(), "Nothing sent from this workspace yet", window, cx);
+        picker.update(cx, |picker, cx| picker.set_placeholder("Search sent requests by URL…", cx));
+
+        let Some(load) = crate::history::load(cx) else { return };
+        self.picker_scan = Some(cx.spawn(async move |_this, cx| {
+            let entries = load.await;
+            let now = zuno_core::history::now_ms();
+            let _ = picker.update(cx, |picker, cx| {
+                picker.extend_decorated(
+                    entries.iter().map(|entry| history_row(entry, now)),
+                    cx,
+                );
+            });
+        }));
+    }
+
+    /// Open a history entry as a new, unsaved tab — never over the file it came from, which may
+    /// have moved on since — with its response when one was recorded.
+    fn open_recorded(
+        &mut self,
+        entry: zuno_core::history::Entry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let spec = RequestSpec {
+            id: self.next_id(cx),
+            ..entry.spec
+        };
+        self.open(spec, window, cx);
+        let zuno_core::history::Outcome::Response(recorded) = entry.outcome else {
+            return;
+        };
+        let Some(view) = self.active() else { return };
+        let body = match recorded.body {
+            zuno_core::history::Kept::Stored => Some(crate::history::read_body(entry.id, cx)),
+            _ => None,
+        };
+        cx.spawn(async move |_this, cx| {
+            let body = match body {
+                Some(read) => read.await.unwrap_or_default(),
+                None => bytes::Bytes::new(),
+            };
+            let response = recorded.to_response(body);
+            let _ = view.update(cx, |view, cx| view.show_recorded(response, cx));
+        })
+        .detach();
+    }
+
     /// Pick the active environment. `None` is always offered, since "send it raw" is a
     /// legitimate choice and otherwise there'd be no way back out.
     fn switch_environment(
@@ -3803,6 +3859,7 @@ impl Workspace {
                     view.update(cx, |view, cx| view.view_run(offset, cx));
                 }
             }
+            picker::Target::Recorded(entry) => self.open_recorded(*entry, window, cx),
             picker::Target::Environment(name) => {
                 self.environment = name;
                 // Persisted immediately rather than at the next send: switching environment
@@ -4923,6 +4980,7 @@ impl Workspace {
         let rows = vec![
             MenuItem::new("Copy as code…", CopyAsCode, &focus, window).into(),
             MenuItem::new("Import from curl on the clipboard", ImportCurl, &focus, window).into(),
+            MenuItem::new("History…", ShowAllHistory, &focus, window).into(),
             MenuRow::Separator,
             MenuItem::new("Request settings", OpenSettings, &focus, window).into(),
         ];
@@ -7625,6 +7683,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::import_dismiss))
             .on_action(cx.listener(Self::switch_environment))
             .on_action(cx.listener(Self::show_history))
+            .on_action(cx.listener(Self::show_all_history))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_defaults))
@@ -8456,6 +8515,49 @@ fn extension_for(base: &str) -> String {
 
 /// Bytes at human scale. The history picker shows sizes side by side, and `184320` next to
 /// `179` reads as noise where `180 KB` next to `179 B` reads as a difference.
+/// One history entry as a picker row: the URL to search by, how it ended, and when.
+fn history_row(entry: &zuno_core::history::Entry, now: u64) -> (picker::Item, picker::Decor) {
+    use zuno_core::history::{Kept, Outcome};
+    let detail = match &entry.outcome {
+        Outcome::Response(recorded) => {
+            let mut detail = format!(
+                "{} {} · {} · {}",
+                recorded.status,
+                recorded.status_text,
+                format_bytes(recorded.size),
+                crate::response_pane::format_duration(std::time::Duration::from_micros(
+                    recorded.total_us
+                )),
+            );
+            if recorded.body == Kept::TooLarge {
+                detail.push_str(" · body not kept");
+            }
+            detail
+        }
+        Outcome::Opened { status: Some(code), status_text } => format!("{code} {status_text} · opened"),
+        Outcome::Opened { status: None, .. } => "opened".to_string(),
+        Outcome::Failed { error } => format!("failed — {error}"),
+    };
+    let label = if entry.spec.url.trim().is_empty() {
+        "(no URL)".to_string()
+    } else {
+        entry.spec.url.clone()
+    };
+    (
+        picker::Item {
+            label: SharedString::from(label),
+            detail: SharedString::from(detail),
+            target: picker::Target::Recorded(Box::new(entry.clone())),
+        },
+        picker::Decor {
+            badge: Some(zuno_core::collection::Badge::of(&entry.spec)),
+            trailing: Some(SharedString::from(zuno_core::history::ago(now, entry.at))),
+            section: None,
+            keys: None,
+        },
+    )
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;

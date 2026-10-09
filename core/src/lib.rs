@@ -27,6 +27,7 @@ pub mod fuzzy;
 pub mod graphql;
 pub mod grpc;
 pub mod highlight;
+pub mod history;
 pub mod hex;
 pub mod html;
 pub mod import;

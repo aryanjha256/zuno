@@ -439,6 +439,15 @@ toggle says what will happen, the badge says what *is* happening.
 back — with each row carrying its status, size and duration, because "which run was the 500?" is the
 question you open it to answer. Choosing one shows it and re-indexes its body off-thread.
 
+**Global history — done, beside it rather than instead of it.** `Alt+H` (or *History…* in the
+request ⋯ menu) lists every request the workspace has sent — method pill, URL, status, size, time,
+"2h ago" — searchable by URL, kept on disk across restarts. Enter opens one as a **new unsaved
+tab** with the response it got. `Ctrl+H` is unchanged: still the tab's own ten runs, in memory.
+The request is kept as typed, so `{{vars}}` never become their secret values; a secret typed
+literally is kept as typed, as the session and collection files already do — decided, not
+masked. Bodies up to 1 MB are kept, 50 MB in all; 500 entries. Runner sends are not recorded.
+Format and limits: architecture.md §12.
+
 It closed the last non-body item in §11, and it was more than a feature: `history` was written and
 read by nothing at all, so ten response bodies per buffer were being retained where nothing could
 reach them. Surfacing it is what makes that memory worth spending.
