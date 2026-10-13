@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -197,6 +197,8 @@ pub struct Workspace {
     pub(crate) history_scroll: UniformListScrollHandle,
     /// The filter's `Changed` and the history global's observer. Dropping either unsubscribes.
     _history_subscriptions: [Subscription; 2],
+    /// What git last said about the workspace, and the Git view's own inputs.
+    pub(crate) git: crate::git_panel::GitState,
     /// The tab strip's horizontal scroll, held so the chevrons can drive it.
     ///
     /// The strip has scrolled since it was built, but only by wheel — with nothing on screen
@@ -470,6 +472,8 @@ impl Workspace {
             cx.observe_global::<crate::history::HistoryDir>(|_, cx| cx.notify()),
         ];
 
+        let git = crate::git_panel::GitState::new(cx);
+
         let mut workspace = Self {
             focus_handle: cx.focus_handle(),
             window_title: String::new(),
@@ -504,6 +508,7 @@ impl Workspace {
             history_selected: None,
             history_scroll: UniformListScrollHandle::new(),
             _history_subscriptions: history_subscriptions,
+            git,
             cert_prompt: None,
             certs: None,
             cookie_viewer: None,
@@ -1609,6 +1614,8 @@ impl Workspace {
                 this.panel_selection = selected
                     .and_then(|path| this.tree.iter().position(|node| node.path == path));
                 this.rebuild_tree_visible();
+                // Whatever moved the files the tree was rescanned for moved them for git too.
+                this.refresh_git(cx);
                 cx.notify();
             })
             .ok();
@@ -3709,8 +3716,207 @@ impl Workspace {
                 window.focus(&filter);
             }
             crate::collection_panel::PanelView::Collections => window.focus(&self.panel_focus),
+            crate::collection_panel::PanelView::Git => {
+                self.refresh_git(cx);
+                // Into the message box when there is one to type in; the panel otherwise, so the
+                // keyboard is never left on something unpainted.
+                if self.git.repo().is_some() && self.git.identity.is_none() {
+                    let message = self.git.message.read(cx).focus_handle(cx);
+                    window.focus(&message);
+                } else {
+                    window.focus(&self.panel_focus);
+                }
+            }
         }
         cx.notify();
+    }
+
+    fn show_git(&mut self, _: &ShowGit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        self.show_panel_view(crate::collection_panel::PanelView::Git, window, cx);
+    }
+
+    /// Ask git about the workspace again, off the UI thread.
+    pub(crate) fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else {
+            self.git.probe = None;
+            self.git.status = None;
+            return;
+        };
+        let git = crate::git_panel::runner(cx);
+        let read = cx.background_executor().spawn(async move {
+            let probe = zuno_core::git::probe(&git, &root);
+            let status = match &probe {
+                zuno_core::git::Probe::Repo(repo) => zuno_core::git::status(&git, repo).ok(),
+                _ => None,
+            };
+            (probe, status)
+        });
+        self.git.refresh = Some(cx.spawn(async move |this, cx| {
+            let (probe, status) = read.await;
+            let _ = this.update(cx, |this, cx| {
+                this.git.probe = Some(probe);
+                this.git.status = status;
+                cx.notify();
+            });
+        }));
+    }
+
+    fn git_refresh(&mut self, _: &GitRefresh, _: &mut Window, cx: &mut Context<Self>) {
+        self.git.error = None;
+        self.refresh_git(cx);
+    }
+
+    fn git_open_download(&mut self, _: &GitOpenDownload, _: &mut Window, cx: &mut Context<Self>) {
+        cx.open_url("https://git-scm.com/downloads");
+    }
+
+    /// Make the workspace a repository, with `*.local.json` ignored before anything can be
+    /// committed — the secrets split is the one thing a first commit must not get wrong.
+    fn git_init(&mut self, _: &GitInit, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = crate::collections::root(cx).map(Path::to_path_buf) else { return };
+        if self.git.busy.is_some() || self.git.repo().is_some() {
+            return;
+        }
+        let git = crate::git_panel::runner(cx);
+        self.git.busy = Some("Initializing…");
+        self.git.error = None;
+        let work = cx.background_executor().spawn(async move {
+            zuno_core::git::init(&git, &root)?;
+            zuno_core::environment::ensure_gitignored(&root)
+                .map_err(|error| zuno_core::git::GitError::Io(error.to_string()))?;
+            Ok::<(), zuno_core::git::GitError>(())
+        });
+        self.git.work = Some(cx.spawn(async move |this, cx| {
+            let result = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.git.busy = None;
+                if let Err(error) = result {
+                    this.git.error = Some(error.to_string());
+                }
+                this.refresh_tree(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Commit everything in the workspace with the typed message.
+    fn git_commit(&mut self, _: &GitCommit, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.git.repo().cloned() else { return };
+        if self.git.busy.is_some() {
+            return;
+        }
+        if self.git.change_count() == 0 {
+            self.git.error = Some("Nothing to commit".to_string());
+            cx.notify();
+            return;
+        }
+        let message = self.git.message.read(cx).text().trim().to_string();
+        if message.is_empty() {
+            self.git.error = Some("Write a message first".to_string());
+            let focus = self.git.message.read(cx).focus_handle(cx);
+            window.focus(&focus);
+            cx.notify();
+            return;
+        }
+        self.run_commit(repo, message, None, window, cx);
+    }
+
+    /// The commit itself, optionally setting the name and email first — the form's path.
+    fn run_commit(
+        &mut self,
+        repo: zuno_core::git::Repo,
+        message: String,
+        identity: Option<(String, String, bool)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let git = crate::git_panel::runner(cx);
+        self.git.busy = Some("Committing…");
+        self.git.error = None;
+        let work = cx.background_executor().spawn(async move {
+            if let Some((name, email, everywhere)) = identity {
+                zuno_core::git::set_identity(&git, &repo.workdir, &name, &email, everywhere)?;
+            }
+            // Every commit re-checks the secrets rule, so a `.gitignore` edited by hand since the
+            // workspace was initialized cannot let a `*.local.json` through.
+            zuno_core::environment::ensure_gitignored(&repo.workdir)
+                .map_err(|error| zuno_core::git::GitError::Io(error.to_string()))?;
+            zuno_core::git::commit(&git, &repo, &message)
+        });
+        self.git.work = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.git.busy = None;
+                match result {
+                    Ok(()) => {
+                        this.git.identity = None;
+                        this.git.message.update(cx, |message, cx| {
+                            let end = message.text().len();
+                            message.replace_range(0..end, "", window, cx);
+                        });
+                        this.set_status("Committed", cx);
+                    }
+                    // Asked once, in place of the commit box, and kept until it succeeds.
+                    Err(zuno_core::git::GitError::NoIdentity) => {
+                        if this.git.identity.is_none() {
+                            let form = crate::git_panel::IdentityForm::new(cx);
+                            let name = form.name.read(cx).focus_handle(cx);
+                            this.git.identity = Some(form);
+                            window.focus(&name);
+                        }
+                    }
+                    Err(error) => this.git.error = Some(error.to_string()),
+                }
+                this.refresh_git(cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Save the form's name and email, then commit the message that was refused for want of them.
+    fn git_save_identity(&mut self, _: &GitSaveIdentity, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.git.repo().cloned() else { return };
+        let Some(form) = &self.git.identity else { return };
+        let name = form.name.read(cx).text().trim().to_string();
+        let email = form.email.read(cx).text().trim().to_string();
+        let everywhere = form.everywhere;
+        if name.is_empty() || email.is_empty() {
+            self.git.error = Some("Both a name and an email are needed".to_string());
+            let focus = if name.is_empty() { &form.name } else { &form.email };
+            let focus = focus.read(cx).focus_handle(cx);
+            window.focus(&focus);
+            cx.notify();
+            return;
+        }
+        let message = self.git.message.read(cx).text().trim().to_string();
+        self.run_commit(repo, message, Some((name, email, everywhere)), window, cx);
+    }
+
+    fn git_toggle_identity_scope(
+        &mut self,
+        _: &GitToggleIdentityScope,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(form) = self.git.identity.as_mut() {
+            form.everywhere = !form.everywhere;
+            cx.notify();
+        }
+    }
+
+    /// A changed file clicked in the Git view: open it when it is a request still on disk.
+    pub(crate) fn open_changed_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let is_request = self.tree.iter().any(|node| {
+            node.path == path && matches!(node.kind, NodeKind::Request { .. })
+        });
+        if is_request {
+            self.open_collection_file(path, window, cx);
+        }
     }
 
     /// The loaded entries and, in order, the indices of those the filter lets through.
@@ -7835,6 +8041,13 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::history_prev))
             .on_action(cx.listener(Self::history_open))
             .on_action(cx.listener(Self::clear_history))
+            .on_action(cx.listener(Self::show_git))
+            .on_action(cx.listener(Self::git_refresh))
+            .on_action(cx.listener(Self::git_open_download))
+            .on_action(cx.listener(Self::git_init))
+            .on_action(cx.listener(Self::git_commit))
+            .on_action(cx.listener(Self::git_save_identity))
+            .on_action(cx.listener(Self::git_toggle_identity_scope))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_defaults))

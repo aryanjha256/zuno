@@ -3802,6 +3802,21 @@ purpose:
   window state, not part of the request model a future CLI shares. JSON rather than SQLite because
   it is one file and one write; nothing forecloses moving history and the response cache into
   SQLite later, which is where that dependency would start to pay for itself.
+- **Git: the user's own `git`, as a subprocess** (`zuno_core::git`). Rejected: linking libgit2
+  (`git2`) or gitoxide. A library has to reimplement credentials, SSH agents, credential helpers
+  and hooks, and pushing to a private remote is exactly where they diverge from the terminal;
+  the binary already does all of it, adds no dependency, and ships nothing. No `git` means a
+  "Git isn't installed" state, not a bundled copy. Every call sets `GIT_TERMINAL_PROMPT=0` — a
+  credential prompt with no terminal would hang forever — and `LC_ALL=C`, so the two failures
+  recognised by text (no identity, nothing to commit) are recognised in every locale.
+  **Scoped to the workspace folder.** The workspace is normally the repository root; when it is a
+  folder inside a larger one, status lists only its files and counts the rest, and a commit is
+  `add -A -- .` then `commit --only -- .` from that folder, so code staged elsewhere in the repo is
+  never swept in — `a_commit_takes_the_workspace_and_nothing_else` breaks if either half widens.
+  The Git view says so in a footnote only in that nested case. **Every commit re-runs
+  `environment::ensure_gitignored`**, so a `.gitignore` edited by hand cannot let a
+  `*.local.json` through. Tests run git with `Git::isolated` — a scratch global config, no system
+  config — because the identity form writes `--global` by default (invariant 6).
 - **Global history: a JSON-lines log, still not SQLite** (`zuno_core::history`, under
   `<config>/history/<workspace id>/`, never in the collection). One line per send, appended off
   the UI thread; bodies ≤1 MB in `bodies/<id>`, the oldest dropped past 50 MB; the log trimmed to

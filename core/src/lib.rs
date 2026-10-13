@@ -24,6 +24,7 @@ pub mod engine;
 pub mod environment;
 pub mod flow;
 pub mod fuzzy;
+pub mod git;
 pub mod graphql;
 pub mod grpc;
 pub mod highlight;

@@ -11404,6 +11404,90 @@ async fn a_new_folder_started_from_history_takes_its_name(cx: &mut TestAppContex
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// The Git view's first run, end to end through the keymap: a workspace that is not a repository
+/// is initialized, a typed message is committed with `Ctrl+Enter`, and git's refusal for want of a
+/// name turns into a form that takes one and then commits.
+///
+/// Git's global config is a scratch file with an *empty* name, so the refusal is certain rather
+/// than dependent on whether this machine's hostname lets git guess an email — and so nothing here
+/// can touch the developer's own config (invariant 6).
+#[gpui::test]
+async fn a_workspace_is_initialized_and_committed_from_the_git_view(cx: &mut TestAppContext) {
+    let dir = scratch_dir("git-view");
+    let root = dir.join("ws");
+    seed_request(&root, "payments-api/create-order.json", "https://a.test/orders");
+    let config = dir.join("gitconfig");
+    std::fs::write(&config, "[init]\n\tdefaultBranch = main\n[user]\n\tname =\n\temail =\n")
+        .expect("config");
+    let git = zuno_core::git::Git::isolated(&config);
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.update(|_, cx| cx.set_global(crate::git_panel::GitRunner(git.clone())));
+    let probe = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, _| workspace.git.probe.clone())
+            .expect("window")
+    };
+
+    cx.press("alt-g");
+    wait_for(&mut cx, "the folder to read as not a repository", |cx| {
+        (probe(cx) == Some(zuno_core::git::Probe::NotARepo)).then_some(())
+    });
+
+    window
+        .update(&mut cx, |_, window, cx| window.dispatch_action(Box::new(crate::actions::GitInit), cx))
+        .expect("window");
+    wait_for(&mut cx, "the repository and its two new files", |cx| {
+        window
+            .update(cx, |workspace, _, _| (workspace.git.change_count() == 2).then_some(()))
+            .expect("window")
+    });
+    let ignore = std::fs::read_to_string(root.join(".gitignore")).expect(".gitignore");
+    assert!(ignore.contains("*.local.json"), "secrets are ignored before the first commit");
+
+    // Now a repository, so `Alt+G` puts the keyboard in the message.
+    cx.press("alt-g");
+    cx.simulate_input("First commit");
+    cx.press("ctrl-enter");
+    wait_for(&mut cx, "the name-and-email form", |cx| {
+        window
+            .update(cx, |workspace, _, _| workspace.git.identity.is_some().then_some(()))
+            .expect("window")
+    });
+
+    // The form has the keyboard: a name, then Enter with no email yet is turned away.
+    cx.simulate_input("Ada");
+    cx.press("enter");
+    cx.run_until_parked();
+    let refused = window
+        .update(&mut cx, |workspace, _, _| workspace.git.error.clone())
+        .expect("window");
+    assert_eq!(refused.as_deref(), Some("Both a name and an email are needed"));
+    cx.simulate_input("ada@example.com");
+    cx.press("enter");
+
+    wait_for(&mut cx, "the commit", |cx| {
+        window
+            .update(cx, |workspace, _, _| {
+                (workspace.git.identity.is_none() && workspace.git.change_count() == 0
+                    && workspace.git.status.is_some())
+                    .then_some(())
+            })
+            .expect("window")
+    });
+    let repo = match zuno_core::git::probe(&git, &root) {
+        zuno_core::git::Probe::Repo(repo) => repo,
+        other => panic!("expected a repository, got {other:?}"),
+    };
+    assert!(zuno_core::git::status(&git, &repo).expect("status").files.is_empty());
+    let message = window
+        .update(&mut cx, |workspace, _, cx| workspace.git.message.read(cx).text().to_string())
+        .expect("window");
+    assert_eq!(message, "", "the message box is cleared once the commit lands");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 #[gpui::test]
 async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
     let dir = scratch_dir("panel-new-folder-escape");

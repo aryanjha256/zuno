@@ -439,6 +439,23 @@ toggle says what will happen, the badge says what *is* happening.
 back — with each row carrying its status, size and duration, because "which run was the 500?" is the
 question you open it to answer. Choosing one shows it and re-indexes its body off-thread.
 
+**Git — in progress, slice 1 of 3 done.** The format was always built for git (one request per
+file, stable bytes); now Zuno speaks it. **A workspace is the repository** — the broad project
+space, synced Bruno-style through the team's own remote, never a Zuno cloud, so it sits inside the
+local-first principle rather than against the collaboration non-goal. A solo developer syncing
+between machines is the same feature.
+
+- **Slice 1 — done: see and commit.** A third view in the panel's switch (`Alt+G`): the branch,
+  ahead/behind or "local only", a multi-line message (`Ctrl+Enter` commits), and the changed files
+  with their pills. The tree marks changed requests (`M`/`A`, coloured) and dots folders holding
+  them; the switch carries a dot from any view. Git not installed, and a folder that is not a
+  repository (Initialize), are states of the view, not errors. A first commit with no name or
+  email turns into a two-field form, global by default.
+- **Slice 2 — next: sync.** Publish to a remote URL, Sync = fetch, rebase (or the repo's own
+  `pull.rebase`), push, and the conflict state that sends you to your editor.
+- **Slice 3: join and inspect.** Clone from New workspace, and a request's diff against its last
+  commit — field by field, in a tab of its own.
+
 **Global history — done, beside it rather than instead of it.** A *History* view in the side
 panel lists every request the workspace has sent, under day headings — method pill, path, a
 coloured status, the time — filtered by URL and kept on disk across restarts. Click a row, or

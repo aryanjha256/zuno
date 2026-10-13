@@ -302,6 +302,12 @@ impl Editor {
         self.scroll.offset().y
     }
 
+    /// Take this editor out of `Tab` order — for one painted in the side panel, which would
+    /// otherwise become a stop before the request's own fields.
+    pub fn leave_tab_order(&mut self) {
+        self.focus_handle = self.focus_handle.clone().tab_stop(false);
+    }
+
     /// Replace the key context — the whole string, which must still contain `TextInput
     /// BodyEditor` or every editing binding stops matching.
     pub fn set_key_context(&mut self, context: &'static str) {

@@ -23,6 +23,7 @@ mod close_panel;
 mod collection_panel;
 mod environment_panel;
 mod flow_panel;
+mod git_panel;
 mod history;
 mod import_panel;
 mod collections;
@@ -66,7 +67,7 @@ use crate::actions::{
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev, CompleteNext, CompletePrev,
     CompleteAccept, CompleteConfirm, CompleteDismiss, TriggerCompletion,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, ShowAllHistory,
-    HistoryNext, HistoryPrev, HistoryOpen,
+    HistoryNext, HistoryPrev, HistoryOpen, ShowGit, GitCommit, GitSaveIdentity,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     ClearCookies, CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
@@ -393,6 +394,11 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         bind!(mac, "down", HistoryNext, Some("HistoryPanel")),
         bind!(mac, "up", HistoryPrev, Some("HistoryPanel")),
         bind!(mac, "enter", HistoryOpen, Some("HistoryPanel")),
+        bind!(mac, "alt-g", ShowGit, None),
+        // In the commit message, Ctrl+Enter commits rather than sending the request — after the
+        // global binding, so the tie goes to this one.
+        bind!(mac, "ctrl-enter", GitCommit, Some("GitMessage")),
+        bind!(mac, "enter", GitSaveIdentity, Some("GitIdentity")),
         // --- Find in the response ---
         //
         // Below the globals for the third time and the same reason: `escape` here has to be

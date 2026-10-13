@@ -27,7 +27,7 @@ use zuno_core::collection::{Badge, Node, NodeKind};
 
 use crate::actions::{
     ClearHistory, CollectionCollapseAll, CollectionExpandAll, NewFolder, NewRequest,
-    OpenCollectionMenu, OpenWorkspaceMenu, ShowAllHistory, ShowCollections,
+    OpenCollectionMenu, OpenWorkspaceMenu, ShowAllHistory, ShowCollections, ShowGit,
 };
 use gpui::Action as _;
 use crate::theme::Theme;
@@ -124,6 +124,10 @@ pub fn render(
     // Resolved once per frame rather than per row: `rename_input_for` would be a lookup on
     // every one of them to answer "no" for all but a single row.
     let renaming = workspace.renaming_row();
+    // What git says differs from the last commit, by path — empty outside a repository.
+    let (changed, dirty) = crate::collections::root(cx)
+        .map(|root| workspace.git.markers(root))
+        .unwrap_or_default();
     // While the new-folder box is open the list is one row longer than `tree_visible`, and every
     // row at or past the insertion point shifts down by one. Rendering it as a real row rather
     // than splicing a placeholder into `tree_visible` keeps that index — which the selection, the
@@ -166,6 +170,10 @@ pub fn render(
                     selection == Some(row_ix),
                     open_path.as_deref() == Some(node.path.as_path()),
                     renaming.as_ref().filter(|(ix, _)| *ix == row_ix).map(|(_, i)| i.clone()),
+                    Git {
+                        change: changed.get(&node.path).copied(),
+                        dirty: dirty.contains(&node.path),
+                    },
                     width,
                     &row_theme,
                     entity.clone(),
@@ -194,22 +202,25 @@ pub fn render(
     // twitching rather than as the panel arriving.
     let revealed = workspace.revealed_panel_width(window);
 
-    let history = workspace.panel_view == PanelView::History;
     // Each view brings its own key context, so the tree's arrows, Enter, Delete and F2 cannot fire
     // against a tree that is not on screen.
-    let context = if history { "HistoryPanel" } else { "CollectionPanel" };
-    let body: Vec<gpui::AnyElement> = if history {
-        vec![
-            history_toolbar(workspace, theme).into_any_element(),
-            history_list(workspace, theme, cx).into_any_element(),
-        ]
-    } else {
-        let mut body = vec![
-            collections_toolbar(theme).into_any_element(),
-            list.into_any_element(),
-        ];
-        body.extend(empty_notice(workspace, theme).map(IntoElement::into_any_element));
-        body
+    let (context, body): (&str, Vec<gpui::AnyElement>) = match workspace.panel_view {
+        PanelView::History => (
+            "HistoryPanel",
+            vec![
+                history_toolbar(workspace, theme).into_any_element(),
+                history_list(workspace, theme, cx).into_any_element(),
+            ],
+        ),
+        PanelView::Git => ("GitPanel", crate::git_panel::render(workspace, theme, cx)),
+        PanelView::Collections => {
+            let mut body = vec![
+                collections_toolbar(theme).into_any_element(),
+                list.into_any_element(),
+            ];
+            body.extend(empty_notice(workspace, theme).map(IntoElement::into_any_element));
+            ("CollectionPanel", body)
+        }
     };
 
     div()
@@ -356,6 +367,7 @@ pub fn resize_handle(
 pub enum PanelView {
     Collections,
     History,
+    Git,
 }
 
 /// Height of the toolbar under the header: the tree's buttons, or History's filter.
@@ -436,8 +448,42 @@ fn header(
                     ShowAllHistory,
                     view == PanelView::History,
                     theme,
-                )),
+                ))
+                .child(
+                    // A dot when there is something to commit, so the switch says so from any
+                    // view — red when a file is conflicted.
+                    div()
+                        .relative()
+                        .child(view_toggle(
+                            "panel-show-git",
+                            Icon::GitBranch,
+                            "Git",
+                            ShowGit,
+                            view == PanelView::Git,
+                            theme,
+                        ))
+                        .children(git_dot(workspace, theme)),
+                ),
         )
+}
+
+fn git_dot(workspace: &Workspace, theme: &Theme) -> Option<Div> {
+    let files = &workspace.git.status.as_ref()?.files;
+    if files.is_empty() {
+        return None;
+    }
+    let conflicted = files
+        .iter()
+        .any(|file| file.kind == zuno_core::git::ChangeKind::Conflicted);
+    Some(
+        div()
+            .absolute()
+            .top(px(1.))
+            .right(px(2.))
+            .size(px(6.))
+            .rounded_full()
+            .bg(if conflicted { theme.status_server_error } else { theme.status_client_error }),
+    )
 }
 
 /// A square of colour with the workspace's initial — the same name always gets the same colour,
@@ -1065,6 +1111,37 @@ fn name_cell(
     cell
 }
 
+/// What git says about one row: a request's change since the last commit, or a folder holding
+/// one.
+struct Git {
+    change: Option<zuno_core::git::ChangeKind>,
+    dirty: bool,
+}
+
+/// The mark at a row's right edge: a request's change letter, or a folder's dot.
+fn git_mark(git: &Git, theme: &Theme) -> Option<Div> {
+    if let Some(kind) = git.change {
+        return Some(
+            div()
+                .flex_none()
+                .font_family(theme.mono.clone())
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(crate::git_panel::change_colour(kind, theme))
+                .child(kind.letter()),
+        );
+    }
+    git.dirty.then(|| {
+        div()
+            .flex_none()
+            .size(px(6.))
+            .mr(px(2.))
+            .rounded_full()
+            .bg(theme.status_client_error)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn row(
     node: &Node,
     row_ix: usize,
@@ -1074,6 +1151,7 @@ fn row(
     // where the panel's keyboard cursor is. Both can be true; they are different questions.
     open: bool,
     renaming: Option<Entity<crate::input::TextInput>>,
+    git: Git,
     panel_width: f32,
     theme: &Theme,
     workspace: Entity<Workspace>,
@@ -1146,9 +1224,13 @@ fn row(
                 .bg(theme.accent),
         );
     }
-    let name_colour = theme.text;
+    // A changed request's name takes its change's colour, as an editor's file tree does.
+    let name_colour = git
+        .change
+        .map_or(theme.text, |kind| crate::git_panel::change_colour(kind, theme));
+    let mark = git_mark(&git, theme);
 
-    match &node.kind {
+    let row = match &node.kind {
         NodeKind::Directory => row
             .child(
                 div().flex_none().w(px(CHEVRON)).child(glyph(
@@ -1215,7 +1297,8 @@ fn row(
                     }
                 }
             }),
-    }
+    };
+    row.children(mark)
 }
 
 #[cfg(test)]

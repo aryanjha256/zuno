@@ -191,6 +191,10 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Show history — every request sent in this workspace", ShowAllHistory),
         command("Show collections", ShowCollections),
         command("Clear this workspace's history", ClearHistory),
+        command("Show Git", ShowGit),
+        command("Commit this workspace's changes", GitCommit),
+        command("Initialize a git repository for this workspace", GitInit),
+        command("Refresh git status", GitRefresh),
         command("Show response body", ShowResponseBody),
         command("Show response headers", ShowResponseHeaders),
         command("Copy the network details — connection and the request as sent", CopyNetworkDetails),
@@ -232,6 +236,9 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::HistoryNext", "only valid in the panel's History view"),
     ("zuno::HistoryPrev", "only valid in the panel's History view"),
     ("zuno::HistoryOpen", "only valid in the panel's History view"),
+    ("zuno::GitSaveIdentity", "only valid in the Git view's name-and-email form"),
+    ("zuno::GitToggleIdentityScope", "only valid in the Git view's name-and-email form"),
+    ("zuno::GitOpenDownload", "a link shown only when git is not installed"),
     // A palette that lists itself is noise; Ctrl+K is how you got here.
     ("zuno::OpenPalette", "this is the palette"),
     // The application menu is a *discovery* surface for people who don't know the palette
