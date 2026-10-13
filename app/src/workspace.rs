@@ -8917,6 +8917,7 @@ fn scroll_chevron(
     // Copied out rather than captured: a closure holding `theme` would borrow it for the
     // element's whole life, which `impl IntoElement + use<>` cannot express.
     let hover_bg = theme.bg_hover;
+    let tip = if delta < 0. { "Scroll tabs left" } else { "Scroll tabs right" };
 
     div()
         .id(id)
@@ -8930,6 +8931,7 @@ fn scroll_chevron(
         .justify_center()
         .w(px(TAB_CHEVRON_WIDTH))
         .cursor_pointer()
+        .tooltip(move |_window, cx| crate::ui::Tooltip::text(tip, cx))
         .hover(move |style| style.bg(hover_bg))
         .on_mouse_down(
             MouseButton::Left,
@@ -9098,6 +9100,10 @@ fn tab_strip(
                                     .size(px(TAB_CLOSE_WIDTH))
                                     .rounded_md()
                                     .relative()
+                                    .cursor_pointer()
+                                    .tooltip(|window, cx| {
+                                        crate::ui::Tooltip::for_action("Close tab", &CloseTab, window, cx)
+                                    })
                                     .hover(|style| style.bg(theme.bg_hover))
                                     .on_mouse_down(
                                         MouseButton::Left,

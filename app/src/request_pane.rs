@@ -1267,6 +1267,7 @@ fn assert_row(
                 .rounded_full()
                 .bg(marker_color)
                 .cursor_pointer()
+                .tooltip(toggle_tip(row.enabled))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, _: &MouseDownEvent, _, cx| {
@@ -1320,6 +1321,7 @@ fn assert_row(
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .tooltip(|_window, cx| crate::ui::Tooltip::text("Remove this assertion", cx))
                 .hover(|style| style.bg(theme.bg_hover))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1399,6 +1401,7 @@ fn capture_row(
                 .rounded_full()
                 .bg(marker_color)
                 .cursor_pointer()
+                .tooltip(toggle_tip(row.enabled))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, _: &MouseDownEvent, _, cx| {
@@ -1466,6 +1469,7 @@ fn capture_row(
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .tooltip(|_window, cx| crate::ui::Tooltip::text("Remove this capture", cx))
                 .hover(|style| style.bg(theme.bg_hover))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1493,6 +1497,12 @@ fn multipart_table(
         let prefix = if part.is_file { "fil" } else { "txt" };
         render_row(&part.row, RowKind::Multipart, prefix, ix, Some(part.is_file), theme, cx)
     }))
+}
+
+/// A row's on/off dot, said in words — a filled or hollow circle is a state, not an instruction.
+fn toggle_tip(enabled: bool) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    let text = if enabled { "On — click to turn this row off" } else { "Off — click to turn this row on" };
+    move |_window, cx| crate::ui::Tooltip::text(text, cx)
 }
 
 /// `file_part` is `Some(is_file)` only for a multipart row — the other three tables hold text,
@@ -1541,6 +1551,7 @@ fn render_row(
                 .rounded_full()
                 .bg(marker_color)
                 .cursor_pointer()
+                .tooltip(toggle_tip(row.enabled))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, _: &MouseDownEvent, _, cx| {
@@ -2193,6 +2204,7 @@ fn saved_messages(
                     .id(("forget-message", ix))
                     .flex_none()
                     .cursor_pointer()
+                    .tooltip(|_window, cx| crate::ui::Tooltip::text("Forget this saved message", cx))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |view, _: &MouseDownEvent, _window, cx| {

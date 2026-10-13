@@ -494,6 +494,7 @@ fn step_row(
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .tooltip(|_window, cx| crate::ui::Tooltip::text("Move this step up", cx))
                 .hover(|style| style.bg(theme.bg_hover))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -513,6 +514,7 @@ fn step_row(
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .tooltip(|_window, cx| crate::ui::Tooltip::text("Move this step down", cx))
                 .hover(|style| style.bg(theme.bg_hover))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -533,6 +535,7 @@ fn step_row(
                 .px_1()
                 .rounded_sm()
                 .cursor_pointer()
+                .tooltip(|_window, cx| crate::ui::Tooltip::text("Remove this step from the flow", cx))
                 .hover(|style| style.bg(theme.bg_hover))
                 .on_mouse_down(
                     MouseButton::Left,

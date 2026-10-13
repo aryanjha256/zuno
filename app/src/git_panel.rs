@@ -745,7 +745,15 @@ fn change_row(
         let deleted = change.kind == ChangeKind::Deleted;
         let change = change.clone();
         let workspace = workspace.clone();
+        // Says what it does before it is clicked: the arrow alone reads as "refresh" as easily as
+        // "undo", and this one throws work away.
+        let tip = match change.kind {
+            ChangeKind::Added => "Delete this new file",
+            ChangeKind::Deleted => "Restore as last committed",
+            _ => "Discard changes — back to the last commit",
+        };
         let control = div()
+            .id(("git-discard", ix))
             .debug_selector(move || format!("git-discard-{ix}"))
             .flex_none()
             .h(px(18.))
@@ -753,6 +761,8 @@ fn change_row(
             .items_center()
             .justify_center()
             .rounded(px(3.))
+            .cursor_pointer()
+            .tooltip(move |_window, cx| crate::ui::Tooltip::text(tip, cx))
             .hover(|style| style.bg(theme.bg_elevated))
             .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
                 // The row under it opens the file; this must not.

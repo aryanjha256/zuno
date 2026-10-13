@@ -335,9 +335,16 @@ fn control_button(
     } else {
         theme.bg_hover
     };
+    let tip = match icon {
+        Icon::Minimize => "Minimize",
+        Icon::Maximize => "Maximize",
+        Icon::Restore => "Restore",
+        _ => "Close window",
+    };
 
     div()
         .id(id)
+        .tooltip(move |_window, cx| crate::ui::Tooltip::text(tip, cx))
         // A no-op outside test builds. It's what lets a test click these buttons, which is the
         // only way to cover the propagation rule below — the bug was *in* the click path.
         .debug_selector(|| id.to_string())

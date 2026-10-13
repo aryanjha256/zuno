@@ -2037,6 +2037,14 @@ fn json_row(
                 .w(px(12.))
                 .text_color(theme.text_muted)
                 .cursor_pointer()
+                .tooltip(move |window, cx| {
+                    crate::ui::Tooltip::for_action(
+                        if folded { "Unfold" } else { "Fold" },
+                        &ToggleFold,
+                        window,
+                        cx,
+                    )
+                })
                 .hover(|style| style.text_color(theme.accent))
                 .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                     // **Deliberately does *not* stop propagation**, which is the opposite of
