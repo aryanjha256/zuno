@@ -584,6 +584,25 @@ pub fn abort_sync(git: &Git, repo: &Repo) -> Result<(), GitError> {
     Ok(())
 }
 
+/// A file as the last commit has it, by its path inside the workspace — `None` when that commit
+/// does not have it (a new file, or no commit yet), which is an answer rather than an error.
+pub fn show_head(git: &Git, repo: &Repo, path: &str) -> Result<Option<Vec<u8>>, GitError> {
+    let prefix = repo.prefix();
+    let full = if prefix.is_empty() { path.to_string() } else { format!("{prefix}/{path}") };
+    match git.run(&repo.toplevel, ["show", &format!("HEAD:{full}")]) {
+        Ok(output) => Ok(Some(output.stdout)),
+        Err(GitError::Failed(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Git's own diff of one file against the last commit, as text — the Changes tab's raw view. Empty
+/// when the saved file matches it; edits still only on screen are not in a file git can see.
+pub fn diff_file(git: &Git, repo: &Repo, path: &str) -> Result<String, GitError> {
+    let output = git.run(&repo.workdir, ["diff", "--no-color", "HEAD", "--", path])?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// A workspace's name from its repository's URL: `git@github.com:acme/acme-platform.git` and
 /// `https://github.com/acme/acme-platform` are both `acme-platform`. `None` when nothing usable is
 /// left, so the caller asks rather than inventing one.
@@ -925,6 +944,8 @@ u UU N... 100644 100644 100644 100644 h1 h2 h3 orders/conflict.json\0\
         }
 
         assert!(status(&scratch.git, &repo).unwrap().files.is_empty());
+        assert_eq!(show_head(&scratch.git, &repo, "kept.json").unwrap().as_deref(), Some(&b"{\"v\": 1}"[..]));
+        assert_eq!(show_head(&scratch.git, &repo, "never.json").unwrap(), None);
         assert_eq!(std::fs::read_to_string(scratch.ws().join("kept.json")).unwrap(), "{\"v\": 1}");
         assert!(scratch.ws().join("gone.json").exists());
         assert!(!scratch.ws().join("new.json").exists());

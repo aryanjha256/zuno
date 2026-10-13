@@ -11642,6 +11642,80 @@ async fn a_workspace_is_cloned_from_a_git_url(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The Changes tab compares what is on screen with the last commit — an unsaved edit included —
+/// and Discard puts the request back as committed.
+#[gpui::test]
+async fn an_unsaved_edit_shows_in_changes_and_discard_undoes_it(cx: &mut TestAppContext) {
+    let dir = scratch_dir("git-changes-tab");
+    let root = dir.join("ws");
+    let config = dir.join("gitconfig");
+    std::fs::write(
+        &config,
+        "[init]\n\tdefaultBranch = main\n[user]\n\tname = Test\n\temail = test@example.com\n",
+    )
+    .expect("config");
+    let git = zuno_core::git::Git::isolated(&config);
+    seed_request(&root, "orders.json", "https://a.test/v1/orders");
+    zuno_core::git::init(&git, &root).expect("init");
+    let repo = match zuno_core::git::probe(&git, &root) {
+        zuno_core::git::Probe::Repo(repo) => repo,
+        other => panic!("{other:?}"),
+    };
+    zuno_core::git::commit(&git, &repo, "first").expect("commit");
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.update(|_, cx| cx.set_global(crate::git_panel::GitRunner(git.clone())));
+    wait_for(&mut cx, "the repository", |cx| {
+        window
+            .update(cx, |workspace, _, _| workspace.git.repo().is_some().then_some(()))
+            .expect("window")
+    });
+
+    cx.press("ctrl-p");
+    wait_for(&mut cx, "the saved request", |cx| {
+        picker_rows(&window, cx).iter().any(|r| r.contains("orders")).then_some(())
+    });
+    cx.simulate_input("orders");
+    cx.press("enter");
+    type_url(&mut cx, "https://a.test/v2/orders");
+
+    let has_changes = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, cx| workspace.active().expect("tab").read(cx).has_changes())
+            .expect("window")
+    };
+    wait_for(&mut cx, "the unsaved edit to show as a change", |cx| has_changes(cx).then_some(()));
+    let url_row = window
+        .update(&mut cx, |workspace, _, cx| {
+            let view = workspace.active().expect("tab").read(cx);
+            let changes = view.changes.as_ref().expect("compared");
+            changes
+                .diff
+                .sections
+                .iter()
+                .flat_map(|section| section.rows.iter())
+                .find(|row| row.key == "URL")
+                .cloned()
+        })
+        .expect("window")
+        .expect("a URL row");
+    assert_eq!(url_row.old.as_deref(), Some("https://a.test/v1/orders"));
+    assert_eq!(url_row.new.as_deref(), Some("https://a.test/v2/orders"));
+
+    window
+        .update(&mut cx, |_, window, cx| {
+            window.dispatch_action(Box::new(crate::actions::GitDiscardActive), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    cx.press("enter");
+    wait_for(&mut cx, "the request back as committed", |cx| {
+        (tabs_of(&window, cx).1.url == "https://a.test/v1/orders" && !has_changes(cx)).then_some(())
+    });
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 #[gpui::test]
 async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
     let dir = scratch_dir("panel-new-folder-escape");

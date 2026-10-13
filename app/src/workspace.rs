@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -3551,6 +3551,8 @@ impl Workspace {
                 cx.notify();
             });
         }
+        // Its last-committed version, so the Changes tab can appear for it.
+        self.load_heads(cx);
     }
 
     /// Open the command palette: every verb in `commands::palette`, with its keybinding.
@@ -3824,9 +3826,154 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 this.git.probe = Some(probe);
                 this.git.status = status;
+                this.load_heads(cx);
                 cx.notify();
             });
         }));
+    }
+
+    /// Give every open request its last-committed version, for the Changes tab — read off the UI
+    /// thread, since it is a `git show` and a parse per file.
+    pub(crate) fn load_heads(&mut self, cx: &mut Context<Self>) {
+        let repo = self.git.repo().cloned();
+        let views: Vec<(Entity<RequestView>, PathBuf)> = self
+            .views
+            .iter()
+            .filter_map(|view| view.read(cx).path.clone().map(|path| (view.clone(), path)))
+            .collect();
+        let Some(repo) = repo else {
+            for (view, _) in views {
+                view.update(cx, |view, cx| view.set_head(None, cx));
+            }
+            return;
+        };
+        let git = crate::git_panel::runner(cx);
+        let paths: Vec<PathBuf> = views.iter().map(|(_, path)| path.clone()).collect();
+        let read = cx.background_executor().spawn(async move {
+            paths
+                .into_iter()
+                .map(|path| {
+                    // Canonical, because `repo.workdir` is — a symlinked home would otherwise put
+                    // every file outside it.
+                    let path = path.canonicalize().unwrap_or(path);
+                    let relative = path.strip_prefix(&repo.workdir).ok()?;
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    let bytes = zuno_core::git::show_head(&git, &repo, &relative).ok()??;
+                    serde_json::from_slice::<RequestSpec>(&bytes).ok()
+                })
+                .collect::<Vec<_>>()
+        });
+        cx.spawn(async move |_this, cx| {
+            let heads = read.await;
+            for ((view, _), head) in views.into_iter().zip(heads) {
+                let _ = view.update(cx, |view, cx| view.set_head(head, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn show_response_changes(&mut self, _: &ShowResponseChanges, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_response_view(ResponseView::Changes, cx);
+    }
+
+    /// Put the active request back as its last commit has it — the buffer at once, and the file
+    /// too when the saved file differs. Asks first, since unsaved edits go with it.
+    fn git_discard_active(&mut self, _: &GitDiscardActive, window: &mut Window, cx: &mut Context<Self>) {
+        if self.modal_open() {
+            return;
+        }
+        let Some(view) = self.active() else { return };
+        if !view.read(cx).has_changes() {
+            self.set_status("This request matches its last commit", cx);
+            return;
+        }
+        let name = view.read(cx).label(cx).to_string();
+        let items = vec![
+            picker::Item {
+                label: SharedString::from(format!("Discard changes to {name}")),
+                detail: SharedString::from("back to the last commit — unsaved edits go too"),
+                target: picker::Target::DiscardActive,
+            },
+            picker::Item {
+                label: SharedString::from("Keep them"),
+                detail: SharedString::default(),
+                target: picker::Target::Dismiss,
+            },
+        ];
+        self.show_picker(items, "", window, cx);
+    }
+
+    fn discard_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        let Some(head) = view.read(cx).head_spec() else { return };
+        let path = view.read(cx).path.clone();
+        view.update(cx, |view, cx| {
+            let id = view.spec(cx).id;
+            view.load(RequestSpec { id, ..head }, cx);
+            cx.notify();
+        });
+        // `load` rebuilt the inputs; focus has to come back to live ones.
+        self.activate(self.active_ix, window, cx);
+        // The saved file too, when it differs from the commit — the buffer alone would read as
+        // edited against it.
+        let change = path.and_then(|path| self.change_for(&path));
+        if let Some(change) = change {
+            self.run_git_op(
+                "Discarding…",
+                "Changes discarded",
+                move |git, repo| zuno_core::git::discard(git, repo, &change),
+                window,
+                cx,
+            );
+        } else {
+            self.set_status("Changes discarded", cx);
+        }
+    }
+
+    /// The Git view's entry for a file, if git lists it as changed.
+    fn change_for(&self, path: &Path) -> Option<zuno_core::git::FileChange> {
+        let repo = self.git.repo()?;
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let relative = path.strip_prefix(&repo.workdir).ok()?.to_string_lossy().replace('\\', "/");
+        self.git
+            .status
+            .as_ref()?
+            .files
+            .iter()
+            .find(|file| file.path == relative)
+            .cloned()
+    }
+
+    /// Switch the Changes tab between the fields and git's own diff of the saved file.
+    fn git_raw_diff(&mut self, _: &GitRawDiff, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        if view.read(cx).raw_diff.is_some() {
+            view.update(cx, |view, cx| {
+                view.raw_diff = None;
+                cx.notify();
+            });
+            return;
+        }
+        let (Some(repo), Some(path)) = (self.git.repo().cloned(), view.read(cx).path.clone()) else {
+            return;
+        };
+        let git = crate::git_panel::runner(cx);
+        let read = cx.background_executor().spawn(async move {
+            let path = path.canonicalize().unwrap_or(path);
+            let relative = path
+                .strip_prefix(&repo.workdir)
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            zuno_core::git::diff_file(&git, &repo, &relative).unwrap_or_default()
+        });
+        cx.spawn(async move |_this, cx| {
+            let text = read.await;
+            let _ = view.update(cx, |view, cx| {
+                view.raw_diff = Some(text);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn git_refresh(&mut self, _: &GitRefresh, _: &mut Window, cx: &mut Context<Self>) {
@@ -4142,6 +4289,10 @@ impl Workspace {
                 format!("Delete {name}"),
                 "it was never committed — the file goes, and cannot be brought back",
             ),
+            zuno_core::git::ChangeKind::Deleted => (
+                format!("Restore {name}"),
+                "brought back as the last commit has it",
+            ),
             _ => (
                 format!("Discard changes to {name}"),
                 "back to the last commit — your edits cannot be brought back",
@@ -4167,9 +4318,15 @@ impl Workspace {
         let is_request = self.tree.iter().any(|node| {
             node.path == path && matches!(node.kind, NodeKind::Request { .. })
         });
-        if is_request {
-            self.open_collection_file(path, window, cx);
+        if !is_request {
+            return;
         }
+        self.open_collection_file(path, window, cx);
+        // What you clicked a *changed* row to see is the change.
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.select_changes_when_ready(cx));
+        }
+        self.load_heads(cx);
     }
 
     /// The loaded entries and, in order, the indices of those the filter lets through.
@@ -4470,6 +4627,7 @@ impl Workspace {
                     cx,
                 );
             }
+            picker::Target::DiscardActive => self.discard_active(window, cx),
             picker::Target::ClearHistory => {
                 crate::history::clear(cx);
                 self.history_selected = None;
@@ -6332,8 +6490,13 @@ impl Workspace {
         // Reached from the palette, whose rows are not filtered by kind — so say why nothing
         // moved, the way the other kind-specific verbs do.
         if !shown {
-            let kind = active.read(cx).kind.choice().label();
-            self.set_status(&format!("Only a gRPC response has trailers, not {kind}"), cx);
+            let message = if view == ResponseView::Changes {
+                "This request matches its last commit".to_string()
+            } else {
+                let kind = active.read(cx).kind.choice().label();
+                format!("Only a gRPC response has trailers, not {kind}")
+            };
+            self.set_status(&message, cx);
         }
     }
 
@@ -8315,6 +8478,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::git_continue))
             .on_action(cx.listener(Self::git_abort))
             .on_action(cx.listener(Self::git_open_conflict))
+            .on_action(cx.listener(Self::show_response_changes))
+            .on_action(cx.listener(Self::git_discard_active))
+            .on_action(cx.listener(Self::git_raw_diff))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_defaults))

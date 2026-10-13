@@ -27,7 +27,8 @@ use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SendRequest,
     ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTrailers, ShowResponseDiff,
     CopyNetworkDetails,
-    ShowResponseNetwork, ToggleFold, ToggleHtmlView, UnfoldAll,
+    ShowResponseNetwork, ToggleFold, ToggleHtmlView, UnfoldAll, ShowResponseChanges,
+    GitDiscardActive, GitRawDiff,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
@@ -61,6 +62,17 @@ pub fn render(
         .bg(theme.bg)
         .border_l_1()
         .border_color(theme.focus_border(focused));
+
+    // **Changes is about the request, so nothing about the answer hides it** — not a stale error,
+    // not an empty pane on a request never sent. A send switches away from it first, so an
+    // in-flight request is never behind it either.
+    if view.response_view == ResponseView::Changes && view.has_changes() {
+        let strip = match view.displayed() {
+            Some(response) => view_tabs(view, response.headers.len(), theme, cx).into_any_element(),
+            None => changes_only_strip(view, theme, cx).into_any_element(),
+        };
+        return pane.child(strip).child(changes_region(view, theme, cx));
+    }
 
     // **A session outranks everything, including its own in-flight state.** Once the socket is
     // open there is no "response" coming and never will be — the transcript *is* the answer —
@@ -120,10 +132,209 @@ pub fn render(
                 }
                 ResponseView::Network => pane.child(network_region(view, response, theme, cx)),
                 ResponseView::Diff => pane.child(diff_region(view, theme, window)),
+                // Handled above whenever it is offered; this is the frame where it just stopped
+                // being, before `keep_response_view_offered` moves the tab back to Body.
+                ResponseView::Changes => pane.child(changes_region(view, theme, cx)),
             }
         }
+        // A request never sent can still have changes — the tab has to be reachable without one.
+        None if view.has_changes() => pane
+            .child(changes_only_strip(view, theme, cx))
+            .child(empty_state(theme, window)),
         None => pane.child(empty_state(theme, window)),
     }
+}
+
+/// The tab strip with Changes alone, for a request that has no response to show tabs for.
+fn changes_only_strip(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_2()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(changes_tab(view, theme, cx))
+}
+
+fn changes_tab(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>) -> impl IntoElement + use<> {
+    div()
+        .relative()
+        .child(view_tab(
+            "response-tab-changes",
+            "Changes".to_string(),
+            view.response_view == ResponseView::Changes,
+            ShowResponseChanges,
+            theme,
+            cx,
+        ))
+        // The dot says "differs from the last commit" — the tab exists only when that is true,
+        // and the dot is what makes it read as a state rather than one more section.
+        .child(
+            div()
+                .absolute()
+                .top(px(9.))
+                .right(px(2.))
+                .size(px(5.))
+                .rounded_full()
+                .bg(theme.status_client_error),
+        )
+}
+
+/// What the request changed since the last commit: sections of rows, or the raw `git diff`.
+fn changes_region(view: &RequestView, theme: &Theme, cx: &gpui::App) -> impl IntoElement + use<> {
+    let raw = view.raw_diff.clone();
+    let caption = if view.is_dirty(cx) {
+        "Since the last commit · includes your unsaved edits"
+    } else {
+        "Since the last commit"
+    };
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .flex_none()
+        .px_3()
+        .py(px(7.))
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().text_xs().text_color(theme.text_muted).child(caption))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .child(crate::ui::icon_text_action(
+                    "changes-discard",
+                    Icon::RotateCcw,
+                    "Discard".into(),
+                    "Back to the last commit",
+                    GitDiscardActive,
+                    theme.text_muted,
+                    theme,
+                ))
+                .child(crate::ui::text_action(
+                    "changes-raw",
+                    if raw.is_some() { "Fields".into() } else { "Raw file diff".into() },
+                    "Switch between fields and git's own diff",
+                    GitRawDiff,
+                    theme,
+                )),
+        );
+
+    let body = match (raw, view.changes.as_ref()) {
+        (Some(text), _) => raw_lines(&text, theme).into_any_element(),
+        (None, Some(changes)) => sections(&changes.diff, theme).into_any_element(),
+        (None, None) => div().into_any_element(),
+    };
+    div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h(px(0.))
+        .child(header)
+        .child(
+            div()
+                .id("changes-scroll")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .child(body),
+        )
+}
+
+fn sections(diff: &zuno_core::spec_diff::SpecDiff, theme: &Theme) -> Div {
+    use zuno_core::spec_diff::Mark;
+    let mut column = div().flex().flex_col().gap(px(14.)).px_3().py(px(10.));
+    for section in &diff.sections {
+        let mut block = div().flex().flex_col().gap(px(3.)).child(
+            div()
+                .text_size(px(10.))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text_faint)
+                .child(section.title.to_uppercase()),
+        );
+        for row in &section.rows {
+            let (sign, colour) = match row.mark {
+                Mark::Added => ("+", theme.status_success),
+                Mark::Removed => ("−", theme.status_server_error),
+                Mark::Changed => ("~", theme.status_client_error),
+            };
+            let short = |value: &Option<String>| {
+                zuno_core::request::elide(value.as_deref().unwrap_or_default(), 120).to_string()
+            };
+            let value = match row.mark {
+                Mark::Added => div().text_color(theme.text).child(short(&row.new)),
+                Mark::Removed => div().text_color(theme.text_faint).line_through().child(short(&row.old)),
+                Mark::Changed => div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.))
+                    .child(div().text_color(theme.text_faint).line_through().child(short(&row.old)))
+                    .child(div().text_color(theme.text_faint).child("→"))
+                    .child(div().text_color(theme.text).child(short(&row.new))),
+            };
+            block = block.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .bg(colour.alpha(0.08))
+                    .font_family(theme.mono.clone())
+                    .text_xs()
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(div().flex_none().w(px(10.)).text_color(colour).child(sign))
+                    .child(div().flex_none().w(px(150.)).overflow_hidden().text_color(theme.text_muted).child(row.key.clone()))
+                    .child(div().flex_1().min_w(px(0.)).overflow_hidden().child(value)),
+            );
+        }
+        column = column.child(block);
+    }
+    if !diff.unchanged.is_empty() {
+        column = column.child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.text_faint)
+                .child(format!("Unchanged: {}.", diff.unchanged.join(", "))),
+        );
+    }
+    column
+}
+
+/// `git diff` output, coloured by each line's first character.
+fn raw_lines(text: &str, theme: &Theme) -> Div {
+    let mut column = div()
+        .flex()
+        .flex_col()
+        .px_3()
+        .py(px(8.))
+        .font_family(theme.mono.clone())
+        .text_xs();
+    if text.trim().is_empty() {
+        return column.child(
+            div()
+                .text_color(theme.text_faint)
+                .child("The saved file matches the last commit — the changes are only on screen."),
+        );
+    }
+    for line in text.lines() {
+        let colour = match line.chars().next() {
+            Some('+') if !line.starts_with("+++") => theme.status_success,
+            Some('-') if !line.starts_with("---") => theme.status_server_error,
+            Some('@') => theme.accent,
+            _ => theme.text_muted,
+        };
+        column = column.child(div().whitespace_nowrap().text_color(colour).child(line.to_string()));
+    }
+    column
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +435,7 @@ fn view_tabs(
             theme,
             cx,
         ))
+        .children(view.has_changes().then(|| changes_tab(view, theme, cx)))
         // Pushes the action row to the far right; the tabs stay left where the eye starts.
         .child(div().flex_1())
         .child(response_actions(theme))

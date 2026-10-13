@@ -101,6 +101,13 @@ struct PendingRecord {
     at: u64,
 }
 
+/// A comparison with the last commit, and the request it was made against — so the next render
+/// can tell whether it is still current.
+pub struct Changes {
+    pub of: RequestSpec,
+    pub diff: zuno_core::spec_diff::SpecDiff,
+}
+
 /// One line of a conversation.
 pub struct TranscriptRow {
     /// Since the connect, so the gaps are readable without a wall clock on every row — which is
@@ -449,6 +456,10 @@ pub enum ResponseView {
     /// What changed since the run before. Last for the same reason Network is third: it is a
     /// question you ask *about* an answer, not one of the answers.
     Diff,
+    /// What this *request* changed since the last commit — about the request, not the response,
+    /// which is why it sits after everything about the answer. Offered only when there is a
+    /// difference, so it needs no empty state of its own.
+    Changes,
 }
 
 impl ResponseView {
@@ -458,12 +469,13 @@ impl ResponseView {
     ///
     /// Trailers is in the list although only gRPC draws it; `cycle_response_view` steps over any
     /// view the kind does not offer, so the order here stays the one visual order.
-    pub const ALL: [ResponseView; 5] = [
+    pub const ALL: [ResponseView; 6] = [
         ResponseView::Body,
         ResponseView::Headers,
         ResponseView::Trailers,
         ResponseView::Network,
         ResponseView::Diff,
+        ResponseView::Changes,
     ];
 
     fn step(self, delta: isize) -> Self {
@@ -561,6 +573,15 @@ pub struct RequestView {
     /// buffer with no file keeps whatever it was created with, so a fresh tab reads clean while
     /// one you typed into does not.
     pub baseline: RequestSpec,
+    /// The request as the last commit has it — what the Changes tab compares against.
+    head: Option<RequestSpec>,
+    /// The last comparison, and the live request it was made against.
+    pub changes: Option<Changes>,
+    changes_task: Option<Task<()>>,
+    /// Asked for the Changes tab before there was a comparison to show.
+    changes_wanted: bool,
+    /// The file's raw `git diff`, while the Changes tab is showing it instead of the fields.
+    pub raw_diff: Option<String>,
     /// The collection file this buffer is backed by, or `None` for a scratch buffer.
     ///
     /// Set when a buffer is opened from a collection or saved into one. It exists because a
@@ -719,6 +740,11 @@ impl RequestView {
             pending_send: None,
             name: String::new(),
             baseline: RequestSpec::default(),
+            head: None,
+            changes: None,
+            changes_task: None,
+            changes_wanted: false,
+            raw_diff: None,
             path: None,
             url: cx.new(|cx| TextInput::new("", "", "UrlBar", cx)),
             headers: Vec::new(),
@@ -809,7 +835,76 @@ impl RequestView {
     /// for gRPC, and each of those three could otherwise land on it where no tab exists: an empty
     /// table with nothing highlighted, and `alt-r` stepping as if from Body.
     pub fn offers_response_view(&self, view: ResponseView) -> bool {
-        view != ResponseView::Trailers || self.kind.as_grpc().is_some()
+        match view {
+            ResponseView::Trailers => self.kind.as_grpc().is_some(),
+            ResponseView::Changes => self.has_changes(),
+            _ => true,
+        }
+    }
+
+    /// The last-committed version, when there is one.
+    pub fn head_spec(&self) -> Option<RequestSpec> {
+        self.head.clone()
+    }
+
+    /// Whether this request differs from its last commit, as last compared.
+    pub fn has_changes(&self) -> bool {
+        self.changes.as_ref().is_some_and(|changes| !changes.diff.is_empty())
+    }
+
+    /// The committed version this request is compared against, or `None` outside a repository
+    /// and for a file the last commit does not have. Set by `Workspace`, which knows the repo.
+    pub fn set_head(&mut self, head: Option<RequestSpec>, cx: &mut Context<Self>) {
+        if self.head != head {
+            self.head = head;
+            self.changes = None;
+            cx.notify();
+        }
+    }
+
+    /// Show the Changes tab as soon as a comparison finds something — the Git view asks before the
+    /// committed version has even been read.
+    pub fn select_changes_when_ready(&mut self, cx: &mut Context<Self>) {
+        if self.has_changes() {
+            self.response_view = ResponseView::Changes;
+        } else {
+            self.changes_wanted = true;
+        }
+        cx.notify();
+    }
+
+    /// Compare what is on screen with the last commit, off the UI thread, when either has moved
+    /// since the last comparison. Assembling `spec` is a clone of the inputs; the comparison —
+    /// JSON bodies parsed and flattened — is the part invariant 3 sends away.
+    fn refresh_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(head) = self.head.clone() else {
+            if self.changes.is_some() {
+                self.changes = None;
+            }
+            return;
+        };
+        let live = self.spec(cx);
+        if self.changes.as_ref().is_some_and(|changes| changes.of == live) || self.changes_task.is_some() {
+            return;
+        }
+        let compare = live.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { zuno_core::spec_diff::diff(&head, &compare) });
+        self.changes_task = Some(cx.spawn(async move |this, cx| {
+            let diff = work.await;
+            let _ = this.update(cx, |this, cx| {
+                this.changes_task = None;
+                this.changes = Some(Changes { of: live, diff });
+                if this.changes_wanted && this.has_changes() {
+                    this.response_view = ResponseView::Changes;
+                    this.changes_wanted = false;
+                }
+                // A tab that was showing Changes when the difference went away falls back to Body.
+                this.keep_response_view_offered();
+                cx.notify();
+            });
+        }));
     }
 
     fn keep_response_view_offered(&mut self) {
@@ -1441,6 +1536,10 @@ impl RequestView {
         // land behind a stale one.
         self.cancel(engine, cx);
 
+        // A send is for its answer: leave the Changes tab so the response is what shows up.
+        if self.response_view == ResponseView::Changes {
+            self.response_view = ResponseView::Body;
+        }
         let typed = self.spec(cx);
         let spec = resolver.apply(&typed);
         let (job, events) = engine.send(spec);
@@ -3341,6 +3440,7 @@ impl Focusable for RequestView {
 impl Render for RequestView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        self.refresh_changes(cx);
 
         let url_focused = self.url_focus(cx).is_focused(window);
 

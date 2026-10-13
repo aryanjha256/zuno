@@ -742,18 +742,17 @@ fn change_row(
     // Shown on the row under the pointer only: a column of undo arrows on every row would read
     // as the list's main verb, and discarding is the one that cannot be taken back.
     let discard = discardable.then(|| {
+        let deleted = change.kind == ChangeKind::Deleted;
         let change = change.clone();
         let workspace = workspace.clone();
-        div()
+        let control = div()
             .debug_selector(move || format!("git-discard-{ix}"))
             .flex_none()
-            .size(px(18.))
+            .h(px(18.))
             .flex()
             .items_center()
             .justify_center()
             .rounded(px(3.))
-            .opacity(0.)
-            .group_hover(GIT_ROW, |style| style.opacity(1.))
             .hover(|style| style.bg(theme.bg_elevated))
             .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
                 // The row under it opens the file; this must not.
@@ -761,8 +760,24 @@ fn change_row(
                 workspace.update(cx, |workspace, cx| {
                     workspace.ask_discard(change.clone(), window, cx)
                 });
-            })
-            .child(glyph(Icon::RotateCcw, theme.text_muted, theme.text, 12.))
+            });
+        if deleted {
+            // A deleted request has no tab to open and no diff to read, so getting it back is the
+            // row's one verb — shown, not hidden behind a hover.
+            control
+                .px(px(6.))
+                .border_1()
+                .border_color(theme.border_focused)
+                .text_size(px(10.))
+                .text_color(theme.text)
+                .child("Restore")
+        } else {
+            control
+                .w(px(18.))
+                .opacity(0.)
+                .group_hover(GIT_ROW, |style| style.opacity(1.))
+                .child(glyph(Icon::RotateCcw, theme.text_muted, theme.text, 12.))
+        }
     });
     let (folder, file) = match change.path.rsplit_once('/') {
         Some((folder, file)) => (folder.to_string(), file.to_string()),

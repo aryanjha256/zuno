@@ -141,6 +141,8 @@ pub enum Target {
     ClearHistory,
     /// Throw away one file's uncommitted changes — the confirmed half of a row's discard.
     DiscardChange(zuno_core::git::FileChange),
+    /// Put the active request back as last committed, buffer and file.
+    DiscardActive,
     /// Run a flow, by name.
     Flow(String),
     /// Append the collection panel's selection to a flow, by name.
@@ -189,6 +191,7 @@ impl Clone for Target {
             Self::Run(offset) => Self::Run(*offset),
             Self::ClearHistory => Self::ClearHistory,
             Self::DiscardChange(change) => Self::DiscardChange(change.clone()),
+            Self::DiscardActive => Self::DiscardActive,
             Self::Flow(name) => Self::Flow(name.clone()),
             Self::AddToFlow(name) => Self::AddToFlow(name.clone()),
             Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),

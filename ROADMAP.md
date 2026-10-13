@@ -439,7 +439,7 @@ toggle says what will happen, the badge says what *is* happening.
 back — with each row carrying its status, size and duration, because "which run was the 500?" is the
 question you open it to answer. Choosing one shows it and re-indexes its body off-thread.
 
-**Git — in progress, slices 1 and 2 of 3 done.** The format was always built for git (one request per
+**Git — done, in three slices.** The format was always built for git (one request per
 file, stable bytes); now Zuno speaks it. **A workspace is the repository** — the broad project
 space, synced Bruno-style through the team's own remote, never a Zuno cloud, so it sits inside the
 local-first principle rather than against the collaboration non-goal. A solo developer syncing
@@ -459,13 +459,21 @@ between machines is the same feature.
   with edits are named — otherwise the next `Ctrl+S` writes the old version over a teammate's.
   The ↓/↑ counts are as of the last fetch: Zuno never fetches on its own, because a background
   fetch can pop an ssh passphrase dialog nobody asked for.
-- **Slice 3: join and inspect — Clone and Discard done, the diff tab next.** New workspace has
-  *From a git URL*: the name comes from the repository, the clone runs under the remote timeout,
-  and Zuno switches into it. Each change row has a hover ↺ that asks first, then deletes a new
-  file or restores a changed one; open tabs reload after. **The diff tab is its own piece of
-  work**: every tab is a `RequestView` today, so a tab that is not a request means generalising
-  the tab list (36 direct uses, plus focus, close and the session save, which must skip it
-  without changing the file).
+- **Slice 3 — done: join and inspect.** New workspace has *From a git URL*: the name comes from
+  the repository, the clone runs under the remote timeout, and Zuno switches into it. Each change
+  row has a hover ↺ that asks first (a deleted request shows **Restore** instead). And **a
+  Changes tab in the request's own response pane**, after Body · Headers · Network · Diff, shown
+  only when the request differs from its last commit: field by field — headers by name, a JSON
+  body by `$.path`, other text by line — with Discard and git's raw diff a click away. Clicking a
+  changed row in the Git view opens the request on that tab.
+
+  **Not a tab of its own, which was the first plan.** Every tab is a `RequestView`, so a diff tab
+  meant generalising the tab list — 36 direct uses, focus, close, and a session save that would
+  have to skip it without changing the file. Inside the request's pane it needed none of that,
+  and came out better: it compares **what is on screen**, unsaved edits included, where a separate
+  tab could only ever show the saved file.
+
+  Left for later, deliberately: switching branches, and resolving conflicts in the app.
 
 **Global history — done, beside it rather than instead of it.** A *History* view in the side
 panel lists every request the workspace has sent, under day headings — method pill, path, a

@@ -3826,6 +3826,15 @@ purpose:
   markers into a request. **Every operation that can rewrite files reloads the open tabs that
   have no edits** (`reload_changed_tabs`) — a tab otherwise keeps the old request and `Ctrl+S`
   writes it over the incoming one; tabs with edits are left and named.
+  **The Changes tab is `zuno_core::spec_diff`**: each part of a request becomes ordered `(key,
+  value)` pairs — headers by name (a repeat numbered, a muted one marked `(off)`), a JSON body by
+  `$.path`, any other text by line, other kinds by their flattened JSON — and two lists compare
+  one way. Rejected: a line diff of the file, which stores the body as one escaped string and so
+  says "line 14" where the person wants `$.amount 100 → 250`. The committed side is `git show
+  HEAD:<path>` per open tab (`Workspace::load_heads`, after each git refresh and each open); the
+  live side is the view's `spec`, so unsaved edits count. The comparison runs off-thread
+  whenever the live spec differs from the one last compared, and the tab is offered only when it
+  found something.
 - **Global history: a JSON-lines log, still not SQLite** (`zuno_core::history`, under
   `<config>/history/<workspace id>/`, never in the collection). One line per send, appended off
   the UI thread; bodies ≤1 MB in `bodies/<id>`, the oldest dropped past 50 MB; the log trimmed to
