@@ -8590,6 +8590,7 @@ dependencies = [
  "bytes",
  "cookie_store",
  "futures-util",
+ "getrandom 0.3.4",
  "html2text",
  "http",
  "http-body-util",

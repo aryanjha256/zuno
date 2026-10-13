@@ -439,6 +439,14 @@ toggle says what will happen, the badge says what *is* happening.
 back — with each row carrying its status, size and duration, because "which run was the 500?" is the
 question you open it to answer. Choosing one shows it and re-indexes its body off-thread.
 
+**Dynamic variables — done.** `{{$guid}}`, `{{$randomUUID}}`, `{{$timestamp}}`,
+`{{$isoTimestamp}}`, `{{$randomInt}}` — Postman's names, so imported collections work unchanged —
+made at send time and fresh per occurrence, anywhere `{{variables}}` resolve. They colour as
+defined, hover with what they make and a sample, and complete once `{{$` is typed (not at a bare
+`{{`, where five generators would bury your own names). The request keeps the placeholder; the
+Network tab's sent request shows what went out. Postman's ~100 fake-data ones (`$randomEmail`, …)
+are not done.
+
 **Git — done, in three slices.** The format was always built for git (one request per
 file, stable bytes); now Zuno speaks it. **A workspace is the repository** — the broad project
 space, synced Bruno-style through the team's own remote, never a Zuno cloud, so it sits inside the

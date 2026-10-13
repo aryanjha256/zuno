@@ -101,7 +101,12 @@ pub fn completion(text: &str, cursor: usize, dismissed: Option<usize>, cx: &App)
         return None;
     }
     let shown = cx.try_global::<crate::auth::ShownResolver>()?;
-    let names = shown.resolver.names();
+    let mut names = shown.resolver.names();
+    // Offered once `$` is typed, not at a bare `{{` — five sample makers sorting ahead of your
+    // own variables would push the names you use most down the list.
+    if prefix.typed.starts_with('$') {
+        names.extend(zuno_core::dynamic::VARIABLES.iter().map(|(name, _)| *name));
+    }
     let items: Vec<String> = zuno_core::environment::rank_names(&names, prefix.typed)
         .into_iter()
         .map(str::to_string)

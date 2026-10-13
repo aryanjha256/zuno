@@ -130,11 +130,23 @@ pub struct VariableInfo {
 /// Whether `name` resolves right now. `None` before any resolver has loaded — a test harness, or
 /// the first frame — so nothing is painted as broken that has not been checked.
 pub fn is_defined(name: &str, cx: &App) -> Option<bool> {
+    if zuno_core::dynamic::is_dynamic(name) {
+        return Some(true);
+    }
     cx.try_global::<ShownResolver>()
         .map(|shown| shown.resolver.get(name).is_some())
 }
 
 pub fn describe(name: &str, cx: &App) -> VariableInfo {
+    // A dynamic variable has no stored value to show, so it shows what it makes and one sample.
+    if let (Some(what), Some(sample)) =
+        (zuno_core::dynamic::describe(name), zuno_core::dynamic::generate(name))
+    {
+        return VariableInfo {
+            value: Some(format!("e.g. {sample}")),
+            origin: format!("{what} · new on every send"),
+        };
+    }
     let Some(shown) = cx.try_global::<ShownResolver>() else {
         return VariableInfo {
             value: None,

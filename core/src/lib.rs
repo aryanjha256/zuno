@@ -19,6 +19,7 @@ pub mod codegen;
 pub mod collection;
 pub mod curl;
 pub mod disposition;
+pub mod dynamic;
 pub mod diff;
 pub mod engine;
 pub mod environment;

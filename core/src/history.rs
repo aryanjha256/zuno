@@ -234,7 +234,7 @@ pub fn row_time(at_ms: u64, now_ms: u64, offset_secs: i32) -> String {
 
 /// Days since 1970-01-01 to `(year, month, day)` in the proleptic Gregorian calendar — Howard
 /// Hinnant's `civil_from_days`, which is exact for every date this will ever see.
-fn civil_from_days(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);

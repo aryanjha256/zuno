@@ -250,9 +250,13 @@ impl Resolver {
             out.push_str(&rest[..start]);
             match self.get(name.trim()) {
                 Some(value) => out.push_str(value),
-                // Unknown: emit the placeholder verbatim so the send-boundary check can
-                // name it, and so a JSON body's own `{{...}}` survives untouched.
-                None => out.push_str(&rest[start..after]),
+                // `{{$guid}}` and the rest: made here, fresh per occurrence.
+                None => match crate::dynamic::generate(name.trim()) {
+                    Some(value) => out.push_str(&value),
+                    // Unknown: emit the placeholder verbatim so the send-boundary check can
+                    // name it, and so a JSON body's own `{{...}}` survives untouched.
+                    None => out.push_str(&rest[start..after]),
+                },
             }
             rest = &rest[after..];
         }
@@ -519,7 +523,8 @@ pub struct VariablePrefix<'a> {
 }
 
 fn is_name_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '_' | '-' | '.')
+    // `$` for the dynamic ones — `{{$guid}}` — so typing `{{$` still completes.
+    c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '$')
 }
 
 /// The `{{name` the cursor is completing, if any.

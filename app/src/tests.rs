@@ -2023,6 +2023,36 @@ async fn a_sent_request_comes_back_from_history_with_its_response(cx: &mut TestA
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// `{{$guid}}` is made at send time, fresh per occurrence, and is not refused as unknown — read
+/// off the request line a real server received.
+#[gpui::test]
+async fn a_dynamic_variable_is_made_fresh_on_send(cx: &mut TestAppContext) {
+    let (base, received) = serve_capturing(OK_JSON);
+    let (view, mut cx) = open_workspace(cx);
+    cx.update(|_, cx| crate::auth::set_for_test(zuno_core::environment::Resolver::default(), cx));
+
+    type_url(&mut cx, &format!("{base}/orders?a={{{{$guid}}}}&b={{{{$guid}}}}"));
+    cx.press("ctrl-enter");
+    wait_for(&mut cx, "a response", |cx| cx.update(|_, cx| view.read(cx).response.clone()));
+
+    let request = received.join().expect("server");
+    let line = request.lines().next().unwrap_or_default().to_string();
+    let query = line.split_once('?').map(|(_, q)| q).unwrap_or_default();
+    let ids: Vec<&str> = query
+        .split(' ')
+        .next()
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        // The sample request brings its own `per_page`; only the two typed here matter.
+        .filter(|(key, _)| *key == "a" || *key == "b")
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(ids.len(), 2, "{line}");
+    assert!(ids.iter().all(|id| id.len() == 36 && &id[14..15] == "4"), "UUIDs v4: {line}");
+    assert_ne!(ids[0], ids[1], "a fresh value per occurrence: {line}");
+}
+
 #[gpui::test]
 async fn the_url_bar_enter_key_also_sends(cx: &mut TestAppContext) {
     let base = serve_once(OK_JSON);
