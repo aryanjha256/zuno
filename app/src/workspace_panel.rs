@@ -11,8 +11,8 @@
 //! out, not the moment it pays.
 
 use gpui::{
-    App, AppContext, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px,
+    App, AppContext, Context, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    Styled, Window, div, px,
 };
 
 use crate::actions::{WorkspaceBrowse, WorkspaceConfirm};
@@ -28,12 +28,26 @@ pub enum WorkspaceEvent {
     /// Name and location, exactly as typed. Turning them into a directory belongs to the
     /// workspace, which owns the filesystem and the registry.
     Confirmed { name: String, location: String },
+    /// Clone `url` into `location`/`name` — the name read off the URL, as `git clone` would.
+    Clone { url: String, name: String, location: String },
+}
+
+/// Where the new workspace's contents come from. **Clone is how a teammate joins**: without it,
+/// everyone after the first needs a terminal before Zuno is any use to them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Empty,
+    Clone,
 }
 
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     pub name: Entity<TextInput>,
     pub location: Entity<TextInput>,
+    pub url: Entity<TextInput>,
+    pub source: Source,
+    /// Set while a clone runs, so the button says so and a second Enter does nothing.
+    pub busy: bool,
     message: Option<SharedString>,
     restore_focus: Option<FocusHandle>,
 }
@@ -52,6 +66,11 @@ impl WorkspacePanel {
             TextInput::new(location, "where the folder goes", "WorkspaceLocation", cx)
         });
 
+        // The name field's context, so Enter and Escape mean what they mean there.
+        let url = cx.new(|cx| {
+            TextInput::new("", "git@github.com:acme/acme-platform.git", "WorkspaceName", cx)
+        });
+
         let focus_handle = cx.focus_handle();
         window.focus(&name.read(cx).focus_handle(cx));
 
@@ -59,13 +78,30 @@ impl WorkspacePanel {
             focus_handle,
             name,
             location,
+            url,
+            source: Source::Empty,
+            busy: false,
             message: None,
             restore_focus,
         }
     }
 
     pub fn report(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.busy = false;
         self.message = Some(message.into());
+        cx.notify();
+    }
+
+    /// Switch between an empty folder and a clone, with the keyboard in the first field of the
+    /// one chosen.
+    pub fn set_source(&mut self, source: Source, window: &mut Window, cx: &mut Context<Self>) {
+        self.source = source;
+        self.message = None;
+        let first = match source {
+            Source::Empty => &self.name,
+            Source::Clone => &self.url,
+        };
+        window.focus(&first.read(cx).focus_handle(cx));
         cx.notify();
     }
 
@@ -87,12 +123,28 @@ impl WorkspacePanel {
     }
 
     pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let location = self.location.read(cx).text().trim().to_string();
+        if self.source == Source::Clone {
+            let url = self.url.read(cx).text().trim().to_string();
+            if url.is_empty() {
+                self.report("Paste the repository's URL", cx);
+                return;
+            }
+            let Some(name) = zuno_core::git::repo_name(&url) else {
+                self.report("That URL doesn't name a repository", cx);
+                return;
+            };
+            cx.emit(WorkspaceEvent::Clone { url, name, location });
+            return;
+        }
         let name = self.name.read(cx).text().trim().to_string();
         if name.is_empty() {
             self.report("Give the workspace a name", cx);
             return;
         }
-        let location = self.location.read(cx).text().trim().to_string();
         cx.emit(WorkspaceEvent::Confirmed { name, location });
     }
 }
@@ -106,6 +158,44 @@ impl Focusable for WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        let cloning = self.source == Source::Clone;
+        let switch = div()
+            .flex()
+            .flex_row()
+            .gap(px(2.))
+            .p(px(2.))
+            .rounded(px(5.))
+            .bg(theme.bg)
+            .border_1()
+            .border_color(theme.border)
+            .child(source_tab("workspace-source-empty", "Empty folder", Source::Empty, self.source, &theme, cx))
+            .child(source_tab("workspace-source-clone", "From a git URL", Source::Clone, self.source, &theme, cx));
+        let first_field = if cloning {
+            labelled("Repository URL", &theme, crate::ui::field_box(self.url.clone(), &theme))
+                .into_any_element()
+        } else {
+            labelled("Name", &theme, crate::ui::field_box(self.name.clone(), &theme))
+                .into_any_element()
+        };
+        let where_to = cloning.then(|| {
+            let url = self.url.read(cx).text().to_string();
+            let location = self.location.read(cx).text().trim().trim_end_matches('/').to_string();
+            let line = match zuno_core::git::repo_name(&url) {
+                Some(name) => format!(
+                    "Clones into {location}/{name}, with your own git — your SSH keys and saved \
+                     credentials work exactly as in a terminal."
+                ),
+                None => "Cloned with your own git — your SSH keys and saved credentials work \
+                         exactly as in a terminal. The name comes from the repository."
+                    .to_string(),
+            };
+            div().text_xs().text_color(theme.text_faint).child(line)
+        });
+        let action_label: SharedString = match (cloning, self.busy) {
+            (true, true) => "Cloning…".into(),
+            (true, false) => "Clone and open".into(),
+            (false, _) => "Create".into(),
+        };
 
         div()
             .absolute()
@@ -136,7 +226,8 @@ impl Render for WorkspacePanel {
                             .text_color(theme.text)
                             .child("New workspace"),
                     )
-                    .child(labelled("Name", &theme, crate::ui::field_box(self.name.clone(), &theme)))
+                    .child(div().flex().child(switch))
+                    .child(first_field)
                     // The browse button pairs with the *box*, not with the field: a row of
                     // [label-over-box, button] centres the button against both lines together,
                     // which lands it up at the label rather than on the input.
@@ -162,6 +253,7 @@ impl Render for WorkspacePanel {
                                 &theme,
                             )),
                     ))
+                    .children(where_to)
                     .children(self.message.clone().map(|message| {
                         div()
                             .text_xs()
@@ -175,7 +267,7 @@ impl Render for WorkspacePanel {
                             .justify_end()
                             .child(crate::ui::text_action(
                                 "workspace-create",
-                                "Create".into(),
+                                action_label,
                                 "Create the workspace",
                                 WorkspaceConfirm,
                                 &theme,
@@ -183,6 +275,41 @@ impl Render for WorkspacePanel {
                     ),
             )
     }
+}
+
+/// One half of the Empty folder / From a git URL switch. The selected half is filled.
+fn source_tab(
+    id: &'static str,
+    label: &'static str,
+    source: Source,
+    current: Source,
+    theme: &crate::theme::Theme,
+    cx: &mut Context<WorkspacePanel>,
+) -> impl IntoElement + use<> {
+    let selected = source == current;
+    let tab = div()
+        .id(id)
+        .debug_selector(move || id.to_string())
+        .h(px(24.))
+        .px_3()
+        .flex()
+        .items_center()
+        .rounded(px(3.))
+        .text_xs()
+        .cursor_pointer()
+        .text_color(if selected { theme.text } else { theme.text_muted })
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |panel, _: &gpui::MouseDownEvent, window, cx| {
+                // `set_source` puts the keyboard in the chosen field; letting the click bubble on
+                // to the dialog's `track_focus` would take it straight back to the dialog, and the
+                // URL typed next would land nowhere.
+                cx.stop_propagation();
+                panel.set_source(source, window, cx);
+            }),
+        )
+        .child(label);
+    if selected { tab.bg(theme.bg_hover) } else { tab }
 }
 
 /// `use<C>` rather than `use<>`: the return has to mention every type parameter in scope, and

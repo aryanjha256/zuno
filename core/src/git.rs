@@ -584,6 +584,52 @@ pub fn abort_sync(git: &Git, repo: &Repo) -> Result<(), GitError> {
     Ok(())
 }
 
+/// A workspace's name from its repository's URL: `git@github.com:acme/acme-platform.git` and
+/// `https://github.com/acme/acme-platform` are both `acme-platform`. `None` when nothing usable is
+/// left, so the caller asks rather than inventing one.
+pub fn repo_name(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let last = trimmed.rsplit(['/', ':', '\\']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    (!name.is_empty() && name != "." && name != "..").then(|| name.to_string())
+}
+
+/// Clone `url` into `dest`, which must not exist yet. Git removes a half-made `dest` itself when
+/// the clone fails.
+pub fn clone(git: &Git, url: &str, dest: &Path) -> Result<(), GitError> {
+    let parent = dest.parent().ok_or_else(|| GitError::Failed("Nowhere to put it".into()))?;
+    std::fs::create_dir_all(parent).map_err(|error| GitError::Io(error.to_string()))?;
+    let dest = dest.display().to_string();
+    git.run_remote(parent, ["clone", "--", url, &dest])?;
+    Ok(())
+}
+
+/// Throw away one file's changes since the last commit: a new file is deleted, a changed or deleted
+/// one is put back as committed.
+///
+/// Renames and conflicts are refused rather than guessed at — a rename needs its original path,
+/// which the row does not carry, and a conflict has Continue and Undo for exactly this.
+pub fn discard(git: &Git, repo: &Repo, change: &FileChange) -> Result<(), GitError> {
+    let path = repo.workdir.join(&change.path);
+    match change.kind {
+        ChangeKind::Added => {
+            // Staged-but-new files are unstaged first; for an untracked one this fails harmlessly.
+            let _ = git.run(&repo.workdir, ["rm", "--cached", "-q", "--", &change.path]);
+            std::fs::remove_file(&path).map_err(|error| GitError::Io(error.to_string()))
+        }
+        ChangeKind::Modified | ChangeKind::Deleted => {
+            git.run(
+                &repo.workdir,
+                ["restore", "--source=HEAD", "--staged", "--worktree", "--", &change.path],
+            )?;
+            Ok(())
+        }
+        ChangeKind::Renamed | ChangeKind::Conflicted => Err(GitError::Failed(
+            "Only an added, changed or deleted file can be discarded here".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +884,50 @@ u UU N... 100644 100644 100644 100644 h1 h2 h3 orders/conflict.json\0\
         assert_eq!((back.ahead, back.behind), (1, 1));
         let text = std::fs::read_to_string(mine.workdir.join("orders/create.json")).unwrap();
         assert!(text.contains("250"), "our version, untouched: {text}");
+    }
+
+    #[test]
+    fn a_repository_names_its_workspace() {
+        assert_eq!(repo_name("git@github.com:acme/acme-platform.git").as_deref(), Some("acme-platform"));
+        assert_eq!(repo_name("https://github.com/acme/acme-platform/").as_deref(), Some("acme-platform"));
+        assert_eq!(repo_name("/srv/git/team.git").as_deref(), Some("team"));
+        assert_eq!(repo_name("https://example.com/.git"), None);
+        assert_eq!(repo_name(""), None);
+    }
+
+    #[test]
+    fn a_clone_is_a_workspace_on_its_remote() {
+        let (scratch, _mine, _theirs) = team("clone");
+        let dest = scratch.root.join("workspaces").join("acme");
+        let remote = scratch.root.join("remote.git").display().to_string();
+        clone(&scratch.git, &remote, &dest).unwrap();
+        assert!(dest.join("orders/create.json").exists());
+        let repo = scratch.repo(&dest);
+        assert!(status(&scratch.git, &repo).unwrap().upstream, "tracking from the start");
+        assert!(clone(&scratch.git, "/nowhere/at/all.git", &scratch.root.join("x")).is_err());
+    }
+
+    #[test]
+    fn discard_puts_each_kind_of_change_back() {
+        let scratch = Scratch::new("discard");
+        scratch.identify();
+        init(&scratch.git, &scratch.ws()).unwrap();
+        scratch.write("kept.json", "{\"v\": 1}");
+        scratch.write("gone.json", "{}");
+        let repo = scratch.repo(&scratch.ws());
+        commit(&scratch.git, &repo, "first").unwrap();
+
+        scratch.write("kept.json", "{\"v\": 2}");
+        std::fs::remove_file(scratch.ws().join("gone.json")).unwrap();
+        scratch.write("new.json", "{}");
+        for change in status(&scratch.git, &repo).unwrap().files {
+            discard(&scratch.git, &repo, &change).unwrap();
+        }
+
+        assert!(status(&scratch.git, &repo).unwrap().files.is_empty());
+        assert_eq!(std::fs::read_to_string(scratch.ws().join("kept.json")).unwrap(), "{\"v\": 1}");
+        assert!(scratch.ws().join("gone.json").exists());
+        assert!(!scratch.ws().join("new.json").exists());
     }
 
     #[test]

@@ -139,6 +139,8 @@ pub enum Target {
     Run(usize),
     /// Forget the workspace's history — the confirmed half of `ClearHistory`.
     ClearHistory,
+    /// Throw away one file's uncommitted changes — the confirmed half of a row's discard.
+    DiscardChange(zuno_core::git::FileChange),
     /// Run a flow, by name.
     Flow(String),
     /// Append the collection panel's selection to a flow, by name.
@@ -186,6 +188,7 @@ impl Clone for Target {
             Self::Environment(name) => Self::Environment(name.clone()),
             Self::Run(offset) => Self::Run(*offset),
             Self::ClearHistory => Self::ClearHistory,
+            Self::DiscardChange(change) => Self::DiscardChange(change.clone()),
             Self::Flow(name) => Self::Flow(name.clone()),
             Self::AddToFlow(name) => Self::AddToFlow(name.clone()),
             Self::BodyType(body_type, kind) => Self::BodyType(*body_type, *kind),

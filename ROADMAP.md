@@ -459,8 +459,13 @@ between machines is the same feature.
   with edits are named — otherwise the next `Ctrl+S` writes the old version over a teammate's.
   The ↓/↑ counts are as of the last fetch: Zuno never fetches on its own, because a background
   fetch can pop an ssh passphrase dialog nobody asked for.
-- **Slice 3: join and inspect.** Clone from New workspace, and a request's diff against its last
-  commit — field by field, in a tab of its own.
+- **Slice 3: join and inspect — Clone and Discard done, the diff tab next.** New workspace has
+  *From a git URL*: the name comes from the repository, the clone runs under the remote timeout,
+  and Zuno switches into it. Each change row has a hover ↺ that asks first, then deletes a new
+  file or restores a changed one; open tabs reload after. **The diff tab is its own piece of
+  work**: every tab is a `RequestView` today, so a tab that is not a request means generalising
+  the tab list (36 direct uses, plus focus, close and the session save, which must skip it
+  without changing the file).
 
 **Global history — done, beside it rather than instead of it.** A *History* view in the side
 panel lists every request the workspace has sent, under day headings — method pill, path, a

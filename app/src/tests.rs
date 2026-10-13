@@ -11563,6 +11563,85 @@ async fn a_synced_change_reaches_the_open_tab(cx: &mut TestAppContext) {
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// Joining a team's workspace without a terminal: New workspace → From a git URL → paste → Enter,
+/// and Zuno is switched into the clone, its requests on disk.
+#[gpui::test]
+async fn a_workspace_is_cloned_from_a_git_url(cx: &mut TestAppContext) {
+    let dir = scratch_dir("git-clone");
+    let config = dir.join("gitconfig");
+    std::fs::write(
+        &config,
+        "[init]\n\tdefaultBranch = main\n[user]\n\tname = Test\n\temail = test@example.com\n",
+    )
+    .expect("config");
+    let git = zuno_core::git::Git::isolated(&config);
+
+    // A team repository with one request in it, on a bare remote.
+    let source = dir.join("source");
+    seed_request(&source, "payments-api/charge.json", "https://a.test/charge");
+    zuno_core::git::init(&git, &source).expect("init");
+    let repo = match zuno_core::git::probe(&git, &source) {
+        zuno_core::git::Probe::Repo(repo) => repo,
+        other => panic!("{other:?}"),
+    };
+    zuno_core::git::commit(&git, &repo, "first").expect("commit");
+    let remote = dir.join("acme-platform.git");
+    let status = std::process::Command::new("git")
+        .args(["clone", "--bare", "-q", "source", "acme-platform.git"])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", &config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("git");
+    assert!(status.success());
+
+    let first = dir.join("first");
+    std::fs::create_dir_all(&first).expect("mkdir");
+    let (window, _view, mut cx) = boot(cx, None, None);
+    cx.update(|_, cx| {
+        cx.set_global(crate::git_panel::GitRunner(git.clone()));
+        crate::app_state::install_at(
+            cx,
+            Some(dir.join("config")),
+            vec![crate::app_state::WorkspaceEntry { id: "first".into(), path: first.clone() }],
+        );
+    });
+
+    window
+        .update(&mut cx, |_, window, cx| {
+            window.dispatch_action(Box::new(crate::actions::NewWorkspace), cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    let panel = window
+        .update(&mut cx, |workspace, _, _| workspace.new_workspace_panel())
+        .expect("window")
+        .expect("the dialog");
+    // Never the real default location (invariant 6).
+    let workspaces = dir.join("workspaces").display().to_string();
+    cx.update(|window, cx| panel.update(cx, |panel, cx| panel.set_location(workspaces, window, cx)));
+
+    let tab = cx.debug_bounds("workspace-source-clone").expect("the clone tab");
+    cx.simulate_click(tab.center(), gpui::Modifiers::default());
+    cx.simulate_input(&remote.display().to_string());
+    cx.press("enter");
+
+    let cloned = dir.join("workspaces").join("acme-platform");
+    wait_for(&mut cx, "Zuno in the cloned workspace", |cx| {
+        cx.update(|_, cx| {
+            (crate::collections::root(cx) == Some(cloned.as_path())).then_some(())
+        })
+    });
+    assert!(cloned.join("payments-api/charge.json").exists());
+
+    cx.update(|_, cx| {
+        crate::session::install_at(cx, None);
+        crate::collections::install_at(cx, None);
+        crate::history::install_at(cx, None);
+    });
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[gpui::test]
 async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
     let dir = scratch_dir("panel-new-folder-escape");

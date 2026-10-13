@@ -746,6 +746,11 @@ impl Workspace {
     /// The picker's visible rows as `label — detail`, which is what a test can assert on
     /// without reaching into rendered elements.
     #[cfg(test)]
+    pub fn new_workspace_panel(&self) -> Option<Entity<crate::workspace_panel::WorkspacePanel>> {
+        self.new_workspace_panel.as_ref().map(|state| state.panel.clone())
+    }
+
+    #[cfg(test)]
     pub fn picker_rows(&self, cx: &App) -> Vec<String> {
         self.picker
             .as_ref()
@@ -2460,15 +2465,26 @@ impl Workspace {
         });
 
         let subscription =
-            cx.subscribe_in(&panel, window, |workspace, panel, event, window, cx| {
-                let crate::workspace_panel::WorkspaceEvent::Confirmed { name, location } = event;
-                workspace.create_workspace(
-                    panel.clone(),
-                    name.clone(),
-                    location.clone(),
-                    window,
-                    cx,
-                );
+            cx.subscribe_in(&panel, window, |workspace, panel, event, window, cx| match event {
+                crate::workspace_panel::WorkspaceEvent::Confirmed { name, location } => {
+                    workspace.create_workspace(
+                        panel.clone(),
+                        name.clone(),
+                        location.clone(),
+                        window,
+                        cx,
+                    );
+                }
+                crate::workspace_panel::WorkspaceEvent::Clone { url, name, location } => {
+                    workspace.clone_workspace(
+                        panel.clone(),
+                        url.clone(),
+                        name.clone(),
+                        location.clone(),
+                        window,
+                        cx,
+                    );
+                }
             });
 
         self.new_workspace_panel = Some(WorkspacePanelState {
@@ -2522,6 +2538,55 @@ impl Workspace {
         self.close_workspace_panel(window, cx);
         self.switch_workspace(&id, window, cx);
         self.set_status(&format!("Created {}", path.display()), cx);
+    }
+
+    /// Clone a repository into `location`/`name`, then register it and switch to it — joining a
+    /// team's workspace without a terminal. Off the UI thread, and bounded like every remote call.
+    fn clone_workspace(
+        &mut self,
+        panel: Entity<crate::workspace_panel::WorkspacePanel>,
+        url: String,
+        name: String,
+        location: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if location.trim().is_empty() {
+            panel.update(cx, |panel, cx| panel.report("Choose where the folder goes", cx));
+            return;
+        }
+        let path = PathBuf::from(shellexpand_home(&location)).join(&name);
+        if path.exists() {
+            panel.update(cx, |panel, cx| {
+                panel.report(format!("{} already exists", path.display()), cx)
+            });
+            return;
+        }
+        panel.update(cx, |panel, cx| {
+            panel.busy = true;
+            cx.notify();
+        });
+        let git = crate::git_panel::runner(cx);
+        let dest = path.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { zuno_core::git::clone(&git, &url, &dest) });
+        self.workspace_prompt = Some(cx.spawn_in(window, async move |workspace, cx| {
+            let result = work.await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                if let Err(error) = result {
+                    panel.update(cx, |panel, cx| panel.report(error.to_string(), cx));
+                    return;
+                }
+                let Some(id) = crate::app_state::add_workspace(cx, path.clone()) else {
+                    panel.update(cx, |panel, cx| panel.report("Workspaces are not being saved", cx));
+                    return;
+                };
+                workspace.close_workspace_panel(window, cx);
+                workspace.switch_workspace(&id, window, cx);
+                workspace.set_status(&format!("Cloned into {}", path.display()), cx);
+            });
+        }));
     }
 
     /// Register a directory that already exists — a collection someone cloned, or one built by
@@ -4060,6 +4125,43 @@ impl Workspace {
         }
     }
 
+    /// A row's ↺: ask before throwing a file's changes away, since nothing brings them back.
+    pub(crate) fn ask_discard(
+        &mut self,
+        change: zuno_core::git::FileChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal_open() {
+            return;
+        }
+        let name = change.path.rsplit('/').next().unwrap_or(&change.path);
+        let name = name.strip_suffix(".json").unwrap_or(name).to_string();
+        let (label, detail) = match change.kind {
+            zuno_core::git::ChangeKind::Added => (
+                format!("Delete {name}"),
+                "it was never committed — the file goes, and cannot be brought back",
+            ),
+            _ => (
+                format!("Discard changes to {name}"),
+                "back to the last commit — your edits cannot be brought back",
+            ),
+        };
+        let items = vec![
+            picker::Item {
+                label: SharedString::from(label),
+                detail: SharedString::from(detail),
+                target: picker::Target::DiscardChange(change),
+            },
+            picker::Item {
+                label: SharedString::from("Keep them"),
+                detail: SharedString::default(),
+                target: picker::Target::Dismiss,
+            },
+        ];
+        self.show_picker(items, "", window, cx);
+    }
+
     /// A changed file clicked in the Git view: open it when it is a request still on disk.
     pub(crate) fn open_changed_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let is_request = self.tree.iter().any(|node| {
@@ -4358,6 +4460,15 @@ impl Workspace {
                 if let Some(view) = self.active() {
                     view.update(cx, |view, cx| view.view_run(offset, cx));
                 }
+            }
+            picker::Target::DiscardChange(change) => {
+                self.run_git_op(
+                    "Discarding…",
+                    "Changes discarded",
+                    move |git, repo| zuno_core::git::discard(git, repo, &change),
+                    window,
+                    cx,
+                );
             }
             picker::Target::ClearHistory => {
                 crate::history::clear(cx);

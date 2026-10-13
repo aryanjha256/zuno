@@ -620,7 +620,8 @@ fn button<A: gpui::Action + Clone + 'static>(
 #[derive(Clone)]
 enum Line {
     Heading(&'static str, usize),
-    File(FileChange),
+    /// A file, and whether its row offers Discard — only your own changes, outside a stopped sync.
+    File(FileChange, bool),
 }
 
 /// The sections, in order. Mid-sync: what is conflicted, then what the remote brings — the local
@@ -631,7 +632,12 @@ fn lines(status: &Status) -> Vec<Line> {
     let mut section = |title: &'static str, files: Vec<FileChange>| {
         if !files.is_empty() {
             lines.push(Line::Heading(title, files.len()));
-            lines.extend(files.into_iter().map(Line::File));
+            let ours = title == "CHANGES";
+            lines.extend(files.into_iter().map(|file| {
+                let discardable = ours
+                    && matches!(file.kind, ChangeKind::Added | ChangeKind::Modified | ChangeKind::Deleted);
+                Line::File(file, discardable)
+            }));
         }
     };
     if status.operation.is_some() {
@@ -692,10 +698,10 @@ fn changes(workspace: &Workspace, theme: &Theme, cx: &mut Context<Workspace>) ->
                 range
                     .map(|ix| match &lines[ix] {
                         Line::Heading(title, count) => section_heading(title, *count, &row_theme),
-                        Line::File(change) => {
+                        Line::File(change, discardable) => {
                             let path = root.as_ref().map(|root| root.join(&change.path));
                             let badge = path.as_ref().and_then(|path| badges.get(path)).cloned();
-                            change_row(ix, change, badge, path, &row_theme, entity.clone())
+                            change_row(ix, change, *discardable, badge, path, &row_theme, entity.clone())
                         }
                     })
                     .collect()
@@ -726,12 +732,38 @@ fn section_heading(title: &'static str, count: usize, theme: &Theme) -> Div {
 fn change_row(
     ix: usize,
     change: &FileChange,
+    discardable: bool,
     badge: Option<Badge>,
     path: Option<PathBuf>,
     theme: &Theme,
     workspace: Entity<Workspace>,
 ) -> Div {
     let colour = change_colour(change.kind, theme);
+    // Shown on the row under the pointer only: a column of undo arrows on every row would read
+    // as the list's main verb, and discarding is the one that cannot be taken back.
+    let discard = discardable.then(|| {
+        let change = change.clone();
+        let workspace = workspace.clone();
+        div()
+            .debug_selector(move || format!("git-discard-{ix}"))
+            .flex_none()
+            .size(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.))
+            .opacity(0.)
+            .group_hover(GIT_ROW, |style| style.opacity(1.))
+            .hover(|style| style.bg(theme.bg_elevated))
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                // The row under it opens the file; this must not.
+                cx.stop_propagation();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.ask_discard(change.clone(), window, cx)
+                });
+            })
+            .child(glyph(Icon::RotateCcw, theme.text_muted, theme.text, 12.))
+    });
     let (folder, file) = match change.path.rsplit_once('/') {
         Some((folder, file)) => (folder.to_string(), file.to_string()),
         None => (String::new(), change.path.clone()),
@@ -766,6 +798,7 @@ fn change_row(
         .gap(px(8.))
         .text_xs()
         .cursor_pointer()
+        .group(GIT_ROW)
         .hover(|style| style.bg(theme.bg_hover))
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
             let Some(path) = path.clone() else { return };
@@ -785,6 +818,7 @@ fn change_row(
                 .child(name_cell)
                 .child(div().text_size(px(10.5)).text_color(theme.text_faint).child(folder)),
         )
+        .children(discard)
         .child(
             div()
                 .flex_none()
@@ -795,3 +829,6 @@ fn change_row(
                 .child(change.kind.letter()),
         )
 }
+
+/// The group a change row's hover-only controls answer to.
+const GIT_ROW: &str = "git-change-row";
