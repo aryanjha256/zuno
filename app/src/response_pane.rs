@@ -370,16 +370,18 @@ fn view_tabs(
     let headers_label = if grpc { "Metadata" } else { "Headers" };
     let trailer_count = view.response.as_ref().map_or(0, |r| r.trailers.len());
 
-    div()
+    // **The tabs scroll, the actions do not.** Six tabs on a narrow pane used to push Copy and ⋯
+    // off the edge, since every tab is `flex_none`; the tabs now sit in a container that shrinks
+    // to what is left and scrolls, and the actions keep their place at the end.
+    let tabs = div()
+        .id("response-tabs")
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
-        .flex_none()
-        .px_2()
-        .bg(theme.bg_panel)
-        .border_b_1()
-        .border_color(theme.border)
+        .flex_1()
+        .min_w(px(0.))
+        .overflow_x_scroll()
         .child(view_tab(
             "response-tab-body",
             "Body".to_string(),
@@ -435,9 +437,20 @@ fn view_tabs(
             theme,
             cx,
         ))
-        .children(view.has_changes().then(|| changes_tab(view, theme, cx)))
-        // Pushes the action row to the far right; the tabs stay left where the eye starts.
-        .child(div().flex_1())
+        .children(view.has_changes().then(|| changes_tab(view, theme, cx)));
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .flex_none()
+        .px_2()
+        .bg(theme.bg_panel)
+        .border_b_1()
+        .border_color(theme.border)
+        // `flex_1` on the tabs is what pushes the actions to the far right.
+        .child(tabs)
         .child(response_actions(theme))
 }
 

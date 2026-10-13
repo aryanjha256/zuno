@@ -268,15 +268,27 @@ pub fn render(
 /// a GraphQL request drew two tabs whose labels described a kind it wasn't — the document behind
 /// one called "Params", the variables behind one called "Body". `a_kinds_tab_strip_is_named_by_
 /// the_kind` is what keeps that from coming back.
-fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<RequestView>) -> Div {
+fn section_tabs(
+    view: &RequestView,
+    theme: &Theme,
+    cx: &mut gpui::Context<RequestView>,
+) -> gpui::Stateful<Div> {
     let active = view.request_tab;
 
+    // **The tabs scroll; nothing else is in this row.** Each tab is `flex_none`, so a strip
+    // wider than the pane used to push whatever followed it off the edge — Save and ⋯ lived
+    // here and were clipped once GraphQL grew a third tab. A scroll container that may shrink
+    // to the pane's width keeps every tab reachable (wheel, or `Alt+Q`).
     let mut strip = div()
+        .id("request-tabs")
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
         .flex_none()
+        .w_full()
+        .min_w(px(0.))
+        .overflow_x_scroll()
         .px_2()
         .bg(theme.bg_panel)
         .border_b_1()
@@ -330,7 +342,7 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
         strip = strip.child(section_tab_boxed(id, label, active == tab, action, theme, cx));
     }
 
-    strip.child(div().flex_1()).child(request_actions(theme))
+    strip
 }
 
 fn count_suffix(label: &str, count: usize) -> String {
@@ -529,6 +541,7 @@ pub(crate) fn toolbar(
                 .child(url_bar(view, theme)),
         )
         .child(send_button(theme, view, cx))
+        .child(request_actions(theme))
 }
 
 /// The URL row's own height, taller than `ui::BAR_HEIGHT`: it holds an inset field and a button
@@ -548,16 +561,18 @@ fn chip_chevron(colour: gpui::Hsla, theme: &Theme) -> impl IntoElement + use<> {
     crate::ui::glyph(Icon::ChevronDown, colour, theme.text, crate::ui::GLYPH_INLINE)
 }
 
-/// The verbs that act on the request, at the far end of the section tabs.
+/// The verbs that act on the request as a whole, at the far end of the URL row, after Send.
 ///
-/// They sat beside Send until the tabs landed, where four grey icons touching the one accent
-/// button made Send read as button 1 of 5. They belong with the request's sections, not with
-/// the thing that sends it.
+/// **Back in this row, after a stay in the tab strip.** They first sat here as four grey icons
+/// touching Send, which made Send read as button 1 of 5, and moved to the end of the section
+/// tabs. That stopped working once the tabs grew — seven on a GraphQL request — and pushed the
+/// pair off the pane's edge. Now they are two, and they sit *after* Send rather than before it,
+/// so Send is still the first thing your eye lands on and the only accent in the row.
 ///
 /// **Save, and a `⋯` for the rest.** Four unlabelled icons in a row read as four equal verbs and
 /// as a second set of tabs, when Save is constant and the others rare — and Import from curl
 /// wore a clipboard, so it and Copy as code looked like two copy buttons. The rare three now
-/// sit in a menu that names them and shows their keys. A rule sets the pair apart from the tabs.
+/// sit in a menu that names them and shows their keys.
 fn request_actions(theme: &Theme) -> Div {
     div()
         .flex()
@@ -565,7 +580,6 @@ fn request_actions(theme: &Theme) -> Div {
         .items_center()
         .gap_1()
         .flex_none()
-        .child(div().flex_none().w(px(1.)).h(px(14.)).mx_1().bg(theme.border))
         .child(icon_button(
             "action-save-request",
             Icon::Save,
