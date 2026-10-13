@@ -473,6 +473,23 @@ fn write_to(path: &std::path::Path, session: &Session) {
     }
 }
 
+/// What a first launch opens: `RequestSpec::sample()`.
+///
+/// **The suite opens a different request**, the one every window-level test was written against —
+/// a POST with a JSON body and headers, so the body editor, formatting and copy-as-curl tests have
+/// something to work on. The welcome request is a product decision and should be free to change
+/// without rewriting tests about the editor; when it changed to a GET with no body, 27 of them
+/// failed for reasons that had nothing to do with what they test.
+#[cfg(not(test))]
+pub fn first_run() -> RequestSpec {
+    RequestSpec::sample()
+}
+
+#[cfg(test)]
+pub fn first_run() -> RequestSpec {
+    crate::tests::fixture_request()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -470,7 +470,7 @@ fn spec_of(view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext) -> Requ
 /// The sample request with a different body, which is the only thing most of these tests
 /// vary. Reaches through the kind so the callers do not each have to.
 fn sample_with_body(body: zuno_core::Body) -> RequestSpec {
-    let mut spec = RequestSpec::sample();
+    let mut spec = fixture_request();
     spec.http_mut().expect("the sample is HTTP").body = body;
     spec
 }
@@ -697,7 +697,7 @@ async fn a_tab_from_a_newer_zuno_is_carried_into_the_next_save(cx: &mut TestAppC
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("session.json");
 
-    let known = serde_json::to_string(&RequestSpec::sample()).expect("serialize");
+    let known = serde_json::to_string(&fixture_request()).expect("serialize");
     let written = format!(
         r#"{{"version":5,"active":0,"tabs":[
             {{"spec":{known},"path":null}},
@@ -3335,7 +3335,7 @@ async fn newlines_never_enter_a_single_line_input(cx: &mut TestAppContext) {
 fn named(name: &str) -> RequestSpec {
     RequestSpec {
         name: name.to_string(),
-        ..RequestSpec::sample()
+        ..fixture_request()
     }
 }
 
@@ -3373,7 +3373,7 @@ async fn ctrl_t_opens_a_buffer_and_focus_follows_it(cx: &mut TestAppContext) {
     let untouched = spec_of(&first, &mut cx);
     assert_eq!(
         untouched.url,
-        RequestSpec::sample().url,
+        fixture_request().url,
         "the first buffer must be untouched"
     );
 }
@@ -3404,7 +3404,7 @@ async fn ctrl_tab_cycles_buffers_and_wraps(cx: &mut TestAppContext) {
 
     // Sitting on the third, so one forward step must wrap to the first.
     cx.press("ctrl-tab");
-    assert_eq!(urls(&mut cx), RequestSpec::sample().url, "next should wrap to the front");
+    assert_eq!(urls(&mut cx), fixture_request().url, "next should wrap to the front");
 
     cx.press("ctrl-shift-tab");
     assert_eq!(urls(&mut cx), "https://c.test", "prev should wrap to the back");
@@ -3829,7 +3829,7 @@ async fn ctrl_w_closes_a_buffer_and_leaves_focus_usable(cx: &mut TestAppContext)
 
     let (count, active) = tabs_of(&window, &mut cx);
     assert_eq!(count, 1);
-    assert_eq!(active.url, RequestSpec::sample().url, "closing should fall back left");
+    assert_eq!(active.url, fixture_request().url, "closing should fall back left");
 
     // After a close, focus is inside a dropped entity unless `activate` moved it — and
     // then no key context matches, so the keymap goes dead with nothing on screen saying
@@ -5410,7 +5410,7 @@ async fn history_does_not_survive_loading_a_different_request(cx: &mut TestAppCo
 
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
-            view.load(RequestSpec::sample(), cx);
+            view.load(fixture_request(), cx);
         })
     });
 
@@ -8473,7 +8473,7 @@ async fn a_sideways_swipe_in_the_editor_does_not_drift_vertically(cx: &mut TestA
         .map(|_| "x".repeat(120))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut spec = RequestSpec::sample();
+    let mut spec = fixture_request();
     spec.http_mut().unwrap().body = Body::Raw {
         text: body,
         kind: RawKind::Text,
@@ -8637,7 +8637,7 @@ async fn a_match_far_down_the_body_is_scrolled_to(cx: &mut TestAppContext) {
     // Loaded from a spec, not typed: 200 lines through `simulate_input` is thirteen seconds.
     let mut body = (0..200).map(|i| format!("\"line{i}\": 1,")).collect::<Vec<_>>();
     body.push("\"needle\": 2".to_string());
-    let mut spec = RequestSpec::sample();
+    let mut spec = fixture_request();
     spec.http_mut().unwrap().body = Body::Raw {
         text: format!("{{\n{}\n}}", body.join("\n")),
         kind: RawKind::Json,
@@ -10010,6 +10010,33 @@ async fn a_multipart_body_survives_a_save_and_reopen(cx: &mut TestAppContext) {
 // was a question Zuno could not answer. See `collection_panel.rs`.
 // ---------------------------------------------------------------------------
 
+/// The request every window in this suite opens with — see `session::first_run`. Kept here, word
+/// for word as the first-run sample once was, so the tests own their fixture rather than borrowing
+/// the product's welcome request.
+pub(crate) fn fixture_request() -> RequestSpec {
+    use zuno_core::{Body, Header, HttpRequest, Method, QueryParam, RawKind, RequestKind};
+    RequestSpec {
+        id: zuno_core::RequestId(1),
+        name: "List repositories".to_string(),
+        url: "https://api.github.com/graphql".to_string(),
+        headers: vec![
+            Header::new("Content-Type", "application/json"),
+            Header::new("Accept", "application/vnd.github+json"),
+            Header::new("User-Agent", concat!("zuno/", env!("CARGO_PKG_VERSION"))),
+            Header::disabled("Authorization", "Bearer {{token}}"),
+        ],
+        kind: RequestKind::Http(HttpRequest {
+            method: Method::Post,
+            query: vec![QueryParam::new("per_page", "50")],
+            body: Body::Raw {
+                text: "{\n  \"query\": \"{ viewer { login } }\"\n}".to_string(),
+                kind: RawKind::Json,
+            },
+        }),
+        ..RequestSpec::default()
+    }
+}
+
 /// Write a request into a collection directory without going through the UI.
 fn seed_request(root: &std::path::Path, relative: &str, url: &str) {
     let path = root.join(relative);
@@ -10018,7 +10045,7 @@ fn seed_request(root: &std::path::Path, relative: &str, url: &str) {
         &path,
         &RequestSpec {
             url: url.to_string(),
-            ..RequestSpec::sample()
+            ..fixture_request()
         },
     )
     .expect("write");

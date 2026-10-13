@@ -407,7 +407,7 @@ impl Workspace {
         // sample request rather than an empty window. `session::load` guarantees a
         // non-empty `tabs` and an in-range `active`, so neither is re-checked here.
         let session = crate::session::load(cx)
-            .unwrap_or_else(|| crate::session::Session::single(RequestSpec::sample()));
+            .unwrap_or_else(|| crate::session::Session::single(crate::session::first_run()));
         let active_ix = session.active;
         let carried_tabs = session.carried.clone();
         if !carried_tabs.is_empty() {

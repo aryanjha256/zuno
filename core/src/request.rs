@@ -1064,25 +1064,28 @@ impl RequestSpec {
 
     /// A populated request for the M1.0 shell to render. Replaced by real
     /// editing in M1.1.
+    /// The request a first launch opens with — Zuno's own repository on GitHub's REST API.
+    ///
+    /// **It has to succeed on the first Send, with nothing set up.** The one it replaced POSTed to
+    /// GitHub's GraphQL endpoint, which needs a token, behind a disabled `Authorization:
+    /// Bearer {{token}}` — a 401 as it stood and a refusal once enabled, so a new user's first
+    /// experience of the app was an error. This one needs no auth and no variables, and answers
+    /// with real JSON worth exploring. Its one limit is GitHub's: 60 unauthenticated calls an hour
+    /// per IP.
     pub fn sample() -> Self {
         Self {
             id: RequestId(1),
-            name: "List repositories".to_string(),
-            url: "https://api.github.com/graphql".to_string(),
+            name: "Zuno on GitHub".to_string(),
+            url: "https://api.github.com/repos/aryanjha256/zuno".to_string(),
             headers: vec![
-                Header::new("Content-Type", "application/json"),
                 Header::new("Accept", "application/vnd.github+json"),
-                Header::new("User-Agent", concat!("zuno/", env!("CARGO_PKG_VERSION"))),
-                Header::disabled("Authorization", "Bearer {{token}}"),
+                Header::new("X-GitHub-Api-Version", "2022-11-28"),
             ],
             settings: RequestSettings::default(),
             kind: RequestKind::Http(HttpRequest {
-                method: Method::Post,
-                query: vec![QueryParam::new("per_page", "50")],
-                body: Body::Raw {
-                    text: "{\n  \"query\": \"{ viewer { login } }\"\n}".to_string(),
-                    kind: RawKind::Json,
-                },
+                method: Method::Get,
+                query: Vec::new(),
+                body: Body::Empty,
             }),
             captures: Vec::new(),
             expect_status: None,
@@ -1320,10 +1323,27 @@ mod tests {
 
     #[test]
     fn disabled_rows_are_excluded_from_the_wire() {
-        let spec = RequestSpec::sample();
-        assert_eq!(spec.headers.len(), 4);
-        assert_eq!(spec.enabled_headers().count(), 3);
+        let spec = RequestSpec {
+            headers: vec![
+                Header::new("Accept", "application/json"),
+                Header::new("User-Agent", "zuno"),
+                Header::disabled("Authorization", "Bearer {{token}}"),
+            ],
+            ..RequestSpec::default()
+        };
+        assert_eq!(spec.enabled_headers().count(), 2);
         assert!(spec.enabled_headers().all(|header| header.name != "Authorization"));
+    }
+
+    /// The first-run request has to succeed on its first Send with nothing set up — the one it
+    /// replaced could not, behind a token it did not have.
+    #[test]
+    fn the_first_run_request_needs_nothing_set_up() {
+        let spec = RequestSpec::sample();
+        assert_eq!(spec.method(), Some(&Method::Get));
+        assert!(spec.auth.is_none());
+        let text = serde_json::to_string(&spec).expect("serialize");
+        assert!(!text.contains("{{"), "no variable to define first: {text}");
     }
 
     #[test]
