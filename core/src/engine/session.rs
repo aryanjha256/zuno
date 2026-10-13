@@ -91,6 +91,15 @@ pub async fn connect(
         }
     };
 
+    // Built before anything connects, so a malformed payload fails here, locally.
+    let init = match graphql.as_ref().map(super::build::connection_init).transpose() {
+        Ok(init) => init,
+        Err(error) => {
+            let _ = events.send(Event::Failed { job, error }).await;
+            return;
+        }
+    };
+
     let started = Instant::now();
     let _ = events.send(Event::Started { job }).await;
 
@@ -220,11 +229,8 @@ pub async fn connect(
     // **`connection_init` first, and nothing may be sent before the ack.** The protocol is
     // explicit that a client which subscribes early gets the connection closed, so the
     // subscribe below waits for `connection_ack` rather than pipelining.
-    if graphql.is_some()
-        && stream
-            .send(Message::Text(r#"{"type":"connection_init"}"#.into()))
-            .await
-            .is_err()
+    if let Some(init) = init
+        && stream.send(Message::Text(init.into())).await.is_err()
     {
         let _ = events
             .send(Event::Failed {

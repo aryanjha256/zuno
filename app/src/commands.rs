@@ -55,6 +55,8 @@ pub fn offered(action: &dyn Action, kind: &crate::kinds::KindEditor) -> bool {
         "zuno::SaveMessage" | "zuno::SendPing" | "zuno::SendBinaryFile" => socket,
         "zuno::DoneSending" | "zuno::OpenGrpcMethod" | "zuno::ShowResponseTrailers" => grpc,
         "zuno::ToggleSchemaBrowser" | "zuno::OpenGraphQlTransport" => graphql,
+        // A third tab only exists where a kind declares one.
+        "zuno::ShowThirdKindTab" => kind.tabs().len() > 2,
         "zuno::ChooseSchemaFile" | "zuno::ReflectSchema" => graphql || grpc,
         "zuno::OpenMethod" => http || graphql,
         "zuno::AddQuery"
@@ -161,6 +163,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Show or hide the auth password", TogglePasswordShown),
         command(format!("Show request {}", slot(0, "params")), ShowParamsTab),
         command(format!("Show request {}", slot(1, "body")), ShowBodyTab),
+        command(format!("Show request {}", slot(2, "connection")), ShowThirdKindTab),
         command("Show request captures", ShowCaptureTab),
         command("Show request assertions", ShowAssertTab),
         command("Run the selected folder", RunFolder),

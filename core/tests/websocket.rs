@@ -423,6 +423,62 @@ fn a_graphql_subscription_rides_a_socket_and_unwraps_its_payloads() {
     server.join().expect("server thread");
 }
 
+/// **The connection params reach the server as `connection_init`'s payload** — what a server
+/// that authenticates subscriptions at the handshake (Hasura, most Apollo setups) reads the
+/// credential from. Before they existed the payload was always empty, and such a server could not
+/// be subscribed to at all. Asserted on the bytes the server received, not on what was built.
+#[test]
+fn connection_params_go_out_as_the_init_payload() {
+    use std::sync::mpsc;
+    use zuno_core::{GraphQlRequest, GraphQlTransport, RequestKind};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (init_tx, init_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(DEADLINE))
+            .expect("read timeout");
+        let mut ws = tungstenite::accept_hdr(
+            stream,
+            |_: &tungstenite::handshake::server::Request,
+             mut response: tungstenite::handshake::server::Response| {
+                response.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    "graphql-transport-ws".parse().expect("header"),
+                );
+                Ok(response)
+            },
+        )
+        .expect("handshake");
+        let init = ws.read().expect("connection_init");
+        let _ = init_tx.send(init.to_text().unwrap_or_default().to_string());
+        let _ = ws.close(None);
+        while ws.read().is_ok() {}
+    });
+
+    let mut spec = RequestSpec::default();
+    spec.url = format!("ws://127.0.0.1:{port}/graphql");
+    spec.kind = RequestKind::GraphQl(GraphQlRequest {
+        query: "subscription { greetings }".to_string(),
+        transport: GraphQlTransport::Auto,
+        connection_params: r#"{"headers": {"Authorization": "Bearer abc"}}"#.to_string(),
+        ..GraphQlRequest::default()
+    });
+
+    let engine = Engine::new().expect("engine");
+    let (_job, _events) = engine.send(spec);
+
+    let init = init_rx.recv_timeout(DEADLINE).expect("the init message");
+    let init: serde_json::Value = serde_json::from_str(&init).expect("JSON");
+    assert_eq!(init["type"], "connection_init");
+    assert_eq!(init["payload"]["headers"]["Authorization"], "Bearer abc");
+
+    server.join().expect("server thread");
+}
+
 /// **A peer that never answers the Close still ends the session.**
 ///
 /// RFC 6455 makes closing an exchange, so the loop goes on reading after `stream.close(None)` —

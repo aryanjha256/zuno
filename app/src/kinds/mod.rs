@@ -255,7 +255,10 @@ impl KindEditor {
         // borrowed temporary here is a compile error rather than a dangle — which is the whole
         // reason these are `&'static` and not owned.
         const HTTP: [KindTab; 2] = [KindTab::new("Params"), KindTab::new("Body")];
-        const GRAPHQL: [KindTab; 2] = [KindTab::new("Query"), KindTab::new("Variables")];
+        // Connection last: set once per server, like Handshake — but after the two you write
+        // every time, since most GraphQL requests never open a socket at all.
+        const GRAPHQL: [KindTab; 3] =
+            [KindTab::new("Query"), KindTab::new("Variables"), KindTab::new("Connection")];
         // Handshake first: it is what you set once, and Message is where the time goes — the
         // same reasoning that puts Body second for HTTP and opens on it.
         const WEBSOCKET: [KindTab; 2] = [KindTab::new("Handshake"), KindTab::new("Message")];
@@ -292,7 +295,8 @@ impl KindEditor {
             //
             // No count: lines are a useful number for a table of rows, not for prose.
             (KindEditor::GraphQl(_), 0) => SharedString::from("Query"),
-            (KindEditor::GraphQl(_), _) => SharedString::from("Variables"),
+            (KindEditor::GraphQl(_), 1) => SharedString::from("Variables"),
+            (KindEditor::GraphQl(_), _) => SharedString::from("Connection"),
             // **The method's name, not the word "Method".** A gRPC buffer is identified by
             // which call it makes, and that is the one thing the URL cannot say — the endpoint
             // is only a host. Bare name rather than the qualified one: the service is usually

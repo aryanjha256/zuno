@@ -22,6 +22,9 @@ pub struct GraphQlEditor {
     /// The variables, as JSON *text*. A second editor rather than a key/value table: they are
     /// a JSON object whose values nest arbitrarily, which a two-column table cannot express.
     pub variables: Entity<Editor>,
+    /// `connection_init`'s payload over WebSocket, as JSON text — see
+    /// `GraphQlRequest::connection_params`. An editor for `variables`' reason: it nests.
+    pub connection: Entity<Editor>,
     /// `operationName` — only meaningful when the document holds more than one named
     /// operation, which is why it is a single line beside the editors rather than a tab.
     pub operation: Entity<TextInput>,
@@ -69,6 +72,13 @@ impl GraphQlEditor {
                 editor
             }),
             variables: cx.new(|cx| Editor::new(&graphql.variables, "{ }", cx)),
+            connection: cx.new(|cx| {
+                Editor::new(
+                    &graphql.connection_params,
+                    "{ \"headers\": { \"Authorization\": \"Bearer {{token}}\" } }",
+                    cx,
+                )
+            }),
             operation: cx.new(|cx| {
                 TextInput::new(
                     graphql.operation.clone().unwrap_or_default(),
@@ -146,6 +156,7 @@ impl GraphQlEditor {
         // out meant a request with only a name filled in was discarded without being asked.
         !self.query.read(cx).text().trim().is_empty()
             || !self.variables.read(cx).text().trim().is_empty()
+            || !self.connection.read(cx).text().trim().is_empty()
             || !self.operation.read(cx).text().trim().is_empty()
             // A transport that was chosen rather than defaulted is a decision, and a kind
             // switch would throw it away as surely as it throws away the document.
@@ -166,6 +177,7 @@ impl GraphQlEditor {
             operation: (!operation.is_empty()).then_some(operation),
             transport: self.transport,
             schema: self.schema.read(cx).text().trim().to_string(),
+            connection_params: self.connection.read(cx).text().to_string(),
         }
     }
 
@@ -182,6 +194,7 @@ impl GraphQlEditor {
             operation,
             transport,
             schema,
+            connection_params,
         } = base;
 
         let typed = self.operation.read(cx).text().trim().to_string();
@@ -193,6 +206,7 @@ impl GraphQlEditor {
             || typed.as_deref() != operation.as_deref()
             || self.transport != *transport
             || self.schema.read(cx).text().trim() != schema
+            || self.connection.read(cx).text() != connection_params
     }
 
     /// Whether this will open a socket, as the engine will decide it.
@@ -219,6 +233,7 @@ impl GraphQlEditor {
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.query.read(cx).focus_handle(cx).is_focused(window)
             || self.variables.read(cx).focus_handle(cx).is_focused(window)
+            || self.connection.read(cx).focus_handle(cx).is_focused(window)
             || self.operation.read(cx).focus_handle(cx).is_focused(window)
             || self.schema.read(cx).focus_handle(cx).is_focused(window)
     }

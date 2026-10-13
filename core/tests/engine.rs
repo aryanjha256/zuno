@@ -1211,6 +1211,7 @@ fn a_graphql_request_sends_its_envelope_as_json() {
         operation: Some("Me".to_string()),
         transport: Default::default(),
         schema: String::new(),
+        connection_params: String::new(),
     });
 
     let (_, events) = engine.send(spec);
@@ -1246,6 +1247,7 @@ fn a_get_graphql_request_sends_no_body() {
         operation: None,
         transport: Default::default(),
         schema: String::new(),
+        connection_params: String::new(),
     });
 
     let (_, events) = engine.send(spec);

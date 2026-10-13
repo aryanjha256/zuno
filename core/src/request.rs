@@ -320,6 +320,19 @@ pub struct GraphQlRequest {
     /// does not know the key — which loses the link and never the file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub schema: String,
+    /// `connection_init`'s payload over WebSocket — graphql-transport-ws's `connectionParams` —
+    /// as JSON *text*. Empty sends none.
+    ///
+    /// **Written by the person, not derived.** The protocol leaves its shape to each server:
+    /// Hasura reads `{"headers": {...}}`, an Apollo server usually `{"authorization": ...}`, and
+    /// an app may read anything it likes — so a payload built from the Auth tab would fit some
+    /// servers and silently fail the rest. Before this existed the payload was always empty, and
+    /// a server that authenticates there could not be subscribed to at all.
+    ///
+    /// Both serde attributes for `transport`'s reason: older files open, untouched ones re-save
+    /// byte for byte, and an older Zuno drops the key on save — the field, never the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub connection_params: String,
 }
 
 /// A gRPC call: which schema, which method on it, and the request message as JSON.
@@ -439,6 +452,7 @@ impl Default for GraphQlRequest {
             operation: None,
             transport: GraphQlTransport::default(),
             schema: String::new(),
+            connection_params: String::new(),
         }
     }
 }
@@ -1639,6 +1653,7 @@ mod tests {
                 operation: Some("R".to_string()),
                 transport: Default::default(),
                 schema: "api.test.graphql".to_string(),
+                connection_params: String::new(),
             }),
             ..RequestSpec::default()
         };

@@ -18,7 +18,7 @@ use crate::actions::{
     ChooseSchemaFile, OpenGrpcMethod, ReflectSchema,
     BodyFindPrev, CancelRequest, ChooseBodyFile, CloseBodyFind,
     OpenBodyType, ReplaceAll, ReplaceNext, SaveMessage, SaveRequest, SendPing,
-    SendRequest, ShowAssertTab, ShowAuthTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab,
+    SendRequest, ShowAssertTab, ShowAuthTab, ShowBodyTab, ShowCaptureTab, ShowHeadersTab, ShowThirdKindTab,
     ShowParamsTab, TogglePasswordShown,
 };
 use crate::ui::{Icon, icon_button};
@@ -153,6 +153,20 @@ pub fn render(
                         .as_ref()
                         .map(|browser| crate::schema_browser::render(browser, theme, cx)),
                 ),
+            (KindEditor::GraphQl(graphql), 2) => pane
+                .child(editor_header(
+                    "Connection",
+                    if graphql.uses_websocket(cx) {
+                        "sent as connection_init's payload when this subscription connects"
+                    } else {
+                        "sent when the operation goes over WebSocket — a subscription, on Auto"
+                    },
+                    theme,
+                ))
+                .child(
+                    editor_region(theme, focused_editor(&graphql.connection, window, cx))
+                        .child(graphql.connection.clone()),
+                ),
             (KindEditor::GraphQl(graphql), _) => pane
                 // **Not `section_header`.** That one is for row tables and draws an add
                 // control unconditionally — pointed here at `RowKind::Query`, it rendered an
@@ -275,14 +289,21 @@ fn section_tabs(view: &RequestView, theme: &Theme, cx: &mut gpui::Context<Reques
                 SharedString::from(count_suffix(metadata_label(view), view.headers.len())),
                 Box::new(ShowHeadersTab),
             ),
-            // **Two slot actions, because no kind has a third tab yet.** A kind that declares
-            // one would have no way to reach it, which `every_kinds_tabs_have_an_action` fails
-            // on rather than leaving as a dead control — that is the point to add a
-            // parameterised `ShowKindTab(u8)`, not before.
+            // **One action per slot, three slots.** GraphQL's Connection was the first third tab;
+            // a kind that declares a fourth would have no way to reach it, which
+            // `every_kinds_tabs_have_an_action` fails on rather than leaving as a dead control.
             RequestTab::Kind(slot) => (
-                if slot == 0 { "request-tab-kind-0" } else { "request-tab-kind-1" },
+                match slot {
+                    0 => "request-tab-kind-0",
+                    1 => "request-tab-kind-1",
+                    _ => "request-tab-kind-2",
+                },
                 view.kind.tab_label(slot),
-                if slot == 0 { Box::new(ShowParamsTab) } else { Box::new(ShowBodyTab) },
+                match slot {
+                    0 => Box::new(ShowParamsTab) as Box<dyn gpui::Action>,
+                    1 => Box::new(ShowBodyTab),
+                    _ => Box::new(ShowThirdKindTab),
+                },
             ),
             // Names the choice when there is one, as `Headers 3` names a count: what a hidden tab
             // costs is not knowing whether anything is in it.

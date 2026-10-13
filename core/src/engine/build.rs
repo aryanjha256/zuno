@@ -349,6 +349,36 @@ pub fn build(client: &Client, spec: &RequestSpec) -> Result<Request, EngineError
 /// `variables` is parsed here rather than held parsed, so the editor can carry text that is
 /// invalid mid-keystroke (§3.1). It must be a JSON **object**: the spec defines it as a map,
 /// and a bare array or number is a mistake worth naming rather than forwarding.
+/// The `connection_init` message: `{"type":"connection_init"}`, with the request's connection
+/// params as its `payload` when there are any.
+///
+/// Checked here, before the socket opens, so a typo is "nothing left the machine" rather than a
+/// server closing the connection with a code to look up. An unresolved `{{var}}` is refused for
+/// the URL's reason — it is almost always the credential, and sending it literally can only fail.
+/// The payload must be an object; the protocol defines it as one.
+pub fn connection_init(graphql: &GraphQlRequest) -> Result<String, EngineError> {
+    let params = graphql.connection_params.trim();
+    if params.is_empty() {
+        return Ok(r#"{"type":"connection_init"}"#.to_string());
+    }
+    if let Some(name) = find_unresolved_variable(params) {
+        return Err(EngineError::UnresolvedVariable {
+            name,
+            location: "the connection params".to_string(),
+        });
+    }
+    let payload: serde_json::Value = serde_json::from_str(params).map_err(|error| EngineError::Build {
+        reason: format!("the connection params are not valid JSON: {error}"),
+    })?;
+    if !payload.is_object() {
+        return Err(EngineError::Build {
+            reason: "the connection params must be a JSON object, like {\"authorization\": \"…\"}"
+                .to_string(),
+        });
+    }
+    Ok(serde_json::json!({ "type": "connection_init", "payload": payload }).to_string())
+}
+
 pub fn graphql_envelope(graphql: &GraphQlRequest) -> Result<serde_json::Value, EngineError> {
     if graphql.query.trim().is_empty() {
         return Err(EngineError::EmptyGraphQlQuery);
@@ -514,6 +544,21 @@ fn build_http(
 mod tests {
     use super::*;
     use crate::request::{FormField, Header, MultipartField, QueryParam, RawKind};
+
+    #[test]
+    fn connection_params_are_checked_before_anything_connects() {
+        let with = |params: &str| GraphQlRequest {
+            connection_params: params.to_string(),
+            ..GraphQlRequest::default()
+        };
+        assert_eq!(connection_init(&with("")).unwrap(), r#"{"type":"connection_init"}"#);
+        assert!(matches!(
+            connection_init(&with(r#"{"authorization": "Bearer {{token}}"}"#)),
+            Err(EngineError::UnresolvedVariable { name, .. }) if name == "token"
+        ));
+        assert!(matches!(connection_init(&with("{not json")), Err(EngineError::Build { .. })));
+        assert!(matches!(connection_init(&with("[1]")), Err(EngineError::Build { .. })));
+    }
 
     /// **A scheme-less gRPC address is plaintext only on loopback**, and the narrowness is the
     /// point: the wide version would send credentials out readable.

@@ -161,6 +161,9 @@ fn body(spec: &RequestSpec) -> Pairs {
             if !graphql.variables.trim().is_empty() {
                 pairs.extend(text_pairs(&graphql.variables, "variables "));
             }
+            if !graphql.connection_params.trim().is_empty() {
+                pairs.extend(text_pairs(&graphql.connection_params, "connection "));
+            }
             pairs
         }
         _ => Vec::new(),

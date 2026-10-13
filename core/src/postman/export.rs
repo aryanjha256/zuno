@@ -430,6 +430,7 @@ mod tests {
             operation: None,
             transport: Default::default(),
             schema: String::new(),
+            connection_params: String::new(),
         });
         write(&root.join("me.json"), &gql).expect("write");
 

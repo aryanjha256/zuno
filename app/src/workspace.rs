@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowThirdKindTab, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -5813,6 +5813,14 @@ impl Workspace {
         self.show_request_tab(RequestTab::Kind(1), cx);
     }
 
+    fn show_third_kind_tab(&mut self, _: &ShowThirdKindTab, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active() else { return };
+        if view.read(cx).kind.tabs().len() < 3 {
+            return;
+        }
+        self.show_request_tab(RequestTab::Kind(2), cx);
+    }
+
     fn show_capture_tab(&mut self, _: &ShowCaptureTab, _: &mut Window, cx: &mut Context<Self>) {
         self.show_request_tab(RequestTab::Capture, cx);
     }
@@ -8481,6 +8489,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_response_changes))
             .on_action(cx.listener(Self::git_discard_active))
             .on_action(cx.listener(Self::git_raw_diff))
+            .on_action(cx.listener(Self::show_third_kind_tab))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_defaults))

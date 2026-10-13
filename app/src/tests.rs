@@ -775,10 +775,14 @@ async fn a_kinds_tab_strip_is_named_by_the_kind(cx: &mut TestAppContext) {
         gql.iter().any(|l| l == "Query"),
         "a GraphQL request must have a Query tab: {gql:?}"
     );
-    assert!(
-        gql.iter().any(|l| l == "Variables"),
-        "and a Variables tab: {gql:?}"
+    // Counted, not `any`: a third tab once fell through to the Variables label, and `any` passed
+    // with two of them on screen.
+    assert_eq!(
+        gql.iter().filter(|l| *l == "Variables").count(),
+        1,
+        "exactly one Variables tab: {gql:?}"
     );
+    assert!(gql.iter().any(|l| l == "Connection"), "and a Connection tab: {gql:?}");
     assert!(
         !gql.iter().any(|l| l.starts_with("Params") || l.starts_with("Body")),
         "and neither Params nor Body, which describe a kind it isn't: {gql:?}"
@@ -787,10 +791,10 @@ async fn a_kinds_tab_strip_is_named_by_the_kind(cx: &mut TestAppContext) {
 
 /// **Every tab a kind declares must be reachable.**
 ///
-/// The strip maps slot 0 and slot 1 onto `ShowParamsTab` and `ShowBodyTab`; a kind declaring a
-/// third tab would render a control with no action behind it. That is a dead control, which is
-/// the failure `affordances()` exists to prevent — so it fails here instead, and the fix is a
-/// parameterised `ShowKindTab(u8)` at that point rather than speculatively now.
+/// The strip maps slots 0, 1 and 2 onto `ShowParamsTab`, `ShowBodyTab` and `ShowThirdKindTab`; a
+/// kind declaring a fourth would render a control with no action behind it. That is a dead
+/// control, which is the failure `affordances()` exists to prevent — so it fails here instead.
+/// This test is what made GraphQL's Connection tab get an action rather than ship dead.
 #[gpui::test]
 async fn every_kinds_tabs_have_an_action(cx: &mut TestAppContext) {
     let (_window, view, mut cx) = boot(cx, None, None);
@@ -805,9 +809,9 @@ async fn every_kinds_tabs_have_an_action(cx: &mut TestAppContext) {
             })
         });
         assert!(
-            count <= 2,
-            "{} declares {count} tabs but only slots 0 and 1 have actions — add a \
-             parameterised ShowKindTab before declaring a third",
+            count <= 3,
+            "{} declares {count} tabs but only slots 0 to 2 have actions — add one before \
+             declaring a fourth",
             choice.label()
         );
     }
@@ -3431,6 +3435,7 @@ async fn a_graphql_request_survives_being_loaded_and_read_back(cx: &mut TestAppC
             operation: Some("Repos".to_string()),
             transport: Default::default(),
             schema: "api.test.graphql".to_string(),
+            connection_params: String::new(),
         }),
         ..RequestSpec::default()
     };

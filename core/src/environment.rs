@@ -311,6 +311,8 @@ impl Resolver {
             RequestKind::GraphQl(graphql) => {
                 scan(&graphql.query);
                 scan(&graphql.variables);
+                // Where a subscription's credential usually lives, so the likeliest place of all.
+                scan(&graphql.connection_params);
             }
             // The request message is the only field here that reaches the wire as *content*.
             // `proto`, `service` and `method` are schema coordinates — they address the call
@@ -405,6 +407,7 @@ impl Resolver {
             RequestKind::GraphQl(graphql) => {
                 graphql.query = self.resolve(&graphql.query).into_owned();
                 graphql.variables = self.resolve(&graphql.variables).into_owned();
+                graphql.connection_params = self.resolve(&graphql.connection_params).into_owned();
             }
             // A saved message is sent verbatim, so `{{token}}` in one has to be substituted
             // here or it reaches the server literally — the same failure form bodies had.

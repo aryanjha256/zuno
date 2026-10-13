@@ -1399,6 +1399,14 @@ Reasons recorded so a future session can judge them, not commitments.
   Server, Hasura and graphql-yoga all default to the socket; before this, a subscription was
   POSTed and the failure said nothing about the transport being the problem.
 
+  **Connection params — done**, and before them those same servers still could not be used when
+  they authenticate the socket: `connection_init` always went out with no payload. A GraphQL
+  request's third tab, **Connection**, holds the payload as JSON — written by the person, because
+  its shape is the server's choice (Hasura reads `{"headers": {...}}`, Apollo usually
+  `{"authorization": ...}`), so deriving it from the Auth tab would fit some servers and silently
+  fail the rest. `{{variables}}` resolve in it; an unresolved one, invalid JSON or a non-object is
+  refused before the socket opens. Empty sends no payload, as before.
+
   `GraphQlRequest::transport` is `Auto` / `Http` / `WebSocket`, and **`Auto` reads the document**
   — `core/src/graphql.rs` finds the operation `operationName` selects, or the only one there is,
   and a `subscription` opens a socket. It is a sniff, not a parser: anything it cannot make sense

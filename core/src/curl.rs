@@ -1343,6 +1343,7 @@ mod tests {
                 operation: None,
                 transport: Default::default(),
                 schema: String::new(),
+                connection_params: String::new(),
             }),
             ..RequestSpec::default()
         }

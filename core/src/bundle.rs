@@ -244,6 +244,7 @@ mod tests {
             operation: Some("Me".into()),
             transport: Default::default(),
             schema: String::new(),
+            connection_params: String::new(),
         });
         write(&root.join("me.json"), &spec).expect("write");
 

@@ -599,6 +599,7 @@ fn graphql_from(body: &Value, method: Option<Method>) -> GraphQlRequest {
         transport: Default::default(),
         // Postman's GraphQL body has no schema reference to import.
         schema: String::new(),
+        connection_params: String::new(),
     }
 }
 

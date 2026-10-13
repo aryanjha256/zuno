@@ -61,6 +61,7 @@ actions!(
         GitAbort,
         GitOpenConflict,
         ShowResponseChanges,
+        ShowThirdKindTab,
         GitDiscardActive,
         GitRawDiff,
         OpenPalette,
