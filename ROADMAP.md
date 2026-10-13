@@ -439,7 +439,7 @@ toggle says what will happen, the badge says what *is* happening.
 back — with each row carrying its status, size and duration, because "which run was the 500?" is the
 question you open it to answer. Choosing one shows it and re-indexes its body off-thread.
 
-**Git — in progress, slice 1 of 3 done.** The format was always built for git (one request per
+**Git — in progress, slices 1 and 2 of 3 done.** The format was always built for git (one request per
 file, stable bytes); now Zuno speaks it. **A workspace is the repository** — the broad project
 space, synced Bruno-style through the team's own remote, never a Zuno cloud, so it sits inside the
 local-first principle rather than against the collaboration non-goal. A solo developer syncing
@@ -451,8 +451,14 @@ between machines is the same feature.
   them; the switch carries a dot from any view. Git not installed, and a folder that is not a
   repository (Initialize), are states of the view, not errors. A first commit with no name or
   email turns into a two-field form, global by default.
-- **Slice 2 — next: sync.** Publish to a remote URL, Sync = fetch, rebase (or the repo's own
-  `pull.rebase`), push, and the conflict state that sends you to your editor.
+- **Slice 2 — done: sync.** Publish (a remote URL, first push, tracking set). Sync = fetch,
+  rebase onto the remote (merge only where the repo sets `pull.rebase=false`), push — with
+  `--autostash`, so uncommitted edits ride along. A conflict stops it in a red state: Open in
+  editor, Continue (refused while `<<<<<<<` markers remain), Undo sync; the list shows CONFLICTS
+  and what is INCOMING. **After any of these, open tabs with no edits reload from disk**, and tabs
+  with edits are named — otherwise the next `Ctrl+S` writes the old version over a teammate's.
+  The ↓/↑ counts are as of the last fetch: Zuno never fetches on its own, because a background
+  fetch can pop an ssh passphrase dialog nobody asked for.
 - **Slice 3: join and inspect.** Clone from New workspace, and a request's diff against its last
   commit — field by field, in a tab of its own.
 

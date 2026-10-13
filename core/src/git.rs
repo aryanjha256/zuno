@@ -65,20 +65,70 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let output = self.command(dir).args(args).output().map_err(|error| {
-            if error.kind() == io::ErrorKind::NotFound {
-                GitError::NotInstalled
-            } else {
-                GitError::Io(error.to_string())
+        let output = self.command(dir).args(args).output().map_err(spawn_error)?;
+        checked(output)
+    }
+
+    /// `run`, for a call that talks to a remote — and may therefore never come back.
+    ///
+    /// **`GIT_TERMINAL_PROMPT=0` covers git's own prompts and not ssh's**: a key with a passphrase
+    /// and no agent makes ssh read `/dev/tty` directly, so a Zuno launched from a terminal would
+    /// wait on a question nobody can see, with the Sync button spinning forever. Bounded instead,
+    /// and the timeout says what probably happened.
+    fn run_remote<I, S>(&self, dir: &Path, args: I) -> Result<Output, GitError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let mut child = self
+            .command(dir)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(spawn_error)?;
+        let deadline = std::time::Instant::now() + REMOTE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(GitError::Failed(
+                        "git gave up waiting for the remote — it may be asking for a password or \
+                         passphrase. Run one fetch in a terminal, or add your key to an ssh agent."
+                            .to_string(),
+                    ));
+                }
+                Err(error) => return Err(GitError::Io(error.to_string())),
             }
-        })?;
-        if output.status.success() {
-            Ok(output)
-        } else {
-            Err(GitError::Failed(
-                String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ))
         }
+        checked(child.wait_with_output().map_err(|error| GitError::Io(error.to_string()))?)
+    }
+}
+
+/// How long a fetch, pull or push may take before it is presumed stuck on a prompt.
+const REMOTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn spawn_error(error: io::Error) -> GitError {
+    if error.kind() == io::ErrorKind::NotFound {
+        GitError::NotInstalled
+    } else {
+        GitError::Io(error.to_string())
+    }
+}
+
+fn checked(output: Output) -> Result<Output, GitError> {
+    if output.status.success() {
+        Ok(output)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // Some failures — a conflicting rebase among them — explain themselves on stdout.
+        Err(GitError::Failed(if stderr.is_empty() { stdout } else { stderr }))
     }
 }
 
@@ -90,6 +140,8 @@ pub enum GitError {
     NoIdentity,
     /// A commit with nothing in it.
     NothingToCommit,
+    /// A sync stopped on a file changed on both sides; the repository is mid-rebase or mid-merge.
+    Conflict,
     /// Git said no; its own message, trimmed.
     Failed(String),
     Io(String),
@@ -101,6 +153,7 @@ impl std::fmt::Display for GitError {
             GitError::NotInstalled => write!(f, "git isn't installed"),
             GitError::NoIdentity => write!(f, "git doesn't know who you are yet"),
             GitError::NothingToCommit => write!(f, "nothing to commit"),
+            GitError::Conflict => write!(f, "a request changed on both sides"),
             GitError::Failed(message) => write!(f, "{message}"),
             GitError::Io(message) => write!(f, "could not run git: {message}"),
         }
@@ -188,10 +241,26 @@ pub struct FileChange {
     pub kind: ChangeKind,
 }
 
+/// A sync that stopped partway, waiting on the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Rebase,
+    Merge,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
-    /// `None` on a detached HEAD.
+    /// `None` on a detached HEAD — which is also what a rebase in progress looks like.
     pub branch: Option<String>,
+    /// No commit yet: there is nothing to publish until there is one.
+    pub initial: bool,
+    /// Whether any remote is configured; Publish is offered until one is.
+    pub remote: bool,
+    /// A rebase or merge stopped on a conflict.
+    pub operation: Option<Operation>,
+    /// What the remote branch changes that this one has not taken yet, inside the workspace —
+    /// as of the last fetch, so it is current right after a Sync and may lag before one.
+    pub incoming: Vec<FileChange>,
     /// Whether the branch tracks a remote branch at all.
     pub upstream: bool,
     pub ahead: u32,
@@ -207,7 +276,83 @@ pub fn status(git: &Git, repo: &Repo) -> Result<Status, GitError> {
         &repo.toplevel,
         ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
     )?;
-    Ok(parse_status(&output.stdout, &repo.prefix()))
+    let mut status = parse_status(&output.stdout, &repo.prefix());
+    status.remote = !git.run(&repo.toplevel, ["remote"])?.stdout.trim_ascii().is_empty();
+    let dir = git_dir(git, repo)?;
+    status.operation = operation_in(&dir);
+    // Which commit is "theirs" and which "ours" for the incoming list. **Mid-rebase `HEAD` is
+    // detached** — no branch, no `@{upstream}` — so both come from the files the rebase keeps:
+    // `onto` is what it is rebasing onto, `ORIG_HEAD` the branch as it was, `head-name` its name.
+    let sides = match status.operation {
+        Some(Operation::Rebase) => {
+            let state = ["rebase-merge", "rebase-apply"]
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.exists());
+            let read = |file: &str| {
+                state
+                    .as_ref()
+                    .and_then(|state| std::fs::read_to_string(state.join(file)).ok())
+                    .map(|text| text.trim().to_string())
+            };
+            if let Some(branch) = read("head-name") {
+                status.branch = Some(branch.trim_start_matches("refs/heads/").to_string());
+            }
+            read("onto").map(|onto| (onto, "ORIG_HEAD".to_string()))
+        }
+        _ if status.upstream && (status.behind > 0 || status.operation.is_some()) => {
+            Some(("@{upstream}".to_string(), "HEAD".to_string()))
+        }
+        _ => None,
+    };
+    if let Some((theirs, ours)) = sides {
+        status.incoming = incoming(git, repo, &theirs, &ours).unwrap_or_default();
+    }
+    Ok(status)
+}
+
+fn git_dir(git: &Git, repo: &Repo) -> Result<PathBuf, GitError> {
+    let output = git.run(&repo.toplevel, ["rev-parse", "--absolute-git-dir"])?;
+    Ok(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
+/// Whether a rebase or merge is waiting, read off the git directory the way git itself does.
+fn operation(git: &Git, repo: &Repo) -> Result<Option<Operation>, GitError> {
+    Ok(operation_in(&git_dir(git, repo)?))
+}
+
+fn operation_in(dir: &Path) -> Option<Operation> {
+    if dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists() {
+        Some(Operation::Rebase)
+    } else if dir.join("MERGE_HEAD").exists() {
+        Some(Operation::Merge)
+    } else {
+        None
+    }
+}
+
+/// The workspace files `theirs` changes since it and `ours` diverged.
+fn incoming(git: &Git, repo: &Repo, theirs: &str, ours: &str) -> Result<Vec<FileChange>, GitError> {
+    let base = git.run(&repo.toplevel, ["merge-base", ours, theirs])?;
+    let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
+    let output = git.run(
+        &repo.toplevel,
+        ["diff", "--name-status", "-z", "--no-renames", &base, theirs],
+    )?;
+    let prefix = repo.prefix();
+    let mut fields = output.stdout.split(|&b| b == 0).map(|f| String::from_utf8_lossy(f).to_string());
+    let mut files = Vec::new();
+    while let (Some(letter), Some(path)) = (fields.next(), fields.next()) {
+        let kind = match letter.as_str() {
+            "A" => ChangeKind::Added,
+            "D" => ChangeKind::Deleted,
+            _ => ChangeKind::Modified,
+        };
+        if let Some(path) = within(&path, &prefix) {
+            files.push(FileChange { path, kind });
+        }
+    }
+    Ok(files)
 }
 
 /// Read `git status --porcelain=v2 --branch -z`, keeping the entries under `prefix`.
@@ -225,6 +370,7 @@ pub fn parse_status(bytes: &[u8], prefix: &str) -> Status {
             let (key, value) = header.split_once(' ').unwrap_or((header, ""));
             match key {
                 "branch.head" if value != "(detached)" => status.branch = Some(value.to_string()),
+                "branch.oid" => status.initial = value == "(initial)",
                 "branch.upstream" => status.upstream = true,
                 "branch.ab" => {
                     for part in value.split(' ') {
@@ -328,6 +474,113 @@ pub fn set_identity(
     let scope = if everywhere { "--global" } else { "--local" };
     git.run(workdir, ["config", scope, "user.name", name])?;
     git.run(workdir, ["config", scope, "user.email", email])?;
+    Ok(())
+}
+
+/// Put the repository on a remote for the first time: `origin` set to `url`, the branch pushed
+/// and tracked, so every later Sync is plain.
+pub fn publish(git: &Git, repo: &Repo, url: &str) -> Result<(), GitError> {
+    if status(git, repo)?.initial {
+        return Err(GitError::Failed("Commit first — there is nothing to publish yet".into()));
+    }
+    let remotes = git.run(&repo.toplevel, ["remote"])?;
+    let has_origin = String::from_utf8_lossy(&remotes.stdout).lines().any(|r| r == "origin");
+    let verb = if has_origin { "set-url" } else { "add" };
+    git.run(&repo.toplevel, ["remote", verb, "origin", url])?;
+    git.run_remote(&repo.toplevel, ["push", "-u", "origin", "HEAD"])?;
+    Ok(())
+}
+
+/// Bring the branch level with its remote: fetch, take their commits under ours, push ours.
+///
+/// **Rebase unless the repository says otherwise** — `pull.rebase=false` is the one way a team
+/// tells git it wants merges, and it is honoured; anything else (unset included) rebases, so the
+/// history stays a line rather than gaining a merge commit per sync. `--autostash` lets a sync run
+/// over uncommitted edits, putting them back afterwards. Done as a local rebase or merge onto the
+/// fetched `@{upstream}` rather than `git pull`, which would fetch a second time.
+///
+/// A conflict is not a failure: it returns `Conflict` and leaves the repository mid-operation for
+/// `continue_sync` or `abort_sync`.
+pub fn sync(git: &Git, repo: &Repo) -> Result<(), GitError> {
+    let before = status(git, repo)?;
+    if before.operation.is_some() {
+        return Err(GitError::Conflict);
+    }
+    if !before.remote {
+        return Err(GitError::Failed("Publish to a remote first".into()));
+    }
+    git.run_remote(&repo.toplevel, ["fetch", "--prune"])?;
+    let fetched = status(git, repo)?;
+    if fetched.upstream && fetched.behind > 0 {
+        let merges = git
+            .run(&repo.toplevel, ["config", "--get", "pull.rebase"])
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "false")
+            .unwrap_or(false);
+        let taken = if merges {
+            git.run(&repo.toplevel, ["merge", "--no-edit", "--autostash", "@{upstream}"])
+        } else {
+            git.run(&repo.toplevel, ["rebase", "--autostash", "@{upstream}"])
+        };
+        if let Err(error) = taken {
+            return Err(match operation(git, repo)? {
+                Some(_) => GitError::Conflict,
+                None => error,
+            });
+        }
+    }
+    push_if_ahead(git, repo)
+}
+
+fn push_if_ahead(git: &Git, repo: &Repo) -> Result<(), GitError> {
+    let now = status(git, repo)?;
+    if !now.upstream {
+        git.run_remote(&repo.toplevel, ["push", "-u", "origin", "HEAD"])?;
+    } else if now.ahead > 0 {
+        git.run_remote(&repo.toplevel, ["push"])?;
+    }
+    Ok(())
+}
+
+/// Finish a sync that stopped on a conflict, once the files are fixed — then push.
+///
+/// A conflicted file stays "unmerged" to git until it is added, so whether it is *fixed* is read
+/// from its contents: any line still opening with git's `<<<<<<<` marker means not yet, and the
+/// file is named. Without that check, Continue would commit the markers into a request file and
+/// the next scan would report it unreadable.
+pub fn continue_sync(git: &Git, repo: &Repo) -> Result<(), GitError> {
+    let now = status(git, repo)?;
+    let Some(operation) = now.operation else {
+        return push_if_ahead(git, repo);
+    };
+    for file in now.files.iter().filter(|f| f.kind == ChangeKind::Conflicted) {
+        let text = std::fs::read_to_string(repo.workdir.join(&file.path)).unwrap_or_default();
+        if text.lines().any(|line| line.starts_with("<<<<<<<")) {
+            return Err(GitError::Failed(format!("{} still has conflict markers", file.path)));
+        }
+    }
+    git.run(&repo.workdir, ["add", "-A", "--", "."])?;
+    let finished = match operation {
+        // `core.editor=true` accepts the commit message git would otherwise open an editor for.
+        Operation::Rebase => git.run(&repo.toplevel, ["-c", "core.editor=true", "rebase", "--continue"]),
+        Operation::Merge => git.run(&repo.toplevel, ["commit", "--no-edit"]),
+    };
+    if let Err(error) = finished {
+        // The next commit of a rebase can conflict too; that is the same state again, not an error.
+        return Err(match self::operation(git, repo)? {
+            Some(_) => GitError::Conflict,
+            None => error,
+        });
+    }
+    push_if_ahead(git, repo)
+}
+
+/// Put everything back as it was before the sync began, uncommitted edits included.
+pub fn abort_sync(git: &Git, repo: &Repo) -> Result<(), GitError> {
+    match operation(git, repo)? {
+        Some(Operation::Rebase) => git.run(&repo.toplevel, ["rebase", "--abort"])?,
+        Some(Operation::Merge) => git.run(&repo.toplevel, ["merge", "--abort"])?,
+        None => return Ok(()),
+    };
     Ok(())
 }
 
@@ -475,6 +728,116 @@ u UU N... 100644 100644 100644 100644 h1 h2 h3 orders/conflict.json\0\
 
         set_identity(&scratch.git, &scratch.ws(), "Test", "test@example.com", false).unwrap();
         commit(&scratch.git, &repo, "first").unwrap();
+    }
+
+    /// A bare repository for the team's remote, the workspace published to it, and a teammate's
+    /// clone of it beside them.
+    fn team(name: &str) -> (Scratch, Repo, Repo) {
+        let scratch = Scratch::new(name);
+        scratch.identify();
+        let remote = scratch.root.join("remote.git");
+        scratch.git.run(&scratch.root, ["init", "--bare", "remote.git"]).unwrap();
+
+        init(&scratch.git, &scratch.ws()).unwrap();
+        scratch.write("orders/create.json", "{\n  \"amount\": 100\n}\n");
+        let mine = scratch.repo(&scratch.ws());
+        commit(&scratch.git, &mine, "first").unwrap();
+        publish(&scratch.git, &mine, &remote.display().to_string()).unwrap();
+
+        scratch
+            .git
+            .run(&scratch.root, ["clone", &remote.display().to_string(), "theirs"])
+            .unwrap();
+        let theirs = scratch.repo(&scratch.root.join("theirs"));
+        (scratch, mine, theirs)
+    }
+
+    fn merges(scratch: &Scratch, repo: &Repo) -> usize {
+        let out = scratch.git.run(&repo.toplevel, ["rev-list", "--merges", "HEAD"]).unwrap();
+        String::from_utf8_lossy(&out.stdout).lines().count()
+    }
+
+    #[test]
+    fn sync_takes_their_commits_under_ours_and_pushes() {
+        let (scratch, mine, theirs) = team("sync");
+        assert!(status(&scratch.git, &mine).unwrap().upstream, "publish tracks the branch");
+
+        std::fs::write(theirs.workdir.join("users.json"), "{}").unwrap();
+        commit(&scratch.git, &theirs, "theirs").unwrap();
+        sync(&scratch.git, &theirs).unwrap();
+
+        scratch.write("health.json", "{}");
+        commit(&scratch.git, &mine, "mine").unwrap();
+        sync(&scratch.git, &mine).unwrap();
+
+        assert!(mine.workdir.join("users.json").exists(), "their request arrived");
+        let after = status(&scratch.git, &mine).unwrap();
+        assert_eq!((after.ahead, after.behind), (0, 0), "and ours went up");
+        assert_eq!(merges(&scratch, &mine), 0, "rebased: no merge commit");
+    }
+
+    #[test]
+    fn a_repo_that_asks_for_merges_gets_one() {
+        let (scratch, mine, theirs) = team("merge");
+        scratch.git.run(&mine.toplevel, ["config", "pull.rebase", "false"]).unwrap();
+
+        std::fs::write(theirs.workdir.join("users.json"), "{}").unwrap();
+        commit(&scratch.git, &theirs, "theirs").unwrap();
+        sync(&scratch.git, &theirs).unwrap();
+        scratch.write("health.json", "{}");
+        commit(&scratch.git, &mine, "mine").unwrap();
+
+        sync(&scratch.git, &mine).unwrap();
+        assert_eq!(merges(&scratch, &mine), 1);
+    }
+
+    /// Both sides change the same request: Sync stops on it, Continue refuses while the markers are
+    /// still in the file, then finishes — and pushes — once they are gone.
+    #[test]
+    fn a_conflict_stops_the_sync_until_it_is_fixed() {
+        let (scratch, mine, theirs) = team("conflict");
+        std::fs::write(theirs.workdir.join("orders/create.json"), "{\n  \"amount\": 300\n}\n").unwrap();
+        commit(&scratch.git, &theirs, "theirs").unwrap();
+        sync(&scratch.git, &theirs).unwrap();
+        scratch.write("orders/create.json", "{\n  \"amount\": 250\n}\n");
+        commit(&scratch.git, &mine, "mine").unwrap();
+
+        assert_eq!(sync(&scratch.git, &mine), Err(GitError::Conflict));
+        let stopped = status(&scratch.git, &mine).unwrap();
+        assert_eq!(stopped.operation, Some(Operation::Rebase));
+        assert!(stopped.files.iter().any(|f| f.path == "orders/create.json"
+            && f.kind == ChangeKind::Conflicted));
+        assert!(
+            stopped.incoming.iter().any(|f| f.path == "orders/create.json"),
+            "what the remote brings is listed even mid-rebase: {:?}",
+            stopped.incoming
+        );
+
+        assert!(matches!(continue_sync(&scratch.git, &mine), Err(GitError::Failed(m)) if m.contains("conflict markers")));
+
+        scratch.write("orders/create.json", "{\n  \"amount\": 250\n}\n");
+        continue_sync(&scratch.git, &mine).unwrap();
+        let done = status(&scratch.git, &mine).unwrap();
+        assert_eq!(done.operation, None);
+        assert_eq!((done.ahead, done.behind), (0, 0), "finished and pushed");
+    }
+
+    #[test]
+    fn undo_puts_the_branch_back_as_it_was() {
+        let (scratch, mine, theirs) = team("abort");
+        std::fs::write(theirs.workdir.join("orders/create.json"), "{\n  \"amount\": 300\n}\n").unwrap();
+        commit(&scratch.git, &theirs, "theirs").unwrap();
+        sync(&scratch.git, &theirs).unwrap();
+        scratch.write("orders/create.json", "{\n  \"amount\": 250\n}\n");
+        commit(&scratch.git, &mine, "mine").unwrap();
+        assert_eq!(sync(&scratch.git, &mine), Err(GitError::Conflict));
+
+        abort_sync(&scratch.git, &mine).unwrap();
+        let back = status(&scratch.git, &mine).unwrap();
+        assert_eq!(back.operation, None);
+        assert_eq!((back.ahead, back.behind), (1, 1));
+        let text = std::fs::read_to_string(mine.workdir.join("orders/create.json")).unwrap();
+        assert!(text.contains("250"), "our version, untouched: {text}");
     }
 
     #[test]

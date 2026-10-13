@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -3906,6 +3906,157 @@ impl Workspace {
         if let Some(form) = self.git.identity.as_mut() {
             form.everywhere = !form.everywhere;
             cx.notify();
+        }
+    }
+
+    /// Run a git operation that can rewrite the workspace's files — publish, sync, continue, undo —
+    /// then rescan, reload the open tabs it changed, and say how it went.
+    fn run_git_op(
+        &mut self,
+        busy: &'static str,
+        done: &'static str,
+        op: impl FnOnce(&zuno_core::git::Git, &zuno_core::git::Repo) -> Result<(), zuno_core::git::GitError>
+        + Send
+        + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.git.repo().cloned() else { return };
+        if self.git.busy.is_some() {
+            return;
+        }
+        let git = crate::git_panel::runner(cx);
+        self.git.busy = Some(busy);
+        self.git.error = None;
+        let work = cx.background_executor().spawn(async move { op(&git, &repo) });
+        self.git.work = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = work.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.git.busy = None;
+                match result {
+                    Ok(()) => this.set_status(done, cx),
+                    // Not a failure: the view turns into the conflict state on the refresh below.
+                    Err(zuno_core::git::GitError::Conflict) => {}
+                    Err(error) => this.git.error = Some(error.to_string()),
+                }
+                this.refresh_tree(cx);
+                this.reload_changed_tabs(window, cx);
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// After git rewrote files under open tabs: reload every tab with no edits of its own from
+    /// disk, and leave — and name — any tab that has edits.
+    ///
+    /// **Without this a sync loses work.** A tab keeps the request it opened with, so after a sync
+    /// brought in a teammate's change it showed the old version, read as edited against the new
+    /// file, and the next `Ctrl+S` wrote the old version back over theirs — silently, since
+    /// nothing on screen said the file had moved.
+    fn reload_changed_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let tabs: Vec<(usize, PathBuf, bool)> = self
+            .views
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, view)| {
+                let view = view.read(cx);
+                view.path.clone().map(|path| (ix, path, view.is_dirty(cx)))
+            })
+            .collect();
+        if tabs.is_empty() {
+            return;
+        }
+        cx.spawn_in(window, async move |workspace, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    tabs.into_iter()
+                        .filter_map(|(ix, path, dirty)| {
+                            collection::read(&path).ok().map(|spec| (ix, spec, dirty))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            let _ = workspace.update_in(cx, |workspace, window, cx| {
+                let mut kept = Vec::new();
+                let mut reloaded_active = false;
+                for (ix, spec, dirty) in read {
+                    let Some(view) = workspace.views.get(ix).cloned() else { continue };
+                    if view.read(cx).baseline == spec {
+                        continue;
+                    }
+                    if dirty {
+                        kept.push(view.read(cx).label(cx).to_string());
+                        continue;
+                    }
+                    view.update(cx, |view, cx| {
+                        let id = view.spec(cx).id;
+                        view.load(RequestSpec { id, ..spec }, cx);
+                        cx.notify();
+                    });
+                    reloaded_active |= ix == workspace.active_ix;
+                }
+                // `load` rebuilt the active tab's inputs, so focus sat on dropped entities.
+                if reloaded_active {
+                    workspace.activate(workspace.active_ix, window, cx);
+                }
+                if !kept.is_empty() {
+                    workspace.set_status(
+                        &format!(
+                            "Changed in the sync, but you have edits open — saving overwrites the \
+                             new version: {}",
+                            kept.join(", ")
+                        ),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn git_publish(&mut self, _: &GitPublish, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self.git.remote_url.read(cx).text().trim().to_string();
+        if url.is_empty() {
+            self.git.error = Some("Paste the remote's URL first".to_string());
+            let focus = self.git.remote_url.read(cx).focus_handle(cx);
+            window.focus(&focus);
+            cx.notify();
+            return;
+        }
+        self.run_git_op(
+            "Publishing…",
+            "Published",
+            move |git, repo| zuno_core::git::publish(git, repo, &url),
+            window,
+            cx,
+        );
+    }
+
+    fn git_sync(&mut self, _: &GitSync, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_git_op("Syncing…", "Synced", zuno_core::git::sync, window, cx);
+    }
+
+    fn git_continue(&mut self, _: &GitContinue, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_git_op("Continuing…", "Synced", zuno_core::git::continue_sync, window, cx);
+    }
+
+    fn git_abort(&mut self, _: &GitAbort, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_git_op("Undoing…", "Sync undone", zuno_core::git::abort_sync, window, cx);
+    }
+
+    /// Open the first conflicted file in the system's editor for `.json`.
+    fn git_open_conflict(&mut self, _: &GitOpenConflict, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(repo) = self.git.repo() else { return };
+        let conflicted = self.git.status.as_ref().and_then(|status| {
+            status
+                .files
+                .iter()
+                .find(|file| file.kind == zuno_core::git::ChangeKind::Conflicted)
+        });
+        if let Some(file) = conflicted {
+            cx.open_with_system(&repo.workdir.join(&file.path));
         }
     }
 
@@ -8048,6 +8199,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::git_commit))
             .on_action(cx.listener(Self::git_save_identity))
             .on_action(cx.listener(Self::git_toggle_identity_scope))
+            .on_action(cx.listener(Self::git_publish))
+            .on_action(cx.listener(Self::git_sync))
+            .on_action(cx.listener(Self::git_continue))
+            .on_action(cx.listener(Self::git_abort))
+            .on_action(cx.listener(Self::git_open_conflict))
             .on_action(cx.listener(Self::open_palette))
             .on_action(cx.listener(Self::open_settings))
             .on_action(cx.listener(Self::open_defaults))

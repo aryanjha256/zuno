@@ -11488,6 +11488,81 @@ async fn a_workspace_is_initialized_and_committed_from_the_git_view(cx: &mut Tes
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// A teammate's change pulled by Sync reaches the tab open on that request.
+///
+/// **This is the data-loss half of Sync.** A tab keeps the request it opened with; if it is not
+/// reloaded, it shows the old version, reads as edited against the new file, and the next
+/// `Ctrl+S` writes the old version back over the teammate's — silently.
+#[gpui::test]
+async fn a_synced_change_reaches_the_open_tab(cx: &mut TestAppContext) {
+    let dir = scratch_dir("git-sync-tab");
+    let root = dir.join("ws");
+    let config = dir.join("gitconfig");
+    std::fs::write(
+        &config,
+        "[init]\n\tdefaultBranch = main\n[user]\n\tname = Test\n\temail = test@example.com\n",
+    )
+    .expect("config");
+    let git = zuno_core::git::Git::isolated(&config);
+    // The teammate's side, run as plain git with the same isolated config.
+    let teammate = |dir: &std::path::Path, args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?}");
+    };
+
+    seed_request(&root, "orders.json", "https://a.test/v1/orders");
+    zuno_core::git::init(&git, &root).expect("init");
+    let repo = match zuno_core::git::probe(&git, &root) {
+        zuno_core::git::Probe::Repo(repo) => repo,
+        other => panic!("{other:?}"),
+    };
+    zuno_core::git::commit(&git, &repo, "first").expect("commit");
+    teammate(&dir, &["init", "--bare", "remote.git"]);
+    let remote = dir.join("remote.git").display().to_string();
+    zuno_core::git::publish(&git, &repo, &remote).expect("publish");
+    teammate(&dir, &["clone", &remote, "theirs"]);
+    seed_request(&dir.join("theirs"), "orders.json", "https://a.test/v2/orders");
+    teammate(&dir.join("theirs"), &["commit", "-am", "v2"]);
+    teammate(&dir.join("theirs"), &["push"]);
+
+    let (window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.update(|_, cx| cx.set_global(crate::git_panel::GitRunner(git.clone())));
+
+    cx.press("ctrl-p");
+    wait_for(&mut cx, "the saved request", |cx| {
+        picker_rows(&window, cx).iter().any(|r| r.contains("orders")).then_some(())
+    });
+    cx.simulate_input("orders");
+    cx.press("enter");
+    assert_eq!(tabs_of(&window, &mut cx).1.url, "https://a.test/v1/orders");
+
+    cx.press("alt-g");
+    wait_for(&mut cx, "the repository", |cx| {
+        window
+            .update(cx, |workspace, _, _| workspace.git.status.is_some().then_some(()))
+            .expect("window")
+    });
+    window
+        .update(&mut cx, |_, window, cx| window.dispatch_action(Box::new(crate::actions::GitSync), cx))
+        .expect("window");
+
+    wait_for(&mut cx, "the teammate's URL in the open tab", |cx| {
+        (tabs_of(&window, cx).1.url == "https://a.test/v2/orders").then_some(())
+    });
+    let dirty = window
+        .update(&mut cx, |workspace, _, cx| workspace.active().expect("tab").read(cx).is_dirty(cx))
+        .expect("window");
+    assert!(!dirty, "reloaded from the file, so it matches it");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 #[gpui::test]
 async fn escape_abandons_a_new_folder(cx: &mut TestAppContext) {
     let dir = scratch_dir("panel-new-folder-escape");

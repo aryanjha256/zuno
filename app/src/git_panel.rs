@@ -10,14 +10,15 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext as _, Context, Div, Entity, Global, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, Styled,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled,
     Task, UniformListScrollHandle, div, px, uniform_list,
 };
 use zuno_core::collection::{Badge, NodeKind};
 use zuno_core::git::{ChangeKind, FileChange, Git, Probe, Status};
 
 use crate::actions::{
-    GitCommit, GitInit, GitOpenDownload, GitRefresh, GitSaveIdentity, GitToggleIdentityScope,
+    GitAbort, GitCommit, GitContinue, GitInit, GitOpenConflict, GitOpenDownload, GitPublish,
+    GitRefresh, GitSaveIdentity, GitSync, GitToggleIdentityScope,
 };
 use crate::input::{Editor, TextInput};
 use crate::theme::Theme;
@@ -47,6 +48,8 @@ pub struct GitState {
     /// Shown in place of the commit box after a commit git refused for want of a name.
     pub identity: Option<IdentityForm>,
     pub message: Entity<Editor>,
+    /// Publish's remote URL.
+    pub remote_url: Entity<TextInput>,
     pub scroll: UniformListScrollHandle,
     pub(crate) refresh: Option<Task<()>>,
     pub(crate) work: Option<Task<()>>,
@@ -67,6 +70,12 @@ impl GitState {
             editor.leave_tab_order();
             editor
         });
+        let remote_url = cx.new(|cx| {
+            let mut input =
+                TextInput::new(String::new(), "git@github.com:you/workspace.git", "GitRemote", cx);
+            input.leave_tab_order();
+            input
+        });
         Self {
             probe: None,
             status: None,
@@ -74,6 +83,7 @@ impl GitState {
             error: None,
             identity: None,
             message,
+            remote_url,
             scroll: UniformListScrollHandle::new(),
             refresh: None,
             work: None,
@@ -149,10 +159,16 @@ pub fn render(workspace: &Workspace, theme: &Theme, cx: &mut Context<Workspace>)
         Some(Probe::NotInstalled) => vec![not_installed(theme).into_any_element()],
         Some(Probe::NotARepo) => vec![not_a_repo(git, theme).into_any_element()],
         Some(Probe::Repo(repo)) => {
-            let mut body = vec![toolbar(git.status.as_ref(), theme).into_any_element()];
-            body.push(match &git.identity {
-                Some(form) => identity_box(form, git, theme).into_any_element(),
-                None => commit_box(git, theme).into_any_element(),
+            let mut body = vec![toolbar(git, theme).into_any_element()];
+            let status = git.status.as_ref();
+            let stopped = status.is_some_and(|status| status.operation.is_some());
+            if status.is_some_and(|status| !status.remote) {
+                body.push(publish_card(git, theme).into_any_element());
+            }
+            body.push(match (&git.identity, stopped) {
+                (_, true) => conflict_box(git, theme).into_any_element(),
+                (Some(form), false) => identity_box(form, git, theme).into_any_element(),
+                (None, false) => commit_box(git, theme).into_any_element(),
             });
             body.push(changes(workspace, theme, cx).into_any_element());
             if repo.is_nested() {
@@ -233,15 +249,25 @@ fn not_a_repo(git: &GitState, theme: &Theme) -> Div {
     .children(git.error.clone().map(|error| error_line(error, theme)))
 }
 
-fn toolbar(status: Option<&Status>, theme: &Theme) -> Div {
+fn toolbar(git: &GitState, theme: &Theme) -> Div {
+    let status = git.status.as_ref();
     let branch = status
         .and_then(|status| status.branch.clone())
         .unwrap_or_else(|| "detached".to_string());
-    let tracking = match status {
-        Some(status) if !status.upstream => "local only".to_string(),
-        Some(status) if status.ahead == 0 && status.behind == 0 => "up to date".to_string(),
-        Some(status) => format!("↓{} ↑{}", status.behind, status.ahead),
-        None => String::new(),
+    // The right end: Sync once there is a remote to sync with, a plain word otherwise.
+    let right = match status {
+        Some(status) if status.operation.is_some() => plain("Syncing paused", theme),
+        Some(status) if !status.remote => plain("local only", theme),
+        Some(status) => {
+            let counts = if status.upstream {
+                format!("↓{} ↑{}", status.behind, status.ahead)
+            } else {
+                "not pushed".to_string()
+            };
+            sync_button(git.busy.filter(|busy| *busy == "Syncing…"), counts, theme)
+                .into_any_element()
+        }
+        None => plain("", theme),
     };
     div()
         .flex()
@@ -272,13 +298,157 @@ fn toolbar(status: Option<&Status>, theme: &Theme) -> Div {
                         .child(branch),
                 ),
         )
+        .child(right)
+}
+
+fn plain(text: &'static str, theme: &Theme) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .text_size(px(10.5))
+        .text_color(theme.text_faint)
+        .child(text)
+        .into_any_element()
+}
+
+/// Sync, with how far apart the branch and its remote are as of the last fetch.
+fn sync_button(busy: Option<&'static str>, counts: String, theme: &Theme) -> gpui::Stateful<Div> {
+    div()
+        .id("git-sync")
+        .debug_selector(|| "git-sync".to_string())
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .flex_none()
+        .h(px(22.))
+        .px(px(8.))
+        .rounded(px(4.))
+        .border_1()
+        .border_color(theme.border_focused)
+        .text_size(px(11.))
+        .text_color(theme.text)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.bg_hover))
+        .tooltip(|window, cx| {
+            crate::ui::Tooltip::for_action("Fetch, rebase onto the remote, push", &GitSync, window, cx)
+        })
+        .on_mouse_down(MouseButton::Left, |_: &MouseDownEvent, window, cx| {
+            cx.stop_propagation();
+            window.dispatch_action(Box::new(GitSync), cx);
+        })
+        .child(glyph(Icon::RotateCw, theme.text, theme.text, 12.))
+        .child(busy.unwrap_or("Sync"))
+        .child(div().text_color(theme.text_faint).child(counts))
+}
+
+/// The first push: a remote's URL and Publish.
+fn publish_card(git: &GitState, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(7.))
+        .m_2()
+        .p(px(10.))
+        .rounded(px(5.))
+        .bg(theme.bg_elevated)
+        .border_1()
+        .border_color(theme.border)
         .child(
             div()
-                .flex_none()
-                .text_size(px(10.5))
-                .text_color(theme.text_faint)
-                .child(tracking),
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.text)
+                .child("Publish to a remote"),
         )
+        .child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.text_muted)
+                .child("Create an empty repository on GitHub, GitLab or anywhere, and paste its URL."),
+        )
+        .child(crate::ui::field_box(git.remote_url.clone(), theme))
+        .child(button(
+            "git-publish",
+            git.busy.filter(|busy| *busy == "Publishing…").unwrap_or("Publish"),
+            GitPublish,
+            false,
+            theme,
+        ))
+}
+
+/// A sync stopped on a conflict: what happened, and the three ways on.
+fn conflict_box(git: &GitState, theme: &Theme) -> Div {
+    let red = theme.status_server_error;
+    let conflicted: Vec<&FileChange> = git
+        .status
+        .as_ref()
+        .map(|status| {
+            status
+                .files
+                .iter()
+                .filter(|file| file.kind == ChangeKind::Conflicted)
+                .collect()
+        })
+        .unwrap_or_default();
+    let name = |file: &FileChange| {
+        let file = file.path.rsplit('/').next().unwrap_or(&file.path);
+        file.strip_suffix(".json").unwrap_or(file).to_string()
+    };
+    let (title, body) = match conflicted.as_slice() {
+        [] => (
+            "Conflicts fixed".to_string(),
+            "Continue to finish the sync and push.".to_string(),
+        ),
+        [one] => (
+            "1 request changed on both sides".to_string(),
+            format!("Your edit and a teammate's both touch {}. Fix it in your editor, then continue.", name(one)),
+        ),
+        many => (
+            format!("{} requests changed on both sides", many.len()),
+            "Fix them in your editor, then continue.".to_string(),
+        ),
+    };
+    let mut actions = div().flex().flex_row().flex_wrap().gap(px(6.)).mt(px(2.));
+    if !conflicted.is_empty() {
+        actions = actions.child(button("git-open-conflict", "Open in editor", GitOpenConflict, false, theme));
+    }
+    actions = actions
+        .child(button(
+            "git-continue",
+            git.busy.filter(|busy| *busy == "Continuing…").unwrap_or("Continue"),
+            GitContinue,
+            conflicted.is_empty(),
+            theme,
+        ))
+        .child(button(
+            "git-abort",
+            git.busy.filter(|busy| *busy == "Undoing…").unwrap_or("Undo sync"),
+            GitAbort,
+            false,
+            theme,
+        ));
+    div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(6.))
+        .m_2()
+        .p(px(10.))
+        .rounded(px(5.))
+        .bg(red.alpha(0.10))
+        .border_1()
+        .border_color(red.alpha(0.35))
+        .child(
+            div()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(red)
+                .child(title),
+        )
+        .child(div().text_size(px(11.)).text_color(theme.text_muted).child(body))
+        .child(actions)
+        .children(git.error.clone().map(|error| error_line(error, theme)))
 }
 
 fn commit_box(git: &GitState, theme: &Theme) -> Div {
@@ -446,14 +616,49 @@ fn button<A: gpui::Action + Clone + 'static>(
     }
 }
 
-/// The changed files: a heading with the count, then one row each.
+/// One line of the Git view's list: a section's heading with its count, or a file in it.
+#[derive(Clone)]
+enum Line {
+    Heading(&'static str, usize),
+    File(FileChange),
+}
+
+/// The sections, in order. Mid-sync: what is conflicted, then what the remote brings — the local
+/// changes git is replaying are its business until it stops. Otherwise: what you changed, then
+/// what the remote has that you have not taken yet.
+fn lines(status: &Status) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut section = |title: &'static str, files: Vec<FileChange>| {
+        if !files.is_empty() {
+            lines.push(Line::Heading(title, files.len()));
+            lines.extend(files.into_iter().map(Line::File));
+        }
+    };
+    if status.operation.is_some() {
+        section(
+            "CONFLICTS",
+            status
+                .files
+                .iter()
+                .filter(|file| file.kind == ChangeKind::Conflicted)
+                .cloned()
+                .collect(),
+        );
+    } else {
+        section("CHANGES", status.files.clone());
+    }
+    section("INCOMING", status.incoming.clone());
+    lines
+}
+
+/// The changed files, by section.
 fn changes(workspace: &Workspace, theme: &Theme, cx: &mut Context<Workspace>) -> impl IntoElement + use<> {
-    let files: Vec<FileChange> = workspace
+    let lines: Vec<Line> = workspace.git.status.as_ref().map(lines).unwrap_or_default();
+    let nothing = workspace
         .git
         .status
         .as_ref()
-        .map(|status| status.files.clone())
-        .unwrap_or_default();
+        .is_none_or(|status| status.files.is_empty() && status.operation.is_none());
     let root = crate::collections::root(cx).map(Path::to_path_buf);
     // A changed request's row wears the same pill or icon as its tree row.
     let badges: HashMap<PathBuf, Badge> = workspace
@@ -466,9 +671,8 @@ fn changes(workspace: &Workspace, theme: &Theme, cx: &mut Context<Workspace>) ->
         .collect();
     let entity = cx.entity();
     let row_theme = theme.clone();
-    let count = files.len();
 
-    let empty = files.is_empty().then(|| {
+    let empty = nothing.then(|| {
         div()
             .px_3()
             .pt_3()
@@ -482,37 +686,41 @@ fn changes(workspace: &Workspace, theme: &Theme, cx: &mut Context<Workspace>) ->
         .flex_col()
         .flex_1()
         .min_h(px(0.))
-        .children((!files.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_row()
-                .justify_between()
-                .items_end()
-                .h(px(26.))
-                .pl_3()
-                .pr(px(10.))
-                .pb(px(5.))
-                .text_size(px(10.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text_faint)
-                .child("CHANGES")
-                .child(count.to_string())
-        }))
         .children(empty)
         .child(
-            uniform_list("git-changes", files.len(), move |range, _window, _cx| {
+            uniform_list("git-changes", lines.len(), move |range, _window, _cx| {
                 range
-                    .map(|ix| {
-                        let change = &files[ix];
-                        let path = root.as_ref().map(|root| root.join(&change.path));
-                        let badge = path.as_ref().and_then(|path| badges.get(path)).cloned();
-                        change_row(ix, change, badge, path, &row_theme, entity.clone())
+                    .map(|ix| match &lines[ix] {
+                        Line::Heading(title, count) => section_heading(title, *count, &row_theme),
+                        Line::File(change) => {
+                            let path = root.as_ref().map(|root| root.join(&change.path));
+                            let badge = path.as_ref().and_then(|path| badges.get(path)).cloned();
+                            change_row(ix, change, badge, path, &row_theme, entity.clone())
+                        }
                     })
                     .collect()
             })
             .track_scroll(workspace.git.scroll.clone())
             .flex_1(),
         )
+}
+
+fn section_heading(title: &'static str, count: usize, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_between()
+        .items_end()
+        .w_full()
+        .h(px(26.))
+        .pl_3()
+        .pr(px(10.))
+        .pb(px(5.))
+        .text_size(px(10.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.text_faint)
+        .child(title)
+        .child(count.to_string())
 }
 
 fn change_row(

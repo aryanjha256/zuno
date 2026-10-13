@@ -67,7 +67,7 @@ use crate::actions::{
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev, CompleteNext, CompletePrev,
     CompleteAccept, CompleteConfirm, CompleteDismiss, TriggerCompletion,
     SettingDecrease, SettingIncrease, SettingNext, SettingPrev, SettingsDismiss, ShowHistory, ShowAllHistory,
-    HistoryNext, HistoryPrev, HistoryOpen, ShowGit, GitCommit, GitSaveIdentity,
+    HistoryNext, HistoryPrev, HistoryOpen, ShowGit, GitCommit, GitSaveIdentity, GitPublish,
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove,
     ClearCookies, CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove,
     NextResponseTab, PrevResponseTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
@@ -399,6 +399,7 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         // global binding, so the tie goes to this one.
         bind!(mac, "ctrl-enter", GitCommit, Some("GitMessage")),
         bind!(mac, "enter", GitSaveIdentity, Some("GitIdentity")),
+        bind!(mac, "enter", GitPublish, Some("GitRemote")),
         // --- Find in the response ---
         //
         // Below the globals for the third time and the same reason: `escape` here has to be

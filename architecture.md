@@ -3817,6 +3817,15 @@ purpose:
   `environment::ensure_gitignored`**, so a `.gitignore` edited by hand cannot let a
   `*.local.json` through. Tests run git with `Git::isolated` — a scratch global config, no system
   config — because the identity form writes `--global` by default (invariant 6).
+  **Sync is a local rebase onto the fetched `@{upstream}`**, not `git pull` (which would fetch
+  twice), with `--autostash`; `pull.rebase=false` gets a merge instead. Calls that reach a remote
+  run under a 120-second timeout: `GIT_TERMINAL_PROMPT=0` silences git's prompts but not ssh's,
+  and a passphrase-protected key with no agent makes ssh wait on `/dev/tty` forever. Mid-rebase
+  `HEAD` is detached, so status reads the branch and "theirs" from `rebase-merge/head-name` and
+  `onto`. Continue refuses while a conflicted file still has `<<<<<<<` lines, or it would commit
+  markers into a request. **Every operation that can rewrite files reloads the open tabs that
+  have no edits** (`reload_changed_tabs`) — a tab otherwise keeps the old request and `Ctrl+S`
+  writes it over the incoming one; tabs with edits are left and named.
 - **Global history: a JSON-lines log, still not SQLite** (`zuno_core::history`, under
   `<config>/history/<workspace id>/`, never in the collection). One line per send, appended off
   the UI thread; bodies ≤1 MB in `bodies/<id>`, the oldest dropped past 50 MB; the log trimmed to
