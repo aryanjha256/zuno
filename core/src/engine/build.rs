@@ -283,6 +283,17 @@ pub fn build_body(spec: &RequestSpec) -> Result<PreparedBody, EngineError> {
                         filename: None,
                         bytes: text.clone().into_bytes(),
                     },
+                    // An OpenAPI import leaves required file parts on with no file, since
+                    // the file is the user's to choose; "could not read the body file :"
+                    // named neither the part nor what to do about it.
+                    MultipartValue::File(path) if path.as_os_str().is_empty() => {
+                        return Err(EngineError::Build {
+                            reason: format!(
+                                "the multipart field \"{}\" has no file chosen — pick one in the Body tab",
+                                field.name.trim()
+                            ),
+                        });
+                    }
                     MultipartValue::File(path) => {
                         // Read here rather than streamed, matching the binary body: the
                         // whole file enters memory. Fine for the uploads an API client

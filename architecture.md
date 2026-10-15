@@ -1700,6 +1700,15 @@ Decisions worth keeping:
   draft, and opening the editor on the right keys nested correctly beats an empty buffer. A
   pre-filled parameter row looks like a decision someone made, and a wrong value *sent* is worse
   than an empty one you have to fill.
+- **The spec's auth is stamped on each request, its secret left as a variable.** Zuno has no
+  folder-level auth, so before this a spec whose every operation needs a token — all thirteen
+  real ones tried declared one — imported as hundreds of requests to fix by hand. `bearer` and
+  OAuth become the Auth tab's Bearer, `basic` its Basic, an API key the header or query row it
+  names; the `{{bearerToken}}`/`{{apiKey}}` they use go into the import's environment, empty and
+  secret, so a key is pasted once. `security: []` is a public endpoint and gets nothing.
+- **Form and multipart bodies arrive as rows, valued like parameters, not like a JSON body.**
+  An author's example or default, otherwise empty, and only required fields on — a row reads as
+  a decision. Stripe declares 611 of 612 operations form-encoded and all of them imported empty.
 - **`$ref` is local-only, and cycles end at a depth cap.** A remote `$ref` is an HTTP fetch in
   the middle of parsing — IO, a runtime, and failures a document cannot express. A cap rather
   than a visited-set because a `User` whose `manager` is a `User` is legal and common, and one

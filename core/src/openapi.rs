@@ -21,9 +21,10 @@
 
 use serde_json::Value;
 
-use crate::import::{Import, Imported};
+use crate::import::{Import, Imported, Variable};
 use crate::{
-    Body, Header, HttpRequest, Method, QueryParam, RawKind, RequestId, RequestKind, RequestSpec,
+    Auth, Body, FormField, Header, HttpRequest, Method, MultipartField, MultipartValue, QueryParam,
+    RawKind, RequestId, RequestKind, RequestSpec,
 };
 
 /// How deep to follow a schema when inventing an example body.
@@ -76,12 +77,21 @@ pub fn parse(root: &Value) -> Result<Import, OpenApiError> {
         title,
         ..Import::default()
     };
+    let mut auth = AuthPlan::new(root);
+    // Operations a split spec keeps in other files. Counted, not listed: DigitalOcean's has 845,
+    // and they all share one cause.
+    let mut external: Vec<String> = Vec::new();
+    let mut external_paths: Vec<String> = Vec::new();
 
     for (path, item) in paths {
         let Some(item) = item.as_object() else {
             import.skipped.push(format!("{path}: not an object"));
             continue;
         };
+        if let Some(reference) = external_ref(item) {
+            external_paths.push(format!("{path} ({reference})"));
+            continue;
+        }
 
         // Parameters declared on the path apply to every operation under it, and an operation
         // may add its own. Collected once rather than per method.
@@ -96,14 +106,229 @@ pub fn parse(root: &Value) -> Result<Import, OpenApiError> {
                 import.skipped.push(format!("{verb} {path}: not an object"));
                 continue;
             };
+            if let Some(reference) = external_ref(operation) {
+                external.push(reference.to_string());
+            }
 
-            import
-                .requests
-                .push(operation_to_request(root, &base, path, method, operation, &shared, &mut import.skipped));
+            let mut imported =
+                operation_to_request(root, &base, path, method, operation, &shared, &mut import.skipped);
+            auth.apply(operation, &mut imported.spec);
+            import.requests.push(imported);
         }
     }
 
+    if let Some(example) = external.first() {
+        import.skipped.push(format!(
+            "{} operations are in other files the spec points to ({example}, …) — Zuno reads one \
+             file, so they have their method and URL only. Import the bundled spec for the rest",
+            external.len()
+        ));
+    }
+    if let Some(example) = external_paths.first() {
+        import.skipped.push(format!(
+            "{} paths are defined entirely in other files, e.g. {example} — not imported",
+            external_paths.len()
+        ));
+    }
+    auth.finish(&mut import);
+
     Ok(import)
+}
+
+/// A `$ref` to another file, standing in for a path item or an operation.
+///
+/// **Reported, never followed.** The importer is handed a document, not a location, so a sibling
+/// file is as unreachable as a remote one — and a split spec quietly importing as bare URLs, with
+/// "0 skipped", was the failure found on DigitalOcean's.
+fn external_ref(object: &serde_json::Map<String, Value>) -> Option<&str> {
+    object
+        .get("$ref")
+        .and_then(Value::as_str)
+        .filter(|reference| !reference.starts_with('#'))
+}
+
+/// How a spec's `securitySchemes` land on its requests.
+///
+/// **Stamped per request, with the secret left as a variable.** Zuno has no folder-level auth, so
+/// an API whose every operation needs a token imported as hundreds of requests to fix by hand —
+/// every spec tried declared its auth, and none of it arrived. Each request gets the scheme in
+/// the field Zuno already sends, and the variable it names goes into the environment the import
+/// creates and selects, so a key is pasted once.
+struct AuthPlan<'a> {
+    root: &'a Value,
+    schemes: Option<&'a serde_json::Map<String, Value>>,
+    /// The spec-wide requirement, which an operation's own `security` replaces.
+    default: Option<&'a Value>,
+    /// Only one `apiKey` scheme can be called `{{apiKey}}`.
+    api_keys: usize,
+    variables: Vec<String>,
+    unsupported: std::collections::BTreeSet<String>,
+}
+
+impl<'a> AuthPlan<'a> {
+    fn new(root: &'a Value) -> Self {
+        let schemes = root
+            .get("components")
+            .and_then(|components| components.get("securitySchemes"))
+            .and_then(Value::as_object);
+        let api_keys = schemes
+            .map(|schemes| {
+                schemes
+                    .values()
+                    .filter(|scheme| {
+                        resolve(root, scheme).get("type").and_then(Value::as_str) == Some("apiKey")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        Self {
+            root,
+            schemes,
+            default: root.get("security"),
+            api_keys,
+            variables: Vec::new(),
+            unsupported: Default::default(),
+        }
+    }
+
+    /// The first requirement that can be met in full. `{}` is an *optional* requirement — the
+    /// operation also works anonymously — so it is passed over rather than read as "no auth",
+    /// and `security: []` on an operation is an explicitly public endpoint, which gets nothing.
+    fn apply(&mut self, operation: &serde_json::Map<String, Value>, spec: &mut RequestSpec) {
+        let Some(requirements) = operation
+            .get("security")
+            .or(self.default)
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+
+        for requirement in requirements {
+            let Some(names) = requirement.as_object().filter(|names| !names.is_empty()) else {
+                continue;
+            };
+            let effects: Option<Vec<SchemeEffect>> =
+                names.keys().map(|name| self.effect(name)).collect();
+            let Some(effects) = effects else { continue };
+
+            for effect in effects {
+                match effect {
+                    SchemeEffect::Auth(auth) => spec.auth = auth,
+                    SchemeEffect::Header(header) => {
+                        if !spec.headers.iter().any(|h| h.name.eq_ignore_ascii_case(&header.name)) {
+                            spec.headers.push(header);
+                        }
+                    }
+                    SchemeEffect::Query(param) => {
+                        if let Some(http) = spec.http_mut()
+                            && !http.query.iter().any(|q| q.name == param.name)
+                        {
+                            http.query.push(param);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    fn effect(&mut self, name: &str) -> Option<SchemeEffect> {
+        let scheme = resolve(self.root, self.schemes?.get(name)?);
+        let kind = scheme.get("type").and_then(Value::as_str).unwrap_or_default();
+
+        let effect = match kind {
+            "http" => match scheme
+                .get("scheme")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("bearer") => SchemeEffect::Auth(Auth::Bearer {
+                    token: self.variable("bearerToken"),
+                }),
+                Some("basic") => SchemeEffect::Auth(Auth::Basic {
+                    username: self.variable("username"),
+                    password: self.variable("password"),
+                }),
+                _ => return self.unsupported(name, kind),
+            },
+            // The token comes from a flow Zuno does not run; what goes on the wire is a bearer
+            // token, so the request is ready the moment one is pasted.
+            "oauth2" | "openIdConnect" => SchemeEffect::Auth(Auth::Bearer {
+                token: self.variable("bearerToken"),
+            }),
+            "apiKey" => {
+                let key = scheme.get("name").and_then(Value::as_str)?.to_string();
+                let variable = if self.api_keys > 1 {
+                    self.variable(&variable_name(name))
+                } else {
+                    self.variable("apiKey")
+                };
+                match scheme.get("in").and_then(Value::as_str) {
+                    Some("header") => SchemeEffect::Header(Header {
+                        enabled: true,
+                        name: key,
+                        value: variable,
+                    }),
+                    Some("query") => SchemeEffect::Query(QueryParam {
+                        enabled: true,
+                        name: key,
+                        value: variable,
+                    }),
+                    Some("cookie") => SchemeEffect::Header(Header {
+                        enabled: true,
+                        name: "Cookie".to_string(),
+                        value: format!("{key}={variable}"),
+                    }),
+                    _ => return self.unsupported(name, kind),
+                }
+            }
+            _ => return self.unsupported(name, kind),
+        };
+        Some(effect)
+    }
+
+    fn variable(&mut self, name: &str) -> String {
+        if !self.variables.iter().any(|known| known == name) {
+            self.variables.push(name.to_string());
+        }
+        format!("{{{{{name}}}}}")
+    }
+
+    fn unsupported(&mut self, name: &str, kind: &str) -> Option<SchemeEffect> {
+        self.unsupported.insert(format!("{name} ({kind})"));
+        None
+    }
+
+    /// Empty and secret: the value is the user's, and it belongs in the gitignored half.
+    fn finish(self, import: &mut Import) {
+        import
+            .variables
+            .extend(self.variables.into_iter().map(|name| Variable {
+                name,
+                value: String::new(),
+                secret: true,
+            }));
+        for scheme in self.unsupported {
+            import
+                .skipped
+                .push(format!("auth scheme {scheme} — not imported, add it by hand"));
+        }
+    }
+}
+
+enum SchemeEffect {
+    Auth(Auth),
+    Header(Header),
+    Query(QueryParam),
+}
+
+/// A scheme's name as a `{{variable}}`: the characters a variable name may hold, the rest `_`.
+fn variable_name(scheme: &str) -> String {
+    scheme
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
 }
 
 /// The first server's URL, with a trailing slash removed so joining a path is unambiguous.
@@ -248,7 +473,8 @@ fn parameter_example(parameter: &serde_json::Map<String, Value>) -> String {
     }
 }
 
-/// The JSON request body, if the operation declares one, and the content type to send it as.
+/// The request body, if the operation declares one, and the content type to send it as — `None`
+/// for a form or multipart body, whose content type the engine sets from the body itself.
 fn request_body(
     root: &Value,
     operation: &serde_json::Map<String, Value>,
@@ -264,13 +490,61 @@ fn request_body(
         return (Body::Empty, None);
     };
 
-    // JSON only. A spec offering `multipart/form-data` or `application/xml` is describing a body
-    // Zuno can author but this importer would have to invent, and an invented XML document is
-    // less use than an empty editor plus the knowledge that a body is expected.
-    let Some((content_type, media)) = content
+    // JSON first; then the two form encodings, whose fields Zuno edits as rows; then `*/*` with a
+    // schema, which is how Kubernetes declares what is in practice a JSON body. XML and the rest
+    // stay empty: an invented XML document is less use than an empty editor plus the knowledge
+    // that a body is expected.
+    let json = content
         .iter()
         .find(|(name, _)| name.starts_with("application/json") || name.ends_with("+json"))
-    else {
+        .map(|(name, media)| (name.clone(), media))
+        .or_else(|| {
+            content
+                .get("*/*")
+                .filter(|media| media.get("schema").is_some())
+                .map(|media| ("application/json".to_string(), media))
+        });
+    let Some((content_type, media)) = json else {
+        let fields = |prefix: &str| {
+            content
+                .iter()
+                .find(|(name, _)| name.starts_with(prefix))
+                .and_then(|(_, media)| form_fields(root, media))
+        };
+        if let Some(fields) = fields("application/x-www-form-urlencoded") {
+            if fields.is_empty() {
+                return (Body::Empty, None);
+            }
+            let fields = fields
+                .into_iter()
+                .map(|field| FormField {
+                    enabled: field.required,
+                    name: field.name,
+                    value: field.value,
+                })
+                .collect();
+            return (Body::Form(fields), None);
+        }
+        if let Some(fields) = fields("multipart/form-data") {
+            if fields.is_empty() {
+                return (Body::Empty, None);
+            }
+            let fields = fields
+                .into_iter()
+                .map(|field| MultipartField {
+                    enabled: field.required,
+                    name: field.name,
+                    // An empty path rather than a guess: the file is the user's to choose.
+                    value: if field.binary {
+                        MultipartValue::File(Default::default())
+                    } else {
+                        MultipartValue::Text(field.value)
+                    },
+                })
+                .collect();
+            return (Body::Multipart(fields), None);
+        }
+
         let offered: Vec<&str> = content.keys().map(String::as_str).collect();
         skipped.push(format!(
             "{} {path}: body is {} — imported empty",
@@ -308,6 +582,76 @@ fn request_body(
         ),
         None => (Body::Empty, Some(content_type.clone())),
     }
+}
+
+struct SchemaField {
+    name: String,
+    value: String,
+    required: bool,
+    binary: bool,
+}
+
+/// A form body's fields, from its schema's properties — required first, then the rest.
+///
+/// **Values follow the parameter rule, not the JSON-body one:** an author's example or default,
+/// otherwise empty. A form is rows, and a row pre-filled with `0` reads as a decision someone made
+/// — see `parameter_example`. Optional fields arrive switched off, for the same reason optional
+/// query parameters do; Stripe's create-a-charge has dozens.
+///
+/// `None` when there are no properties to read, so a schemaless form is still reported as
+/// skipped rather than imported as an empty body that looks deliberate. An *empty* `properties`
+/// is the opposite case — a declared "no fields", which Stripe writes on all 298 of its
+/// body-less operations — and is `Some(vec![])`, imported empty without a note.
+fn form_fields(root: &Value, media: &Value) -> Option<Vec<SchemaField>> {
+    let schema = resolve(root, media.get("schema")?);
+    let example = media.get("example").and_then(Value::as_object);
+
+    // `allOf` composes the fields, so its branches merge here — the opposite of `sample_of`,
+    // which only picks one because it cannot tell `allOf` from `oneOf` safely in a JSON value.
+    let mut branches = vec![schema.clone()];
+    if let Some(all) = schema.get("allOf").and_then(Value::as_array) {
+        branches.extend(all.iter().map(|branch| resolve(root, branch)));
+    }
+
+    let mut fields: Vec<SchemaField> = Vec::new();
+    let mut declared = false;
+    for branch in &branches {
+        let required: Vec<&str> = branch
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let Some(properties) = branch.get("properties").and_then(Value::as_object) else {
+            continue;
+        };
+        declared = true;
+        for (name, property) in properties {
+            if fields.iter().any(|field| &field.name == name) {
+                continue;
+            }
+            let property = resolve(root, property);
+            let value = example
+                .and_then(|example| example.get(name))
+                .or_else(|| property.get("example"))
+                .or_else(|| property.get("default"));
+            fields.push(SchemaField {
+                name: name.clone(),
+                value: match value {
+                    Some(Value::String(text)) => text.clone(),
+                    Some(scalar @ (Value::Number(_) | Value::Bool(_))) => scalar.to_string(),
+                    _ => String::new(),
+                },
+                required: required.contains(&name.as_str()),
+                binary: property.get("format").and_then(Value::as_str) == Some("binary"),
+            });
+        }
+    }
+
+    if !declared {
+        return None;
+    }
+    fields.sort_by_key(|field| !field.required);
+    Some(fields)
 }
 
 /// A minimal JSON document matching a schema's shape.
@@ -566,6 +910,103 @@ mod tests {
         assert!(
             import.skipped.iter().any(|note| note.contains("multipart/form-data")),
             "the skipped body must be reported: {:?}",
+            import.skipped
+        );
+    }
+
+    /// **The spec's auth arrives on every request, as a variable to fill once.** Every real spec
+    /// tried declared its auth and none of it was imported, so a first send was always a 401.
+    #[test]
+    fn security_schemes_reach_each_request_with_their_secret_as_a_variable() {
+        let import = read(
+            r##"{
+              "openapi": "3.0.3",
+              "servers": [{ "url": "https://api.test" }],
+              "security": [{}, { "bearer": [] }],
+              "components": { "securitySchemes": {
+                "bearer": { "type": "http", "scheme": "Bearer" },
+                "key": { "type": "apiKey", "in": "query", "name": "api_key" },
+                "tls": { "type": "mutualTLS" }
+              } },
+              "paths": {
+                "/me": { "get": { "operationId": "me" } },
+                "/health": { "get": { "operationId": "health", "security": [] } },
+                "/search": { "get": { "operationId": "search", "security": [{ "tls": [] }, { "key": [] }] } }
+              }
+            }"##,
+        )
+        .expect("parse");
+
+        // `{}` means "also works anonymously", so the real requirement after it is used.
+        assert_eq!(
+            find(&import, "me").spec.auth,
+            Auth::Bearer { token: "{{bearerToken}}".into() }
+        );
+        // `security: []` is a public endpoint, deliberately.
+        assert_eq!(find(&import, "health").spec.auth, Auth::None);
+        // A requirement Zuno cannot meet falls through to the next, and is named.
+        let search = find(&import, "search").spec.http().unwrap();
+        assert!(search.query.iter().any(|q| q.name == "api_key" && q.value == "{{apiKey}}" && q.enabled));
+        assert!(import.skipped.iter().any(|note| note.contains("tls (mutualTLS)")), "{:?}", import.skipped);
+
+        let names: Vec<(&str, bool)> = import
+            .variables
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.secret))
+            .collect();
+        assert_eq!(names, vec![("bearerToken", true), ("apiKey", true)]);
+    }
+
+    /// **Form and multipart bodies arrive as rows.** Stripe declares 611 of its 612 operations
+    /// form-encoded, and every one of them imported with an empty body.
+    #[test]
+    fn form_bodies_become_fields_with_only_the_required_ones_on() {
+        let import = read(
+            r##"{
+              "openapi": "3.0.3",
+              "paths": {
+                "/charges": { "post": { "operationId": "charge", "requestBody": { "content": {
+                  "application/x-www-form-urlencoded": { "schema": {
+                    "type": "object", "required": ["currency", "amount"],
+                    "properties": {
+                      "amount": { "type": "integer" },
+                      "currency": { "type": "string", "example": "usd" },
+                      "description": { "type": "string" }
+                    } } } } } } },
+                "/files": { "post": { "operationId": "upload", "requestBody": { "content": {
+                  "multipart/form-data": { "schema": { "type": "object", "required": ["file"],
+                    "properties": { "file": { "type": "string", "format": "binary" }, "purpose": { "type": "string" } } } } } } } },
+                "/pods": { "post": { "operationId": "pod", "requestBody": { "content": {
+                  "*/*": { "schema": { "type": "object", "properties": { "kind": { "type": "string" } } } } } } } },
+                "/split": { "get": { "$ref": "paths/split.yaml" } }
+              }
+            }"##,
+        )
+        .expect("parse");
+
+        let Body::Form(fields) = &find(&import, "charge").spec.http().unwrap().body else {
+            panic!("a form body must import as a form");
+        };
+        let rows: Vec<(&str, &str, bool)> = fields
+            .iter()
+            .map(|field| (field.name.as_str(), field.value.as_str(), field.enabled))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("amount", "", true), ("currency", "usd", true), ("description", "", false)]
+        );
+
+        let Body::Multipart(parts) = &find(&import, "upload").spec.http().unwrap().body else {
+            panic!("a multipart body must import as multipart");
+        };
+        assert_eq!(parts[0].value, MultipartValue::File(Default::default()));
+        assert!(parts[0].enabled && !parts[1].enabled);
+
+        assert!(matches!(find(&import, "pod").spec.http().unwrap().body, Body::Raw { kind: RawKind::Json, .. }));
+
+        assert!(
+            import.skipped.iter().any(|note| note.contains("paths/split.yaml")),
+            "a split spec must say so: {:?}",
             import.skipped
         );
     }
