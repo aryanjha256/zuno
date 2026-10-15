@@ -408,7 +408,8 @@ automatically is a later slice, and one that now has somewhere to live.
   Three modes — none, Basic, Bearer — on every kind, since every kind sends headers through
   `build_headers`. A typed, enabled `Authorization` row wins, and the derived row is struck through
   to say so. Per request, not per folder: folder-level auth with an inherit default was discussed
-  and deferred, and `curl -u` / Postman `basic` still import as a header rather than into the tab.
+  and deferred. Postman `basic` imports into the tab, since encoding it at import froze its
+  `{{placeholders}}` into a credential nobody has; `curl -u` still imports as a header.
 - **OAuth is not an auth helper.** Client-credentials flow is: send a token request, extract a value
   from the response, use it in the next request. That's **request chaining** below, and it's the
   motivating case for it.

@@ -27,8 +27,8 @@ use serde_json::{Map, Value};
 
 use crate::import::{EnvironmentImport, Import, Imported, Variable};
 use crate::{
-    Body, FormField, GraphQlRequest, Header, Method, MultipartField, MultipartValue, QueryParam,
-    RawKind, RequestId, RequestKind, RequestSpec,
+    Auth, Body, FormField, GraphQlRequest, Header, Method, MultipartField, MultipartValue,
+    QueryParam, RawKind, RequestId, RequestKind, RequestSpec,
 };
 
 /// How deep imported folders may nest.
@@ -321,6 +321,17 @@ fn request_from(
                     .any(|existing| existing.name.eq_ignore_ascii_case(&header.name))
                 {
                     spec.headers.push(header);
+                }
+            }
+            // A typed `Authorization` row would win over the tab at send anyway; leaving the tab
+            // empty keeps the request from showing a struck-through credential it never uses.
+            AuthEffect::Basic { username, password } => {
+                if !spec
+                    .headers
+                    .iter()
+                    .any(|existing| existing.name.eq_ignore_ascii_case("Authorization"))
+                {
+                    spec.auth = Auth::Basic { username, password };
                 }
             }
             AuthEffect::Query(param) => {
@@ -627,26 +638,31 @@ fn raw_kind(body: &Value, text: &str) -> RawKind {
     }
 }
 
-/// What an auth block becomes. Lowered to a header even for `basic` and `bearer`, which the Auth
-/// tab could hold since it landed: importing into the tab is a separate decision not yet taken
-/// (ROADMAP, under the Auth tab), and a header is still exactly what goes on the wire.
+/// What an auth block becomes. `bearer` is still lowered to a header, which resolves correctly
+/// as written; `basic` goes to the Auth tab, because its header is an encoding of the values and
+/// so cannot carry a placeholder.
 enum AuthEffect {
     Header(Header),
     Query(QueryParam),
+    Basic { username: String, password: String },
 }
 
 fn auth_effect(auth: &Value, name: &str, skipped: &mut Vec<String>) -> Option<AuthEffect> {
     let kind = auth.get("type").and_then(Value::as_str)?;
 
-    // Postman stores each type's parameters as an *array* of `{key, value}` rows rather than as
-    // an object, so every lookup goes through this.
+    // v2.1 stores each type's parameters as an *array* of `{key, value}` rows; **v2.0 stores
+    // them as a plain object**. Reading only the rows turned every v2.0 `basic` into
+    // `Basic Og==` — an empty username and password, sent without a word in the report.
     let field = |wanted: &str| -> String {
-        array(auth.get(kind))
-            .iter()
-            .find(|row| row.get("key").and_then(Value::as_str) == Some(wanted))
-            .and_then(|row| row.get("value"))
-            .map(scalar)
-            .unwrap_or_default()
+        let params = auth.get(kind);
+        let value = match params.and_then(Value::as_object) {
+            Some(object) => object.get(wanted),
+            None => array(params)
+                .iter()
+                .find(|row| row.get("key").and_then(Value::as_str) == Some(wanted))
+                .and_then(|row| row.get("value")),
+        };
+        value.map(scalar).unwrap_or_default()
     };
 
     match kind {
@@ -655,13 +671,13 @@ fn auth_effect(auth: &Value, name: &str, skipped: &mut Vec<String>) -> Option<Au
             "Authorization",
             format!("Bearer {}", field("token")),
         ))),
-        "basic" => Some(AuthEffect::Header(Header::new(
-            "Authorization",
-            format!(
-                "Basic {}",
-                crate::curl::base64(format!("{}:{}", field("username"), field("password")).as_bytes())
-            ),
-        ))),
+        // Into the Auth tab rather than a header, because **encoding at import froze the
+        // placeholders**: base64 of `{{id}}:{{secret}}` is a credential nobody has, and no
+        // environment could fill it in afterwards. The tab encodes after resolution.
+        "basic" => Some(AuthEffect::Basic {
+            username: field("username"),
+            password: field("password"),
+        }),
         "apikey" => {
             let (key, value) = (field("key"), field("value"));
             if key.is_empty() {
@@ -673,10 +689,28 @@ fn auth_effect(auth: &Value, name: &str, skipped: &mut Vec<String>) -> Option<Au
                 _ => Some(AuthEffect::Header(Header::new(key, value))),
             }
         }
+        // **An OAuth 2 block that already holds a token is just that token on the wire**, which is
+        // all Postman sends until someone asks it for a new one. Lowered like `bearer`; the grant
+        // settings for fetching a fresh token have nowhere to go, and refreshing it means editing
+        // the variable it usually is. Without a token there is nothing to send, so it is skipped.
+        "oauth2" if !field("accessToken").is_empty() => {
+            let token = field("accessToken");
+            if field("addTokenTo") == "queryParams" {
+                return Some(AuthEffect::Query(QueryParam::new("access_token", token)));
+            }
+            let prefix = match field("headerPrefix") {
+                prefix if prefix.is_empty() => "Bearer".to_string(),
+                prefix => prefix,
+            };
+            Some(AuthEffect::Header(Header::new(
+                "Authorization",
+                format!("{prefix} {token}"),
+            )))
+        }
         other => {
-            // OAuth 2, AWS SigV4, Digest, NTLM, Hawk. Each is a signing procedure rather than a
-            // value to copy, so there is nothing to lower — and saying which one is missing
-            // beats a request that looks complete and 401s.
+            // OAuth 2 with no token, AWS SigV4, Digest, NTLM, Hawk. Each is a signing procedure
+            // rather than a value to copy, so there is nothing to lower — and saying which one is
+            // missing beats a request that looks complete and 401s.
             skipped.push(format!("{name}: {other} auth"));
             None
         }
@@ -1050,15 +1084,16 @@ mod tests {
             Some("Bearer {{token}}")
         );
 
-        // Replaced at the request.
+        // Replaced at the request — Basic into the Auth tab, which encodes at send.
         let get = &find(&import, "Get").spec;
         assert_eq!(
-            get.headers
-                .iter()
-                .find(|header| header.name == "Authorization")
-                .map(|header| header.value.as_str()),
-            Some("Basic dXNlcjpwYXNz")
+            get.auth,
+            Auth::Basic {
+                username: "user".into(),
+                password: "pass".into()
+            }
         );
+        assert!(!get.headers.iter().any(|header| header.name == "Authorization"));
 
         // `noauth` at the request turns the collection's off rather than being ignored.
         let login = &find(&import, "Login").spec;
@@ -1077,6 +1112,65 @@ mod tests {
                 .find(|header| header.name == "X-Api-Key")
                 .map(|header| header.value.as_str()),
             Some("{{apiKey}}")
+        );
+    }
+
+    /// **v2.0 auth is an object, and OAuth 2 with a token is a header.** Shaped on commercetools'
+    /// published collection, where both broke at once: its token request went out as
+    /// `Basic Og==` and every other request lost its auth, so nothing in it could be sent.
+    #[test]
+    fn v2_0_auth_objects_and_oauth2_tokens_reach_the_wire() {
+        let import = read(
+            r#"{
+              "info": { "name": "Shop", "schema": "https://schema.getpostman.com/json/collection/v2.0.0/collection.json" },
+              "auth": { "type": "oauth2", "oauth2": { "accessToken": "{{token}}", "addTokenTo": "header", "tokenType": "Bearer" } },
+              "item": [
+                { "name": "Token", "request": {
+                    "method": "POST", "url": "https://auth.test/oauth/token",
+                    "auth": { "type": "basic", "basic": { "username": "{{id}}", "password": "{{secret}}" } } } },
+                { "name": "Products", "request": { "method": "GET", "url": "https://api.test/products" } },
+                { "name": "Query", "request": {
+                    "method": "GET", "url": "https://api.test/q",
+                    "auth": { "type": "oauth2", "oauth2": [
+                      { "key": "accessToken", "value": "abc" }, { "key": "addTokenTo", "value": "queryParams" } ] } } },
+                { "name": "Unfetched", "request": {
+                    "method": "GET", "url": "https://api.test/u",
+                    "auth": { "type": "oauth2", "oauth2": [ { "key": "grant_type", "value": "client_credentials" } ] } } }
+              ]
+            }"#,
+        )
+        .expect("parse");
+        let authorization = |name: &str| {
+            find(&import, name)
+                .spec
+                .headers
+                .iter()
+                .find(|header| header.name == "Authorization")
+                .map(|header| header.value.clone())
+        };
+
+        // Placeholders intact, so an environment can still fill them in at send.
+        assert_eq!(
+            find(&import, "Token").spec.auth,
+            Auth::Basic {
+                username: "{{id}}".into(),
+                password: "{{secret}}".into()
+            }
+        );
+        assert_eq!(authorization("Products").as_deref(), Some("Bearer {{token}}"));
+
+        let query = &find(&import, "Query").spec.http().unwrap().query;
+        assert!(
+            query.iter().any(|param| param.name == "access_token" && param.value == "abc"),
+            "{query:?}"
+        );
+
+        // No token means nothing to send, and the report says why.
+        assert_eq!(authorization("Unfetched"), None);
+        assert!(
+            import.skipped.iter().any(|note| note == "Unfetched: oauth2 auth"),
+            "{:?}",
+            import.skipped
         );
     }
 

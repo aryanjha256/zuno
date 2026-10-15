@@ -517,7 +517,14 @@ mod tests {
                 .collect()
         };
         assert_eq!(authorization("/bearer"), vec!["Bearer {{token}}".to_string()]);
-        assert_eq!(authorization("/basic"), vec![format!("Basic {}", crate::curl::base64(b"alice:pw"))]);
+        // Basic comes back into the tab it left, not as a frozen header.
+        assert_eq!(authorization("/basic"), Vec::<String>::new());
+        let basic_back = back
+            .requests
+            .iter()
+            .find(|r| r.spec.url.ends_with("/basic"))
+            .expect("request");
+        assert_eq!(basic_back.spec.auth, basic.auth);
         assert_eq!(authorization("/typed"), vec!["Bearer typed".to_string()]);
 
         std::fs::remove_dir_all(&root).ok();
