@@ -24,7 +24,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::request::{
-    Body, Header, Method, MultipartField, MultipartValue, RawKind, RequestSettings, RequestSpec,
+    Auth, Body, Header, Method, MultipartField, MultipartValue, RawKind, RequestSettings,
+    RequestSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -51,9 +52,171 @@ pub struct CurlImport {
     pub ignored: Vec<String>,
 }
 
+/// curl's short options that take a value, read from `curl --help all` (8.18) rather than
+/// written from memory. Everything else after a single `-` is a switch.
+///
+/// **Knowing which flags take a value is what keeps the URL the URL.** Without it,
+/// `curl -c cookies.txt https://…` read `cookies.txt` as the URL and the real one as a stray
+/// argument, and `-XDELETE` — a cluster, the way curl reads every single-dash token — matched
+/// nothing and imported as a GET.
+const VALUE_SHORT: &str = "ACDEFHKPQTUXYbcdehmortuwxyz";
+
+/// The long options that take a value, from the same source.
+const VALUE_LONG: &[&str] = &[
+    "--abstract-unix-socket", "--alt-svc", "--aws-sigv4", "--cacert", "--capath", "--cert",
+    "--cert-type", "--ciphers", "--config", "--connect-timeout", "--connect-to", "--continue-at",
+    "--cookie", "--cookie-jar", "--create-file-mode", "--crlfile", "--curves", "--data",
+    "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode", "--delegation",
+    "--dns-interface", "--dns-ipv4-addr", "--dns-ipv6-addr", "--dns-servers", "--doh-url",
+    "--dump-header", "--ech", "--egd-file", "--engine", "--etag-compare", "--etag-save",
+    "--expect100-timeout", "--form", "--form-string", "--ftp-account",
+    "--ftp-alternative-to-user", "--ftp-method", "--ftp-port", "--ftp-ssl-ccc-mode",
+    "--happy-eyeballs-timeout-ms", "--haproxy-clientip", "--header", "--help", "--hostpubmd5",
+    "--hostpubsha256", "--hsts", "--interface", "--ip-tos", "--ipfs-gateway", "--json",
+    "--keepalive-cnt", "--keepalive-time", "--key", "--key-type", "--knownhosts", "--krb",
+    "--libcurl", "--limit-rate", "--local-port", "--login-options", "--mail-auth", "--mail-from",
+    "--mail-rcpt", "--max-filesize", "--max-redirs", "--max-time", "--netrc-file", "--noproxy",
+    "--oauth2-bearer", "--output", "--output-dir", "--parallel-max", "--parallel-max-host",
+    "--pass", "--pinnedpubkey", "--preproxy", "--proto", "--proto-default", "--proto-redir",
+    "--proxy", "--proxy-cacert", "--proxy-capath", "--proxy-cert", "--proxy-cert-type",
+    "--proxy-ciphers", "--proxy-crlfile", "--proxy-header", "--proxy-key", "--proxy-key-type",
+    "--proxy-pass", "--proxy-pinnedpubkey", "--proxy-service-name", "--proxy-tls13-ciphers",
+    "--proxy-tlsauthtype", "--proxy-tlspassword", "--proxy-tlsuser", "--proxy-user",
+    "--proxy1.0", "--pubkey", "--quote", "--random-file", "--range", "--rate", "--referer",
+    "--request", "--request-target", "--resolve", "--retry", "--retry-delay", "--retry-max-time",
+    "--sasl-authzid", "--service-name", "--sigalgs", "--socks4", "--socks4a", "--socks5",
+    "--socks5-gssapi-service", "--socks5-hostname", "--speed-limit", "--speed-time",
+    "--ssl-sessions", "--stderr", "--telnet-option", "--tftp-blksize", "--time-cond", "--tls-max",
+    "--tls13-ciphers", "--tlsauthtype", "--tlspassword", "--tlsuser", "--trace", "--trace-ascii",
+    "--trace-config", "--unix-socket", "--upload-file", "--upload-flags", "--url", "--url-query",
+    "--user", "--user-agent", "--variable", "--vlan-priority", "--write-out",
+];
+
+enum Arg {
+    Flag(String, Option<String>),
+    Positional(String),
+}
+
+/// Tokens as curl reads them: `-sSL` is three switches, `-XPOST` is `-X POST`, `-HX: y` is a
+/// header, and a flag that takes a value takes the next token whatever it looks like.
+fn expand(tokens: Vec<String>) -> Result<Vec<Arg>, CurlError> {
+    let mut args = Vec::new();
+    let mut tokens = tokens.into_iter();
+    while let Some(token) = tokens.next() {
+        if let Some(long) = token.strip_prefix("--").filter(|long| !long.is_empty()) {
+            // `--flag=value` is not curl syntax, but it is accepted here as a convenience.
+            let (flag, inline) = match long.split_once('=') {
+                Some((flag, value)) => (format!("--{flag}"), Some(value.to_string())),
+                None => (token.clone(), None),
+            };
+            let value = match inline {
+                Some(value) => Some(value),
+                None if VALUE_LONG.contains(&flag.as_str()) => Some(
+                    tokens
+                        .next()
+                        .ok_or_else(|| CurlError::MissingValue { flag: flag.clone() })?,
+                ),
+                None => None,
+            };
+            args.push(Arg::Flag(flag, value));
+        } else if token.len() > 1 && token.starts_with('-') {
+            let mut chars = token[1..].char_indices();
+            while let Some((at, short)) = chars.next() {
+                let flag = format!("-{short}");
+                if VALUE_SHORT.contains(short) {
+                    let rest = &token[1 + at + short.len_utf8()..];
+                    let value = if rest.is_empty() {
+                        tokens
+                            .next()
+                            .ok_or_else(|| CurlError::MissingValue { flag: flag.clone() })?
+                    } else {
+                        rest.to_string()
+                    };
+                    args.push(Arg::Flag(flag, Some(value)));
+                    break;
+                }
+                args.push(Arg::Flag(flag, None));
+            }
+        } else {
+            args.push(Arg::Positional(token));
+        }
+    }
+    Ok(args)
+}
+
+/// curl's `--data-urlencode` and `--url-query` encoding: unreserved characters kept, a space as
+/// `+`, everything else percent-encoded — measured against curl 8.18, which is what a server
+/// receiving the original command saw. Sending the text raw turned Twilio's `From=+1501…` into a
+/// number starting with a space, and split any value holding a `&` in two.
+fn url_encode(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// One `--data-urlencode` / `--url-query` argument, in its four spellings: `content`,
+/// `=content`, `name=content`, and the file forms `@file` / `name@file`, which name a file this
+/// importer does not read and so come back `None`.
+fn encode_pair(raw: &str) -> Option<String> {
+    let at = raw.find('@');
+    match raw.find('=') {
+        Some(eq) if at.is_none_or(|at| eq < at) => {
+            let (name, content) = (&raw[..eq], &raw[eq + 1..]);
+            Some(if name.is_empty() {
+                url_encode(content)
+            } else {
+                format!("{name}={}", url_encode(content))
+            })
+        }
+        _ if at.is_some() => None,
+        _ => Some(url_encode(raw)),
+    }
+}
+
+/// Chrome's "Copy as cURL (cmd)" escapes for cmd.exe: every quote is `^"`, specials are `^&`,
+/// and a line ends in ` ^`. Undone first, which leaves an ordinary double-quoted command.
+/// Recognised by how that output always starts, so a bash command with a `^` in its data is
+/// never touched.
+fn uncmd(input: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = input.trim_start();
+    let after = trimmed
+        .strip_prefix("curl.exe")
+        .or_else(|| trimmed.strip_prefix("curl"))
+        .unwrap_or_default();
+    if !after.trim_start().starts_with("^\"") {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '^' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\r') => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+            }
+            Some('\n') | None => {}
+            Some(escaped) => out.push(escaped),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Parse a curl command line.
 pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
-    let tokens = tokenize(input)?;
+    let tokens = tokenize(&uncmd(input))?;
     let mut tokens = tokens.into_iter().peekable();
 
     // Tolerate a copied shell prompt and the `curl` word itself. Some sources paste
@@ -65,7 +228,10 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
             tokens.next();
             continue;
         }
-        if first.eq_ignore_ascii_case("curl") || first.ends_with("/curl") {
+        // `curl.exe` is how Microsoft's docs and PowerShell spell it, since `curl` alone is an
+        // alias for `Invoke-WebRequest` there.
+        let lower = first.to_ascii_lowercase();
+        if lower == "curl" || lower == "curl.exe" || lower.ends_with("/curl") || lower.ends_with("\\curl.exe") {
             tokens.next();
             saw_curl = true;
         }
@@ -102,42 +268,35 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
         ..RequestSpec::default()
     };
 
-    while let Some(token) = tokens.next() {
-        // A bare `-` is curl's stdin marker; nothing to import from it.
-        if !token.starts_with('-') || token == "-" {
-            if url.is_none() {
-                url = Some(token);
-            } else {
-                ignored.push(token);
-            }
-            continue;
-        }
+    // `-d @file`: curl reads the file, where `--data-raw @file` sends the text. Sent as the file's
+    // bytes, which differs from curl only in curl stripping the file's newlines.
+    let mut data_file: Option<PathBuf> = None;
+    let mut upload: Option<PathBuf> = None;
+    let mut url_query: Vec<String> = Vec::new();
 
-        // Split `--flag=value` so both spellings work.
-        let (flag, inline_value) = match token.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") => (flag.to_string(), Some(value.to_string())),
-            _ => (token.clone(), None),
-        };
-
-        let mut take_value = |flag: &str| -> Result<String, CurlError> {
-            if let Some(value) = inline_value.clone() {
-                return Ok(value);
+    for arg in expand(tokens.collect())? {
+        let (flag, value) = match arg {
+            // A bare `-` is curl's stdin marker; nothing to import from it.
+            Arg::Positional(token) => {
+                if url.is_none() && token != "-" {
+                    url = Some(token);
+                } else {
+                    ignored.push(token);
+                }
+                continue;
             }
-            tokens.next().ok_or_else(|| CurlError::MissingValue {
-                flag: flag.to_string(),
-            })
+            Arg::Flag(flag, value) => (flag, value),
         };
+        // `expand` has already taken a value for every flag that needs one.
+        let value_of = || value.clone().unwrap_or_default();
 
         match flag.as_str() {
-            "--url" => url = Some(take_value(&flag)?),
+            "--url" => url = Some(value_of()),
 
-            "-X" | "--request" => {
-                method = Some(parse_method(&take_value(&flag)?));
-            }
+            "-X" | "--request" => method = Some(parse_method(&value_of())),
 
             "-H" | "--header" => {
-                let raw = take_value(&flag)?;
-                if let Some(header) = parse_header(&raw) {
+                if let Some(header) = parse_header(&value_of()) {
                     if header.name.eq_ignore_ascii_case("content-type") {
                         explicit_content_type = true;
                     }
@@ -145,12 +304,32 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
                 }
             }
 
-            "-d" | "--data" | "--data-raw" | "--data-ascii" | "--data-urlencode" => {
-                data.push(take_value(&flag)?);
+            "-d" | "--data" | "--data-ascii" => {
+                let value = value_of();
+                match value.strip_prefix('@').filter(|path| !path.is_empty() && *path != "-") {
+                    Some(path) => data_file = Some(PathBuf::from(path)),
+                    None => data.push(value),
+                }
+            }
+            "--data-raw" => data.push(value_of()),
+            "--data-urlencode" => match encode_pair(&value_of()) {
+                Some(encoded) => data.push(encoded),
+                None => ignored.push(format!("{flag} {} (a file to encode)", value_of())),
+            },
+            "--url-query" => {
+                // `+` opts out of encoding.
+                let value = value_of();
+                match value.strip_prefix('+') {
+                    Some(raw) => url_query.push(raw.to_string()),
+                    None => match encode_pair(&value) {
+                        Some(encoded) => url_query.push(encoded),
+                        None => ignored.push(format!("{flag} {value} (a file to encode)")),
+                    },
+                }
             }
 
             "--data-binary" => {
-                let value = take_value(&flag)?;
+                let value = value_of();
                 // Only `--data-binary` gives `@` file semantics that we can represent.
                 match value.strip_prefix('@') {
                     Some(path) => binary_body = Some(PathBuf::from(path)),
@@ -159,7 +338,7 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
             }
 
             "--json" => {
-                data.push(take_value(&flag)?);
+                data.push(value_of());
                 if !explicit_content_type {
                     headers.push(Header::new("Content-Type", "application/json"));
                     explicit_content_type = true;
@@ -167,26 +346,38 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
                 headers.push(Header::new("Accept", "application/json"));
             }
 
-            "-F" | "--form" | "--form-string" => {
-                if let Some(field) = parse_form_field(&take_value(&flag)?) {
+            "-F" | "--form" => {
+                if let Some(field) = parse_form_field(&value_of()) {
                     form.push(field);
                 }
             }
+            // The literal twin of `-F`: a leading `@` or `<` is text, not a file.
+            "--form-string" => {
+                if let Some((name, text)) = value_of().split_once('=') {
+                    form.push(MultipartField {
+                        enabled: true,
+                        name: name.trim().to_string(),
+                        value: MultipartValue::Text(text.to_string()),
+                    });
+                }
+            }
+
+            "-T" | "--upload-file" => upload = Some(PathBuf::from(value_of())),
 
             "-u" | "--user" => {
                 // curl turns this into a Basic auth header; do the same so the imported
                 // request is self-contained and the credential is visible/editable.
-                let credentials = take_value(&flag)?;
                 headers.push(Header::new(
                     "Authorization",
-                    format!("Basic {}", base64(credentials.as_bytes())),
+                    format!("Basic {}", base64(value_of().as_bytes())),
                 ));
             }
+            "--oauth2-bearer" => spec.auth = Auth::Bearer { token: value_of() },
 
-            "-A" | "--user-agent" => headers.push(Header::new("User-Agent", take_value(&flag)?)),
-            "-e" | "--referer" => headers.push(Header::new("Referer", take_value(&flag)?)),
+            "-A" | "--user-agent" => headers.push(Header::new("User-Agent", value_of())),
+            "-e" | "--referer" => headers.push(Header::new("Referer", value_of())),
             "-b" | "--cookie" => {
-                let value = take_value(&flag)?;
+                let value = value_of();
                 // `-b` with no `=` means "read cookies from this file", which is not
                 // something an imported request can carry.
                 if value.contains('=') {
@@ -204,8 +395,7 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
             "--compressed" => spec.settings.accept_encodings = true,
 
             "-m" | "--max-time" => {
-                let value = take_value(&flag)?;
-                if let Ok(seconds) = value.parse::<f64>()
+                if let Ok(seconds) = value_of().parse::<f64>()
                     && seconds > 0.0
                 {
                     spec.settings.timeout = Some(std::time::Duration::from_secs_f64(seconds));
@@ -217,14 +407,11 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
             | "-S" | "--show-error" | "-O" | "--remote-name" | "--progress-bar" | "-#"
             | "--no-progress-meter" | "-N" | "--no-buffer" => {}
 
-            // Recognised as taking a value, but nothing in the model holds them yet.
-            "-o" | "--output" | "-w" | "--write-out" | "--proxy" | "-x" | "--cacert" | "--cert"
-            | "--key" | "--connect-timeout" | "--retry" | "--resolve" | "--interface" => {
-                let value = take_value(&flag).unwrap_or_default();
-                ignored.push(format!("{flag} {value}").trim_end().to_string());
-            }
-
-            _ => ignored.push(flag.clone()),
+            // Anything else is named, with its value when it took one.
+            _ => ignored.push(match &value {
+                Some(value) => format!("{flag} {value}"),
+                None => flag.clone(),
+            }),
         }
     }
 
@@ -237,6 +424,36 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
     if !saw_curl && !looks_like_url(&url) {
         return Err(CurlError::NotCurl);
     }
+
+    if !url_query.is_empty() {
+        let separator = if url.contains('?') { '&' } else { '?' };
+        url = format!("{url}{separator}{}", url_query.join("&"));
+    }
+
+    // `-T` is a PUT of the file, and a URL ending in `/` gets the file's name appended.
+    if let Some(path) = upload {
+        if url.ends_with('/')
+            && let Some(name) = path.file_name()
+        {
+            url.push_str(&name.to_string_lossy());
+        }
+        method = method.or(Some(Method::Put));
+        binary_body = binary_body.or(Some(path));
+    }
+
+    // A `-d @file` among other `-d` values would need the file read to join them; the text
+    // ones are kept and the file is named rather than silently dropped.
+    let form_encoded_file = match data_file {
+        Some(path) if data.is_empty() && binary_body.is_none() => {
+            binary_body = Some(path);
+            true
+        }
+        Some(path) => {
+            ignored.push(format!("-d @{} (alongside other data)", path.display()));
+            false
+        }
+        None => false,
+    };
 
     // `-G` means "send the data as a query string instead of a body".
     if as_get && !data.is_empty() {
@@ -251,7 +468,7 @@ pub fn parse(input: &str) -> Result<CurlImport, CurlError> {
 
     // curl's own default: data with no explicit type is form-urlencoded. Adding it here
     // is what stops an imported request behaving differently from its source command.
-    if matches!(body, Body::Raw { .. }) && !explicit_content_type {
+    if (matches!(body, Body::Raw { .. }) || form_encoded_file) && !explicit_content_type {
         headers.push(Header::new(
             "Content-Type",
             "application/x-www-form-urlencoded",
@@ -416,8 +633,9 @@ fn tokenize(input: &str) -> Result<Vec<String>, CurlError> {
 
     while let Some(ch) = chars.next() {
         match ch {
-            // Windows-style continuation, as pasted from cmd.exe instructions.
-            '^' if matches!(chars.peek(), Some('\n') | Some('\r')) => {
+            // Windows-style continuations: `^` from cmd.exe instructions, a backtick from
+            // PowerShell's. The `\r` of a CRLF is whitespace below, so consuming one char is enough.
+            '^' | '`' if matches!(chars.peek(), Some('\n') | Some('\r')) => {
                 chars.next();
             }
             '\\' => match chars.peek() {
@@ -626,6 +844,50 @@ mod tests {
             }
         );
         assert!(import.ignored.is_empty(), "{:?}", import.ignored);
+    }
+
+    /// **Flags read the way curl reads them**, each case found by sending the original command
+    /// with real curl and the import with Zuno to one server and comparing what arrived.
+    #[test]
+    fn flags_are_read_the_way_curl_reads_them() {
+        // A single-dash token is a cluster, and a value flag takes the rest of it.
+        let spec = import("curl -XDELETE -H'X-Token: abc' https://x.test/a").spec;
+        assert_eq!(spec.http().unwrap().method, Method::Delete);
+        assert!(spec.headers.iter().any(|h| h.name == "X-Token" && h.value == "abc"));
+        let spec = import("curl -sX PATCH https://x.test/a -d 'a=1'").spec;
+        assert_eq!((spec.http().unwrap().method.clone(), spec.url.as_str()), (Method::Patch, "https://x.test/a"));
+        assert!(import("curl -sSL https://x.test/a").spec.settings.follow_redirects);
+
+        // A flag Zuno has no use for still takes its value, so the URL stays the URL.
+        let imported = import("curl -c jar.txt --max-redirs 5 https://x.test/a");
+        assert_eq!(imported.spec.url, "https://x.test/a");
+        assert!(imported.ignored.contains(&"-c jar.txt".to_string()), "{:?}", imported.ignored);
+
+        // Encoded as curl 8.18 sends it: Twilio's own example lost the `+` of a phone number.
+        let spec = import("curl https://x.test/m --data-urlencode 'From=+1501' --data-urlencode 'q=a b&c'").spec;
+        let Body::Raw { text, .. } = &spec.http().unwrap().body else { panic!("a body") };
+        assert_eq!(text, "From=%2B1501&q=a+b%26c");
+
+        // `-d @file` is the file, sent form-encoded unless told otherwise; `--data-raw` is not.
+        let spec = import("curl https://x.test/i -d @body.json").spec;
+        assert_eq!(spec.http().unwrap().body, Body::Binary("body.json".into()));
+        assert!(spec.headers.iter().any(|h| h.value == "application/x-www-form-urlencoded"));
+        let spec = import("curl https://x.test/i --data-raw @body.json").spec;
+        assert!(matches!(&spec.http().unwrap().body, Body::Raw { text, .. } if text == "@body.json"));
+
+        // `-T` is a PUT of the file; `--oauth2-bearer` is the Auth tab.
+        let spec = import("curl -T report.csv https://x.test/up/").spec;
+        assert_eq!((spec.http().unwrap().method.clone(), spec.url.as_str()), (Method::Put, "https://x.test/up/report.csv"));
+        let spec = import("curl --oauth2-bearer t0k https://x.test/me").spec;
+        assert_eq!(spec.auth, Auth::Bearer { token: "t0k".into() });
+
+        // Chrome's "Copy as cURL (cmd)" and PowerShell's `curl.exe`.
+        let spec = import("curl ^\"https://x.test/w^\" ^\n  -H ^\"accept: a/b^\" ^\n  --data-raw ^\"^{^\\^\"n^\\^\":1^}^\"").spec;
+        assert_eq!(spec.url, "https://x.test/w");
+        assert!(matches!(&spec.http().unwrap().body, Body::Raw { text, .. } if text == r#"{"n":1}"#));
+        let spec = import("curl.exe https://x.test/ps `\n  -H \"Accept: a/b\"").spec;
+        assert_eq!(spec.url, "https://x.test/ps");
+        assert_eq!(spec.headers.len(), 1);
     }
 
     #[test]
