@@ -7,9 +7,16 @@ Postman-level capability, Zed-level feel: a virtualized response viewer that hol
 multi-megabyte JSON, request tabs as editor buffers, curl import, response diffing, and
 collections stored as one file per request so they live in git like anything else you own.
 
-[![Rust](https://github.com/aryanjha256/zuno/actions/workflows/rust.yml/badge.svg)](https://github.com/aryanjha256/zuno/actions/workflows/rust.yml)
+<p align="center">
+  <a href="https://github.com/aryanjha256/zuno/actions/workflows/rust.yml"><img src="https://github.com/aryanjha256/zuno/actions/workflows/rust.yml/badge.svg" alt="Rust"></a>
+  <a href="https://github.com/aryanjha256/zuno/actions/workflows/release.yml"><img src="https://github.com/aryanjha256/zuno/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://github.com/aryanjha256/zuno/releases/latest"><img src="https://img.shields.io/github/v/release/aryanjha256/zuno" alt="Latest release"></a>
+  <a href="https://github.com/aryanjha256/zuno/releases"><img src="https://img.shields.io/github/downloads/aryanjha256/zuno/total" alt="Downloads"></a>
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="Platforms">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License"></a>
+</p>
 
-[![Release](https://github.com/aryanjha256/zuno/actions/workflows/release.yml/badge.svg)](https://github.com/aryanjha256/zuno/actions/workflows/release.yml)
+![Opening a request from the palette, sending it, folding and searching the response, then a 5000-row response](docs/demo.gif)
 
 ## Install
 
