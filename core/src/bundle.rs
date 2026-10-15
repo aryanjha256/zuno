@@ -113,8 +113,8 @@ pub fn parse(root: &Value) -> Result<Import, ImportError> {
         });
     }
 
-    let mut skipped = Vec::new();
-    let requests = stored
+    let skipped = Vec::new();
+    let requests: Vec<Imported> = stored
         .requests
         .into_iter()
         .map(|request| {
@@ -130,20 +130,20 @@ pub fn parse(root: &Value) -> Result<Import, ImportError> {
         })
         .collect();
 
-    // Folders with no requests in them. Named here so the import can create them; a folder you
-    // made and have not filled is still something you arranged.
-    let empty: Vec<String> = stored
+    // `folders` lists *every* directory, so the ones a request already lands in — or under — are
+    // created anyway and are not empty. Treating the whole list as empty reported "151 empty
+    // folders — recreate them" on a collection that had none, and created nothing either way.
+    let empty_folders: Vec<Vec<String>> = stored
         .folders
         .into_iter()
         .filter(|folder| !folder.is_empty())
+        .map(|folder| folder.split('/').map(str::to_string).collect::<Vec<_>>())
+        .filter(|folder| {
+            !requests
+                .iter()
+                .any(|request| request.folders.starts_with(folder))
+        })
         .collect();
-    if !empty.is_empty() {
-        skipped.push(format!(
-            "{} empty folder(s) — recreate them if you need them: {}",
-            empty.len(),
-            empty.join(", ")
-        ));
-    }
 
     Ok(Import {
         requests,
@@ -167,6 +167,7 @@ pub fn parse(root: &Value) -> Result<Import, ImportError> {
                     .collect(),
             })
             .collect(),
+        empty_folders,
         recovered: 0,
         skipped,
     })

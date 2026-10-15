@@ -12088,6 +12088,52 @@ async fn importing_a_spec_from_a_file_fills_the_collection(cx: &mut TestAppConte
     remove_scratch(&mut cx, &dir.join("session.json"));
 }
 
+/// **A bundle arrives as it left: each request's own settings, and its empty folders.** The import
+/// stamped your defaults over every request — right for Postman and OpenAPI, which carry no
+/// settings, and wrong for the one format whose job is to carry them. And every folder was
+/// reported "empty — recreate them" while none was created.
+#[gpui::test]
+async fn a_bundle_keeps_its_settings_and_its_empty_folders(cx: &mut TestAppContext) {
+    let dir = scratch_dir("import-bundle");
+    let root = dir.join("collections");
+    std::fs::create_dir_all(&root).expect("mkdir");
+
+    let mut spec = RequestSpec::default();
+    spec.name = "slow".into();
+    spec.url = "https://api.test/slow".into();
+    spec.settings.timeout = Some(std::time::Duration::from_secs(7));
+    spec.settings.verify_tls = false;
+    let entry = zuno_core::collection::Entry {
+        path: dir.join("api").join("slow.json"),
+        relative: "api/slow.json".into(),
+        spec: spec.clone(),
+    };
+    let bundle = zuno_core::bundle::to_bundle(
+        "team",
+        &[entry],
+        &["api".to_string(), "drafts".to_string()],
+        &[],
+    );
+    let file = dir.join("team.zuno.json");
+    std::fs::write(&file, bundle).expect("write");
+
+    let (_window, _view, mut cx) = boot(cx, Some(dir.join("session.json")), Some(root.clone()));
+    cx.run_until_parked();
+    cx.press("ctrl-shift-i");
+    cx.simulate_input(&file.display().to_string());
+    cx.press("enter");
+
+    let written = root.join("team").join("api").join("slow.json");
+    wait_for(&mut cx, "the imported request", |_| written.exists().then_some(()));
+
+    let imported: RequestSpec =
+        serde_json::from_slice(&std::fs::read(&written).expect("read")).expect("parse");
+    assert_eq!(imported.settings, spec.settings, "a bundle's own settings must survive");
+    assert!(root.join("team").join("drafts").is_dir(), "the empty folder must be created");
+
+    remove_scratch(&mut cx, &dir.join("session.json"));
+}
+
 #[gpui::test]
 async fn importing_a_spec_from_a_url_goes_through_the_engine(cx: &mut TestAppContext) {
     // A URL fetch reuses `Engine::send` rather than a second HTTP client, so it inherits the

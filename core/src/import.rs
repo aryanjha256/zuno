@@ -103,6 +103,9 @@ pub struct Import {
     pub requests: Vec<Imported>,
     /// Environments carried by name. Empty for every importer but the bundle.
     pub environments: Vec<NamedVariables>,
+    /// Folders to create although no request lands in them, as `folders` paths. Only a bundle
+    /// knows of any: a folder you made and have not filled is still something you arranged.
+    pub empty_folders: Vec<Vec<String>>,
     /// What to name the folder everything lands in: `info.title` or `info.name`.
     pub title: Option<String>,
     /// Collection-level variables, for the environment written alongside the requests. An

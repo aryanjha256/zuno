@@ -240,15 +240,28 @@ fn url_for(spec: &RequestSpec) -> Value {
         return json!({ "raw": raw });
     }
 
+    // **The URL's own `?y=1` goes in the list too.** Zuno keeps a typed query string in the URL
+    // rather than splitting it into rows, and an importer that finds a `query` list builds the
+    // URL from it — ours and Postman's both — so leaving those pairs only in `raw` dropped them
+    // on the other side. Kept as typed, not decoded: a `+` or `%20` must come back as written.
+    let inline = spec
+        .url
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or_default())
+        .unwrap_or_default()
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| pair.split_once('=').unwrap_or((pair, "")))
+        .map(|(key, value)| json!({ "key": key, "value": value }));
+
     json!({
         "raw": raw,
-        "query": params
-            .iter()
-            .map(|param| json!({
+        "query": inline
+            .chain(params.iter().map(|param| json!({
                 "key": param.name.trim(),
                 "value": param.value,
                 "disabled": !param.enabled,
-            }))
+            })))
             .collect::<Vec<_>>(),
     })
 }
@@ -472,6 +485,40 @@ mod tests {
         let graphql = me.spec.graphql().expect("must re-import as a GraphQL request");
         assert_eq!(graphql.query, "query Me { me { id } }");
         assert_eq!(graphql.variables, r#"{"n": 1}"#);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A query typed into the URL survives beside the query rows.** The structured list is what
+    /// an importer builds the URL from, so pairs left only in `raw` were dropped on re-import.
+    #[test]
+    fn a_query_typed_into_the_url_survives_beside_the_rows() {
+        let root = root();
+        let mut spec = RequestSpec::default();
+        spec.url = "https://api.test/x?y=1&flag".into();
+        if let crate::request::RequestKind::Http(http) = &mut spec.kind {
+            http.query = vec![
+                QueryParam { enabled: true, name: "page".into(), value: "2".into() },
+                QueryParam { enabled: false, name: "off".into(), value: "1".into() },
+            ];
+        }
+        write(&root.join("x.json"), &spec).expect("write");
+
+        let export = to_collection("x", &scan(&root));
+        let value: serde_json::Value = serde_json::from_str(&export.json).expect("JSON");
+        let back = crate::postman::parse(&value).expect("re-import");
+        let query: Vec<(&str, &str, bool)> = back.requests[0]
+            .spec
+            .http()
+            .unwrap()
+            .query
+            .iter()
+            .map(|param| (param.name.as_str(), param.value.as_str(), param.enabled))
+            .collect();
+        assert_eq!(
+            query,
+            vec![("y", "1", true), ("flag", "", true), ("page", "2", true), ("off", "1", false)]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

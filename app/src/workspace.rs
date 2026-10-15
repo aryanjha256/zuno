@@ -3041,15 +3041,29 @@ impl Workspace {
                 });
             // `allocate` creates the directory and picks a free name, so re-importing the same
             // spec adds `-2` files rather than overwriting a request someone has since edited.
-            let spec = RequestSpec {
-                settings: defaults.clone(),
-                ..request.spec.clone()
-            };
+            //
+            // Only a request that arrives with factory settings takes yours: Postman and OpenAPI
+            // carry none, but a bundle carries each request's own, and stamping over them threw
+            // away the timeouts and TLS choices a bundle exists to move between Zunos.
+            let mut spec = request.spec.clone();
+            if spec.settings == zuno_core::RequestSettings::default() {
+                spec.settings = defaults.clone();
+            }
             match collection::allocate(&directory, &spec.name)
                 .and_then(|path| collection::write(&path, &spec).map(|()| path))
             {
                 Ok(_) => written += 1,
                 Err(_) => failures += 1,
+            }
+        }
+        for folder in &import.empty_folders {
+            let directory = folder
+                .iter()
+                .fold(base.clone(), |directory, part| {
+                    directory.join(collection::slug(part))
+                });
+            if std::fs::create_dir_all(&directory).is_err() {
+                failures += 1;
             }
         }
 
