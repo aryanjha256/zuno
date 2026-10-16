@@ -1363,6 +1363,7 @@ impl Workspace {
         picker.update(cx, |picker, cx| {
             picker.set_placeholder("Search open and saved requests…", cx);
             picker.decorate(buffer_decor, cx);
+            picker.set_match_detail(cx);
         });
 
         // Fill in the saved requests as they arrive. The picker is already usable.

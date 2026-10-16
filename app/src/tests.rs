@@ -4369,6 +4369,40 @@ async fn a_saved_request_can_be_reopened_from_the_picker(cx: &mut TestAppContext
     remove_scratch(&mut cx, &session);
 }
 
+/// **Ctrl+P finds a request by its URL, but never ranks a URL above a name.** An imported Stripe
+/// collection names its requests `PostCharges`; what a person types is `charges` or `/v1/ch`.
+#[gpui::test]
+async fn ctrl_p_matches_urls_after_names(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("picker-url");
+    let save = |name: &str, url: &str| {
+        let mut spec = RequestSpec::default();
+        spec.url = url.into();
+        zuno_core::collection::write(&root.join(format!("{name}.json")), &spec).expect("write");
+    };
+    save("PostCharges", "https://api.stripe.com/v1/charges");
+    save("invoice", "https://x.test/charges/list");
+    save("other", "https://x.test/o");
+    let (window, _, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+
+    cx.press("ctrl-p");
+    wait_for(&mut cx, "the scanned requests", |cx| {
+        picker_rows(&window, cx).iter().any(|r| r.starts_with("other")).then_some(())
+    });
+
+    cx.simulate_input("charges");
+    let rows = picker_rows(&window, &mut cx);
+    let names: Vec<&str> = rows.iter().map(|r| r.split(" — ").next().unwrap_or("")).collect();
+    assert_eq!(names, ["PostCharges", "invoice"], "the name match first, then the URL match");
+
+    // A path nobody would type into a name still finds it.
+    cx.press("ctrl-a");
+    cx.simulate_input("/v1/ch");
+    let rows = picker_rows(&window, &mut cx);
+    assert!(rows.len() == 1 && rows[0].starts_with("PostCharges"), "{rows:?}");
+
+    remove_scratch(&mut cx, &session);
+}
+
 #[gpui::test]
 async fn reopening_a_saved_request_remembers_its_file(cx: &mut TestAppContext) {
     // Opening from a collection has to set `path`, or the next Ctrl+S derives a fresh name

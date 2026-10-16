@@ -207,12 +207,12 @@ pub struct Item {
     pub label: SharedString,
     /// Dimmed trailing context — a URL, or a relative path.
     ///
-    /// **Not matched against.** `refilter` ranks `label` alone, so a buffer row displays a URL you
-    /// cannot search by: `Ctrl+P` finds a request by `posts`, not by `api.github.com`. Deliberate
-    /// for now — the label is what a person is reaching for, and scoring both would let a long URL
-    /// outrank a name that matches exactly — but worth knowing, because the row visibly shows text
-    /// the filter ignores. Doing it properly needs per-field weights so a detail hit can never beat
-    /// a label hit, which is more machinery than the current scale asks for.
+    /// **Matched only where a picker opts in** (`set_match_detail`, which only `Ctrl+P` does), and
+    /// then as a second tier: every label match ranks first, and a row the detail alone matched
+    /// follows. That ordering is what the earlier "label only" rule was protecting — a long URL
+    /// must never outrank a name that matches exactly — and tiers give it without per-field
+    /// weights. Imported collections are why it changed: Stripe's names are `PostCharges`, and
+    /// what a person types is `/charges`.
     pub detail: SharedString,
     pub target: Target,
 }
@@ -269,6 +269,8 @@ pub struct Picker {
     /// last of §11's non-body gaps. A plain `fn` pointer rather than a boxed closure —
     /// nothing needs captured state, and it keeps `Picker` free of a type parameter.
     fallback: Option<fn(&str) -> Option<Item>>,
+    /// Whether rows the label missed may match on their detail — see `Item::detail`.
+    match_detail: bool,
     /// The current query's derived candidate, if the fallback produced one.
     ///
     /// Held apart from `items` rather than appended to it: appending would mean truncating
@@ -314,9 +316,17 @@ impl Picker {
             empty_hint,
             fallback: None,
             derived: None,
+            match_detail: false,
         };
         picker.refilter(cx);
         picker
+    }
+
+    /// Let the detail column match too, after every label match.
+    pub fn set_match_detail(&mut self, cx: &mut Context<Self>) {
+        self.match_detail = true;
+        self.refilter(cx);
+        cx.notify();
     }
 
     /// What the filter box says while empty.
@@ -404,6 +414,16 @@ impl Picker {
         let query = self.query(cx);
         let labels: Vec<&str> = self.items.iter().map(|item| item.label.as_ref()).collect();
         self.matches = zuno_core::fuzzy::rank(&query, labels);
+        // A substring, not a fuzzy match: scattered across a long URL, the letters of `users`
+        // turn up almost everywhere, while `/users` or `api.github` typed is meant literally.
+        let needle = query.trim().to_lowercase();
+        if self.match_detail && !needle.is_empty() {
+            let by_label = self.matches.clone();
+            self.matches.extend(self.items.iter().enumerate().filter_map(|(ix, item)| {
+                (!by_label.contains(&ix) && item.detail.to_lowercase().contains(&needle))
+                    .then_some(ix)
+            }));
+        }
         // Deliberately not ranked among the real rows: it is the "or use what I typed"
         // escape hatch, so it belongs last regardless of how it would score.
         self.derived = self.fallback.and_then(|build| build(&query));
