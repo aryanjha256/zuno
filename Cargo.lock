@@ -8557,7 +8557,7 @@ dependencies = [
 
 [[package]]
 name = "zuno"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-channel 2.5.0",
  "bytes",
@@ -8583,7 +8583,7 @@ dependencies = [
 
 [[package]]
 name = "zuno-core"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "apollo-compiler",
  "async-channel 2.5.0",
