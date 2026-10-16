@@ -107,9 +107,12 @@ impl Parser {
             self.at_start = false;
         }
 
-        while let Some((line, consumed)) = next_line(&self.pending) {
+        // **One drain at the end, not one per line.** Draining each line shifted everything after
+        // it, so a chunk holding many lines cost lines × size: 1.8 MB in one push took 1.9 s.
+        let mut offset = 0;
+        while let Some((line, consumed)) = next_line(&self.pending[offset..]) {
             let line = String::from_utf8_lossy(&line).into_owned();
-            self.pending.drain(..consumed);
+            offset += consumed;
             if let Some(event) = self.line(&line) {
                 events.push(event);
             }
@@ -118,6 +121,7 @@ impl Parser {
                 return events;
             }
         }
+        self.pending.drain(..offset);
 
         // **Checked after the loop, because an unterminated line never reaches `line`.** A
         // stream that sends megabytes with no terminator in them leaves every byte sitting in
