@@ -418,10 +418,14 @@ impl Picker {
         // turn up almost everywhere, while `/users` or `api.github` typed is meant literally.
         let needle = query.trim().to_lowercase();
         if self.match_detail && !needle.is_empty() {
-            let by_label = self.matches.clone();
+            // A table, not `matches.contains`: a one-letter query matches nearly every label,
+            // and the search made each keystroke cost labels × items — 40 ms at 12,000 requests.
+            let mut by_label = vec![false; self.items.len()];
+            for &ix in &self.matches {
+                by_label[ix] = true;
+            }
             self.matches.extend(self.items.iter().enumerate().filter_map(|(ix, item)| {
-                (!by_label.contains(&ix) && item.detail.to_lowercase().contains(&needle))
-                    .then_some(ix)
+                (!by_label[ix] && item.detail.to_lowercase().contains(&needle)).then_some(ix)
             }));
         }
         // Deliberately not ranked among the real rows: it is the "or use what I typed"
