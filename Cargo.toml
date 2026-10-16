@@ -51,6 +51,12 @@ reqwest = { version = "0.13", default-features = false, features = [
     # Multipart bodies. Enabled when multipart authoring landed; `build.rs` returns
     # `UnsupportedBody` without it.
     "multipart",
+    # The OS proxy settings, which `ProxyMode::System` promises. A default feature that
+    # `default-features = false` dropped, so a Mac or Windows proxy set in network settings
+    # rather than `HTTPS_PROXY` was ignored while the status bar said "proxy: system".
+    # Manual settings only: the Windows `ProxyServer`/`ProxyOverride` pair and the macOS
+    # HTTP/HTTPS proxies. A PAC script is not read on either. Linux adds nothing.
+    "system-proxy",
 ] }
 tokio = { version = "1", features = [
     "rt-multi-thread",
