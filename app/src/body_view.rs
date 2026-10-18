@@ -127,6 +127,7 @@ impl BodyView {
         if body.is_empty() {
             return Self::plain(BodyKind::Empty, None);
         }
+        let body = to_utf8(body, content_type.as_deref());
 
         let is_json = looks_like_json(&body, content_type.as_deref());
         let too_large = body.len() > MAX_AUTO_PARSE;
@@ -621,6 +622,46 @@ fn widest_of(lines: &LineIndex) -> (usize, (u16, u32)) {
     (ix, (0, lines.line(ix).0.chars().count() as u32))
 }
 
+/// The body re-encoded as UTF-8 for display, when it is text in another encoding.
+///
+/// **Only what is shown changes**: the response keeps the bytes the server sent, so saving,
+/// diffing and the size line are untouched. Before this a Latin-1, Windows-1252 or UTF-16 body
+/// fell through to a hex dump even when its `charset` said exactly what it was.
+///
+/// Valid UTF-8 is left alone whatever the header claims, because a label that disagrees with the
+/// bytes is wrong more often than the bytes are, and decoding UTF-8 as Latin-1 turns `é` into
+/// `Ã©`. Only a body that says it is text is decoded — a textual type or a declared `charset` —
+/// and then by its byte-order mark, its `charset`, or Windows-1252, the Encoding Standard's
+/// default for legacy text. **A byte-order mark alone is not evidence**: a binary body can open
+/// with `FF FE`, and decoding one as UTF-16 replaces its hex dump with nonsense.
+fn to_utf8(body: Bytes, content_type: Option<&str>) -> Bytes {
+    let bom = encoding_rs::Encoding::for_bom(&body).map(|(encoding, _)| encoding);
+    if bom.is_none() && std::str::from_utf8(&body).is_ok() {
+        return body;
+    }
+
+    let lower = content_type.unwrap_or_default().to_ascii_lowercase();
+    let declared = lower.split(';').find_map(|part| {
+        let label = part.trim().strip_prefix("charset=")?;
+        encoding_rs::Encoding::for_label(label.trim_matches('"').as_bytes())
+    });
+    let textual = ["text/", "json", "xml", "html", "javascript"]
+        .iter()
+        .any(|kind| lower.contains(kind));
+    if !textual && declared.is_none() {
+        return body;
+    }
+
+    match bom.or(declared).or(Some(encoding_rs::WINDOWS_1252)) {
+        // Declared UTF-8 and not valid as UTF-8: nothing to decode it as, so the hex dump stays.
+        Some(encoding) if encoding != encoding_rs::UTF_8 || bom.is_some() => {
+            let (text, _, _) = encoding.decode(&body);
+            Bytes::from(text.into_owned())
+        }
+        _ => body,
+    }
+}
+
 /// Text if it decodes, otherwise a hex dump of the bytes.
 ///
 /// **`BodyKind::Binary` used to be the end of the road** — one line saying how many bytes came
@@ -676,6 +717,34 @@ mod tests {
             false,
             HtmlView::default(),
         )
+    }
+
+    /// **Text in another encoding is shown as text.** Each of these was a hex dump.
+    #[test]
+    fn a_body_in_another_encoding_is_decoded_for_display() {
+        let first_line = |bytes: Vec<u8>, content_type: &str| -> Option<String> {
+            let view = BodyView::build(Bytes::from(bytes), Some(content_type.into()), false, HtmlView::default());
+            match &view.kind {
+                BodyKind::Text(lines) => Some(lines.line(0).0.to_string()),
+                _ => None,
+            }
+        };
+
+        // Declared.
+        let latin1 = encoding_rs::WINDOWS_1252.encode("Café crème").0.into_owned();
+        assert_eq!(first_line(latin1.clone(), "text/plain; charset=iso-8859-1").as_deref(), Some("Café crème"));
+        // Undeclared, but a textual type: the Encoding Standard's legacy default.
+        assert_eq!(first_line(latin1.clone(), "text/plain").as_deref(), Some("Café crème"));
+        // A binary type is never guessed at.
+        assert!(first_line(latin1, "application/octet-stream").is_none(), "still a hex dump");
+        // Valid UTF-8 is kept as UTF-8 even under a Latin-1 label — decoding it would make `Ã©`.
+        assert_eq!(first_line("Café".as_bytes().to_vec(), "text/plain; charset=latin1").as_deref(), Some("Café"));
+
+        // UTF-16 JSON, found by its byte-order mark, parses as JSON.
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend("{\"ok\":true}".encode_utf16().flat_map(u16::to_le_bytes));
+        let view = BodyView::build(Bytes::from(utf16), Some("application/json".into()), false, HtmlView::default());
+        assert!(view.outline().is_some(), "UTF-16 JSON should open as a tree");
     }
 
     #[test]

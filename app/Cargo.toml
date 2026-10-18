@@ -39,6 +39,11 @@ dirs = "7"
 # Chosen over chrono, which would be a new crate tree for one heading.
 time = { version = "0.3.55", features = ["local-offset"] }
 
+# Showing a Latin-1, Windows-1252 or UTF-16 body as text rather than as a hex dump: the WHATWG
+# Encoding Standard's labels and decoders, as Firefox uses them. Already compiled through gpui at
+# this version, so this names it rather than adding one.
+encoding_rs = "0.8.35"
+
 # `build.rs` draws `assets/icons/zuno.svg` into an `.ico` and embeds it in `zuno.exe`, where gpui
 # reads the window icon from. Windows only, so Linux and macOS builds compile none of these.
 # `resvg` is gpui's version for the dev-dependency's reason below; `embed-resource` 3 is the one

@@ -8576,6 +8576,7 @@ dependencies = [
  "bytes",
  "dirs 7.0.0",
  "embed-resource",
+ "encoding_rs",
  "futures-util",
  "gpui",
  "http",
