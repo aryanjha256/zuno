@@ -7,22 +7,15 @@ the top of the GitHub release page.
 ## Unreleased
 
 ### Added
-- **Toasts for errors and finished work.** A failure (a save, an import, a sync) shows in a toast
-  that stays until you dismiss it, with the full message one click away and Retry where it makes
-  sense. An import, export or clone that finishes in the background shows one that fades. An
-  import now lists what it skipped, which used to go nowhere visible. Small confirmations stay in
-  the status bar.
-- **Ctrl+P finds a request by its URL** as well as its name. Name matches always rank first, so a
-  long URL never pushes aside the request you named.
+- Toasts for errors and finished background work; errors stay until dismissed.
+- Ctrl+P finds requests by URL as well as name.
 
 ### Fixed
-- Responses in **Latin-1, Windows-1252 or UTF-16** show as text instead of a hex dump. Only what
-  is displayed is converted; saved and diffed bodies keep the exact bytes the server sent.
-- **JSON that starts with a byte-order mark** (as ASP.NET and Windows tools send it) parses, in
-  the viewer and for captures and assertions.
-- On **macOS and Windows**, a proxy set in the system's network settings is used when Zuno's
-  proxy is set to "system". Automatic configuration (a PAC script) is not read yet.
-- Ctrl+P stays fast at any size: about 6 ms per keystroke with 12,000 saved requests.
+- Latin-1, Windows-1252 and UTF-16 responses show as text, not a hex dump.
+- JSON starting with a byte-order mark parses.
+- macOS and Windows system proxy settings are used.
+- Ctrl+P stays fast with large collections.
+- Ctrl+W asks before closing an unsaved curl-import or restored tab.
 
 ## 0.5.6 - 2026-10-16
 
