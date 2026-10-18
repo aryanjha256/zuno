@@ -6,6 +6,8 @@ the top of the GitHub release page.
 
 ## Unreleased
 
+## 0.5.7 - 2026-10-19
+
 ### Added
 - Toasts for errors and finished background work; errors stay until dismissed.
 - Ctrl+P finds requests by URL as well as name.
