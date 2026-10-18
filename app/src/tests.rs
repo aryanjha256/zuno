@@ -3911,6 +3911,11 @@ async fn a_curl_import_opens_a_new_buffer_instead_of_replacing_one(cx: &mut Test
         before.url,
         "the original buffer must survive an import"
     );
+
+    // The import is the only copy, so closing it must ask rather than drop it.
+    cx.press("ctrl-w");
+    cx.run_until_parked();
+    assert_eq!(tabs_of(&window, &mut cx).0, 2, "ctrl-w on an unsaved import must ask, not close");
 }
 
 #[gpui::test]

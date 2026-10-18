@@ -6491,7 +6491,19 @@ impl Workspace {
             id: self.next_id(cx),
             ..import.spec
         };
+        let settings = spec.settings.clone();
         self.open(spec, window, cx);
+        // **Measured against a blank tab, not against itself.** `open` takes what it is given as
+        // the clean state, which is right for a file and wrong here: the import was clean, so
+        // Ctrl+W closed it without asking and the only copy was gone.
+        if let Some(view) = self.active() {
+            view.update(cx, |view, _| {
+                view.baseline = RequestSpec {
+                    settings,
+                    ..RequestSpec::default()
+                };
+            });
+        }
         // After `open`, so the status lands on the new buffer rather than the one that
         // happened to be in front when the import ran.
         self.set_status(&message, cx);
