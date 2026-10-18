@@ -46,7 +46,11 @@ struct Parser<'a> {
 pub fn flatten(src: &[u8]) -> Result<Vec<Row>, JsonError> {
     let mut parser = Parser {
         src,
-        pos: 0,
+        // **Past a UTF-8 byte-order mark**, which ASP.NET and Windows tooling put in front of
+        // JSON: it is not JSON whitespace, so a body opening with one failed at byte 0 and the
+        // viewer, captures and assertions all fell back to raw text. Spans stay offsets into
+        // `src`, so nothing downstream sees the difference.
+        pos: if src.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 },
         // Roughly one row per 24 bytes of JSON, clamped so a huge body doesn't reserve
         // wildly and a tiny one doesn't reallocate.
         rows: Vec::with_capacity((src.len() / 24).clamp(8, 1 << 20)),

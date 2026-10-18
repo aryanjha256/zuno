@@ -620,6 +620,15 @@ mod tests {
         JsonOutline::parse(Bytes::from_static(json.as_bytes())).expect("valid json")
     }
 
+    /// ASP.NET and Windows tooling open JSON with a UTF-8 byte-order mark, and the viewer,
+    /// captures and assertions all read through here.
+    #[test]
+    fn a_byte_order_mark_before_the_json_is_skipped() {
+        let outline = outline("\u{feff}{\"id\":7}");
+        assert_eq!(outline.len(), 3);
+        assert_eq!(crate::capture::extract(&outline, "$.id").as_deref(), Some("7"));
+    }
+
     #[test]
     fn a_scalar_document_is_one_row() {
         let outline = outline("42");
