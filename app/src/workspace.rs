@@ -8364,6 +8364,23 @@ impl Workspace {
         .detach();
     }
 
+    /// Copy on a toast says "Copied" for a moment.
+    pub(crate) fn toast_copied(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(toast) = self.toasts.get_mut(id) else { return };
+        toast.copied = true;
+        cx.notify();
+        cx.spawn(async move |workspace, cx| {
+            cx.background_executor().timer(crate::toast::COPIED_FOR).await;
+            let _ = workspace.update(cx, |workspace, cx| {
+                if let Some(toast) = workspace.toasts.get_mut(id) {
+                    toast.copied = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
         self.toasts.dismiss(id);
         cx.notify();

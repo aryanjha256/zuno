@@ -4305,8 +4305,46 @@ async fn a_done_toast_fades_and_an_error_stays_until_dismissed(cx: &mut TestAppC
     );
     assert!(ids(&mut cx).is_empty());
 
-    // And the close button dismisses.
+    // Details opens and closes, and Copy says it copied — both read as dead without feedback.
     cx.press("escape");
+    let long = "Could not save: Permission denied (os error 13) while writing \
+                /home/someone/collections/Billing-API/invoices/create-invoice.json";
+    window
+        .update(&mut cx, |workspace, _, cx| workspace.toast_error_with(long, None, cx))
+        .expect("window");
+    cx.run_until_parked();
+    let id = ids(&mut cx)[0];
+    let toast = |cx: &mut VisualTestContext| {
+        window
+            .update(cx, |workspace, _, _| {
+                let toast = &workspace.toasts.list[0];
+                (toast.expanded, toast.copied)
+            })
+            .expect("window")
+    };
+    let details = cx
+        .debug_bounds(selector(format!("toast-{id}-details")))
+        .expect("Details on a long error");
+    cx.simulate_click(details.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(toast(&mut cx), (true, false), "Details should open");
+
+    let copy = cx.debug_bounds(selector(format!("toast-{id}-copy"))).expect("Copy");
+    cx.simulate_click(copy.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()).as_deref(),
+        Some(long)
+    );
+    assert_eq!(toast(&mut cx), (true, true), "Copy should say it copied");
+    cx.executor().advance_clock(crate::toast::COPIED_FOR * 2);
+    cx.run_until_parked();
+    assert_eq!(toast(&mut cx), (true, false), "and go back to Copy");
+    window
+        .update(&mut cx, |workspace, _, cx| workspace.dismiss_toast(id, cx))
+        .expect("window");
+
+    // And the close button dismisses.
     window
         .update(&mut cx, |workspace, _, cx| {
             workspace.toast_error_with("Could not move: no such folder", None, cx)

@@ -51,7 +51,13 @@ pub struct Toast {
     pub action: Option<(SharedString, Box<dyn Action>)>,
     pub expanded: bool,
     pub hovered: bool,
+    /// Copy was just pressed: its label reads "Copied" until `COPIED_FOR` passes, because a
+    /// clipboard write is otherwise invisible and the button felt dead.
+    pub copied: bool,
 }
+
+/// How long Copy says "Copied".
+pub const COPIED_FOR: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 pub struct Toasts {
@@ -86,6 +92,7 @@ impl Toasts {
             action,
             expanded: false,
             hovered: false,
+            copied: false,
         });
         id
     }
@@ -167,21 +174,30 @@ fn one(toast: &Toast, theme: &Theme, cx: &mut Context<Workspace>) -> gpui::AnyEl
         }
     });
 
-    let button = |label: SharedString, element_id: SharedString, primary: bool| {
+    // **Every button answers the pointer twice**: a background on hover and a darker one while
+    // pressed. A text colour shifting from grey to lighter grey was the only response before,
+    // so Details and Copy read as dead even when they worked.
+    let button = |label: SharedString, element_id: SharedString, primary: bool, icon: Option<(Icon, gpui::Hsla)>| {
+        let text = if primary { theme.text } else { theme.text_muted };
         div()
             .id(element_id)
+            .group(crate::ui::ICON_GROUP)
             .h(px(24.))
             .px_2()
             .flex()
+            .flex_row()
             .items_center()
+            .gap_1()
             .rounded_sm()
             .text_xs()
             .cursor_pointer()
-            .when(primary, |button| {
-                button.bg(theme.bg_hover).border_1().border_color(theme.border).text_color(theme.text)
-            })
-            .when(!primary, |button| button.text_color(theme.text_muted))
-            .hover(|style| style.text_color(theme.text))
+            .text_color(text)
+            .border_1()
+            .border_color(if primary { theme.border } else { gpui::transparent_black() })
+            .when(primary, |button| button.bg(theme.bg_hover))
+            .hover(|style| style.bg(theme.bg_hover).border_color(theme.text_faint).text_color(theme.text))
+            .active(|style| style.bg(theme.bg))
+            .children(icon.map(|(icon, color)| glyph(icon, color, color, 12.)))
             .child(label)
     };
 
@@ -189,7 +205,7 @@ fn one(toast: &Toast, theme: &Theme, cx: &mut Context<Workspace>) -> gpui::AnyEl
     if let Some((label, action)) = &toast.action {
         let action = action.boxed_clone();
         buttons.push(
-            button(label.clone(), format!("toast-{id}-action").into(), true)
+            button(label.clone(), format!("toast-{id}-action").into(), true, None)
                 .debug_selector(move || format!("toast-{id}-action"))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -203,9 +219,19 @@ fn one(toast: &Toast, theme: &Theme, cx: &mut Context<Workspace>) -> gpui::AnyEl
         );
     }
     if long {
-        let label = if toast.expanded { "Hide details" } else { "Details" };
+        let (label, chevron) = if toast.expanded {
+            ("Hide details", Icon::ChevronUp)
+        } else {
+            ("Details", Icon::ChevronDown)
+        };
         buttons.push(
-            button(label.into(), format!("toast-{id}-details").into(), false)
+            button(
+                label.into(),
+                format!("toast-{id}-details").into(),
+                false,
+                Some((chevron, theme.text_muted)),
+            )
+                .debug_selector(move || format!("toast-{id}-details"))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -224,13 +250,20 @@ fn one(toast: &Toast, theme: &Theme, cx: &mut Context<Workspace>) -> gpui::AnyEl
             Some(detail) => format!("{}: {detail}", toast.title),
             None => toast.title.to_string(),
         };
+        let (label, icon) = if toast.copied {
+            ("Copied", Some((Icon::Check, theme.status_success)))
+        } else {
+            ("Copy", Some((Icon::Copy, theme.text_muted)))
+        };
         buttons.push(
-            button("Copy".into(), format!("toast-{id}-copy").into(), false)
+            button(label.into(), format!("toast-{id}-copy").into(), false, icon)
+                .debug_selector(move || format!("toast-{id}-copy"))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |_, _: &MouseDownEvent, _, cx| {
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                        this.toast_copied(id, cx);
                     }),
                 )
                 .into_any_element(),
