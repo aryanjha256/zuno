@@ -408,7 +408,11 @@ impl Workspace {
         // Reopen where you left off. A missing or unreadable session falls back to one
         // sample request rather than an empty window. `session::load` guarantees a
         // non-empty `tabs` and an in-range `active`, so neither is re-checked here.
-        let session = crate::session::load(cx)
+        let loaded = crate::session::load(cx);
+        // Only a tab that came back from disk can be the sole copy of anything; the first-run
+        // sample is not, and closing it should not ask.
+        let restored = loaded.is_some();
+        let session = loaded
             .unwrap_or_else(|| crate::session::Session::single(crate::session::first_run()));
         let active_ix = session.active;
         let carried_tabs = session.carried.clone();
@@ -432,6 +436,9 @@ impl Workspace {
                     let mut view = RequestView::new(tab.spec, cx);
                     // Restoring this is what makes Ctrl+S after a restart overwrite the
                     // request's own file instead of deriving a fresh name beside it.
+                    if restored && tab.path.is_none() {
+                        view.mark_unsaved();
+                    }
                     view.path = tab.path;
                     view
                 })
@@ -647,8 +654,10 @@ impl Workspace {
     /// Split from `switch_workspace` because forgetting the active workspace re-resolves the
     /// globals without going through `set_active`, and the window still has to follow.
     fn reload_active_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let session = crate::session::load(cx)
-            .unwrap_or_else(|| crate::session::Session::single(RequestSpec::default()));
+        let loaded = crate::session::load(cx);
+        let restored = loaded.is_some();
+        let session =
+            loaded.unwrap_or_else(|| crate::session::Session::single(RequestSpec::default()));
 
         self.views = session
             .tabs
@@ -656,6 +665,9 @@ impl Workspace {
             .map(|tab| {
                 cx.new(|cx| {
                     let mut view = RequestView::new(tab.spec, cx);
+                    if restored && tab.path.is_none() {
+                        view.mark_unsaved();
+                    }
                     view.path = tab.path;
                     view
                 })
@@ -6491,18 +6503,9 @@ impl Workspace {
             id: self.next_id(cx),
             ..import.spec
         };
-        let settings = spec.settings.clone();
         self.open(spec, window, cx);
-        // **Measured against a blank tab, not against itself.** `open` takes what it is given as
-        // the clean state, which is right for a file and wrong here: the import was clean, so
-        // Ctrl+W closed it without asking and the only copy was gone.
         if let Some(view) = self.active() {
-            view.update(cx, |view, _| {
-                view.baseline = RequestSpec {
-                    settings,
-                    ..RequestSpec::default()
-                };
-            });
+            view.update(cx, |view, _| view.mark_unsaved());
         }
         // After `open`, so the status lands on the new buffer rather than the one that
         // happened to be in front when the import ran.

@@ -3992,6 +3992,14 @@ async fn every_saved_buffer_is_restored_not_just_the_active_one(cx: &mut TestApp
         "the buffer that was in front should be in front again"
     );
 
+    // Unsaved, so the restored copy is the only one: closing it must ask.
+    cx.press("ctrl-w");
+    cx.run_until_parked();
+    let tabs = window
+        .update(&mut cx, |workspace, _, _| workspace.tab_count())
+        .expect("window");
+    assert_eq!(tabs, 3, "ctrl-w on a restored unsaved tab must ask, not close");
+
     remove_scratch(&mut cx, &path);
 }
 

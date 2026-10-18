@@ -1274,6 +1274,19 @@ impl RequestView {
         cx.notify();
     }
 
+    /// Measure this buffer against a blank tab rather than against what it opened with.
+    ///
+    /// For content that exists nowhere else — a curl import, an unsaved tab brought back by a
+    /// restart or a workspace switch. `load` takes what it is given as the clean state, which is
+    /// right for a file and wrong for these: they opened clean, so Ctrl+W dropped the only copy
+    /// without asking. A blank tab still reads clean, since the settings are kept.
+    pub fn mark_unsaved(&mut self) {
+        self.baseline = RequestSpec {
+            settings: self.baseline.settings.clone(),
+            ..RequestSpec::default()
+        };
+    }
+
     /// Whether this buffer differs from the file it came from.
     ///
     /// Compares against `baseline` field by field rather than building `spec()` and comparing
