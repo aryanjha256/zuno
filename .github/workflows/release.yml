@@ -354,6 +354,13 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # Only the changelog: the notes open with this version's section, and nothing else in the
+      # repository is needed to publish what the build jobs already made.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -380,7 +387,19 @@ jobs:
       # on the indentation surviving two levels of stripping.
       - name: Write the release notes
         run: |
+          # This version's CHANGELOG.md section, without its heading. A manual run is on a branch
+          # rather than a tag, finds no section, and writes the install half alone.
+          version="${GITHUB_REF_NAME#v}"
+          awk -v version="$version" '
+            /^## / { if (found) exit; if ($2 == version) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > changes.md
           {
+            if [ -s changes.md ]; then
+              echo "## What's new in $version"
+              cat changes.md
+              echo
+            fi
             echo '### Install or update'
             echo
             echo '```bash'

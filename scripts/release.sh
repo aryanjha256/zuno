@@ -15,6 +15,9 @@
 # `env!("CARGO_PKG_VERSION")`, and cargo-deb names the package from it. Nothing else needs
 # editing, and the tag is checked against it by the release workflow.
 #
+# CHANGELOG.md's `## Unreleased` section must have entries; it is renamed to the new version and
+# committed with the bump, and the release workflow puts that section at the top of the page.
+#
 # Nothing is pushed without `--push`. A commit and a tag are both local and both undoable;
 # a pushed tag builds and publishes a GitHub Release.
 
@@ -34,7 +37,7 @@ for arg in "$@"; do
     case "$arg" in
         --push) push=true ;;
         --no-test) run_tests=false ;;
-        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown flag: $arg" ;;
         *) [ -z "$bump" ] || die "give one version, got '$bump' and '$arg'"; bump="$arg" ;;
     esac
@@ -80,6 +83,12 @@ if git ls-remote --exit-code --tags origin "$tag" >/dev/null 2>&1; then
 fi
 
 [ "$version" != "$current" ] || die "already at $version"
+
+# The release page opens with this version's changelog section, so a release with nothing under
+# Unreleased would publish a page that says nothing about itself.
+[ -f CHANGELOG.md ] || die "no CHANGELOG.md"
+unreleased=$(awk '/^## Unreleased/ { on = 1; next } /^## / { on = 0 } on && /^- / { n++ } END { print n + 0 }' CHANGELOG.md)
+[ "$unreleased" -gt 0 ] || die "CHANGELOG.md has nothing under '## Unreleased' — add what this release changes"
 # Sorts the two versions and complains if the new one is not the later. `sort -V` is
 # GNU-only, which is fine: this repo builds Debian packages on Linux.
 if [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" != "$version" ]; then
@@ -89,7 +98,7 @@ fi
 # --- write --------------------------------------------------------------------------
 
 # Restore the manifests if anything below fails, so a failed run leaves nothing behind.
-restore() { git checkout -- Cargo.toml Cargo.lock 2>/dev/null || true; }
+restore() { git checkout -- Cargo.toml Cargo.lock CHANGELOG.md 2>/dev/null || true; }
 trap restore ERR
 
 step "bumping [workspace.package] version"
@@ -108,6 +117,16 @@ mv Cargo.toml.new Cargo.toml
 written=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zuno") | .version')
 [ "$written" = "$version" ] || die "bump did not take: cargo still reports $written"
 
+step "naming the Unreleased changes $version"
+# The section keeps its contents and gains a version and date; a fresh empty Unreleased goes
+# above it for the next round of work.
+awk -v version="$version" -v today="$(date +%F)" '
+    !done && /^## Unreleased/ { print; print ""; print "## " version " - " today; done = 1; next }
+    { print }
+' CHANGELOG.md > CHANGELOG.md.new
+mv CHANGELOG.md.new CHANGELOG.md
+grep -q "^## $version - " CHANGELOG.md || die "the changelog heading for $version did not land"
+
 step "refreshing Cargo.lock"
 cargo update -w --quiet
 
@@ -121,7 +140,7 @@ trap - ERR
 # --- commit and tag -----------------------------------------------------------------
 
 step "committing"
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -q -m "release $version"
 
 step "tagging $tag"
