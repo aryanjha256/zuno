@@ -45,6 +45,7 @@ mod settings_panel;
 #[cfg(test)]
 mod tests;
 mod theme;
+mod toast;
 mod ui;
 mod update;
 mod workspace;

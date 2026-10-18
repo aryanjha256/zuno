@@ -98,6 +98,8 @@ pub enum Icon {
     Cookie,
     Waypoints,
     FileBadge,
+    CircleAlert,
+    CircleCheck,
 }
 
 impl Icon {
@@ -116,6 +118,8 @@ impl Icon {
             Icon::Cookie => "icons/cookie.svg",
             Icon::Waypoints => "icons/waypoints.svg",
             Icon::FileBadge => "icons/file-badge.svg",
+            Icon::CircleAlert => "icons/circle-alert.svg",
+            Icon::CircleCheck => "icons/circle-check.svg",
             Icon::Eye => "icons/eye.svg",
             Icon::EyeOff => "icons/eye-off.svg",
             Icon::EllipsisVertical => "icons/ellipsis-vertical.svg",
@@ -177,6 +181,8 @@ impl Icon {
         Icon::Waypoints,
         Icon::File,
         Icon::FileBadge,
+        Icon::CircleAlert,
+        Icon::CircleCheck,
         Icon::Eye,
         Icon::EyeOff,
         Icon::EllipsisVertical,
@@ -238,6 +244,8 @@ impl AssetSource for Assets {
             "icons/waypoints.svg" => include_bytes!("../assets/icons/waypoints.svg"),
             "icons/file.svg" => include_bytes!("../assets/icons/file.svg"),
             "icons/file-badge.svg" => include_bytes!("../assets/icons/file-badge.svg"),
+            "icons/circle-alert.svg" => include_bytes!("../assets/icons/circle-alert.svg"),
+            "icons/circle-check.svg" => include_bytes!("../assets/icons/circle-check.svg"),
             "icons/eye.svg" => include_bytes!("../assets/icons/eye.svg"),
             "icons/eye-off.svg" => include_bytes!("../assets/icons/eye-off.svg"),
             "icons/ellipsis-vertical.svg" => include_bytes!("../assets/icons/ellipsis-vertical.svg"),

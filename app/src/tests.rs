@@ -3255,7 +3255,7 @@ async fn a_curl_command_on_the_clipboard_becomes_the_request(cx: &mut TestAppCon
 async fn an_unparseable_clipboard_reports_instead_of_wrecking_the_request(
     cx: &mut TestAppContext,
 ) {
-    let (view, mut cx) = open_workspace(cx);
+    let (window, view, mut cx) = boot(cx, None, None);
 
     let before = spec_of(&view, &mut cx);
     // Genuinely unparseable: an unbalanced quote. (Prose is rejected too, but by the
@@ -3269,9 +3269,8 @@ async fn an_unparseable_clipboard_reports_instead_of_wrecking_the_request(
     assert_eq!(before.url, after.url);
     assert_eq!(before.http().unwrap().method, after.http().unwrap().method);
 
-    let status = cx.update(|_, cx| view.read(cx).status.clone());
     assert!(
-        status.is_some_and(|s| s.contains("Could not import")),
+        last_toast(&window, &mut cx).is_some_and(|s| s.contains("Could not import")),
         "the failure should be reported"
     );
 }
@@ -4240,6 +4239,87 @@ async fn a_url_that_looks_like_a_path_cannot_write_outside_the_collection(
     assert!(saved.starts_with(&root), "{saved:?}");
 
     remove_scratch(&mut cx, &session);
+}
+
+/// The newest toast as `title: detail` — where an error or finished background work is reported
+/// now, rather than in the status bar's message line.
+fn last_toast(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext) -> Option<String> {
+    window
+        .update(cx, |workspace, _, _| workspace.toast_texts().last().cloned())
+        .expect("window")
+}
+
+/// **Finished work fades, an error stays, and a toast's buttons are real mouse paths.** The fade
+/// and the hover pause run on the simulated clock, so nothing here waits in real time.
+#[gpui::test]
+async fn a_done_toast_fades_and_an_error_stays_until_dismissed(cx: &mut TestAppContext) {
+    let (window, _view, mut cx) = boot(cx, None, None);
+    let ids = |cx: &mut VisualTestContext| -> Vec<u64> {
+        window
+            .update(cx, |workspace, _, _| workspace.toasts.list.iter().map(|toast| toast.id).collect())
+            .expect("window")
+    };
+
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.toast_done("Exported 3 request(s)", None, cx);
+            workspace.toast_error_with(
+                "Could not save: permission denied",
+                Some(("Settings".into(), Box::new(crate::OpenSettings))),
+                cx,
+            );
+        })
+        .expect("window");
+    cx.run_until_parked();
+    let (done, error) = match ids(&mut cx)[..] {
+        [done, error] => (done, error),
+        ref other => panic!("two toasts, got {other:?}"),
+    };
+
+    // Read while the pointer rests on it: the fade waits.
+    window
+        .update(&mut cx, |workspace, _, _| workspace.toasts.get_mut(done).unwrap().hovered = true)
+        .expect("window");
+    cx.executor().advance_clock(crate::toast::FADE_AFTER * 2);
+    cx.run_until_parked();
+    assert_eq!(ids(&mut cx), [done, error], "a hovered toast must not fade");
+
+    window
+        .update(&mut cx, |workspace, _, _| workspace.toasts.get_mut(done).unwrap().hovered = false)
+        .expect("window");
+    cx.executor().advance_clock(crate::toast::FADE_AFTER * 2);
+    cx.run_until_parked();
+    assert_eq!(ids(&mut cx), [error], "finished work fades; an error stays");
+
+    // The action dispatches what its keybinding would, and takes the toast with it.
+    // `debug_bounds` wants a `&'static str`, and these names carry an id.
+    let selector = |name: String| -> &'static str { Box::leak(name.into_boxed_str()) };
+    let action = cx
+        .debug_bounds(selector(format!("toast-{error}-action")))
+        .expect("the action button");
+    cx.simulate_click(action.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        window.update(&mut cx, |workspace, _, _| workspace.settings_is_open()).expect("window"),
+        "the toast's button should have opened settings"
+    );
+    assert!(ids(&mut cx).is_empty());
+
+    // And the close button dismisses.
+    cx.press("escape");
+    window
+        .update(&mut cx, |workspace, _, cx| {
+            workspace.toast_error_with("Could not move: no such folder", None, cx)
+        })
+        .expect("window");
+    cx.run_until_parked();
+    let id = ids(&mut cx)[0];
+    let close = cx
+        .debug_bounds(selector(format!("toast-{id}-close")))
+        .expect("the close button");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(ids(&mut cx).is_empty(), "× should dismiss the error");
 }
 
 /// The picker's currently-visible rows, top to bottom.
@@ -5812,7 +5892,7 @@ async fn trailers_are_reachable_only_where_they_are_drawn(cx: &mut TestAppContex
 /// reports it cannot read the file, and with no collection reflection says where it would save.
 #[gpui::test]
 async fn the_grpc_method_tab_controls_dispatch(cx: &mut TestAppContext) {
-    let (view, mut cx) = open_workspace(cx);
+    let (window, view, mut cx) = boot(cx, None, None);
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             let kind = crate::kinds::KindEditor::empty(crate::kinds::KindChoice::Grpc, cx);
@@ -5821,12 +5901,19 @@ async fn the_grpc_method_tab_controls_dispatch(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
+    // What a click reported, wherever it went: a schema that cannot be read is an error and
+    // toasts, while "open a collection first" answers the click in the status bar.
     let status = |cx: &mut VisualTestContext| {
-        cx.update(|_, cx| view.read(cx).status.as_ref().map(|s| s.to_string()))
-            .unwrap_or_default()
+        let line = cx
+            .update(|_, cx| view.read(cx).status.as_ref().map(|s| s.to_string()))
+            .unwrap_or_default();
+        format!("{line} {}", last_toast(&window, cx).unwrap_or_default())
     };
     let clear = |cx: &mut VisualTestContext| {
-        cx.update(|_, cx| view.update(cx, |view, _| view.status = None))
+        cx.update(|_, cx| view.update(cx, |view, _| view.status = None));
+        window
+            .update(cx, |workspace, _, _| workspace.toasts.list.clear())
+            .expect("window");
     };
 
     let select = cx.debug_bounds("grpc-choose-method").expect("the method select");
@@ -13635,7 +13722,7 @@ async fn a_postman_export_imports_as_a_tree_with_its_environment_selected(cx: &m
     )
     .expect("write export");
 
-    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
     cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
@@ -13685,8 +13772,7 @@ async fn a_postman_export_imports_as_a_tree_with_its_environment_selected(cx: &m
 
     // And it says so, because a silent environment switch is the failure mode rather than the
     // switch itself.
-    let status = cx.update(|_, cx| view.read(cx).status.clone());
-    let status = status.expect("the import reports what it did");
+    let status = last_toast(&window, &mut cx).expect("the import reports what it did");
     assert!(
         status.contains("2 requests") && status.contains("now selected"),
         "the report must name both halves: {status:?}"
@@ -13722,7 +13808,7 @@ async fn a_postman_environment_export_lands_split_and_gitignored(cx: &mut TestAp
     )
     .expect("write export");
 
-    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
     cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
@@ -13756,7 +13842,7 @@ async fn a_postman_environment_export_lands_split_and_gitignored(cx: &mut TestAp
         .expect("window");
     assert_eq!(active.as_deref(), Some("Staging"));
 
-    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    let status = last_toast(&window, &mut cx).expect("status");
     assert!(
         status.contains("2 variables") && status.contains("now selected"),
         "the report must name both halves: {status:?}"
@@ -13789,7 +13875,7 @@ async fn a_postman_globals_export_lands_on_the_base_layer_and_selects_nothing(
     )
     .expect("write export");
 
-    let (window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
     cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
@@ -13819,7 +13905,7 @@ async fn a_postman_globals_export_lands_on_the_base_layer_and_selects_nothing(
         .expect("window");
     assert_eq!(badge, zuno_core::environment::GLOBALS);
 
-    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    let status = last_toast(&window, &mut cx).expect("status");
     assert!(
         status.contains("globals are always active"),
         "nobody should go looking for it in the switcher: {status:?}"
@@ -13871,7 +13957,7 @@ async fn a_recovered_script_arrives_on_the_request_it_came_from(cx: &mut TestApp
     )
     .expect("write export");
 
-    let (_window, view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    let (window, _view, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
 
     cx.press("ctrl-shift-i");
     cx.simulate_input(export.to_str().expect("path"));
@@ -13890,7 +13976,7 @@ async fn a_recovered_script_arrives_on_the_request_it_came_from(cx: &mut TestApp
     assert_eq!(spec.assertions[0].value, "admin");
 
     // And the report says so, because "3 skipped" on its own reads as "the scripts were lost".
-    let status = cx.update(|_, cx| view.read(cx).status.clone()).expect("status");
+    let status = last_toast(&window, &mut cx).expect("status");
     assert!(
         status.contains("recovered 3 rules"),
         "the import must say the scripts were read: {status:?}"

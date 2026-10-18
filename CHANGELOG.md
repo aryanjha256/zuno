@@ -7,6 +7,11 @@ the top of the GitHub release page.
 ## Unreleased
 
 ### Added
+- **Toasts for errors and finished work.** A failure (a save, an import, a sync) shows in a toast
+  that stays until you dismiss it, with the full message one click away and Retry where it makes
+  sense. An import, export or clone that finishes in the background shows one that fades. An
+  import now lists what it skipped, which used to go nowhere visible. Small confirmations stay in
+  the status bar.
 - **Ctrl+P finds a request by its URL** as well as its name. Name matches always rank first, so a
   long URL never pushes aside the request you named.
 

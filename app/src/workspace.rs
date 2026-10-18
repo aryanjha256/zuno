@@ -164,6 +164,8 @@ pub struct Workspace {
     /// holds other things" from "you have not saved anything yet". Open a folder of images and
     /// the old message claimed the second while the truth was the first.
     pub(crate) tree_skipped: usize,
+    /// Errors and finished background work — see `toast`.
+    pub(crate) toasts: crate::toast::Toasts,
     pub(crate) panel_visible: bool,
     /// The panel's width as the user left it, **unclamped**.
     ///
@@ -497,6 +499,7 @@ impl Workspace {
             collapsed: HashSet::new(),
             tree_scanned: false,
             tree_skipped: 0,
+            toasts: Default::default(),
             panel_visible: session_panel,
             panel_width: session_width,
             panel_reveal: 1.0,
@@ -1084,7 +1087,7 @@ impl Workspace {
 
         if kept > 0 {
             let what = if kept == 1 { "request" } else { "requests" };
-            self.set_status(&format!("Could not save {kept} {what}; left open"), cx);
+            self.toast_error(&format!("Could not save {kept} {what}; left open"), cx);
         }
     }
 
@@ -2111,7 +2114,7 @@ impl Workspace {
             collection::remove(&path)
         };
         if let Err(error) = removed {
-            self.set_status(&format!("Could not delete: {error}"), cx);
+            self.toast_error(&format!("Could not delete: {error}"), cx);
             return;
         }
 
@@ -2203,7 +2206,7 @@ impl Workspace {
                 self.refresh_tree(cx);
                 self.set_status(&format!("Duplicated as {name}"), cx);
             }
-            Err(error) => self.set_status(&format!("Could not duplicate: {error}"), cx),
+            Err(error) => self.toast_error(&format!("Could not duplicate: {error}"), cx),
         }
     }
 
@@ -2223,7 +2226,7 @@ impl Workspace {
             collection::trash(&path)
         };
         if let Err(error) = trashed {
-            self.set_status(&format!("Could not trash: {error}"), cx);
+            self.toast_error(&format!("Could not trash: {error}"), cx);
             return;
         }
 
@@ -2306,7 +2309,7 @@ impl Workspace {
         let moved = match collection::move_to(&path, &directory) {
             Ok(moved) => moved,
             Err(error) => {
-                self.set_status(&format!("Could not move: {error}"), cx);
+                self.toast_error(&format!("Could not move: {error}"), cx);
                 return;
             }
         };
@@ -2585,7 +2588,7 @@ impl Workspace {
                 };
                 workspace.close_workspace_panel(window, cx);
                 workspace.switch_workspace(&id, window, cx);
-                workspace.set_status(&format!("Cloned into {}", path.display()), cx);
+                workspace.toast_done(&format!("Cloned into {}", path.display()), None, cx);
             });
         }));
     }
@@ -2615,7 +2618,7 @@ impl Workspace {
             workspace
                 .update_in(cx, |workspace, window, cx| {
                     let Some(id) = crate::app_state::add_workspace(cx, path.clone()) else {
-                        workspace.set_status("Workspaces are not being saved", cx);
+                        workspace.toast_error("Workspaces are not being saved", cx);
                         return;
                     };
                     workspace.switch_workspace(&id, window, cx);
@@ -3114,8 +3117,10 @@ impl Workspace {
                 eprintln!("[zuno] import: {note}");
             }
         }
-        self.set_status(&message, cx);
-        cx.notify();
+        // The skipped notes as the toast's details: they used to reach only the terminal, so
+        // "22 skipped" said that something was dropped and nowhere on screen said what.
+        let details = (!import.skipped.is_empty()).then(|| import.skipped.join("\n"));
+        self.toast_done(&message, details, cx);
     }
 
     /// Write an import's variables into an environment and select it.
@@ -3222,8 +3227,7 @@ impl Workspace {
         self.globals_active = globals_has_values(cx);
         crate::auth::refresh(self.environment.clone(), cx);
         self.import = None;
-        self.set_status(&message, cx);
-        cx.notify();
+        self.toast_done(&message, None, cx);
     }
 
     fn format_body(&mut self, _: &FormatBody, window: &mut Window, cx: &mut Context<Self>) {
@@ -3426,7 +3430,7 @@ impl Workspace {
                 self.open_collection_file(path, window, cx);
                 self.set_status(&format!("Created {shown}"), cx);
             }
-            Err(error) => self.set_status(&format!("Could not create: {error}"), cx),
+            Err(error) => self.toast_error(&format!("Could not create: {error}"), cx),
         }
     }
 
@@ -3455,7 +3459,7 @@ impl Workspace {
                         self.refresh_tree(cx);
                         self.set_status(&format!("Created {name}"), cx);
                     }
-                    Err(error) => self.set_status(&format!("Could not create: {error}"), cx),
+                    Err(error) => self.toast_error(&format!("Could not create: {error}"), cx),
                 },
                 NewNode::Request => self.create_request(&state.parent, &typed, window, cx),
             }
@@ -3504,7 +3508,7 @@ impl Workspace {
                 }
                 self.refresh_tree(cx);
             }
-            Err(error) => self.set_status(&format!("Could not rename: {error}"), cx),
+            Err(error) => self.toast_error(&format!("Could not rename: {error}"), cx),
         }
         cx.notify();
     }
@@ -3546,7 +3550,7 @@ impl Workspace {
         let spec = match collection::read(&path) {
             Ok(spec) => spec,
             Err(error) => {
-                self.set_status(&format!("Could not open: {error}"), cx);
+                self.toast_error(&format!("Could not open: {error}"), cx);
                 return;
             }
         };
@@ -4228,8 +4232,10 @@ impl Workspace {
                 if reloaded_active {
                     workspace.activate(workspace.active_ix, window, cx);
                 }
+                // A toast that stays: losing someone's edits to a careless save is the outcome
+                // this exists to prevent, and one truncated grey line did not prevent it.
                 if !kept.is_empty() {
-                    workspace.set_status(
+                    workspace.toast_error(
                         &format!(
                             "Changed in the sync, but you have edits open — saving overwrites the \
                              new version: {}",
@@ -5645,15 +5651,15 @@ impl Workspace {
                 .update(cx, |workspace, cx| match written {
                     Ok(()) => {
                         // **What did not travel is part of the result, not a footnote.**
-                        let message = if skipped.is_empty() {
-                            format!("Exported {count} request(s)")
-                        } else {
-                            format!("Exported {count} request(s) — {}", skipped.join("; "))
-                        };
-                        workspace.set_status(&message, cx);
+                        let details = (!skipped.is_empty()).then(|| skipped.join("\n"));
+                        workspace.toast_done(
+                            &format!("Exported {count} request(s) to {}", path.display()),
+                            details,
+                            cx,
+                        );
                     }
                     Err(error) => {
-                        workspace.set_status(&format!("Could not write the export: {error}"), cx)
+                        workspace.toast_error(&format!("Could not write the export: {error}"), cx)
                     }
                 })
                 .ok();
@@ -6059,7 +6065,7 @@ impl Workspace {
         };
         let Some(engine) = cx.engine() else { return };
         let Ok(flow) = zuno_core::flow::read(&root, name) else {
-            self.set_status(&format!("Could not read the flow {name:?}"), cx);
+            self.toast_error(&format!("Could not read the flow {name:?}"), cx);
             return;
         };
 
@@ -6090,7 +6096,7 @@ impl Workspace {
         let mut flow = match zuno_core::flow::read(&root, name) {
             Ok(flow) => flow,
             Err(error) => {
-                self.set_status(&format!("{error}"), cx);
+                self.toast_error(&format!("{error}"), cx);
                 return;
             }
         };
@@ -6098,7 +6104,7 @@ impl Workspace {
 
         match zuno_core::flow::save(&root, &flow) {
             Ok(()) => self.set_status(&format!("Added {relative} to {name}"), cx),
-            Err(error) => self.set_status(&format!("{error}"), cx),
+            Err(error) => self.toast_error(&format!("{error}"), cx),
         }
     }
 
@@ -6464,7 +6470,7 @@ impl Workspace {
         let import = match zuno_core::curl::parse(&text) {
             Ok(import) => import,
             Err(error) => {
-                self.set_status(&format!("Could not import: {error}"), cx);
+                self.toast_error(&format!("Could not import: {error}"), cx);
                 return;
             }
         };
@@ -7492,9 +7498,9 @@ impl Workspace {
                         .file_name()
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.display().to_string());
-                    workspace.set_status(&format!("Saved the response to {shown}"), cx);
+                    workspace.toast_done(&format!("Saved the response to {shown}"), None, cx);
                 }
-                Err(error) => workspace.set_status(&format!("Could not save: {error}"), cx),
+                Err(error) => workspace.toast_error(&format!("Could not save: {error}"), cx),
             });
         }));
     }
@@ -7587,7 +7593,7 @@ impl Workspace {
         let Some(view) = self.active() else { return };
 
         let Some(engine) = cx.engine() else {
-            self.set_status("The HTTP engine failed to start — restart Zuno", cx);
+            self.toast_error("The HTTP engine failed to start — restart Zuno", cx);
             return;
         };
 
@@ -7650,7 +7656,11 @@ impl Workspace {
                 match collection::allocate(&root, &label) {
                     Ok(path) => path,
                     Err(error) => {
-                        self.set_status(&format!("Could not save: {error}"), cx);
+                        self.toast_error_with(
+                &format!("Could not save: {error}"),
+                Some(("Retry".into(), Box::new(SaveRequest))),
+                cx,
+            );
                         return;
                     }
                 }
@@ -7658,7 +7668,11 @@ impl Workspace {
         };
 
         if let Err(error) = collection::write(&path, &spec) {
-            self.set_status(&format!("Could not save: {error}"), cx);
+            self.toast_error_with(
+                &format!("Could not save: {error}"),
+                Some(("Retry".into(), Box::new(SaveRequest))),
+                cx,
+            );
             return;
         }
 
@@ -7853,7 +7867,7 @@ impl Workspace {
         }
 
         let Some(engine) = cx.engine() else {
-            self.set_status("The HTTP engine failed to start — restart Zuno", cx);
+            self.toast_error("The HTTP engine failed to start — restart Zuno", cx);
             return;
         };
 
@@ -7977,7 +7991,7 @@ impl Workspace {
     /// cannot answer a query, and a GET would put the whole introspection query in the URL.
     fn introspect(&mut self, view: gpui::Entity<RequestView>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(engine) = cx.engine() else {
-            self.set_status("The HTTP engine failed to start — restart Zuno", cx);
+            self.toast_error("The HTTP engine failed to start — restart Zuno", cx);
             return;
         };
         let Some(root) = crate::collections::root(cx).map(std::path::Path::to_path_buf) else {
@@ -8119,7 +8133,7 @@ impl Workspace {
         let schema = match zuno_core::grpc::Schema::compile(path) {
             Ok(schema) => schema,
             Err(error) => {
-                self.set_status(&error.to_string(), cx);
+                self.toast_error(&error.to_string(), cx);
                 return;
             }
         };
@@ -8255,7 +8269,7 @@ impl Workspace {
                     });
                     workspace.set_status(&format!("Sent {name} as a binary frame ({size})"), cx);
                 }
-                Err(reason) => workspace.set_status(&format!("Could not send {name}: {reason}"), cx),
+                Err(reason) => workspace.toast_error(&format!("Could not send {name}: {reason}"), cx),
             });
         })
         .detach();
@@ -8302,6 +8316,70 @@ impl Workspace {
         if cancelled {
             self.set_status("Cancelled", cx);
         }
+    }
+
+    /// Something failed: a toast that stays until dismissed. Not for "you cannot do that here",
+    /// which answers a key just pressed and belongs in the status bar.
+    fn toast_error(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.toast_error_with(message, None, cx);
+    }
+
+    pub(crate) fn toast_error_with(
+        &mut self,
+        message: &str,
+        action: Option<(SharedString, Box<dyn gpui::Action>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (title, detail) = crate::toast::split(message);
+        self.toasts
+            .push(crate::toast::ToastKind::Error, title, detail, action);
+        cx.notify();
+    }
+
+    /// Work that finished in the background: a toast that fades, unless the pointer is on it.
+    pub(crate) fn toast_done(&mut self, title: &str, detail: Option<String>, cx: &mut Context<Self>) {
+        let id = self
+            .toasts
+            .push(crate::toast::ToastKind::Done, title.to_string(), detail, None);
+        cx.notify();
+        cx.spawn(async move |workspace, cx| {
+            loop {
+                cx.background_executor().timer(crate::toast::FADE_AFTER).await;
+                let finished = workspace
+                    .update(cx, |workspace, cx| match workspace.toasts.get_mut(id) {
+                        None => true,
+                        // Being read: look again after another interval.
+                        Some(toast) if toast.hovered => false,
+                        Some(_) => {
+                            workspace.dismiss_toast(id, cx);
+                            true
+                        }
+                    })
+                    .unwrap_or(true);
+                if finished {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn dismiss_toast(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.toasts.dismiss(id);
+        cx.notify();
+    }
+
+    /// Each toast as `title: detail`, oldest first.
+    #[cfg(test)]
+    pub(crate) fn toast_texts(&self) -> Vec<String> {
+        self.toasts
+            .list
+            .iter()
+            .map(|toast| match &toast.detail {
+                Some(detail) => format!("{}: {detail}", toast.title),
+                None => toast.title.to_string(),
+            })
+            .collect()
     }
 
     fn set_status(&mut self, message: &str, cx: &mut Context<Self>) {
@@ -8718,6 +8796,8 @@ impl Render for Workspace {
                 &theme,
                 window,
             ))
+            // Above the panes and the status bar, below every modal.
+            .children(crate::toast::render(&self.toasts, &theme, cx))
             // Above the panes, below the resize edges.
             .children(self.picker.as_ref().map(|state| state.picker.clone()))
             .children(self.settings.as_ref().map(|state| state.panel.clone()))
