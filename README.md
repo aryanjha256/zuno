@@ -18,6 +18,41 @@ collections stored as one file per request so they live in git like anything els
 
 ![Opening a request from the palette, sending it, folding and searching the response, then a 5000-row response](docs/demo.gif)
 
+## What it does
+
+- **Every kind of API:** HTTP, GraphQL (schema-aware completion and validation, subscriptions),
+  WebSocket, server-sent events and gRPC (all four call shapes).
+- **Keyboard first:** Ctrl+P jumps to any request by name or URL, Ctrl+Enter sends, Ctrl+K lists
+  every command.
+- **Fast with big responses:** a virtualized JSON viewer that folds, searches and scrolls
+  multi-megabyte bodies without stalling.
+- **Your requests are files:** one file per request, in folders you can commit. A git panel
+  commits, syncs and shows what changed in a request since the last commit.
+- **Bring what you have:** import Postman collections and environments, OpenAPI 3 specs (JSON or
+  YAML) and curl commands. Export to Postman or a Zuno bundle.
+- **Environments and variables,** with secrets kept in a gitignored file, plus captures and
+  assertions to chain requests and a runner for a whole collection.
+- **See what really happened:** timing, connection and certificate details, the request exactly
+  as sent, cookies, and a diff against the previous response.
+- **No account, no cloud.** Linux, macOS and Windows.
+
+## Keyboard
+
+Ctrl on Linux and Windows, ⌘ on macOS.
+
+| Key | Does |
+|---|---|
+| Ctrl+P | Open a request by name or URL |
+| Ctrl+Enter | Send |
+| Ctrl+K | Every command |
+| Ctrl+L | Focus the URL |
+| Ctrl+S | Save |
+| Ctrl+E | Switch environment |
+| Ctrl+F | Find in the response |
+| Ctrl+Shift+X | Copy as code |
+| Ctrl+Shift+I | Import Postman, OpenAPI or curl |
+| Alt+H / Alt+G | History / Git |
+
 ## Install
 
 ```bash
@@ -113,11 +148,9 @@ cargo deb -p zuno
 
 ## Documentation
 
-Three documents, three jobs:
-
+- [`CHANGELOG.md`](CHANGELOG.md) — what changed in each release.
 - [`ROADMAP.md`](ROADMAP.md) — what's next and why in that order.
 - [`architecture.md`](architecture.md) — how it works, and what was tried and abandoned.
-- [`CLAUDE.md`](CLAUDE.md) — commands, invariants, and the traps.
 
 ## License
 
