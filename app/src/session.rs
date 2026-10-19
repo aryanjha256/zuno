@@ -463,6 +463,7 @@ fn write_to(path: &std::path::Path, session: &Session) {
         return;
     }
 
+    let started = std::time::Instant::now();
     match serde_json::to_vec_pretty(session) {
         Ok(bytes) => {
             if let Err(error) = std::fs::write(path, bytes) {
@@ -471,6 +472,7 @@ fn write_to(path: &std::path::Path, session: &Session) {
         }
         Err(error) => eprintln!("[zuno] could not serialize session: {error}"),
     }
+    crate::perf::session_saved(started.elapsed());
 }
 
 /// What a first launch opens: `RequestSpec::sample()`.

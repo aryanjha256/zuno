@@ -33,6 +33,7 @@ mod engine;
 mod kinds;
 mod input;
 mod paths;
+mod perf;
 mod picker;
 mod platform_keys;
 mod run_panel;
@@ -100,13 +101,16 @@ struct Boot {
 
 impl Boot {
     fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
+        let start = Instant::now();
+        perf::started(start);
+        Self { start }
     }
 
-    fn mark(&self, stage: &str) {
-        timing!("{stage:<20} {:>9.2?}", self.start.elapsed());
+    /// Printed for `ZUNO_TIMING`, and kept for the performance monitor.
+    fn mark(&self, stage: &'static str) {
+        let elapsed = self.start.elapsed();
+        perf::boot_stage(stage, elapsed);
+        timing!("{stage:<20} {:>9.2?}", elapsed);
     }
 }
 

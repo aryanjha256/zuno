@@ -308,6 +308,7 @@ actions!(
         CancelRequest,
         // Application
         ToggleTheme,
+        TogglePerfMonitor,
         Quit,
     ]
 );

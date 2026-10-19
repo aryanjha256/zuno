@@ -228,6 +228,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Clear stored cookies", ClearCookies),
         // Application.
         command("Toggle theme", ToggleTheme),
+        command("Toggle performance monitor", TogglePerfMonitor),
         command("Quit", Quit),
     ]
 }

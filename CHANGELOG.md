@@ -6,6 +6,9 @@ the top of the GitHub release page.
 
 ## Unreleased
 
+### Added
+- A performance monitor (palette or app menu): CPU, memory, FPS and frame time, background work and startup.
+
 ### Changed
 - Ctrl+P treats spaces as separating words, matched in any order.
 

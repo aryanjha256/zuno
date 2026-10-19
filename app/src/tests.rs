@@ -4264,6 +4264,31 @@ fn last_toast(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext
 
 /// **Finished work fades, an error stays, and a toast's buttons are real mouse paths.** The fade
 /// and the hover pause run on the simulated clock, so nothing here waits in real time.
+/// The palette row opens the monitor, it reads memory on its own, and × closes it.
+#[gpui::test]
+async fn the_performance_monitor_opens_reads_memory_and_closes(cx: &mut TestAppContext) {
+    let (window, _view, mut cx) = boot(cx, None, None);
+    let open = |cx: &mut VisualTestContext| {
+        window.update(cx, |workspace, _, _| workspace.perf_monitor_open()).expect("window")
+    };
+
+    cx.dispatch_action(crate::actions::TogglePerfMonitor);
+    cx.run_until_parked();
+    assert!(open(&mut cx));
+    #[cfg(target_os = "linux")]
+    assert!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.perf_memory().is_some())
+            .expect("window"),
+        "the refresh task should have read resident memory"
+    );
+
+    let close = cx.debug_bounds("perf-monitor-close").expect("the close button");
+    cx.simulate_click(close.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!open(&mut cx));
+}
+
 #[gpui::test]
 async fn a_done_toast_fades_and_an_error_stays_until_dismissed(cx: &mut TestAppContext) {
     let (window, _view, mut cx) = boot(cx, None, None);

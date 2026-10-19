@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowThirdKindTab, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowThirdKindTab, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, TogglePerfMonitor, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -166,6 +166,7 @@ pub struct Workspace {
     pub(crate) tree_skipped: usize,
     /// Errors and finished background work — see `toast`.
     pub(crate) toasts: crate::toast::Toasts,
+    perf: Option<crate::perf::Monitor>,
     pub(crate) panel_visible: bool,
     /// The panel's width as the user left it, **unclamped**.
     ///
@@ -507,6 +508,7 @@ impl Workspace {
             tree_scanned: false,
             tree_skipped: 0,
             toasts: Default::default(),
+            perf: None,
             panel_visible: session_panel,
             panel_width: session_width,
             panel_reveal: 1.0,
@@ -6908,6 +6910,7 @@ impl Workspace {
             // discoverable path to a keystroke an icon can only hint at.
             MenuItem::new("Collection panel", ToggleCollectionPanel, &focus, window).into(),
             MenuItem::new("Toggle theme", ToggleTheme, &focus, window).into(),
+            MenuItem::new("Performance monitor", TogglePerfMonitor, &focus, window).into(),
             MenuRow::Separator,
             // Request-scoped above app-scoped, and named apart: one edits the buffer in front of
             // you, the other edits what a new one starts from.
@@ -7608,6 +7611,55 @@ impl Workspace {
         crate::app_state::set_theme(cx, appearance);
         // A theme change repaints every window, not just this view.
         cx.refresh_windows();
+    }
+
+    fn toggle_perf_monitor(&mut self, _: &TogglePerfMonitor, _: &mut Window, cx: &mut Context<Self>) {
+        if self.perf.is_some() {
+            self.close_perf_monitor(cx);
+            return;
+        }
+        // CPU and memory are read off the UI thread; the tick also repaints the frame numbers,
+        // which are recorded every frame but only shown when something redraws the monitor.
+        let refresh = cx.spawn(async move |workspace, cx| {
+            loop {
+                let sample = cx
+                    .background_executor()
+                    .spawn(async { crate::perf::sample() })
+                    .await;
+                let open = workspace
+                    .update(cx, |workspace, cx| match workspace.perf.as_mut() {
+                        Some(monitor) => {
+                            monitor.record(sample);
+                            crate::perf::repainting();
+                            cx.notify();
+                            true
+                        }
+                        None => false,
+                    })
+                    .unwrap_or(false);
+                if !open {
+                    break;
+                }
+                cx.background_executor().timer(crate::perf::REFRESH).await;
+            }
+        });
+        self.perf = Some(crate::perf::Monitor::new(refresh));
+        cx.notify();
+    }
+
+    pub(crate) fn close_perf_monitor(&mut self, cx: &mut Context<Self>) {
+        self.perf = None;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn perf_monitor_open(&self) -> bool {
+        self.perf.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn perf_memory(&self) -> Option<u64> {
+        self.perf.as_ref().and_then(|monitor| monitor.memory())
     }
 
     fn send_request(&mut self, _: &SendRequest, window: &mut Window, cx: &mut Context<Self>) {
@@ -8473,6 +8525,8 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The root view renders every frame, so this to the last paint is the frame's CPU time.
+        let frame_started = Instant::now();
         let theme = cx.theme().clone();
         let focused_region = self.focused_region(window, cx);
         // Before anything reads it: a GraphQL request's schema is parsed off-thread the first
@@ -8723,6 +8777,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::save_response))
             .on_action(cx.listener(Self::copy_as_code))
             .on_action(cx.listener(Self::toggle_theme))
+            .on_action(cx.listener(Self::toggle_perf_monitor))
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
@@ -8862,8 +8917,15 @@ impl Render for Workspace {
                 let cookies = cx.engine().map(|engine| engine.cookies()).unwrap_or_default();
                 crate::cookie_panel::render(panel, &cookies, &theme, cx)
             }))
+            .children(self.perf.as_ref().map(|monitor| crate::perf::render(monitor, &theme, cx)))
             // Last, so the edge strips sit above the panes for hit-testing.
             .children(crate::chrome::resize_handles(window))
+            // Painted after everything else, so it closes the frame's CPU time for the monitor.
+            .child(
+                gpui::canvas(|_, _, _| {}, move |_, _, _, _| crate::perf::frame(frame_started.elapsed()))
+                    .absolute()
+                    .size_0(),
+            )
     }
 
 }

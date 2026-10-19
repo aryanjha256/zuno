@@ -2344,10 +2344,13 @@ impl RequestView {
         // frame, so splitting them would buy two background hops and a window in which the
         // summary says the body changed while the Diff tab still shows nothing.
         let compute = cx.background_executor().spawn(async move {
-            (
+            let started = std::time::Instant::now();
+            let diffs = (
                 ResponseDiff::between(&previous, &current),
                 BodyDiff::between(&previous, &current),
-            )
+            );
+            crate::perf::diffed(started.elapsed());
+            diffs
         });
 
         self.diff_task = Some(cx.spawn(async move |this, cx| {
@@ -2393,6 +2396,7 @@ impl RequestView {
             let elapsed = started.elapsed();
 
             let _ = this.update(cx, |this, cx| {
+                crate::perf::body_indexed(elapsed, len, view.row_count());
                 timing!(
                     "body     index {:>9.2?}  {len} bytes  {} rows",
                     elapsed,
