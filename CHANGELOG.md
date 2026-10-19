@@ -6,6 +6,8 @@ the top of the GitHub release page.
 
 ## Unreleased
 
+## 0.5.8 - 2026-10-19
+
 ### Added
 - A performance monitor (palette or app menu): CPU, memory, FPS and frame time, background work and startup.
 - A keyboard shortcuts sheet with search, opened with Ctrl+/.
