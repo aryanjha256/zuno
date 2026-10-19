@@ -406,10 +406,10 @@ jobs:
             echo 'curl -fsSL https://raw.githubusercontent.com/aryanjha256/zuno/main/scripts/install.sh | sh'
             echo '```'
             echo
-            echo 'The same command does both — it installs Zuno if you do not have it and'
+            echo 'The same command does both: it installs Zuno if you do not have it and'
             echo 'updates it if you do. On Debian and Ubuntu it installs the .deb and asks'
-            echo 'for sudo only to run `apt-get install`; everywhere else — Fedora, openSUSE,'
-            echo 'Arch — it unpacks the tarball into `~/.local`, with no sudo at all.'
+            echo 'for sudo only to run `apt-get install`. Everywhere else (Fedora, openSUSE,'
+            echo 'Arch) it unpacks the tarball into `~/.local`, with no sudo at all.'
             echo
             echo 'On a Mac with Apple Silicon it installs `Zuno.app` into `/Applications`. Use'
             echo 'the command rather than downloading the macOS archive in a browser: the app'
@@ -448,7 +448,7 @@ jobs:
             echo
             echo '</details>'
             echo
-            echo '<details><summary>Or run the AppImage — one file, nothing installed</summary>'
+            echo '<details><summary>Or run the AppImage: one file, nothing installed</summary>'
             echo
             echo '```bash'
             echo 'chmod +x Zuno-*-x86_64.AppImage && ./Zuno-*-x86_64.AppImage'
@@ -460,7 +460,7 @@ jobs:
             echo '</details>'
             echo
             echo 'Requires x86-64 Linux with glibc 2.35+: Ubuntu 22.04+, Debian 12+,'
-            echo 'Fedora 36+, or anything as recent — or an Apple Silicon Mac on macOS 11+,'
+            echo 'Fedora 36+, or anything as recent; or an Apple Silicon Mac on macOS 11+,'
             echo 'or 64-bit Windows 10 or 11.'
             echo
             echo 'Zuno renders through Vulkan. On a machine with no GPU driver present,'

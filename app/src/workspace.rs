@@ -5670,9 +5670,11 @@ impl Workspace {
                             cx,
                         );
                     }
-                    Err(error) => {
-                        workspace.toast_error(&format!("Could not write the export: {error}"), cx)
-                    }
+                    Err(error) => workspace.toast_error_with(
+                        &format!("Could not write the export: {error}"),
+                        Some(("Retry".into(), Box::new(ExportCollection))),
+                        cx,
+                    ),
                 })
                 .ok();
         }));
@@ -7515,7 +7517,11 @@ impl Workspace {
                         .unwrap_or_else(|| path.display().to_string());
                     workspace.toast_done(&format!("Saved the response to {shown}"), None, cx);
                 }
-                Err(error) => workspace.toast_error(&format!("Could not save: {error}"), cx),
+                Err(error) => workspace.toast_error_with(
+                    &format!("Could not save: {error}"),
+                    Some(("Retry".into(), Box::new(SaveResponse))),
+                    cx,
+                ),
             });
         }));
     }
