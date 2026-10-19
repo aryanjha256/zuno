@@ -6,6 +6,9 @@ the top of the GitHub release page.
 
 ## Unreleased
 
+### Changed
+- Ctrl+P treats spaces as separating words, matched in any order.
+
 ## 0.5.7 - 2026-10-19
 
 ### Added

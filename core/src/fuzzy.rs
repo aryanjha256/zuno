@@ -42,28 +42,38 @@ const TRAILING: i32 = -1;
 /// Case-insensitive. An empty query matches everything at 0, which is what makes a picker
 /// list its whole set before you type.
 pub fn score(query: &str, candidate: &str) -> Option<i32> {
-    score_against(&query.chars().collect::<Vec<_>>(), candidate)
+    score_words(&words(query), candidate)
 }
 
-/// `score`, with the query already split into characters.
+/// The query split on whitespace, each word as characters.
 ///
-/// Split out so `rank` can collect the query **once** for a whole ranking pass instead of once per
+/// A space separates terms rather than matching a literal space, so `user create` finds
+/// "Create user": each word is matched on its own, in any order, as VS Code and Zed do.
+fn words(query: &str) -> Vec<Vec<char>> {
+    query.split_whitespace().map(|word| word.chars().collect()).collect()
+}
+
+/// Every word must match; the score is their sum.
+///
+/// Split out so `rank` can split the query **once** for a whole ranking pass instead of once per
 /// candidate — it is the same string every time, and a picker re-ranks its entire list on every
 /// keystroke.
 ///
-/// The empty-query rule lives here rather than in `score` so both entry points share it. That
-/// matters more than it looks: falling through to the loop below with no needles scores `-trailing`,
-/// which would sort an unfiltered list by length and quietly discard the order the caller
-/// assembled.
-fn score_against(needles: &[char], candidate: &str) -> Option<i32> {
-    if needles.is_empty() {
+/// The empty-query rule lives here so both entry points share it. That matters more than it looks:
+/// scoring with no needles gives `-trailing`, which would sort an unfiltered list by length and
+/// quietly discard the order the caller assembled.
+fn score_words(words: &[Vec<char>], candidate: &str) -> Option<i32> {
+    if words.is_empty() {
         return Some(0);
     }
-
-    // Collected once rather than repeatedly indexing a &str: matching walks with
-    // lookbehind, which char_indices makes awkward, and these are short strings.
+    // Collected once per candidate rather than per word, or repeatedly indexing a &str: matching
+    // walks with lookbehind, which char_indices makes awkward, and these are short strings.
     let haystack: Vec<char> = candidate.chars().collect();
+    words.iter().try_fold(0, |total, word| Some(total + score_against(word, &haystack)?))
+}
 
+/// One word's subsequence score against an already-collected candidate.
+fn score_against(needles: &[char], haystack: &[char]) -> Option<i32> {
     let mut total = 0;
     let mut at = 0;
     let mut previous_match: Option<usize> = None;
@@ -140,13 +150,13 @@ fn is_boundary(haystack: &[char], index: usize) -> bool {
 /// unstable sort here would scramble that for equal scores.
 pub fn rank(query: &str, candidates: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<usize> {
     // Collected once for the pass, not once per candidate.
-    let needles: Vec<char> = query.chars().collect();
+    let words = words(query);
 
     let mut scored: Vec<(usize, i32)> = candidates
         .into_iter()
         .enumerate()
         .filter_map(|(ix, candidate)| {
-            score_against(&needles, candidate.as_ref()).map(|score| (ix, score))
+            score_words(&words, candidate.as_ref()).map(|score| (ix, score))
         })
         .collect();
 
@@ -164,6 +174,18 @@ mod tests {
             .into_iter()
             .map(|ix| candidates[ix])
             .collect()
+    }
+
+    #[test]
+    fn spaces_separate_words_matched_in_any_order() {
+        // Neither query is a subsequence of the label with its space taken literally.
+        assert!(score("create user", "createUser").is_some());
+        assert_eq!(ranked("user create", &["List users", "Create user"]), ["Create user"]);
+        // Every word must match somewhere.
+        assert!(score("create order", "Create user").is_none());
+        // Stray spaces change nothing.
+        assert_eq!(score("  users ", "users"), score("users", "users"));
+        assert_eq!(ranked("   ", &["b", "a"]), ["b", "a"]);
     }
 
     #[test]
