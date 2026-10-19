@@ -297,9 +297,15 @@ pub fn render(
     let body = div()
         .id("shortcuts-body")
         .max_h(px(BODY_HEIGHT))
+        // Shrinks with a short window rather than pushing the sheet off it.
+        .flex_shrink()
+        .min_h(px(0.))
         .overflow_y_scroll()
         .flex()
         .flex_row()
+        // Each column as tall as its rows. Stretched to the row's height, the overflow stayed
+        // inside the columns and the scroll container had nothing to scroll.
+        .items_start()
         .when(empty, |body| {
             body.child(
                 div()
@@ -409,6 +415,7 @@ pub fn render(
         .justify_center()
         .items_start()
         .pt(px(64.))
+        .pb(px(24.))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(|this, _: &MouseDownEvent, window, cx| this.close_shortcuts(window, cx)),
@@ -419,6 +426,8 @@ pub fn render(
                 .debug_selector(|| "shortcuts-sheet".to_string())
                 .w(px(WIDTH))
                 .max_w(gpui::relative(0.94))
+                // Never taller than the window leaves; the body scrolls instead.
+                .max_h_full()
                 .flex()
                 .flex_col()
                 .rounded_md()
