@@ -35,8 +35,6 @@ const BUDGET: Duration = Duration::from_micros(16_667);
 /// Fewer frames than this in the last second reads as idle rather than as a rate.
 const IDLE_BELOW: usize = 2;
 /// Linux reports CPU time in `USER_HZ`, which is 100 on every architecture it runs on.
-#[cfg(target_os = "linux")]
-const TICKS_PER_SECOND: f64 = 100.0;
 
 #[derive(Clone, Copy)]
 pub struct BodyIndex {
@@ -152,42 +150,41 @@ pub fn snapshot() -> Snapshot {
 /// What one refresh reads from the OS. Taken off the UI thread.
 pub struct Sample {
     at: Instant,
-    cpu_ticks: Option<u64>,
+    cpu: Option<Duration>,
     memory: Option<u64>,
 }
 
 pub fn sample() -> Sample {
     Sample {
         at: Instant::now(),
-        cpu_ticks: cpu_ticks(),
-        memory: memory_bytes(),
+        cpu: os::cpu_time(),
+        memory: os::memory_bytes(),
     }
 }
 
-/// Memory as GNOME System Monitor counts it: resident minus shared, which is `RssAnon`. Plain
-/// resident memory (`VmRSS`) also counts shared libraries and the GPU driver's mappings in full,
-/// and read well above what the system monitor showed.
-///
-/// A file read on Linux; macOS and Windows need per-platform calls, and say "n/a" until they have
-/// them.
-fn memory_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
+/// Whether this platform reads CPU and memory at all; elsewhere both say "n/a".
+const MEASURED: bool = cfg!(any(target_os = "linux", target_os = "macos", target_os = "windows"));
+
+/// Each platform's reading of the two numbers, chosen to match its own system monitor: memory is
+/// what GNOME System Monitor, Activity Monitor and Task Manager show in their Memory column, and
+/// CPU time is user plus system.
+#[cfg(target_os = "linux")]
+mod os {
+    use std::time::Duration;
+
+    /// Linux reports CPU time in `USER_HZ`, which is 100 on every architecture it runs on.
+    const TICKS_PER_SECOND: f64 = 100.0;
+
+    /// Resident minus shared, which is `RssAnon`. Plain resident memory (`VmRSS`) also counts
+    /// shared libraries and the GPU driver's mappings in full, and read well above GNOME's figure.
+    pub fn memory_bytes() -> Option<u64> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|line| line.starts_with("RssAnon:"))?;
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kb * 1024)
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
 
-/// User plus system CPU time, in clock ticks, from `/proc/self/stat`.
-fn cpu_ticks() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
+    pub fn cpu_time() -> Option<Duration> {
         let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
         // The command name is parenthesised and may hold spaces, so count fields after its end.
         // `utime` and `stime` are fields 14 and 15; the state, field 3, is the first after it.
@@ -195,10 +192,103 @@ fn cpu_ticks() -> Option<u64> {
         let mut fields = rest.split_whitespace().skip(11);
         let user: u64 = fields.next()?.parse().ok()?;
         let system: u64 = fields.next()?.parse().ok()?;
-        Some(user + system)
+        Some(Duration::from_secs_f64((user + system) as f64 / TICKS_PER_SECOND))
     }
-    #[cfg(not(target_os = "linux"))]
-    {
+}
+
+#[cfg(target_os = "macos")]
+mod os {
+    use std::time::Duration;
+
+    /// The physical footprint, which is Activity Monitor's Memory column. Resident size counts
+    /// shared and compressed pages differently and reads well off it.
+    pub fn memory_bytes() -> Option<u64> {
+        // SAFETY: a zeroed `rusage_info_v2` is a valid value of a plain C struct of integers.
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is writable and is the layout `RUSAGE_INFO_V2` asks the kernel to fill.
+        let result = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                (&mut info as *mut libc::rusage_info_v2).cast(),
+            )
+        };
+        (result == 0).then_some(info.ri_phys_footprint)
+    }
+
+    /// `getrusage` rather than `rusage_info`'s times, which are in Mach absolute-time units and
+    /// would need a timebase conversion that differs between Intel and Apple Silicon.
+    pub fn cpu_time() -> Option<Duration> {
+        // SAFETY: a zeroed `rusage` is a valid value of a plain C struct of integers.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is writable and is the struct `getrusage` fills.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return None;
+        }
+        let time = |value: libc::timeval| {
+            Duration::new(value.tv_sec as u64, value.tv_usec as u32 * 1000)
+        };
+        Some(time(usage.ru_utime) + time(usage.ru_stime))
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod os {
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    /// The private working set, which is Task Manager's Memory column. The `EX2` counters that
+    /// carry it need Windows 10 1809 or later; before that the call fails and this says "n/a".
+    pub fn memory_bytes() -> Option<u64> {
+        let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
+            cb: size,
+            ..Default::default()
+        };
+        // SAFETY: `counters` is writable, `cb` and `size` give its real size, and the current
+        // process handle is a pseudo-handle that needs no closing.
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                (&mut counters as *mut PROCESS_MEMORY_COUNTERS_EX2).cast::<PROCESS_MEMORY_COUNTERS>(),
+                size,
+            )
+        };
+        (ok != 0).then_some(counters.PrivateWorkingSetSize as u64)
+    }
+
+    pub fn cpu_time() -> Option<Duration> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: four writable `FILETIME`s, and a pseudo-handle that needs no closing.
+        let ok = unsafe {
+            GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user)
+        };
+        if ok == 0 {
+            return None;
+        }
+        // In 100-nanosecond units, split across two halves.
+        let units = |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
+        Some(Duration::from_nanos((units(kernel) + units(user)) * 100))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+mod os {
+    use std::time::Duration;
+
+    pub fn memory_bytes() -> Option<u64> {
+        None
+    }
+
+    pub fn cpu_time() -> Option<Duration> {
         None
     }
 }
@@ -226,10 +316,10 @@ impl Monitor {
         if let Some(memory) = sample.memory {
             push(&mut self.memory, memory);
         }
-        if let (Some(previous), Some(ticks)) = (&self.last, sample.cpu_ticks)
-            && let Some(before) = previous.cpu_ticks
+        if let (Some(previous), Some(spent)) = (&self.last, sample.cpu)
+            && let Some(before) = previous.cpu
         {
-            push(&mut self.cpu, cpu_percent(ticks.saturating_sub(before), sample.at - previous.at));
+            push(&mut self.cpu, cpu_percent(spent.saturating_sub(before), sample.at - previous.at));
         }
         self.last = Some(sample);
     }
@@ -246,19 +336,13 @@ fn push<T>(series: &mut VecDeque<T>, value: T) {
     series.push_back(value);
 }
 
-#[cfg(target_os = "linux")]
-fn cpu_percent(ticks: u64, over: Duration) -> f32 {
+fn cpu_percent(spent: Duration, over: Duration) -> f32 {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
     let seconds = over.as_secs_f64();
     if seconds <= 0.0 {
         return 0.0;
     }
-    (ticks as f64 / TICKS_PER_SECOND / seconds / cores * 100.0) as f32
-}
-
-#[cfg(not(target_os = "linux"))]
-fn cpu_percent(_: u64, _: Duration) -> f32 {
-    0.0
+    (spent.as_secs_f64() / seconds / cores * 100.0) as f32
 }
 
 fn ms(duration: Duration) -> String {
@@ -436,7 +520,7 @@ pub fn render(monitor: &Monitor, theme: &Theme, cx: &mut Context<Workspace>) -> 
         .child(cell(
             "CPU",
             figure(
-                cpu_now.map_or_else(|| if cfg!(target_os = "linux") { none() } else { "n/a".into() }, |cpu| format!("{cpu:.1}")),
+                cpu_now.map_or_else(|| if MEASURED { none() } else { "n/a".into() }, |cpu| format!("{cpu:.1}")),
                 if cpu_now.is_some() { "%" } else { "" },
             ),
             sparkline(monitor.cpu.iter().copied().collect(), theme.method_get).into_any_element(),
@@ -660,18 +744,23 @@ mod tests {
         assert_eq!(stats.frames.len(), 1);
     }
 
-    #[cfg(target_os = "linux")]
+    /// Runs on each CI platform, which is the only place the macOS and Windows readings execute.
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
-    fn cpu_and_memory_are_read_on_linux() {
-        let bytes = memory_bytes().expect("RssAnon should be readable");
+    fn cpu_and_memory_are_read_on_this_platform() {
+        let bytes = os::memory_bytes().expect("memory should be readable");
         assert!(bytes > 1024 * 1024, "a running test binary uses more than 1 MB: {bytes}");
-        // Burn some CPU so the tick count has to move.
-        let before = cpu_ticks().expect("utime and stime should be readable");
+        // Burn some CPU so the reading has to move.
+        let before = os::cpu_time().expect("CPU time should be readable");
         let spin = Instant::now();
         let mut x = 0u64;
         while spin.elapsed() < Duration::from_millis(100) {
             x = std::hint::black_box(x.wrapping_add(1));
         }
-        assert!(cpu_ticks().unwrap() > before, "100 ms of spinning should show as CPU time");
+        // A floor, not a range: the time is per process, and the rest of the suite runs in
+        // parallel, so the reading may be far above 100 ms. A floor still catches a units
+        // mistake that under-reads by ten or more.
+        let spent = os::cpu_time().unwrap().saturating_sub(before);
+        assert!(spent >= Duration::from_millis(10), "100 ms of spinning read as {spent:?}");
     }
 }

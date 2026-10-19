@@ -44,6 +44,21 @@ time = { version = "0.3.55", features = ["local-offset"] }
 # this version, so this names it rather than adding one.
 encoding_rs = "0.8.35"
 
+# The performance monitor's CPU and memory on macOS: `getrusage` for CPU time and
+# `proc_pid_rusage` for the footprint Activity Monitor shows. Already compiled through gpui.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.189"
+
+# The same on Windows: `GetProcessTimes` and `GetProcessMemoryInfo`'s private working set, which is
+# Task Manager's Memory column. Already compiled through gpui's dependencies; the features only add
+# these two modules' bindings.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 # `build.rs` draws `assets/icons/zuno.svg` into an `.ico` and embeds it in `zuno.exe`, where gpui
 # reads the window icon from. Windows only, so Linux and macOS builds compile none of these.
 # `resvg` is gpui's version for the dev-dependency's reason below; `embed-resource` 3 is the one

@@ -8584,6 +8584,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ico",
+ "libc",
  "resvg",
  "serde",
  "serde_json",
@@ -8592,6 +8593,7 @@ dependencies = [
  "tokio-tungstenite",
  "unicode-segmentation",
  "url",
+ "windows-sys 0.61.2",
  "zuno-core",
 ]
 

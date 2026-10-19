@@ -4275,12 +4275,12 @@ async fn the_performance_monitor_opens_reads_memory_and_closes(cx: &mut TestAppC
     cx.dispatch_action(crate::actions::TogglePerfMonitor);
     cx.run_until_parked();
     assert!(open(&mut cx));
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     assert!(
         window
             .update(&mut cx, |workspace, _, _| workspace.perf_memory().is_some())
             .expect("window"),
-        "the refresh task should have read resident memory"
+        "the refresh task should have read memory"
     );
 
     let close = cx.debug_bounds("perf-monitor-close").expect("the close button");
