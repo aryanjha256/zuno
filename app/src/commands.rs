@@ -229,6 +229,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         // Application.
         command("Toggle theme", ToggleTheme),
         command("Toggle performance monitor", TogglePerfMonitor),
+        command("Keyboard shortcuts", ShowShortcuts),
         command("Quit", Quit),
     ]
 }
@@ -411,6 +412,7 @@ const EXCLUDED: &[(&str, &str)] = &[
     ("zuno::CookiesPrev", "only valid inside the cookie viewer"),
     ("zuno::CookiesRemove", "only valid inside the cookie viewer"),
     ("zuno::CookiesDismiss", "only valid inside the cookie viewer"),
+    ("zuno::ShortcutsDismiss", "only valid inside the shortcuts sheet"),
     ("zuno::MenuNext", "only valid inside the row menu"),
     ("zuno::MenuPrev", "only valid inside the row menu"),
     ("zuno::MenuConfirm", "only valid inside the row menu"),

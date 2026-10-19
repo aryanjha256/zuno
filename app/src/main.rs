@@ -43,6 +43,7 @@ mod request_view;
 mod response_pane;
 mod session;
 mod settings_panel;
+mod shortcuts;
 #[cfg(test)]
 mod tests;
 mod theme;
@@ -65,6 +66,7 @@ use crate::actions::{
     FocusPrev, FocusResponse, FocusUrl, FoldAll, ImportCurl, NewTab, NextRequestTab, NextTab,
     OpenBodyType, PrevRequestTab,
     OpenAppMenu, OpenMethod, OpenPalette, OpenRequest, OpenSettings, PickerConfirm, PickerDismiss, PickerNext,
+    ShowShortcuts, ShortcutsDismiss,
     PickerPrev, PrevTab, Quit, RemoveRow, SaveRequest, SaveResponse, SendRequest, SettingConfirm,
     SuggestConfirm, SuggestDismiss, SuggestNext, SuggestPrev, CompleteNext, CompletePrev,
     CompleteAccept, CompleteConfirm, CompleteDismiss, TriggerCompletion,
@@ -372,6 +374,8 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         // block above the Application section and Esc stops closing the picker.
         bind!(mac, "ctrl-p", OpenRequest, None),
         bind!(mac, "ctrl-k", OpenPalette, None),
+        // What Slack, GitHub and Gmail use for their shortcut lists, and never typed into a field.
+        bind!(mac, "ctrl-/", ShowShortcuts, None),
         // F10 is the desktop convention for "open this window's menu", so the menu has a
         // keystroke to advertise rather than being mouse-only.
         bind!(mac, "f10", OpenAppMenu, None),
@@ -516,6 +520,9 @@ fn bindings_for(mac: bool) -> Vec<KeyBinding> {
         bind!(mac, "up", CookiesPrev, Some("CookiePanel")),
         bind!(mac, "delete", CookiesRemove, Some("CookiePanel")),
         bind!(mac, "shift-delete", ClearCookies, Some("CookiePanel")),
+        // After the global `escape`, for the same tie-break. The sheet's search field is the leaf
+        // context while it is open, `TextInput Shortcuts`.
+        bind!(mac, "escape", ShortcutsDismiss, Some("Shortcuts")),
         // The header-name dropdown. Scoped to `HeaderCell`, and **after** the global `escape`
         // above — a leaf-matching predicate ties with a context-less one and the tie goes to
         // later registration, which is what makes these win while a header name has focus.

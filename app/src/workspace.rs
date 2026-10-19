@@ -52,7 +52,7 @@ use crate::actions::{
     CertsConfirm, CertsDismiss, CertsNext, CertsPrev, CertsRemove, ChooseClientCert,
     ChooseRootCa, OpenCertificates,
     CookiesDismiss, CookiesNext, CookiesPrev, CookiesRemove, OpenCookies,
-    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowThirdKindTab, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, TogglePerfMonitor, UnfoldAll,
+    CloseAllTabs, CloseOtherTabs, CloseTabsToTheRight, OpenTabMenu, RemoveProxy, SetProxy, ShowBodyTab, ShowHeadersTab, ShowAuthTab, OpenAuthMenu, OpenRequestMenu, OpenResponseMenu, UseNoAuth, UseBasicAuth, UseBearerAuth, TogglePasswordShown, ShowHistory, ShowAllHistory, ShowCollections, HistoryNext, HistoryPrev, HistoryOpen, ClearHistory, ShowGit, GitInit, GitCommit, GitRefresh, GitSaveIdentity, GitToggleIdentityScope, GitOpenDownload, GitPublish, GitSync, GitContinue, GitAbort, GitOpenConflict, ShowResponseChanges, GitDiscardActive, GitRawDiff, ShowThirdKindTab, ShowParamsTab, SwitchEnvironment, ToggleRow, ToggleTheme, TogglePerfMonitor, ShowShortcuts, ShortcutsDismiss, UnfoldAll,
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
@@ -218,6 +218,7 @@ pub struct Workspace {
     cert_prompt: Option<Task<()>>,
     certs: Option<crate::cert_panel::CertPanel>,
     cookie_viewer: Option<crate::cookie_panel::CookiePanel>,
+    shortcuts: Option<crate::shortcuts::ShortcutsSheet>,
     tab_menu_anchor: Option<gpui::Point<gpui::Pixels>>,
     system_proxy: Option<String>,
     pub(crate) tab_scroll: ScrollHandle,
@@ -524,6 +525,7 @@ impl Workspace {
             cert_prompt: None,
             certs: None,
             cookie_viewer: None,
+            shortcuts: None,
             tab_menu_anchor: None,
             system_proxy: [
                 "HTTP_PROXY",
@@ -720,6 +722,7 @@ impl Workspace {
             || self.close_confirm.is_some()
             || self.certs.is_some()
             || self.cookie_viewer.is_some()
+            || self.shortcuts.is_some()
             || self.new_workspace_panel.is_some()
             || self.environment_panel.is_some()
             || self.run.is_some()
@@ -4990,6 +4993,40 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens the sheet, or closes it when it is already open, so its own key toggles it.
+    fn show_shortcuts(&mut self, _: &ShowShortcuts, window: &mut Window, cx: &mut Context<Self>) {
+        if self.shortcuts.is_some() {
+            self.close_shortcuts(window, cx);
+            return;
+        }
+        if self.modal_open() {
+            return;
+        }
+        let restore = Some(window.focused(cx).unwrap_or_else(|| self.focus_handle.clone()));
+        let sheet = crate::shortcuts::ShortcutsSheet::new(restore, cx);
+        let focus = sheet.focus_handle(cx);
+        self.shortcuts = Some(sheet);
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn shortcuts_dismiss(&mut self, _: &ShortcutsDismiss, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_shortcuts(window, cx);
+    }
+
+    pub(crate) fn close_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sheet) = self.shortcuts.take() else { return };
+        if let Some(focus) = sheet.restore_focus {
+            window.focus(&focus);
+        }
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shortcuts_open(&self) -> bool {
+        self.shortcuts.is_some()
+    }
+
     fn cookies_dismiss(&mut self, _: &CookiesDismiss, window: &mut Window, cx: &mut Context<Self>) {
         let Some(panel) = self.cookie_viewer.take() else { return };
         if let Some(focus) = panel.restore_focus {
@@ -6905,6 +6942,7 @@ impl Workspace {
             MenuRow::Separator,
             MenuItem::new("Find request", OpenRequest, &focus, window).into(),
             MenuItem::new("Command palette", OpenPalette, &focus, window).into(),
+            MenuItem::new("Keyboard shortcuts", ShowShortcuts, &focus, window).into(),
             MenuRow::Separator,
             // The two toggles. Both already have a titlebar icon, and a menu row is the
             // discoverable path to a keystroke an icon can only hint at.
@@ -8778,6 +8816,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::copy_as_code))
             .on_action(cx.listener(Self::toggle_theme))
             .on_action(cx.listener(Self::toggle_perf_monitor))
+            .on_action(cx.listener(Self::show_shortcuts))
+            .on_action(cx.listener(Self::shortcuts_dismiss))
             .on_action(cx.listener(Self::save_request))
             .on_action(cx.listener(Self::send_request))
             .on_action(cx.listener(Self::cancel_request))
@@ -8916,6 +8956,10 @@ impl Render for Workspace {
             .children(self.cookie_viewer.as_ref().map(|panel| {
                 let cookies = cx.engine().map(|engine| engine.cookies()).unwrap_or_default();
                 crate::cookie_panel::render(panel, &cookies, &theme, cx)
+            }))
+            .children(self.shortcuts.as_ref().map(|sheet| {
+                let response = self.active().map(|view| view.read(cx).response_focus.clone());
+                crate::shortcuts::render(sheet, response.as_ref(), &theme, window, cx)
             }))
             .children(self.perf.as_ref().map(|monitor| crate::perf::render(monitor, &theme, cx)))
             // Last, so the edge strips sit above the panes for hit-testing.

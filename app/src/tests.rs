@@ -4264,6 +4264,47 @@ fn last_toast(window: &gpui::WindowHandle<Workspace>, cx: &mut VisualTestContext
 
 /// **Finished work fades, an error stays, and a toast's buttons are real mouse paths.** The fade
 /// and the hover pause run on the simulated clock, so nothing here waits in real time.
+/// A global shortcut left off the sheet is invisible until someone looks for it there, so this is
+/// the palette drift test's rule applied to the sheet: every context-less binding is listed.
+#[gpui::test]
+async fn every_global_shortcut_is_on_the_sheet(cx: &mut TestAppContext) {
+    let _ = cx;
+    let listed: std::collections::BTreeSet<&str> =
+        crate::shortcuts::listed_global_actions().into_iter().collect();
+    let missing: std::collections::BTreeSet<&str> = crate::bindings_for(false)
+        .iter()
+        .filter(|binding| binding.predicate().is_none())
+        .map(|binding| binding.action().name())
+        .filter(|name| !listed.contains(name))
+        .collect();
+    assert!(missing.is_empty(), "global shortcuts missing from the sheet: {missing:?}");
+}
+
+/// Its own key opens it and focuses the search; Escape closes it and hands the keyboard back, so
+/// the same key opens it again.
+#[gpui::test]
+async fn the_shortcuts_sheet_opens_and_closes_from_the_keyboard(cx: &mut TestAppContext) {
+    let (window, _view, mut cx) = boot(cx, None, None);
+    let open = |cx: &mut VisualTestContext| {
+        window.update(cx, |workspace, _, _| workspace.shortcuts_open()).expect("window")
+    };
+
+    cx.press("ctrl-/");
+    cx.run_until_parked();
+    assert!(open(&mut cx));
+
+    cx.press("escape");
+    cx.run_until_parked();
+    assert!(!open(&mut cx), "Escape in the search field should close the sheet");
+
+    cx.press("ctrl-/");
+    cx.run_until_parked();
+    assert!(open(&mut cx), "the keymap should still reach the workspace after closing");
+    cx.press("ctrl-/");
+    cx.run_until_parked();
+    assert!(!open(&mut cx), "its own key toggles it closed");
+}
+
 /// The palette row opens the monitor, it reads memory on its own, and × closes it.
 #[gpui::test]
 async fn the_performance_monitor_opens_reads_memory_and_closes(cx: &mut TestAppContext) {

@@ -309,6 +309,8 @@ actions!(
         // Application
         ToggleTheme,
         TogglePerfMonitor,
+        ShowShortcuts,
+        ShortcutsDismiss,
         Quit,
     ]
 );

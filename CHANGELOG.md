@@ -8,6 +8,7 @@ the top of the GitHub release page.
 
 ### Added
 - A performance monitor (palette or app menu): CPU, memory, FPS and frame time, background work and startup.
+- A keyboard shortcuts sheet with search, opened with Ctrl+/.
 
 ### Changed
 - Ctrl+P treats spaces as separating words, matched in any order.
