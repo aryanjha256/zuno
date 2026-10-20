@@ -1772,7 +1772,7 @@ fn text_button(
 /// One `shape_line` of a ten-character sample per frame — negligible, and the only way to get an
 /// advance that matches what the viewer paints. See `BodyView::widest_extent` for why measuring
 /// this ourselves beats letting `uniform_list` measure a row.
-fn content_width(view: &RequestView, theme: &Theme, window: &Window) -> Pixels {
+fn content_width(view: &RequestView, gutter: Pixels, advance: Pixels) -> Pixels {
     let Some(body) = &view.body_view else {
         return px(0.);
     };
@@ -1781,6 +1781,13 @@ fn content_width(view: &RequestView, theme: &Theme, window: &Window) -> Pixels {
         return px(0.);
     }
 
+    // Gutter, indent, fold marker, the text itself, and a little slack so rounding never clips
+    // the last glyph — over-reaching by a few pixels is invisible, falling short is the bug.
+    gutter + px(4.) + px(depth as f32 * INDENT) + px(12.) + advance * chars as f32 + px(8.)
+}
+
+/// The width of one character in the body's font, measured rather than assumed.
+fn mono_advance(theme: &Theme, window: &Window) -> Pixels {
     const SAMPLE: &str = "0123456789";
     let font_size = window.rem_size() * 0.75;
     let font = gpui::font(theme.mono.clone());
@@ -1792,15 +1799,32 @@ fn content_width(view: &RequestView, theme: &Theme, window: &Window) -> Pixels {
         underline: None,
         strikethrough: None,
     }];
-    let advance = window
+    window
         .text_system()
         .shape_line(SAMPLE.into(), font_size, &runs, None)
         .width
-        / SAMPLE.len() as f32;
+        / SAMPLE.len() as f32
+}
 
-    // Indent, fold marker, the text itself, and a little slack so rounding never clips the last
-    // glyph — over-reaching by a few pixels is invisible, falling short is the bug.
-    px(4.) + px(depth as f32 * INDENT) + px(12.) + advance * chars as f32 + px(8.)
+/// Space either side of the line numbers.
+const GUTTER_PAD: f32 = 16.;
+
+/// A gutter wide enough for the largest line number, so a long body's numbers line up.
+fn gutter_width(lines: usize, advance: Pixels) -> Pixels {
+    let digits = lines.max(1).to_string().len();
+    advance * digits as f32 + px(GUTTER_PAD)
+}
+
+/// One row's line number, right-aligned in the gutter.
+fn line_number(number: usize, width: Pixels, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .w(width)
+        .pr(px(GUTTER_PAD / 2.))
+        .flex()
+        .justify_end()
+        .text_color(theme.text_faint)
+        .child(number.to_string())
 }
 
 fn body_region(
@@ -1827,7 +1851,15 @@ fn body_region(
     let matched = view.current_match_bytes(cx);
     let selected = view.selected_body_row();
     let widest = body.widest_visible_ix();
-    let content = content_width(view, theme, window);
+    // Line numbers for the tree and for text; a hex dump already starts each row with its
+    // offset, and a second column of numbers beside it would only compete.
+    let advance = mono_advance(theme, window);
+    let gutter = match &body.kind {
+        BodyKind::Json(outline) => gutter_width(outline.len(), advance),
+        BodyKind::Text(lines) => gutter_width(lines.len(), advance),
+        BodyKind::Hex(_) | BodyKind::Empty => px(0.),
+    };
+    let content = content_width(view, gutter, advance);
     let scroll = view.body_scroll.clone();
 
     let list = match &body.kind {
@@ -1838,8 +1870,10 @@ fn body_region(
             hit,
             matched.clone(),
             selected,
+            body.selected_scope(),
             widest,
             content,
+            gutter,
             scroll,
             theme,
             cx,
@@ -1856,6 +1890,7 @@ fn body_region(
             selected,
             widest,
             content,
+            None,
             false,
             scroll,
             theme,
@@ -1870,6 +1905,7 @@ fn body_region(
                 selected,
                 widest,
                 content,
+                Some(gutter),
                 body.raw_is_json(),
                 scroll,
                 theme,
@@ -1893,8 +1929,10 @@ fn json_list(
     hit: Option<u32>,
     matched: Option<std::ops::Range<u32>>,
     selected: Option<u32>,
+    scope: Option<(u32, u32)>,
     widest: usize,
     content: Pixels,
+    gutter: Pixels,
     scroll: UniformListScrollHandle,
     theme: &Theme,
     cx: &mut Context<RequestView>,
@@ -1904,6 +1942,11 @@ fn json_list(
     let view = cx.entity().downgrade();
     let indicator_scroll = scroll.clone();
     let count = visible.len();
+    // The selection's block: its guide's level, and the rows strictly inside it.
+    let active = scope.and_then(|(open, close)| {
+        let depth = outline.row(open as usize)?.depth;
+        Some((depth, open, close))
+    });
 
     uniform_list("json-body", count, move |range, _window, _cx| {
         range
@@ -1923,6 +1966,10 @@ fn json_list(
                     hit == Some(row_ix as u32),
                     (hit == Some(row_ix as u32)).then(|| matched.clone()).flatten(),
                     selected == Some(row_ix as u32),
+                    gutter,
+                    active.and_then(|(depth, open, close)| {
+                        (row_ix as u32 > open && (row_ix as u32) < close).then_some(depth)
+                    }),
                     &row_theme,
                     view.clone(),
                 )
@@ -1963,6 +2010,8 @@ fn json_row(
     is_hit: bool,
     matched: Option<std::ops::Range<u32>>,
     is_selected: bool,
+    gutter: Pixels,
+    active_guide: Option<u16>,
     theme: &Theme,
     view: gpui::WeakEntity<RequestView>,
 ) -> Div {
@@ -2002,7 +2051,22 @@ fn json_row(
         .flex_row()
         .items_center()
         .h(px(ROW_HEIGHT))
-        .pl(px(4.0 + row.depth as f32 * INDENT))
+        // For the indent guides, which are placed over the row rather than taking room in it.
+        .relative()
+        .child(line_number(row_ix + 1, gutter, theme))
+        .child(div().flex_none().w(px(4.0 + row.depth as f32 * INDENT)))
+        .children((0..row.depth).map(|level| {
+            // Under the fold marker of the container that opened this level, so the line runs
+            // from a block's chevron down to its close.
+            let color = if active_guide == Some(level) { theme.text_faint } else { theme.border };
+            div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(gutter + px(4.0 + level as f32 * INDENT + 6.0))
+                .w(px(1.))
+                .bg(color)
+        }))
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |event: &MouseDownEvent, window, cx| {
             let _ = selecting.update(cx, |view, cx| {
@@ -2046,6 +2110,7 @@ fn json_row(
         line = line.child(
             div()
                 .id(("fold", row_ix))
+                .debug_selector(move || format!("fold-{row_ix}"))
                 .flex_none()
                 .w(px(12.))
                 .text_color(theme.text_muted)
@@ -2082,6 +2147,9 @@ fn json_row(
     // only be coloured whole. It also collapses up to five elements per row into one, on the
     // surface that has 1.31M of them.
     let mut painted = PaintedRow::default();
+    // An open row and its close share a depth, so the pair always match in colour.
+    let brackets = &theme.syntax.brackets;
+    let bracket = brackets[row.depth as usize % brackets.len()];
 
     if !row.key.is_none() {
         painted.push_from(outline.text(row.key), theme.syntax.key, row.key.start);
@@ -2099,15 +2167,19 @@ fn json_row(
             row.value.start,
         ),
         RowKind::ObjectOpen if folded => {
-            painted.push(&format!("{{ … {} }}", plural(row.child_count)), theme.syntax.punct)
+            painted.push("{", bracket);
+            painted.push(&format!(" … {} ", plural(row.child_count)), theme.syntax.punct);
+            painted.push("}", bracket);
         }
         RowKind::ArrayOpen if folded => {
-            painted.push(&format!("[ … {} ]", plural(row.child_count)), theme.syntax.punct)
+            painted.push("[", bracket);
+            painted.push(&format!(" … {} ", plural(row.child_count)), theme.syntax.punct);
+            painted.push("]", bracket);
         }
-        RowKind::ObjectOpen => painted.push("{", theme.syntax.punct),
-        RowKind::ArrayOpen => painted.push("[", theme.syntax.punct),
-        RowKind::ObjectClose => painted.push("}", theme.syntax.punct),
-        RowKind::ArrayClose => painted.push("]", theme.syntax.punct),
+        RowKind::ObjectOpen => painted.push("{", bracket),
+        RowKind::ArrayOpen => painted.push("[", bracket),
+        RowKind::ObjectClose => painted.push("}", bracket),
+        RowKind::ArrayClose => painted.push("]", bracket),
     }
 
     if row.trailing_comma {
@@ -2250,6 +2322,7 @@ fn text_list(
     selected: Option<u32>,
     widest: usize,
     content: Pixels,
+    gutter: Option<Pixels>,
     highlight: bool,
     scroll: UniformListScrollHandle,
     theme: &Theme,
@@ -2300,6 +2373,7 @@ fn text_list(
                             window.dispatch_action(OpenRowMenu.boxed_clone(), cx);
                         },
                     )
+                    .children(gutter.map(|width| line_number(ix + 1, width, &row_theme)))
                     .child(div().flex_none().child(raw_line(
                         text,
                         highlight,
@@ -2563,7 +2637,7 @@ fn diff_region(view: &RequestView, theme: &Theme, window: &Window) -> Div {
 
             container.children(notice).child(diff_list(
                 lines.clone(),
-                content_width(view, theme, window),
+                content_width(view, px(0.), mono_advance(theme, window)),
                 view.diff_scroll.clone(),
                 theme,
             ))

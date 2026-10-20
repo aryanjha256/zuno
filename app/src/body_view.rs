@@ -114,6 +114,10 @@ pub struct BodyView {
     /// questions, and sharing one highlight would make stepping through matches move a
     /// selection the user placed.
     selected: Option<u32>,
+    /// The open and close rows of the container the selection sits in, whose indent guide is
+    /// drawn brighter. Kept beside `selected` and set only with it: finding it scans back from
+    /// the selection, which inside a large array is too long a walk to repeat every frame.
+    scope: Option<(u32, u32)>,
 }
 
 impl BodyView {
@@ -150,6 +154,7 @@ impl BodyView {
                         widest_visible: 0,
                         widest_extent: (0, 0),
                         selected: None,
+                        scope: None,
                     };
                     // The same path a fold takes, so the initial state cannot disagree with
                     // every later one.
@@ -230,7 +235,7 @@ impl BodyView {
         // The selection is an index into the half being left, and the two halves share no line
         // numbering at all — row 40 of the markup is nowhere near row 40 of the text — so
         // carrying it over would land the cursor somewhere arbitrary and call it where you were.
-        self.selected = None;
+        self.select_row(None);
         (self.widest_visible, self.widest_extent) = widest_of(&lines);
         self.kind = BodyKind::Text(lines);
     }
@@ -250,6 +255,7 @@ impl BodyView {
             widest_visible,
             widest_extent,
             selected: None,
+            scope: None,
         }
     }
 
@@ -422,9 +428,10 @@ impl BodyView {
         if let Some(selected) = self.selected {
             if self.visible.binary_search(&selected).is_err() {
                 let above = self.visible.partition_point(|row| *row < selected);
-                self.selected = above
+                let snapped = above
                     .checked_sub(1)
                     .and_then(|ix| self.visible.get(ix).copied());
+                self.select_row(snapped);
             }
         }
     }
@@ -432,6 +439,20 @@ impl BodyView {
     /// The selected **row** index, for highlighting and for the copy verbs.
     pub fn selected(&self) -> Option<u32> {
         self.selected
+    }
+
+    /// The open and close rows of the container holding the selection, if it is in one.
+    pub fn selected_scope(&self) -> Option<(u32, u32)> {
+        self.scope
+    }
+
+    /// Every change of selection comes through here, so `scope` cannot fall out of step.
+    fn select_row(&mut self, row: Option<u32>) {
+        self.selected = row;
+        self.scope = match (&self.kind, row) {
+            (BodyKind::Json(outline), Some(row)) => enclosing(outline, row as usize),
+            _ => None,
+        };
     }
 
     /// Where the selection sits in the visible index, which is what `uniform_list` scrolls by.
@@ -452,7 +473,7 @@ impl BodyView {
             BodyKind::Empty => None,
         }?;
 
-        self.selected = Some(row_ix);
+        self.select_row(Some(row_ix));
         Some(visible_ix)
     }
 
@@ -602,6 +623,18 @@ fn widest_json_row(outline: &JsonOutline, visible: &[u32]) -> (usize, (u16, u32)
     (best, extent)
 }
 
+/// The open and close rows of the container `row` sits in, or `None` at the top level.
+///
+/// Every row between a container's open and its close is deeper than the open, so walking back
+/// from `row` to the first shallower row lands on that open. A close row belongs to the same
+/// container as its own open, which the walk gets for free since the two share a depth.
+pub fn enclosing(outline: &JsonOutline, row: usize) -> Option<(u32, u32)> {
+    let depth = outline.row(row)?.depth;
+    let open = (0..row).rev().find(|ix| outline.row(*ix).is_some_and(|r| r.depth < depth))?;
+    let close = open + outline.row(open)?.subtree_len as usize;
+    Some((open as u32, close as u32))
+}
+
 /// Whether a visible row is a folded container.
 ///
 /// Derived from `visible` rather than from the fold flags, so the render closure never
@@ -717,6 +750,22 @@ mod tests {
             false,
             HtmlView::default(),
         )
+    }
+
+    /// The brighter guide belongs to the block the selection is in, and moves with it.
+    #[test]
+    fn the_selected_rows_enclosing_block_is_found() {
+        // Rows: 0 {  1 "a": {  2 "b": 1  3 }  4 "c": [  5 2  6 ]  7 }
+        let mut view = build(r#"{"a":{"b":1},"c":[2]}"#, Some("application/json"));
+        let at = |view: &mut BodyView, row: u32| {
+            let visible_ix = view.visible().binary_search(&row).expect("row is drawn");
+            view.select_visible(visible_ix);
+            view.selected_scope()
+        };
+        assert_eq!(at(&mut view, 2), Some((1, 3)), "\"b\" is inside \"a\"");
+        assert_eq!(at(&mut view, 3), Some((0, 7)), "a close row belongs to its own parent");
+        assert_eq!(at(&mut view, 5), Some((4, 6)));
+        assert_eq!(at(&mut view, 0), None, "the root sits in nothing");
     }
 
     /// **Text in another encoding is shown as text.** Each of these was a hex dump.

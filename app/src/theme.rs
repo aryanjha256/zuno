@@ -121,6 +121,9 @@ pub struct SyntaxTheme {
     pub number: Hsla,
     pub literal: Hsla,
     pub punct: Hsla,
+    /// Brackets coloured by nesting depth, cycling, so an opening bracket can be matched to its
+    /// close by eye.
+    pub brackets: [Hsla; 4],
 }
 
 /// Colours for the inline body diff.
@@ -205,6 +208,12 @@ impl Theme {
                 number: rgb(0xe0b070).into(),
                 literal: rgb(0xb98ee6).into(),
                 punct: rgb(0x7b7b84).into(),
+                brackets: [
+                    rgb(0xe6c07b).into(),
+                    rgb(0xc792ea).into(),
+                    rgb(0x6cb6ff).into(),
+                    rgb(0xf2937a).into(),
+                ],
             },
 
             timeline: TimelineTheme {
@@ -271,6 +280,12 @@ impl Theme {
                 number: rgb(0x8a5a00).into(),
                 literal: rgb(0x7040a8).into(),
                 punct: rgb(0x8b8b94).into(),
+                brackets: [
+                    rgb(0x8f6200).into(),
+                    rgb(0x8445b8).into(),
+                    rgb(0x1f68c4).into(),
+                    rgb(0xb8492a).into(),
+                ],
             },
 
             timeline: TimelineTheme {

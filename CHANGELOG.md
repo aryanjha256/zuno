@@ -6,6 +6,9 @@ the top of the GitHub release page.
 
 ## Unreleased
 
+### Added
+- The response body shows line numbers, indent guides and brackets coloured by depth.
+
 ## 0.5.8 - 2026-10-19
 
 ### Added

@@ -7855,12 +7855,9 @@ async fn clicking_a_fold_chevron_folds_and_still_leaves_the_keyboard_working(
     cx.run_until_parked();
 
     let before = cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().row_count());
-    let row = cx.debug_bounds("response-row-1").expect("the outer object's row");
-    // Past the depth indent, on the 12px chevron itself.
-    cx.simulate_click(
-        gpui::point(row.left() + gpui::px(4.0 + 13.0 + 6.0), row.center().y),
-        gpui::Modifiers::default(),
-    );
+    // The chevron's own bounds, so the line-number gutter and indent can move it freely.
+    let chevron = cx.debug_bounds("fold-1").expect("the outer object's fold chevron");
+    cx.simulate_click(chevron.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
     assert!(
