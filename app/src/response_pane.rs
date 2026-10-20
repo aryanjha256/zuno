@@ -1962,6 +1962,10 @@ fn body_region(
                 .p_4()
                 .child(
                     gpui::img(gpui::ImageSource::Render(preview.image.clone()))
+                        // The id is what animates a GIF: `Img` keeps its current frame in
+                        // element state, which only exists for an element with one. Without it
+                        // every render starts at frame 0 and the picture never moves.
+                        .id("response-image-frames")
                         .size_full()
                         .object_fit(gpui::ObjectFit::ScaleDown),
                 ),
