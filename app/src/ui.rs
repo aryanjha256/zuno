@@ -441,7 +441,7 @@ pub fn icon_button_tinted<A: gpui::Action + Clone + 'static>(
     tint: Hsla,
     theme: &Theme,
 ) -> impl IntoElement + use<A> {
-    button_in(id, icon, label, action, tint, theme)
+    button_in(id, icon, label, action, tint, 22., theme)
 }
 
 /// An icon button that dispatches an action, with a tooltip naming its keystroke.
@@ -462,7 +462,20 @@ pub fn icon_button<A: gpui::Action + Clone + 'static>(
     action: A,
     theme: &Theme,
 ) -> impl IntoElement + use<A> {
-    button_in(id, icon, label, action, theme.text_muted, theme)
+    button_in(id, icon, label, action, theme.text_muted, 22., theme)
+}
+
+/// `icon_button` at a given square size, for a row whose other controls are taller than 22px,
+/// so its hover box matches theirs.
+pub fn icon_button_sized<A: gpui::Action + Clone + 'static>(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    action: A,
+    size: f32,
+    theme: &Theme,
+) -> impl IntoElement + use<A> {
+    button_in(id, icon, label, action, theme.text_muted, size, theme)
 }
 
 /// The shared body. One place, so the stop-propagation rule and the tooltip cannot be present on
@@ -473,6 +486,7 @@ fn button_in<A: gpui::Action + Clone + 'static>(
     label: &'static str,
     action: A,
     tint: Hsla,
+    size: f32,
     theme: &Theme,
 ) -> impl IntoElement + use<A> {
     let tooltip_action = action.clone();
@@ -485,7 +499,7 @@ fn button_in<A: gpui::Action + Clone + 'static>(
         .flex()
         .items_center()
         .justify_center()
-        .size(px(22.))
+        .size(px(size))
         .rounded_md()
         .cursor_pointer()
         .hover(|style| style.bg(theme.bg_hover))

@@ -514,7 +514,7 @@ pub(crate) fn toolbar(
         .flex_none()
         .h(px(URL_ROW_HEIGHT))
         .px(px(6.))
-        .py(px(5.))
+        .py(px(ROW_PAD))
         .bg(theme.bg_elevated)
         .border_b_1()
         .border_color(theme.border)
@@ -525,7 +525,7 @@ pub(crate) fn toolbar(
                 .items_center()
                 .flex_1()
                 .min_w(px(0.))
-                .h_full()
+                .h(px(FIELD_HEIGHT))
                 .rounded_md()
                 .overflow_hidden()
                 .bg(theme.bg)
@@ -545,9 +545,15 @@ pub(crate) fn toolbar(
 }
 
 /// The URL row's own height, taller than `ui::BAR_HEIGHT`: it holds an inset field and a button
-/// rather than flat labels, and at 30px they would be 20px tall. Nothing lines up against this
-/// row, so it need not share the other bars' height.
-const URL_ROW_HEIGHT: f32 = 38.;
+/// rather than flat labels. 36 so its bottom rule meets the collection panel's "Collections" rule
+/// across the window (with one tab open it meets the workspace rule too).
+const URL_ROW_HEIGHT: f32 = 36.;
+/// The space above and below the field: the 2px the row lost came from here, not from the field.
+const ROW_PAD: f32 = 4.;
+/// The field's height, which Send and the icon buttons beside it share, so the four read as one
+/// row rather than two full-height controls and two shorter icons floating beside them. The row
+/// less its 1px bottom rule and its padding.
+const FIELD_HEIGHT: f32 = URL_ROW_HEIGHT - 1. - ROW_PAD * 2.;
 
 /// The rule between two segments. A filled 1px child rather than a border on either neighbour,
 /// because a div carries one `border_color` for all four sides and the row's already spoken for.
@@ -580,18 +586,20 @@ fn request_actions(theme: &Theme) -> Div {
         .items_center()
         .gap_1()
         .flex_none()
-        .child(icon_button(
+        .child(crate::ui::icon_button_sized(
             "action-save-request",
             Icon::Save,
             "Save request to collection",
             SaveRequest,
+            FIELD_HEIGHT,
             theme,
         ))
-        .child(icon_button(
+        .child(crate::ui::icon_button_sized(
             "action-more",
             Icon::EllipsisVertical,
             "More — copy as code, import from curl, request settings",
             crate::actions::OpenRequestMenu,
+            FIELD_HEIGHT,
             theme,
         ))
 }
@@ -712,7 +720,7 @@ fn send_button(
         .flex()
         .items_center()
         .flex_none()
-        .h_full()
+        .h(px(FIELD_HEIGHT))
         .rounded_md()
         .px_4()
         .text_xs()
