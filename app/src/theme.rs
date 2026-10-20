@@ -345,33 +345,6 @@ impl Theme {
     }
 }
 
-/// Monospace families worth trying, best first. GPUI falls back gracefully on a
-/// miss, but picking from what's actually installed avoids a silent substitution
-/// that makes column alignment look broken.
-const MONO_CANDIDATES: &[&str] = &[
-    "JetBrains Mono",
-    "Fira Code",
-    "Cascadia Code",
-    "SF Mono",
-    "Menlo",
-    "Consolas",
-    "DejaVu Sans Mono",
-    "Liberation Mono",
-    "Noto Sans Mono",
-    "Ubuntu Mono",
-    "monospace",
-];
-
-pub fn pick_mono_font(cx: &App) -> SharedString {
-    let available = cx.text_system().all_font_names();
-    for candidate in MONO_CANDIDATES {
-        if available.iter().any(|name| name == candidate) {
-            return SharedString::from(*candidate);
-        }
-    }
-    SharedString::from("monospace")
-}
-
 /// Sugar for reading the theme off any context that derefs to `App`.
 pub trait ActiveTheme {
     fn theme(&self) -> &Theme;

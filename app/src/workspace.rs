@@ -8610,6 +8610,8 @@ impl Render for Workspace {
         div()
             .id("zuno")
             .key_context("Zuno")
+            // The interface font, once, for everything inside the window; see `fonts`.
+            .font_family(crate::fonts::UI)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::focus_url))
             .on_action(cx.listener(Self::focus_body))

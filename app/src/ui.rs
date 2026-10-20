@@ -367,6 +367,9 @@ impl Render for Tooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         div()
+            // A tooltip is its own view, drawn outside the workspace's tree, so it does not
+            // inherit the font set at the window's root.
+            .font_family(crate::fonts::UI)
             .px_2()
             .py_1()
             .rounded_md()

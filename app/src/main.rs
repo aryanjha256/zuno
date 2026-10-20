@@ -23,6 +23,7 @@ mod close_panel;
 mod collection_panel;
 mod environment_panel;
 mod flow_panel;
+mod fonts;
 mod git_panel;
 mod history;
 mod import_panel;
@@ -131,8 +132,8 @@ fn main() {
         // everything downstream reads.
         app_state::install(cx);
 
-        let mono = theme::pick_mono_font(cx);
-        cx.set_global(Theme::new(app_state::theme(cx), mono));
+        fonts::install(cx);
+        cx.set_global(Theme::new(app_state::theme(cx), fonts::MONO.into()));
         register_keymap(cx);
         boot.mark("theme + keymap");
 

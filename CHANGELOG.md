@@ -11,6 +11,9 @@ the top of the GitHub release page.
 - An empty collection offers Save and Import buttons instead of a line of text.
 - Image responses (PNG, JPEG, GIF, WebP, SVG, BMP, TIFF) show as the picture, with a toggle to the bytes.
 
+### Changed
+- Zuno ships its own fonts, IBM Plex Sans and JetBrains Mono, so it looks the same on every platform.
+
 ## 0.5.8 - 2026-10-19
 
 ### Added
