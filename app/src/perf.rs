@@ -242,8 +242,12 @@ mod os {
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
-    /// The private working set, which is Task Manager's Memory column. The `EX2` counters that
-    /// carry it need Windows 10 1809 or later; before that the call fails and this says "n/a".
+    /// The private working set, which is Task Manager's Memory column.
+    ///
+    /// **Falls back to private bytes when that reads 0.** The field belongs to the `EX2` counters,
+    /// and a Windows build that predates them still succeeds, filling the fields it knows and
+    /// leaving this one at zero: CI's runner did exactly that. Private bytes (`PrivateUsage`,
+    /// Task Manager's "Commit size") is filled by every version and is the nearest figure.
     pub fn memory_bytes() -> Option<u64> {
         let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
         let mut counters = PROCESS_MEMORY_COUNTERS_EX2 {
@@ -259,7 +263,14 @@ mod os {
                 size,
             )
         };
-        (ok != 0).then_some(counters.PrivateWorkingSetSize as u64)
+        if ok == 0 {
+            return None;
+        }
+        let bytes = match counters.PrivateWorkingSetSize {
+            0 => counters.PrivateUsage,
+            private_working_set => private_working_set,
+        };
+        Some(bytes as u64)
     }
 
     pub fn cpu_time() -> Option<Duration> {
