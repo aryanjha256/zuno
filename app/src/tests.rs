@@ -133,6 +133,35 @@ async fn the_registry_resolves_the_active_workspace_into_root_and_session(cx: &m
 /// `DEFAULT_WIDTH`, which is the whole class of weak assertion CLAUDE.md's Lessons section is
 /// about. What a person notices is the panel getting wider, so that is what this reads.
 ///
+/// An empty collection offers two buttons, and each has to do what it says: a button that
+/// draws and dispatches nothing looks exactly like one that works.
+#[gpui::test]
+async fn the_empty_collection_buttons_save_and_import(cx: &mut TestAppContext) {
+    let (session, root) = scratch_collection("empty-collection");
+    std::fs::create_dir_all(&root).expect("collection root");
+    let (window, _v, mut cx) = boot(cx, Some(session.clone()), Some(root.clone()));
+    cx.run_until_parked();
+
+    let import = cx.debug_bounds("empty-import").expect("the import button");
+    cx.simulate_click(import.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        window
+            .update(&mut cx, |workspace, _, _| workspace.import_panel_for_test().is_some())
+            .expect("window"),
+        "Import should open the import panel"
+    );
+    cx.press("escape");
+    cx.run_until_parked();
+
+    let save = cx.debug_bounds("empty-save-request").expect("the save button");
+    cx.simulate_click(save.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(collection_files(&root).len(), 1, "Save should write the open request");
+
+    remove_scratch(&mut cx, &session);
+}
+
 /// **Two moves, not one, and that is gpui's contract rather than a flake.** The first move past
 /// `DRAG_THRESHOLD` is what *starts* the drag: it runs in the bubble phase and sets
 /// `active_drag`, while `on_drag_move` is a capture-phase listener that has already run and

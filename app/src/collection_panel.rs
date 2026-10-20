@@ -26,10 +26,12 @@ use zuno_core::Method;
 use zuno_core::collection::{Badge, Node, NodeKind};
 
 use crate::actions::{
-    ClearHistory, CollectionCollapseAll, CollectionExpandAll, NewFolder, NewRequest,
+    ClearHistory, CollectionCollapseAll, CollectionExpandAll, ImportDocument, NewFolder, NewRequest,
+    SaveRequest,
     OpenCollectionMenu, OpenWorkspaceMenu, ShowAllHistory, ShowCollections, ShowGit,
 };
 use gpui::Action as _;
+use gpui::prelude::FluentBuilder as _;
 use crate::theme::Theme;
 use crate::ui::{Icon, glyph, icon_button};
 use crate::workspace::Workspace;
@@ -218,7 +220,7 @@ pub fn render(
                 collections_toolbar(theme).into_any_element(),
                 list.into_any_element(),
             ];
-            body.extend(empty_notice(workspace, theme).map(IntoElement::into_any_element));
+            body.extend(empty_notice(workspace, theme, window).map(IntoElement::into_any_element));
             ("CollectionPanel", body)
         }
     };
@@ -919,7 +921,11 @@ fn new_node_cell(
 /// Shown instead of an empty list, because a blank panel is indistinguishable from a broken
 /// one. Says what to do rather than only what is absent — the same shape as the picker's
 /// "press Ctrl+S to save the one you're editing" fallback.
-fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement + use<>> {
+fn empty_notice(
+    workspace: &Workspace,
+    theme: &Theme,
+    window: &Window,
+) -> Option<impl IntoElement + use<>> {
     if !workspace.tree.is_empty() {
         return None;
     }
@@ -940,6 +946,15 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
         return None;
     }
 
+    // Three states, not two. A folder that holds *other* things is not an empty collection, and
+    // saying "Nothing saved yet" there described the wrong problem — the same courtesy
+    // `Import::skipped` already extends.
+    let line = match (workspace.tree_scanned, workspace.tree_skipped) {
+        (false, _) => SharedString::from("Reading the collection…"),
+        (true, 0) => return Some(empty_collection(theme, window).into_any_element()),
+        (true, 1) => SharedString::from("No requests here — 1 other file was skipped."),
+        (true, n) => SharedString::from(format!("No requests here — {n} other files were skipped.")),
+    };
     Some(
         div()
             .absolute()
@@ -949,21 +964,77 @@ fn empty_notice(workspace: &Workspace, theme: &Theme) -> Option<impl IntoElement
             .px_3()
             .text_xs()
             .text_color(theme.text_faint)
-            // Three states, not two. A folder that holds *other* things is not an empty
-            // collection, and saying "Nothing saved yet" there described the wrong problem —
-            // the same courtesy `Import::skipped` already extends.
-            .child(match (workspace.tree_scanned, workspace.tree_skipped) {
-                (false, _) => SharedString::from("Reading the collection…"),
-                (true, 0) => SharedString::from(
-                    "Nothing saved yet. Ctrl+S writes the request you're editing into the \
-                     collection.",
-                ),
-                (true, 1) => SharedString::from("No requests here — 1 other file was skipped."),
-                (true, n) => {
-                    SharedString::from(format!("No requests here — {n} other files were skipped."))
-                }
-            }),
+            .child(line)
+            .into_any_element(),
     )
+}
+
+/// A collection with nothing in it: what it is for, and the two ways to fill it.
+///
+/// **Buttons, not only a sentence.** A new user with no requests has nothing else in the panel
+/// to click, so the line that used to name `Ctrl+S` left the mouse with no path at all. Each
+/// button shows its key, so the mouse path teaches the keyboard one.
+fn empty_collection(theme: &Theme, window: &Window) -> impl IntoElement + use<> {
+    let button = |id: &'static str, label: &'static str, action: Box<dyn gpui::Action>, primary: bool| {
+        let key = crate::workspace::keybinding_label(action.as_ref(), window);
+        div()
+            .id(id)
+            .debug_selector(move || id.to_string())
+            .h(px(28.))
+            .w_full()
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme.border)
+            .when(primary, |button| button.bg(theme.bg_hover))
+            .text_color(if primary { theme.text } else { theme.text_muted })
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.bg_hover).border_color(theme.text_faint).text_color(theme.text))
+            .active(|style| style.bg(theme.bg))
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.dispatch_action(action.boxed_clone(), cx);
+            })
+            .child(div().flex_1().min_w(px(0.)).overflow_hidden().whitespace_nowrap().child(label))
+            .child(crate::ui::keycaps(&key, theme))
+    };
+
+    div()
+        .absolute()
+        .top(px(HEADER_HEIGHT + TOOLBAR_HEIGHT))
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .px_3()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .text_xs()
+        .child(div().mb_1().child(glyph(Icon::FileStack, theme.text_faint, theme.text_faint, 40.)))
+        .child(div().text_sm().text_color(theme.text).child("No requests saved"))
+        .child(
+            div()
+                .text_center()
+                .text_color(theme.text_muted)
+                .child("Saving the request you're editing puts it here, as a file you can commit."),
+        )
+        .child(
+            div()
+                .mt_2()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                // Short enough to sit beside their keycaps at the panel's narrowest, `MIN_WIDTH`.
+                .child(button("empty-save-request", "Save request", Box::new(SaveRequest), true))
+                .child(button("empty-import", "Import", Box::new(ImportDocument), false)),
+        )
 }
 
 /// Roughly how many characters of a name fit at `depth`, in the panel's font at `text_xs`.

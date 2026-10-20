@@ -8,6 +8,7 @@ the top of the GitHub release page.
 
 ### Added
 - The response body shows line numbers, indent guides and brackets coloured by depth.
+- An empty collection offers Save and Import buttons instead of a line of text.
 
 ## 0.5.8 - 2026-10-19
 

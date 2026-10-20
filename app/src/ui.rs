@@ -100,6 +100,8 @@ pub enum Icon {
     FileBadge,
     CircleAlert,
     CircleCheck,
+    /// The empty collection's illustration, drawn large, hence a lighter stroke than the rest.
+    FileStack,
 }
 
 impl Icon {
@@ -120,6 +122,7 @@ impl Icon {
             Icon::FileBadge => "icons/file-badge.svg",
             Icon::CircleAlert => "icons/circle-alert.svg",
             Icon::CircleCheck => "icons/circle-check.svg",
+            Icon::FileStack => "icons/file-stack.svg",
             Icon::Eye => "icons/eye.svg",
             Icon::EyeOff => "icons/eye-off.svg",
             Icon::EllipsisVertical => "icons/ellipsis-vertical.svg",
@@ -183,6 +186,7 @@ impl Icon {
         Icon::FileBadge,
         Icon::CircleAlert,
         Icon::CircleCheck,
+        Icon::FileStack,
         Icon::Eye,
         Icon::EyeOff,
         Icon::EllipsisVertical,
@@ -246,6 +250,7 @@ impl AssetSource for Assets {
             "icons/file-badge.svg" => include_bytes!("../assets/icons/file-badge.svg"),
             "icons/circle-alert.svg" => include_bytes!("../assets/icons/circle-alert.svg"),
             "icons/circle-check.svg" => include_bytes!("../assets/icons/circle-check.svg"),
+            "icons/file-stack.svg" => include_bytes!("../assets/icons/file-stack.svg"),
             "icons/eye.svg" => include_bytes!("../assets/icons/eye.svg"),
             "icons/eye-off.svg" => include_bytes!("../assets/icons/eye-off.svg"),
             "icons/ellipsis-vertical.svg" => include_bytes!("../assets/icons/ellipsis-vertical.svg"),
