@@ -56,7 +56,7 @@ use crate::actions::{
     NextResponseTab, PrevResponseTab, ShowResponseBody, ShowResponseDiff, ShowResponseHeaders,
     CopyNetworkDetails,
     ShowResponseTrailers,
-    ShowResponseNetwork, ToggleHtmlView,
+    ShowResponseNetwork, ToggleHtmlView, ToggleImageView,
     CollectionCollapse, CollectionConfirm, CollectionExpand, CollectionNext, CollectionPrev,
     ConfirmDeleteRequest, DeleteRequest, OpenCollectionMenu, ToggleCollectionPanel,
     CancelClose, CancelRename, CloseChoiceNext, CloseChoicePrev, CollectionCollapseAll,
@@ -6653,6 +6653,12 @@ impl Workspace {
         self.show_response_view(ResponseView::Diff, cx);
     }
 
+    fn toggle_image_view(&mut self, _: &ToggleImageView, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(view) = self.active() {
+            view.update(cx, |view, cx| view.toggle_image_view(cx));
+        }
+    }
+
     fn toggle_html_view(&mut self, _: &ToggleHtmlView, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(view) = self.active() {
             view.update(cx, |view, cx| view.toggle_html_view(cx));
@@ -8772,6 +8778,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::show_response_network))
             .on_action(cx.listener(Self::show_response_diff))
             .on_action(cx.listener(Self::toggle_html_view))
+            .on_action(cx.listener(Self::toggle_image_view))
             .on_action(cx.listener(Self::find_in_body))
             .on_action(cx.listener(Self::body_find_next))
             .on_action(cx.listener(Self::body_find_prev))

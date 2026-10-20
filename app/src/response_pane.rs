@@ -27,12 +27,13 @@ use crate::actions::{
     CancelRequest, CopyResponse, FindInResponse, FoldAll, OpenRowMenu, SendRequest,
     ShowHistory, ShowResponseBody, ShowResponseHeaders, ShowResponseTrailers, ShowResponseDiff,
     CopyNetworkDetails,
-    ShowResponseNetwork, ToggleFold, ToggleHtmlView, UnfoldAll, ShowResponseChanges,
+    ShowResponseNetwork, ToggleFold, ToggleHtmlView, ToggleImageView, UnfoldAll, ShowResponseChanges,
     GitDiscardActive, GitRawDiff,
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
 use gpui::prelude::FluentBuilder as _;
+use gpui::StyledImage as _;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, TextSearch, ResponseView};
 use zuno_core::body_diff::{BodyDiff, DiffLine, LineKind};
@@ -1732,6 +1733,30 @@ fn body_header(view: &RequestView, theme: &Theme, cx: &mut Context<RequestView>)
         ));
     }
 
+    // An image's size and format, and the swap to its bytes. Offered only on a body that decoded,
+    // so it cannot appear inert anywhere else.
+    if let Some(preview) = view.body_view.as_ref().and_then(BodyView::image) {
+        let size = preview.image.size(0);
+        actions = actions.child(
+            div()
+                .flex_none()
+                .text_color(theme.text_muted)
+                .child(format!("{} × {} · {}", size.width.0, size.height.0, preview.format)),
+        );
+        let (label, tooltip) = if preview.showing {
+            ("show bytes", "Show the response's bytes")
+        } else {
+            ("show image", "Show the image")
+        };
+        actions = actions.child(text_action(
+            "toggle-image-view",
+            label.into(),
+            tooltip,
+            ToggleImageView,
+            theme,
+        ));
+    }
+
     // The explicit escape hatch for an over-the-cap body. Never parse silently, and
     // never refuse silently either.
     if let Some(BodyNotice::TooLarge { .. }) = view.body_view.as_ref().and_then(|b| b.notice.clone())
@@ -1925,6 +1950,23 @@ fn body_region(
     };
 
     let notice = body.notice.as_ref().map(|notice| notice_bar(notice, theme));
+
+    // The picture, scaled down to fit and never up: a 16px icon blown up to the pane would hide
+    // the one thing a preview is for, which is seeing what was actually sent.
+    if let Some(preview) = body.image().filter(|preview| preview.showing) {
+        return container.children(notice).child(
+            div()
+                .debug_selector(|| "response-image".to_string())
+                .flex_1()
+                .min_h(px(0.))
+                .p_4()
+                .child(
+                    gpui::img(gpui::ImageSource::Render(preview.image.clone()))
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::ScaleDown),
+                ),
+        );
+    }
 
     // The row holding the current match, and the row the reader has selected. Both are
     // plain `Option<u32>` and therefore `Copy`, so the render closures capture them without
@@ -2568,6 +2610,14 @@ fn notice_bar(notice: &BodyNotice, theme: &Theme) -> Div {
                 format_bytes(*len as u64),
                 format_bytes(zuno_core::html::MAX_EXTRACT_BYTES as u64)
             ),
+        ),
+        BodyNotice::ImageUndecodable { message } => (
+            theme.status_server_error,
+            format!("labelled as an image, but it did not decode ({message}); showing the bytes"),
+        ),
+        BodyNotice::ImageTooLarge => (
+            theme.status_client_error,
+            "too large to preview as an image; showing the bytes".to_string(),
         ),
     };
 

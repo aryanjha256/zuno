@@ -247,6 +247,7 @@ actions!(
         ShowResponseNetwork,
         ShowResponseDiff,
         ToggleHtmlView,
+        ToggleImageView,
         FindInResponse,
         FindNext,
         FindPrev,

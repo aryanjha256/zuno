@@ -35,9 +35,38 @@ pub enum BodyKind {
 
 }
 
+/// Image bodies over this are not decoded for preview: the hex dump still answers "is this the
+/// thing I asked for", and decoding a huge one would hold its full-size pixels in memory.
+pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+/// Decoded images over this many pixels are dropped again: about 200 MB of pixels at the cap.
+pub const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
+/// Turns an image body into pixels: gpui's own decoder, with the SVG renderer it needs already
+/// inside. A closure because gpui does not export that renderer's type, so it cannot be named
+/// in a signature, only captured.
+pub type ImageDecoder = Box<dyn FnOnce(gpui::Image) -> Result<Arc<gpui::RenderImage>, String> + Send>;
+
+/// A body that decoded as an image.
+///
+/// **Decoded here, on the background executor, and handed to `img()` finished**, rather than
+/// giving `img()` the bytes. Given bytes, gpui decodes into an app-wide asset cache that nothing
+/// empties, so every image response would stay decoded until Zuno quit. Held here, the pixels go
+/// with the body; the GPU's copy is released by `RequestView::set_body_view`, which is the one
+/// place a body is replaced.
+pub struct ImagePreview {
+    pub image: Arc<gpui::RenderImage>,
+    pub format: &'static str,
+    /// The image, rather than its bytes, is on screen.
+    pub showing: bool,
+}
+
 /// Why the body isn't shown as JSON, when it might have been.
 #[derive(Debug, Clone)]
 pub enum BodyNotice {
+    /// Declared or recognised as an image, but its bytes did not decode as one.
+    ImageUndecodable { message: String },
+    /// An image too large to preview, by bytes or by pixels.
+    ImageTooLarge,
     TooLarge { len: usize },
     ParseFailed { message: String },
     /// An HTML body past `html::MAX_EXTRACT_BYTES`, so there is no text view to offer.
@@ -118,18 +147,31 @@ pub struct BodyView {
     /// drawn brighter. Kept beside `selected` and set only with it: finding it scans back from
     /// the selection, which inside a large array is too long a walk to repeat every frame.
     scope: Option<(u32, u32)>,
+    /// `Some` for a body that decoded as an image. `kind` still holds its hex dump (or, for an
+    /// SVG, its source), so search, copy and every accessor keep working on the bytes, and the
+    /// toggle only changes what is drawn.
+    image: Option<ImagePreview>,
 }
 
 impl BodyView {
     /// Classify and index a body. **Background executor only.**
+    ///
+    /// `images` decodes an image body; `None` skips image previews, as for a WebSocket frame,
+    /// where the bytes are payload rather than a picture to look at.
     pub fn build(
         body: Bytes,
         content_type: Option<String>,
         force_parse: bool,
         html_view: HtmlView,
+        images: Option<ImageDecoder>,
     ) -> Self {
         if body.is_empty() {
             return Self::plain(BodyKind::Empty, None);
+        }
+        if let (Some(decode), Some((format, label))) =
+            (images, image_format(&body, content_type.as_deref()))
+        {
+            return Self::decoded_image(body, format, label, decode);
         }
         let body = to_utf8(body, content_type.as_deref());
 
@@ -155,6 +197,7 @@ impl BodyView {
                         widest_extent: (0, 0),
                         selected: None,
                         scope: None,
+                        image: None,
                     };
                     // The same path a fold takes, so the initial state cannot disagree with
                     // every later one.
@@ -185,6 +228,60 @@ impl BodyView {
             .then(|| hex::is_truncated(len).then_some(BodyNotice::HexTruncated { len }))
             .flatten();
         Self::plain(kind, notice)
+    }
+
+    /// An image body: its bytes indexed as usual, and the picture decoded beside them.
+    ///
+    /// Anything that goes wrong falls back to the bytes with a notice, never to a blank pane: an
+    /// HTML error page served as `image/png` is exactly what the hex dump exists to show.
+    fn decoded_image(
+        body: Bytes,
+        format: gpui::ImageFormat,
+        label: &'static str,
+        decode: ImageDecoder,
+    ) -> Self {
+        let len = body.len();
+        let bytes_view = |notice: Option<BodyNotice>| {
+            let kind = text_or_binary(body.clone());
+            let truncated = matches!(kind, BodyKind::Hex(_)) && hex::is_truncated(len);
+            Self::plain(kind, notice.or(truncated.then_some(BodyNotice::HexTruncated { len })))
+        };
+        if len > MAX_IMAGE_BYTES {
+            return bytes_view(Some(BodyNotice::ImageTooLarge));
+        }
+        match decode(gpui::Image::from_bytes(format, body.to_vec())) {
+            Ok(image) => {
+                let size = image.size(0);
+                if u64::from(size.width.0 as u32) * u64::from(size.height.0 as u32) > MAX_IMAGE_PIXELS {
+                    return bytes_view(Some(BodyNotice::ImageTooLarge));
+                }
+                let mut view = bytes_view(None);
+                view.image = Some(ImagePreview { image, format: label, showing: true });
+                view
+            }
+            Err(message) => bytes_view(Some(BodyNotice::ImageUndecodable { message })),
+        }
+    }
+
+    /// The decoded image, if this body is one.
+    pub fn image(&self) -> Option<&ImagePreview> {
+        self.image.as_ref()
+    }
+
+    /// Whether the picture, rather than its bytes, is on screen.
+    pub fn showing_image(&self) -> bool {
+        self.image.as_ref().is_some_and(|image| image.showing)
+    }
+
+    pub fn set_image_showing(&mut self, showing: bool) {
+        if let Some(image) = self.image.as_mut() {
+            image.showing = showing;
+        }
+    }
+
+    /// Hand back the decoded image so its GPU copy can be released.
+    pub fn take_image(&mut self) -> Option<Arc<gpui::RenderImage>> {
+        self.image.take().map(|preview| preview.image)
     }
 
     /// An HTML body, indexed twice — once as markup, once as the text inside it.
@@ -256,6 +353,7 @@ impl BodyView {
             widest_extent,
             selected: None,
             scope: None,
+            image: None,
         }
     }
 
@@ -623,6 +721,43 @@ fn widest_json_row(outline: &JsonOutline, visible: &[u32]) -> (usize, (u16, u32)
     (best, extent)
 }
 
+/// Whether a body is an image Zuno can preview, and the format's name for the label.
+///
+/// The declared type decides when there is one. Only a body with no type, or the
+/// `application/octet-stream` that means "unknown", is sniffed, and only for the four formats
+/// whose leading bytes cannot be mistaken for text.
+fn image_format(body: &[u8], content_type: Option<&str>) -> Option<(gpui::ImageFormat, &'static str)> {
+    use gpui::ImageFormat;
+    let declared = content_type
+        .map(|value| value.split(';').next().unwrap_or("").trim().to_ascii_lowercase());
+    let format = match declared.as_deref() {
+        None | Some("application/octet-stream") => {
+            if body.starts_with(b"\x89PNG\r\n\x1a\n") {
+                ImageFormat::Png
+            } else if body.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                ImageFormat::Jpeg
+            } else if body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a") {
+                ImageFormat::Gif
+            } else if body.len() > 12 && &body[..4] == b"RIFF" && &body[8..12] == b"WEBP" {
+                ImageFormat::Webp
+            } else {
+                return None;
+            }
+        }
+        Some(mime) => ImageFormat::from_mime_type(mime)?,
+    };
+    let label = match format {
+        ImageFormat::Png => "PNG",
+        ImageFormat::Jpeg => "JPEG",
+        ImageFormat::Webp => "WebP",
+        ImageFormat::Gif => "GIF",
+        ImageFormat::Svg => "SVG",
+        ImageFormat::Bmp => "BMP",
+        ImageFormat::Tiff => "TIFF",
+    };
+    Some((format, label))
+}
+
 /// The open and close rows of the container `row` sits in, or `None` at the top level.
 ///
 /// Every row between a container's open and its close is deeper than the open, so walking back
@@ -749,6 +884,7 @@ mod tests {
             content_type.map(str::to_string),
             false,
             HtmlView::default(),
+            None,
         )
     }
 
@@ -772,7 +908,7 @@ mod tests {
     #[test]
     fn a_body_in_another_encoding_is_decoded_for_display() {
         let first_line = |bytes: Vec<u8>, content_type: &str| -> Option<String> {
-            let view = BodyView::build(Bytes::from(bytes), Some(content_type.into()), false, HtmlView::default());
+            let view = BodyView::build(Bytes::from(bytes), Some(content_type.into()), false, HtmlView::default(), None);
             match &view.kind {
                 BodyKind::Text(lines) => Some(lines.line(0).0.to_string()),
                 _ => None,
@@ -792,7 +928,7 @@ mod tests {
         // UTF-16 JSON, found by its byte-order mark, parses as JSON.
         let mut utf16 = vec![0xFF, 0xFE];
         utf16.extend("{\"ok\":true}".encode_utf16().flat_map(u16::to_le_bytes));
-        let view = BodyView::build(Bytes::from(utf16), Some("application/json".into()), false, HtmlView::default());
+        let view = BodyView::build(Bytes::from(utf16), Some("application/json".into()), false, HtmlView::default(), None);
         assert!(view.outline().is_some(), "UTF-16 JSON should open as a tree");
     }
 
@@ -807,7 +943,7 @@ mod tests {
         let long = "x".repeat(41);
         let deep = "y".repeat(31);
         let json = format!(r#"{{"k":"{long}","a":{{"b":{{"c":{{"d":{{"e":{{"f":{{"d":"{deep}"}}}}}}}}}}}}}}"#);
-        let view = BodyView::build(Bytes::from(json), Some("application/json".into()), false, HtmlView::default());
+        let view = BodyView::build(Bytes::from(json), Some("application/json".into()), false, HtmlView::default(), None);
 
         let outline = view.outline().expect("json");
         let row = outline.row(view.widest_visible_ix()).expect("a row");
@@ -875,6 +1011,7 @@ mod tests {
             None,
             false,
             HtmlView::default(),
+            None,
         );
 
         let BodyKind::Hex(lines) = &view.kind else {
@@ -896,7 +1033,7 @@ mod tests {
     #[test]
     fn an_oversized_body_is_not_parsed_but_is_still_shown() {
         let big = format!("[{}]", "1,".repeat(MAX_AUTO_PARSE / 2 + 8));
-        let view = BodyView::build(Bytes::from(big.clone()), Some("application/json".into()), false, HtmlView::default());
+        let view = BodyView::build(Bytes::from(big.clone()), Some("application/json".into()), false, HtmlView::default(), None);
 
         assert!(!view.is_json(), "over the cap, JSON must not be parsed");
         assert!(matches!(view.notice, Some(BodyNotice::TooLarge { .. })));
@@ -904,7 +1041,7 @@ mod tests {
 
         // ...and forcing it parses. (Malformed here, since the generator leaves a
         // trailing comma — what matters is that force bypasses the cap.)
-        let forced = BodyView::build(Bytes::from(big), Some("application/json".into()), true, HtmlView::default());
+        let forced = BodyView::build(Bytes::from(big), Some("application/json".into()), true, HtmlView::default(), None);
         assert!(
             forced.is_json() || matches!(forced.notice, Some(BodyNotice::ParseFailed { .. })),
             "forcing should attempt a parse rather than report TooLarge"

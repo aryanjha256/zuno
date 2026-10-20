@@ -213,6 +213,7 @@ pub fn palette(kind: Option<&crate::kinds::KindEditor>) -> Vec<Command> {
         command("Show response network — timing, connection, the request as sent", ShowResponseNetwork),
         command("Show response diff", ShowResponseDiff),
         command("Toggle HTML text / raw", ToggleHtmlView),
+        command("Toggle image / bytes", ToggleImageView),
         command("Next response tab", NextResponseTab),
         command("Previous response tab", PrevResponseTab),
         command("Find in response", FindInResponse),

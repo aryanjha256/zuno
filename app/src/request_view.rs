@@ -735,6 +735,8 @@ pub struct RequestView {
 
 impl RequestView {
     pub fn new(spec: RequestSpec, cx: &mut Context<Self>) -> Self {
+        // A closed tab takes its image body's GPU copy with it; see `set_body_view`.
+        cx.on_release(|view, cx| view.set_body_view(None, cx)).detach();
         let mut view = Self {
             id: spec.id,
             pending_send: None,
@@ -997,7 +999,7 @@ impl RequestView {
         self.body_diff = None;
         self.history.clear();
         self.viewing = 0;
-        self.body_view = None;
+        self.set_body_view(None, cx);
         self.body_task = None;
         self.diff_task = None;
         self.inflight = None;
@@ -1066,6 +1068,30 @@ impl RequestView {
         if let Some(body) = self.body_view.as_mut() {
             body.set_html_view(next);
         }
+        cx.notify();
+    }
+
+    /// Replace the displayed body. **Every replacement goes through here**, because an image body
+    /// leaves a copy in the GPU's sprite atlas that nothing frees by itself: gpui keeps it until
+    /// `drop_image` is called for it, so a body dropped any other way leaks its texture.
+    pub fn set_body_view(&mut self, view: Option<BodyView>, cx: &mut App) {
+        let old = std::mem::replace(&mut self.body_view, view);
+        if let Some(image) = old.and_then(|mut old| old.take_image()) {
+            cx.drop_image(image, None);
+        }
+    }
+
+    /// Swap an image body between the picture and its bytes.
+    ///
+    /// A no-op on anything that is not a decoded image, so the palette row can exist
+    /// unconditionally.
+    pub fn toggle_image_view(&mut self, cx: &mut Context<Self>) {
+        let Some(body) = self.body_view.as_mut() else { return };
+        if body.image().is_none() {
+            return;
+        }
+        let showing = body.showing_image();
+        body.set_image_showing(!showing);
         cx.notify();
     }
 
@@ -1563,7 +1589,7 @@ impl RequestView {
         };
 
         self.error = None;
-        self.body_view = None;
+        self.set_body_view(None, cx);
         self.body_task = None;
         self.status = None;
         // A reconnect is a new conversation. The old transcript is kept until *here* rather
@@ -1971,6 +1997,8 @@ impl RequestView {
             Some(Some(moved)) => self.session_selected = Some(moved),
             Some(None) => {
                 self.session_selected = None;
+                // Directly, not through `set_body_view`: this is a session frame's body, and
+                // frames are built without image decoding, so there is no texture to release.
                 self.body_view = None;
                 self.body_task = None;
             }
@@ -2051,7 +2079,7 @@ impl RequestView {
         };
 
         self.session_selected = Some(ix);
-        self.body_view = None;
+        self.set_body_view(None, cx);
 
         // `None` content type, honestly: a WebSocket frame carries no such header. `BodyView`
         // sniffs the bytes, which is the only evidence there is.
@@ -2061,12 +2089,12 @@ impl RequestView {
         // happens to contain markup is payload — showing it as prose would hide what was sent.
         let build = cx
             .background_executor()
-            .spawn(async move { BodyView::build(body, None, false, crate::body_view::HtmlView::Raw) });
+            .spawn(async move { BodyView::build(body, None, false, crate::body_view::HtmlView::Raw, None) });
 
         self.body_task = Some(cx.spawn(async move |this, cx| {
             let view = build.await;
             let _ = this.update(cx, |this, cx| {
-                this.body_view = Some(view);
+                this.set_body_view(Some(view), cx);
                 // No `run_captures` here, unlike `index_body`: a session has no captures — see
                 // `KindEditor::checks_a_response`, which is why it has no Capture tab either.
                 if this.is_searching() {
@@ -2375,7 +2403,7 @@ impl RequestView {
     /// doesn't exist in gpui 0.2.2.
     pub fn index_body(&mut self, force_parse: bool, cx: &mut Context<Self>) {
         let Some(response) = self.displayed() else {
-            self.body_view = None;
+            self.set_body_view(None, cx);
             self.body_task = None;
             return;
         };
@@ -2385,10 +2413,14 @@ impl RequestView {
         let len = body.len();
         let html_view = self.html_view;
 
-        self.body_view = None;
+        self.set_body_view(None, cx);
+        let renderer = cx.svg_renderer();
+        let images: Option<crate::body_view::ImageDecoder> = Some(Box::new(move |image: gpui::Image| {
+            image.to_image_data(renderer).map_err(|error| error.to_string())
+        }));
         let build = cx
             .background_executor()
-            .spawn(async move { BodyView::build(body, content_type, force_parse, html_view) });
+            .spawn(async move { BodyView::build(body, content_type, force_parse, html_view, images) });
 
         self.body_task = Some(cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
@@ -2402,7 +2434,7 @@ impl RequestView {
                     elapsed,
                     view.row_count()
                 );
-                this.body_view = Some(view);
+                this.set_body_view(Some(view), cx);
                 this.run_captures(CaptureTrigger::Send, cx);
                 // Matches belong to the bytes they were found in. A resend, or picking a run
                 // out of the history browser, replaces those bytes — so offsets from the old

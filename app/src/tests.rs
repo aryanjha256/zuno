@@ -2952,7 +2952,13 @@ async fn a_binary_response_is_shown_as_a_hex_dump(cx: &mut TestAppContext) {
             !body.is_json() && !body.raw_is_json(),
             "a hex dump must never be syntax-highlighted as JSON"
         );
-        assert!(body.notice.is_none(), "21 bytes is not a truncation");
+        // Not a truncation. It does carry the image notice: this is a JPEG header with no image
+        // behind it, so the preview fell back to the bytes and says why.
+        assert!(
+            !matches!(body.notice, Some(crate::body_view::BodyNotice::HexTruncated { .. })),
+            "21 bytes is not a truncation"
+        );
+        assert!(body.image().is_none(), "a bare JPEG header has no picture to show");
     });
 }
 
@@ -7758,6 +7764,74 @@ async fn a_copied_command_imports_back_into_an_equivalent_request(cx: &mut TestA
         !status.to_lowercase().contains("ignored"),
         "an exported command must not contain flags the importer drops: {status:?}"
     );
+}
+
+/// A 1×1 transparent PNG, the smallest valid one.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// Send to a server answering `body` as `content_type`, and wait for the body to be indexed.
+fn respond_with_image(
+    cx: &mut TestAppContext,
+    content_type: &str,
+    body: &[u8],
+) -> (gpui::Entity<RequestView>, VisualTestContext) {
+    let (_, view, mut cx) = boot(cx, None, None);
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    let url = serve_bytes(Box::leak(response.into_boxed_slice()));
+    cx.press("ctrl-l ctrl-a");
+    cx.simulate_input(&url);
+    send_and_wait(&mut cx, &view, 200);
+    wait_for_body(&view, &mut cx);
+    cx.run_until_parked();
+    (view, cx)
+}
+
+/// An image response is drawn as the picture, and the toggle swaps to its bytes and back.
+#[gpui::test]
+async fn an_image_response_is_shown_as_the_picture(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_image(cx, "image/png", TINY_PNG);
+
+    let size = cx.update(|_, cx| {
+        let body = view.read(cx).body_view.as_ref().expect("indexed");
+        body.image().map(|preview| (preview.image.size(0), preview.format))
+    });
+    let (size, format) = size.expect("a PNG should decode into a preview");
+    assert_eq!((size.width.0, size.height.0, format), (1, 1, "PNG"));
+    assert!(cx.debug_bounds("response-image").is_some(), "the picture should be drawn");
+
+    cx.dispatch_action(crate::actions::ToggleImageView);
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().showing_image()),
+        "the toggle should swap to the bytes"
+    );
+}
+
+/// An HTML error page served as `image/png` is the case the hex dump exists for: the preview
+/// must fall back to the bytes and say why, never show an empty pane.
+#[gpui::test]
+async fn a_body_that_is_not_really_an_image_falls_back_to_its_bytes(cx: &mut TestAppContext) {
+    let (view, mut cx) = respond_with_image(cx, "image/png", b"<html>500 Internal Server Error</html>");
+    cx.update(|_, cx| {
+        let body = view.read(cx).body_view.as_ref().expect("indexed");
+        assert!(body.image().is_none());
+        assert!(
+            matches!(body.notice, Some(crate::body_view::BodyNotice::ImageUndecodable { .. })),
+            "the notice should say it did not decode: {:?}",
+            body.notice
+        );
+    });
 }
 
 /// A response with an arbitrary content type and raw body bytes.
