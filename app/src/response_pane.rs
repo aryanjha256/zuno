@@ -32,6 +32,7 @@ use crate::actions::{
 };
 use crate::ui::{HScrollIndicator, Icon, icon_button, text_action};
 use gpui::Action as _;
+use gpui::prelude::FluentBuilder as _;
 use crate::body_view::{BodyKind, BodyNotice, BodyView, is_folded_at};
 use crate::request_view::{InFlight, RequestView, TextSearch, ResponseView};
 use zuno_core::body_diff::{BodyDiff, DiffLine, LineKind};
@@ -1817,16 +1818,96 @@ fn gutter_width(lines: usize, advance: Pixels) -> Pixels {
     advance * digits as f32 + px(GUTTER_PAD)
 }
 
-/// One row's line number, right-aligned in the gutter.
-fn line_number(number: usize, width: Pixels, theme: &Theme) -> Div {
-    div()
-        .flex_none()
-        .w(width)
-        .pr(px(GUTTER_PAD / 2.))
-        .flex()
-        .justify_end()
-        .text_color(theme.text_faint)
-        .child(number.to_string())
+/// The body lists' horizontal padding, which the pinned gutter has to cover too.
+const LIST_PAD: f32 = 8.;
+
+/// Which line number a visible row shows.
+#[derive(Clone)]
+enum Numbering {
+    /// A folded tree skips rows, so the number is the row's own, looked up through `visible`.
+    Rows(Arc<Vec<u32>>),
+    /// One visible row per line.
+    Lines,
+}
+
+/// The line numbers, **pinned** while the body scrolls sideways.
+///
+/// Drawn as a list decoration rather than as part of each row, because a row scrolls with the
+/// content and the numbers would slide off with it, which is when they are wanted most. A
+/// decoration is laid out in the same prepaint as the scroll, at the offset gpui just applied,
+/// so cancelling `scroll_offset.x` here holds still. Reading the scroll handle while building
+/// rows is a frame behind and wobbles (CLAUDE.md's trap table).
+///
+/// The rows keep an empty gutter-wide spacer underneath, so their layout is unchanged, and this
+/// paints over it with an opaque background so text scrolled under it does not show through.
+/// It carries no listener, so it has no hitbox, and a click lands on the row beneath.
+struct Gutter {
+    numbering: Numbering,
+    width: Pixels,
+    selected: Option<u32>,
+    hit: Option<u32>,
+    theme: Theme,
+}
+
+impl gpui::UniformListDecoration for Gutter {
+    fn compute(
+        &self,
+        visible: std::ops::Range<usize>,
+        _bounds: gpui::Bounds<Pixels>,
+        scroll_offset: gpui::Point<Pixels>,
+        item_height: Pixels,
+        _item_count: usize,
+        _window: &mut Window,
+        _cx: &mut gpui::App,
+    ) -> AnyElement {
+        let theme = &self.theme;
+        let rows = visible.clone().map(|ix| {
+            let row = match &self.numbering {
+                Numbering::Rows(visible) => visible.get(ix).copied().unwrap_or(ix as u32),
+                Numbering::Lines => ix as u32,
+            };
+            let mut cell = div()
+                .h(item_height)
+                .w_full()
+                .pl(px(LIST_PAD * 2.))
+                .pr(px(GUTTER_PAD / 2.))
+                .flex()
+                .items_center()
+                .justify_end()
+                .text_color(theme.text_faint)
+                .child((row + 1).to_string());
+            // The row's own highlights, carried across the gutter so the band reads as one.
+            if self.hit == Some(row) {
+                cell = cell.bg(theme.bg_hover).border_l_2().border_color(theme.accent);
+            }
+            if self.selected == Some(row) {
+                cell = cell.bg(theme.selection);
+            }
+            div().bg(theme.bg).child(cell)
+        });
+
+        // A decoration's origin is shifted by the scroll on both axes. The vertical shift is
+        // wanted, since the numbers follow their rows; the horizontal one is cancelled. Rows sit
+        // two paddings in from the list's edge when it scrolls sideways (gpui adds `padding.left`
+        // to an already padded origin), so the column starts that far back to cover the strip
+        // that scrolled text would otherwise show through.
+        div()
+            .w_full()
+            .h_full()
+            .child(
+                div()
+                    .debug_selector(|| "response-gutter".to_string())
+                    .ml(-scroll_offset.x - px(LIST_PAD * 2.))
+                    .mt(item_height * visible.start as f32)
+                    .w(self.width + px(LIST_PAD * 2.))
+                    .flex()
+                    .flex_col()
+                    .font_family(theme.mono.clone())
+                    .text_xs()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
 }
 
 fn body_region(
@@ -1944,6 +2025,13 @@ fn json_list(
     let view = cx.entity().downgrade();
     let indicator_scroll = scroll.clone();
     let count = visible.len();
+    let numbers = Gutter {
+        numbering: Numbering::Rows(visible.clone()),
+        width: gutter,
+        selected,
+        hit,
+        theme: theme.clone(),
+    };
     // The selection's block: its guide's level, and the rows strictly inside it.
     let active = scope.and_then(|(open, close)| {
         let depth = outline.row(open as usize)?.depth;
@@ -1987,6 +2075,8 @@ fn json_list(
     // to nothing and the switch above appears not to work at all.
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     .with_width_from_item(Some(widest))
+    // Before the scroll indicator, so the bar along the bottom draws over the gutter too.
+    .with_decoration(numbers)
     .with_decoration(HScrollIndicator {
         scroll: indicator_scroll,
         color: theme.text_faint,
@@ -2055,7 +2145,8 @@ fn json_row(
         .h(px(ROW_HEIGHT))
         // For the indent guides, which are placed over the row rather than taking room in it.
         .relative()
-        .child(line_number(row_ix + 1, gutter, theme))
+        // Room for the pinned line numbers, which `Gutter` paints over this.
+        .child(div().flex_none().w(gutter))
         .child(div().flex_none().w(px(4.0 + row.depth as f32 * INDENT)))
         // Only the deepest few levels: one line per level is fine at ordinary depths, but a body
         // nested 100,000 deep would put that many elements on every row. The shallow ones sit far
@@ -2378,7 +2469,8 @@ fn text_list(
                             window.dispatch_action(OpenRowMenu.boxed_clone(), cx);
                         },
                     )
-                    .children(gutter.map(|width| line_number(ix + 1, width, &row_theme)))
+                    // Room for the pinned line numbers, which `Gutter` paints over this.
+                    .children(gutter.map(|width| div().flex_none().w(width)))
                     .child(div().flex_none().child(raw_line(
                         text,
                         highlight,
@@ -2427,6 +2519,15 @@ fn text_list(
     // See `json_list`: the sampled-row index is what makes this do anything.
     .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
     .with_width_from_item(Some(widest))
+    .when_some(gutter, |list, width| {
+        list.with_decoration(Gutter {
+            numbering: Numbering::Lines,
+            width,
+            selected,
+            hit,
+            theme: theme.clone(),
+        })
+    })
     .with_decoration(HScrollIndicator {
         scroll: indicator_scroll,
         color: theme.text_faint,

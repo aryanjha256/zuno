@@ -8567,6 +8567,42 @@ fn wheel(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, dx: f32, dy:
 }
 
 #[gpui::test]
+async fn the_line_numbers_stay_pinned_while_the_body_scrolls_sideways(cx: &mut TestAppContext) {
+    // Drawn as part of each row, the numbers slid off with the text, which is exactly when a
+    // long line makes them worth having. Measured against the list, never against the gutter's
+    // own previous bounds alone: a gutter that never painted would agree with itself.
+    let rows: Vec<String> = (0..40).map(|i| format!(r#""k{i}":"{}""#, "x".repeat(400))).collect();
+    let wide = format!("{{{}}}", rows.join(","));
+    let (_view, mut cx) = respond_with(cx, "application/json", wide);
+
+    let list = cx.debug_bounds("response-body").expect("the body list");
+    let gutter = cx.debug_bounds("response-gutter").expect("the line numbers");
+    assert!(
+        (gutter.left() - list.left()).abs() < gpui::px(1.),
+        "the gutter starts at the list's edge: {:?} vs {:?}",
+        gutter.left(),
+        list.left()
+    );
+
+    let thumb_before = cx.debug_bounds("h-scroll-thumb").expect("the thumb").left();
+    focus_response(&mut cx);
+    for _ in 0..6 {
+        cx.press("right");
+    }
+    cx.run_until_parked();
+    let thumb_after = cx.debug_bounds("h-scroll-thumb").expect("the thumb").left();
+    assert!(thumb_after > thumb_before, "the body must actually have scrolled");
+
+    let gutter_after = cx.debug_bounds("response-gutter").expect("the line numbers");
+    assert!(
+        (gutter_after.left() - list.left()).abs() < gpui::px(1.),
+        "the line numbers must stay put while the text scrolls: {:?} vs {:?}",
+        gutter_after.left(),
+        list.left()
+    );
+}
+
+#[gpui::test]
 async fn the_scroll_bar_sits_at_the_bottom_and_stays_put_while_scrolling(
     cx: &mut TestAppContext,
 ) {
