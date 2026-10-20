@@ -41,6 +41,8 @@ use crate::theme::Theme;
 /// every row must agree — that constraint is exactly what buys O(visible) rendering.
 const ROW_HEIGHT: f32 = 18.0;
 const INDENT: f32 = 13.0;
+/// Indent guides drawn per row at most, nearest the text first.
+const MAX_GUIDES: u16 = 32;
 
 pub fn render(
     view: &RequestView,
@@ -2055,7 +2057,10 @@ fn json_row(
         .relative()
         .child(line_number(row_ix + 1, gutter, theme))
         .child(div().flex_none().w(px(4.0 + row.depth as f32 * INDENT)))
-        .children((0..row.depth).map(|level| {
+        // Only the deepest few levels: one line per level is fine at ordinary depths, but a body
+        // nested 100,000 deep would put that many elements on every row. The shallow ones sit far
+        // to the left of deep text, off screen whenever deep rows are.
+        .children((row.depth.saturating_sub(MAX_GUIDES)..row.depth).map(|level| {
             // Under the fold marker of the container that opened this level, so the line runs
             // from a block's chevron down to its close.
             let color = if active_guide == Some(level) { theme.text_faint } else { theme.border };
