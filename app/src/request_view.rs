@@ -2782,6 +2782,11 @@ impl RequestView {
         // you want the body. Switching is less surprising than a find bar that appears to do
         // nothing.
         self.response_view = ResponseView::Body;
+        // The same reasoning for an image: the search runs over its bytes, so show them, or the
+        // bar would count matches in a view that is not on screen.
+        if let Some(body) = self.body_view.as_mut() {
+            body.set_image_showing(false);
+        }
 
         if self.search.is_none() {
             let query = cx.new(|cx| TextInput::new(String::new(), "Find in response…", "ResponseSearch", cx));
@@ -2949,6 +2954,11 @@ impl RequestView {
     /// these keys resolve, since the binding is scoped to its context.
     pub fn move_body_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         let Some(body) = self.body_view.as_mut() else { return };
+        // The rows are the bytes behind the picture; moving through them unseen does nothing a
+        // reader can follow.
+        if body.showing_image() {
+            return;
+        }
         let Some(visible_ix) = body.move_selection(delta) else {
             return;
         };

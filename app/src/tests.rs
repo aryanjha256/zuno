@@ -7816,6 +7816,17 @@ async fn an_image_response_is_shown_as_the_picture(cx: &mut TestAppContext) {
         !cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().showing_image()),
         "the toggle should swap to the bytes"
     );
+
+    // Back to the picture, then search: the search runs over the bytes, so they come forward
+    // rather than the bar counting matches in a view that is not on screen.
+    cx.dispatch_action(crate::actions::ToggleImageView);
+    cx.run_until_parked();
+    cx.dispatch_action(crate::actions::FindInResponse);
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| view.read(cx).body_view.as_ref().unwrap().showing_image()),
+        "opening search should show the bytes it searches"
+    );
 }
 
 /// An HTML error page served as `image/png` is the case the hex dump exists for: the preview

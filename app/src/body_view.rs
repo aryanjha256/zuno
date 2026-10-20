@@ -38,8 +38,12 @@ pub enum BodyKind {
 /// Image bodies over this are not decoded for preview: the hex dump still answers "is this the
 /// thing I asked for", and decoding a huge one would hold its full-size pixels in memory.
 pub const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-/// Decoded images over this many pixels are dropped again: about 200 MB of pixels at the cap.
+/// Images declaring more pixels than this are not decoded: about 200 MB once decoded. For an
+/// animated GIF it is every frame together, since each one is decoded and kept.
 pub const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+/// An image whose size cannot be read from its header is previewed only below this, since
+/// nothing else bounds what decoding it would allocate.
+const MAX_UNSIZED_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Turns an image body into pixels: gpui's own decoder, with the SVG renderer it needs already
 /// inside. A closure because gpui does not export that renderer's type, so it cannot be named
@@ -249,6 +253,26 @@ impl BodyView {
         if len > MAX_IMAGE_BYTES {
             return bytes_view(Some(BodyNotice::ImageTooLarge));
         }
+        // Bytes that do not even start like the declared format are not that format: an HTML
+        // error page served as `image/png` is the usual case, and reading its first bytes as a
+        // PNG header would report a nonsense size rather than the truth.
+        if !has_signature(&body, format) {
+            return bytes_view(Some(BodyNotice::ImageUndecodable {
+                message: format!("the bytes do not start like a {label}"),
+            }));
+        }
+        // **Before decoding, from the header.** A few kilobytes can declare a picture of billions
+        // of pixels, and the decoder allocates for what is declared, so a cap checked afterwards
+        // has already paid for it. A body whose size cannot be read is previewed only while small.
+        match declared_pixels(&body, format) {
+            Some(pixels) if pixels > MAX_IMAGE_PIXELS => {
+                return bytes_view(Some(BodyNotice::ImageTooLarge));
+            }
+            None if len > MAX_UNSIZED_IMAGE_BYTES => {
+                return bytes_view(Some(BodyNotice::ImageTooLarge));
+            }
+            _ => {}
+        }
         match decode(gpui::Image::from_bytes(format, body.to_vec())) {
             Ok(image) => {
                 let size = image.size(0);
@@ -273,9 +297,13 @@ impl BodyView {
         self.image.as_ref().is_some_and(|image| image.showing)
     }
 
+    /// Show the picture or its bytes. Showing the picture clears the row selection, which belongs
+    /// to the bytes: kept, the copy verbs would copy a row that is no longer on screen.
     pub fn set_image_showing(&mut self, showing: bool) {
-        if let Some(image) = self.image.as_mut() {
-            image.showing = showing;
+        let Some(image) = self.image.as_mut() else { return };
+        image.showing = showing;
+        if showing {
+            self.select_row(None);
         }
     }
 
@@ -758,6 +786,143 @@ fn image_format(body: &[u8], content_type: Option<&str>) -> Option<(gpui::ImageF
     Some((format, label))
 }
 
+/// Whether a body starts the way its declared image format must.
+fn has_signature(body: &[u8], format: gpui::ImageFormat) -> bool {
+    use gpui::ImageFormat;
+    match format {
+        ImageFormat::Png => body.starts_with(b"\x89PNG\r\n\x1a\n"),
+        ImageFormat::Jpeg => body.starts_with(&[0xFF, 0xD8, 0xFF]),
+        ImageFormat::Gif => body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a"),
+        ImageFormat::Webp => body.len() > 12 && &body[..4] == b"RIFF" && &body[8..12] == b"WEBP",
+        ImageFormat::Bmp => body.starts_with(b"BM"),
+        ImageFormat::Tiff => body.starts_with(b"II*\0") || body.starts_with(b"MM\0*"),
+        // XML may open with a declaration, a comment or a doctype first.
+        ImageFormat::Svg => body.get(..body.len().min(4096)).is_some_and(|head| {
+            head.windows(4).any(|window| window == b"<svg")
+        }),
+    }
+}
+
+/// How many pixels an image declares it will decode to, read from its header alone.
+///
+/// `None` when the header cannot be read, which the caller treats as "only if small". Each arm
+/// reads the format's own size fields; nothing here decodes pixel data.
+fn declared_pixels(body: &[u8], format: gpui::ImageFormat) -> Option<u64> {
+    use gpui::ImageFormat;
+    let u16_le = |at: usize| body.get(at..at + 2).map(|b| u64::from(u16::from_le_bytes([b[0], b[1]])));
+    let u32_be = |at: usize| {
+        body.get(at..at + 4).map(|b| u64::from(u32::from_be_bytes([b[0], b[1], b[2], b[3]])))
+    };
+    let i32_le = |at: usize| {
+        body.get(at..at + 4)
+            .map(|b| u64::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]]).unsigned_abs()))
+    };
+    let u24_le = |at: usize| {
+        body.get(at..at + 3).map(|b| u64::from(b[0]) | u64::from(b[1]) << 8 | u64::from(b[2]) << 16)
+    };
+    match format {
+        // IHDR is always the first chunk: width and height straight after its type.
+        ImageFormat::Png => Some(u32_be(16)? * u32_be(20)?),
+        ImageFormat::Bmp => Some(i32_le(18)? * i32_le(22)?),
+        // The logical screen size, times every frame, since each one is decoded and kept.
+        ImageFormat::Gif => Some(u16_le(6)? * u16_le(8)? * gif_frames(body)?.max(1)),
+        ImageFormat::Jpeg => jpeg_size(body),
+        ImageFormat::Webp => match body.get(12..16)? {
+            b"VP8 " => Some((u16_le(26)? & 0x3FFF) * (u16_le(28)? & 0x3FFF)),
+            b"VP8L" => {
+                let bits = body.get(21..25)?;
+                let width = 1 + (u64::from(bits[0]) | (u64::from(bits[1]) & 0x3F) << 8);
+                let height = 1
+                    + (u64::from(bits[1]) >> 6 | u64::from(bits[2]) << 2 | (u64::from(bits[3]) & 0x0F) << 10);
+                Some(width * height)
+            }
+            b"VP8X" => Some((u24_le(24)? + 1) * (u24_le(27)? + 1)),
+            _ => None,
+        },
+        ImageFormat::Svg => svg_size(body),
+        ImageFormat::Tiff => None,
+    }
+}
+
+/// A JPEG's size, from its first start-of-frame marker.
+fn jpeg_size(body: &[u8]) -> Option<u64> {
+    let mut at = 2;
+    while at + 9 < body.len() {
+        if body[at] != 0xFF {
+            return None;
+        }
+        let marker = body[at + 1];
+        match marker {
+            // Padding, and markers with no length.
+            0xFF => at += 1,
+            0x01 | 0xD0..=0xD9 => at += 2,
+            // Start of frame: every SOFn except DHT (C4), JPG (C8) and DAC (CC).
+            0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
+                let height = u64::from(u16::from_be_bytes([body[at + 5], body[at + 6]]));
+                let width = u64::from(u16::from_be_bytes([body[at + 7], body[at + 8]]));
+                return Some(width * height);
+            }
+            _ => at += 2 + usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]])),
+        }
+    }
+    None
+}
+
+/// How many frames a GIF holds, by walking its blocks without decoding any of them.
+fn gif_frames(body: &[u8]) -> Option<u64> {
+    // Skip a run of sub-blocks: each is a length byte and that many bytes, ending at a zero.
+    let skip_sub_blocks = |mut at: usize| -> Option<usize> {
+        loop {
+            let size = usize::from(*body.get(at)?);
+            at += 1 + size;
+            if size == 0 {
+                return Some(at);
+            }
+        }
+    };
+    let flags = *body.get(10)?;
+    let mut at = 13 + if flags & 0x80 != 0 { 3 << ((flags & 0x07) + 1) } else { 0 };
+    let mut frames = 0;
+    loop {
+        match *body.get(at)? {
+            0x3B => return Some(frames),
+            0x21 => at = skip_sub_blocks(at + 2)?,
+            0x2C => {
+                frames += 1;
+                let local = *body.get(at + 9)?;
+                at += 10 + if local & 0x80 != 0 { 3 << ((local & 0x07) + 1) } else { 0 };
+                // The LZW minimum code size, then the image data.
+                at = skip_sub_blocks(at + 1)?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// An SVG's rendered size, from the root element's `width` and `height`, or its `viewBox`.
+///
+/// gpui renders an SVG at the size it declares, so a document claiming a vast canvas would
+/// allocate it. Units other than plain numbers and `px` are not worth interpreting here; they
+/// return `None`, and the caller previews only a small body.
+fn svg_size(body: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(body.get(..body.len().min(4096))?).ok()?;
+    let tag = &text[text.find("<svg")?..];
+    let tag = &tag[..tag.find('>')?];
+    let attr = |name: &str| -> Option<&str> {
+        let start = tag.find(&format!(" {name}=\""))? + name.len() + 3;
+        Some(&tag[start..start + tag[start..].find('"')?])
+    };
+    let number = |value: &str| value.trim().trim_end_matches("px").parse::<f64>().ok();
+    let (width, height) = match (attr("width").and_then(number), attr("height").and_then(number)) {
+        (Some(width), Some(height)) => (width, height),
+        _ => {
+            let parts: Vec<f64> = attr("viewBox")?.split_whitespace().filter_map(|part| part.parse().ok()).collect();
+            (*parts.get(2)?, *parts.get(3)?)
+        }
+    };
+    (width.is_finite() && height.is_finite()).then(|| (width.max(0.) * height.max(0.)) as u64)
+}
+
 /// The open and close rows of the container `row` sits in, or `None` at the top level.
 ///
 /// Every row between a container's open and its close is deeper than the open, so walking back
@@ -886,6 +1051,44 @@ mod tests {
             HtmlView::default(),
             None,
         )
+    }
+
+    /// **A tiny file declaring a vast image is refused before it is decoded.** The decoder here
+    /// fails the test if it is ever called, so the cap cannot be the after-the-fact kind.
+    #[test]
+    fn an_image_bomb_is_refused_from_its_header() {
+        let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
+        png.extend_from_slice(&30_000u32.to_be_bytes());
+        png.extend_from_slice(&30_000u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
+        let decoder: ImageDecoder = Box::new(|_| panic!("a bomb must not reach the decoder"));
+        let view = BodyView::build(Bytes::from(png), Some("image/png".into()), false, HtmlView::default(), Some(decoder));
+        assert!(view.image().is_none());
+        assert!(matches!(view.notice, Some(BodyNotice::ImageTooLarge)), "{:?}", view.notice);
+    }
+
+    #[test]
+    fn declared_sizes_are_read_from_each_header() {
+        use gpui::ImageFormat;
+        // A JPEG: an APP0 segment to skip, then a baseline start-of-frame, 512 wide and 256 high.
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+        jpeg.extend_from_slice(&[0; 14]);
+        jpeg.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 8, 0x01, 0x00, 0x02, 0x00]);
+        jpeg.extend_from_slice(&[0; 12]);
+        assert_eq!(declared_pixels(&jpeg, ImageFormat::Jpeg), Some(512 * 256));
+
+        // A GIF of three 1x1 frames, each counted, since each is decoded and kept.
+        let mut gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00".to_vec();
+        for _ in 0..3 {
+            gif.extend_from_slice(&[0x2C, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0]);
+        }
+        gif.push(0x3B);
+        assert_eq!(declared_pixels(&gif, ImageFormat::Gif), Some(3));
+
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="100000"></svg>"#;
+        assert_eq!(declared_pixels(svg, ImageFormat::Svg), Some(10_000_000_000));
+        let svg = br#"<svg viewBox="0 0 24 24"><path d="M0 0"/></svg>"#;
+        assert_eq!(declared_pixels(svg, ImageFormat::Svg), Some(576));
     }
 
     /// The brighter guide belongs to the block the selection is in, and moves with it.
