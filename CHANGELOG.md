@@ -10,6 +10,7 @@ the top of the GitHub release page.
 - The response body shows line numbers, indent guides and brackets coloured by depth; the request body editor shows the same line numbers and bracket colours.
 - An empty collection offers Save and Import buttons instead of a line of text.
 - Image responses (PNG, JPEG, GIF, WebP, SVG, BMP, TIFF) show as the picture, with a toggle to the bytes.
+- Timestamps, hex colours and JWTs in a JSON response are marked, and hovering one shows the date, the colour's values or the decoded token.
 
 ### Changed
 - Zuno ships its own fonts, IBM Plex Sans and JetBrains Mono, so it looks the same on every platform.

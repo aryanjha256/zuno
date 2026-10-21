@@ -2298,6 +2298,14 @@ fn json_row(
         painted.push(": ", theme.syntax.punct);
     }
 
+    if let RowKind::Scalar(kind) = row.kind {
+        let value = outline.text(row.value);
+        let key = (!row.key.is_none()).then(|| outline.text(row.key));
+        if let Some(smart) = zuno_core::smart::classify(key, value, kind) {
+            return line.child(smart_value(painted, smart, value, kind, &row, row_ix, matched, theme));
+        }
+    }
+
     match row.kind {
         RowKind::Scalar(kind) => painted.push_from(
             outline.text(row.value),
@@ -2329,6 +2337,143 @@ fn json_row(
     }
 
     line.child(div().flex_none().child(painted.into_element(matched, theme)))
+}
+
+/// A value `smart::classify` recognised: underlined, or led by a swatch for a colour, with a card
+/// on hover.
+///
+/// The value is its own text element, split from the key, because the card belongs to the value
+/// alone and a colour's swatch sits between the two. The card is built when it opens, not here,
+/// so decoding a token costs nothing for rows nobody hovers.
+#[allow(clippy::too_many_arguments)]
+fn smart_value(
+    prefix: PaintedRow,
+    smart: zuno_core::smart::Smart,
+    value: &str,
+    kind: ScalarKind,
+    row: &Row,
+    row_ix: usize,
+    matched: Option<std::ops::Range<u32>>,
+    theme: &Theme,
+) -> Div {
+    let mut painted = PaintedRow::default();
+    painted.push_from(
+        value,
+        match kind {
+            ScalarKind::Number => theme.syntax.number,
+            _ => theme.syntax.string,
+        },
+        row.value.start,
+    );
+    let swatch = match smart {
+        zuno_core::smart::Smart::Colour { r, g, b, a } => Some(
+            div()
+                .flex_none()
+                .size(px(10.))
+                .mr(px(6.))
+                .rounded_sm()
+                .border_1()
+                .border_color(theme.border)
+                .bg(gpui::Rgba {
+                    r: f32::from(r) / 255.,
+                    g: f32::from(g) / 255.,
+                    b: f32::from(b) / 255.,
+                    a: f32::from(a) / 255.,
+                }),
+        ),
+        _ => {
+            painted.underline = Some(0..value.len());
+            None
+        }
+    };
+    if row.trailing_comma {
+        painted.push(",", theme.syntax.punct);
+    }
+
+    let value_len = value.len();
+    let source = value.to_string();
+    let text = gpui::InteractiveText::new(("smart-value", row_ix), painted.into_element(matched.clone(), theme))
+        .tooltip(move |ix, _window, cx| {
+            (ix < value_len).then(|| {
+                let card = zuno_core::smart::card(
+                    smart,
+                    &source,
+                    zuno_core::history::now_ms() as i64,
+                    crate::history::local_offset(),
+                );
+                gpui::AppContext::new(cx, |_| SmartCard { card }).into()
+            })
+        });
+
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .when(!prefix.text.is_empty(), |el| el.child(prefix.into_element(matched, theme)))
+        .children(swatch)
+        .child(text)
+}
+
+struct SmartCard {
+    card: zuno_core::smart::Card,
+}
+
+impl gpui::Render for SmartCard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use zuno_core::smart::Tone;
+        let theme = crate::theme::ActiveTheme::theme(&**cx).clone();
+        div()
+            // Drawn outside the workspace's tree, like `ui::Tooltip`, so it sets its own font.
+            .font_family(crate::fonts::UI)
+            .text_xs()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .bg(theme.bg_elevated)
+            .shadow_md()
+            .border_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .mb_1()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text_faint)
+                    .child(self.card.title),
+            )
+            .children(self.card.lines.iter().map(|line| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .h(px(18.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(64.))
+                            .whitespace_nowrap()
+                            .text_color(theme.text_muted)
+                            .child(line.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .font_family(theme.mono.clone())
+                            .text_color(match line.tone {
+                                Tone::Plain => theme.text,
+                                Tone::Muted => theme.text_muted,
+                                Tone::Warn => theme.status_redirect,
+                                Tone::Bad => theme.status_client_error,
+                            })
+                            .child(line.value.clone()),
+                    )
+            }))
+            .children(self.card.foot.map(|foot| {
+                div().mt_1().text_color(theme.text_faint).child(foot)
+            }))
+    }
 }
 
 /// One line of the raw view, lexed if the body was meant to be JSON.
@@ -2393,6 +2538,8 @@ struct PaintedRow {
     /// A folded container's `{ … 3 items }` summary has no source, so a match can never be
     /// located inside text that isn't the body's.
     sources: Vec<(std::ops::Range<usize>, u32)>,
+    /// A recognised value, which `smart_value` marks so the hover card can be found.
+    underline: Option<std::ops::Range<usize>>,
 }
 
 impl PaintedRow {
@@ -2427,9 +2574,11 @@ impl PaintedRow {
 
     fn into_element(self, matched: Option<std::ops::Range<u32>>, theme: &Theme) -> gpui::StyledText {
         let matched = matched.and_then(|range| self.locate(range));
+        let underline = self.underline.clone();
         let highlights = crate::ui::split_spans(self.text.len(), &self.colours, matched)
             .into_iter()
             .map(|(range, colour, hit)| {
+                let underlined = underline.as_ref().is_some_and(|u| u.contains(&range.start));
                 (
                     range,
                     gpui::HighlightStyle {
@@ -2437,6 +2586,11 @@ impl PaintedRow {
                         // syntax colour is a contrast lottery this palette has no reason to run.
                         color: Some(if hit { theme.text_on_accent } else { colour.unwrap_or(theme.text) }),
                         background_color: hit.then_some(theme.accent),
+                        underline: underlined.then_some(gpui::UnderlineStyle {
+                            thickness: px(1.),
+                            color: Some(theme.text_faint),
+                            wavy: false,
+                        }),
                         ..Default::default()
                     },
                 )

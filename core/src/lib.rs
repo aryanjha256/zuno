@@ -41,6 +41,7 @@ pub mod request;
 pub mod runner;
 pub mod response;
 pub mod search;
+pub mod smart;
 pub mod spec_diff;
 pub mod sse;
 pub mod headers;
