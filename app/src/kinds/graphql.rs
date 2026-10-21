@@ -69,9 +69,14 @@ impl GraphQlEditor {
             query: cx.new(|cx| {
                 let mut editor = Editor::new(&graphql.query, "query { … }", cx);
                 editor.set_key_context("TextInput BodyEditor GraphQlQuery");
+                editor.set_line_numbers(true);
                 editor
             }),
-            variables: cx.new(|cx| Editor::new(&graphql.variables, "{ }", cx)),
+            variables: cx.new(|cx| {
+                let mut editor = Editor::new(&graphql.variables, "{ }", cx);
+                editor.set_line_numbers(true);
+                editor
+            }),
             connection: cx.new(|cx| {
                 Editor::new(
                     &graphql.connection_params,

@@ -1792,15 +1792,18 @@ fn focused_editor(
 /// **One definition, used by every editor surface.** The HTTP body had all of this and the
 /// GraphQL editors were hand-rolled without it: no padding, no background, and no focus border,
 /// so nothing on screen said which of the two you were typing into.
+///
+/// **No visible box at rest, only a ring while focused.** A full-height frame made the request
+/// body look like a different surface from the response beside it, which sits directly on its
+/// pane. The border is kept, transparent, so focusing it does not shift the text by a pixel.
 fn editor_region(theme: &Theme, focused: bool) -> Div {
     div()
         .flex_1()
         .min_h(px(0.))
-        .m_2()
         .p_2()
         .bg(theme.bg)
         .border_1()
-        .border_color(theme.focus_border(focused))
+        .border_color(if focused { theme.border_focused } else { gpui::transparent_black() })
         .font_family(theme.mono.clone())
         .text_xs()
         .text_color(theme.text)

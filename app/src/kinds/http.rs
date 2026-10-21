@@ -98,7 +98,11 @@ impl HttpEditor {
             _ => Vec::new(),
         };
 
-        let body_editor = cx.new(|cx| Editor::new(body_text, "Request body…", cx));
+        let body_editor = cx.new(|cx| {
+            let mut editor = Editor::new(body_text, "Request body…", cx);
+            editor.set_line_numbers(true);
+            editor
+        });
         body_editor.update(cx, |editor, cx| {
             editor.set_highlight_json(matches!(body_kind, RawKind::Json), cx)
         });

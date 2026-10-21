@@ -54,6 +54,13 @@ pub struct Editor {
     history: crate::input::History,
     /// Byte offset where each line starts. Always contains at least `0`.
     line_starts: Vec<usize>,
+    /// Bracket nesting at the start of each line, parallel to `line_starts`, so a visible line's
+    /// brackets can be coloured by depth without re-reading everything above it every frame.
+    /// Rebuilt with `line_starts`, which is already a full pass per edit.
+    line_depths: Vec<u16>,
+    /// A gutter of line numbers, as the response viewer has. Off for the one-line-ish editors,
+    /// like the commit message, where numbering would be noise.
+    line_numbers: bool,
     placeholder: SharedString,
 
     selection: Range<usize>,
@@ -101,12 +108,15 @@ impl Editor {
     pub fn new(text: impl Into<String>, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         let content: String = text.into();
         let line_starts = compute_line_starts(&content);
+        let line_depths = compute_line_depths(&content, line_starts.len());
 
         Self {
             focus_handle: cx.focus_handle().tab_stop(true),
             scroll: ScrollHandle::new(),
             content,
             line_starts,
+            line_depths,
+            line_numbers: false,
             history: crate::input::History::default(),
             placeholder: placeholder.into(),
             selection: 0..0,
@@ -353,6 +363,18 @@ impl Editor {
             + layout.x_for_index(cursor.saturating_sub(self.line_start(line)));
         let top = bounds.top() + self.last_line_height * (line as f32);
         Some(Bounds::new(point(x, top), size(px(1.), self.last_line_height)))
+    }
+
+    /// Rebuild everything derived from the content's lines. Every content change comes through
+    /// here, so the depths cannot fall out of step with the starts.
+    fn reindex_lines(&mut self) {
+        self.line_starts = compute_line_starts(&self.content);
+        self.line_depths = compute_line_depths(&self.content, self.line_starts.len());
+    }
+
+    /// Show a gutter of line numbers.
+    pub fn set_line_numbers(&mut self, on: bool) {
+        self.line_numbers = on;
     }
 
     pub fn set_highlight_json(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -734,7 +756,7 @@ impl Editor {
     /// waiting in `line_of`, not a cosmetic problem.
     fn restore(&mut self, snapshot: crate::input::EditSnapshot, cx: &mut Context<Self>) {
         self.content = snapshot.content;
-        self.line_starts = compute_line_starts(&self.content);
+        self.reindex_lines();
         self.selection = snapshot.selection;
         self.selection_reversed = snapshot.reversed;
         self.marked_range = None;
@@ -1041,6 +1063,37 @@ fn compute_line_starts(content: &str) -> Vec<usize> {
     starts
 }
 
+/// The bracket depth at the start of each of `lines` lines: how many `{`/`[` are open there.
+///
+/// String-aware, so a brace inside `"…"` does not count. Saturating, so unbalanced input, which
+/// a half-typed body always is, can only under-count rather than wrap.
+fn compute_line_depths(content: &str, lines: usize) -> Vec<u16> {
+    let mut depths = Vec::with_capacity(lines);
+    depths.push(0);
+    let (mut depth, mut in_string, mut escaped) = (0u16, false, false);
+    for byte in content.bytes() {
+        match byte {
+            // A JSON string cannot hold a raw newline, so an unclosed quote ends with its line
+            // rather than swallowing every bracket below it.
+            b'\n' => {
+                depths.push(depth);
+                (in_string, escaped) = (false, false);
+            }
+            _ if in_string => match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            },
+            b'"' => in_string = true,
+            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depths
+}
+
 impl EntityInputHandler for Editor {
     fn text_for_range(
         &mut self,
@@ -1105,7 +1158,7 @@ impl EntityInputHandler for Editor {
             .replace_range(range.clone(), new_text);
         // Line starts shift on every edit. A full rescan is a memchr sweep — ~10µs on a
         // 100KB body, which is what makes a rope unnecessary here.
-        self.line_starts = compute_line_starts(&self.content);
+        self.reindex_lines();
 
         let cursor = range.start + new_text.len();
         self.selection = cursor..cursor;
@@ -1134,7 +1187,7 @@ impl EntityInputHandler for Editor {
         }
 
         self.content.replace_range(range.clone(), new_text);
-        self.line_starts = compute_line_starts(&self.content);
+        self.reindex_lines();
 
         self.marked_range = if new_text.is_empty() {
             None
@@ -1307,7 +1360,15 @@ struct Prepaint {
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
     h_offset: Pixels,
+    /// The text area: the element's bounds less the gutter.
+    text_bounds: Bounds<Pixels>,
+    numbers: Vec<(usize, ShapedLine)>,
+    /// Where the numbers' right edges sit.
+    numbers_right: Pixels,
 }
+
+/// Space either side of the line numbers, matching the response viewer's gutter.
+const GUTTER_PAD: f32 = 16.;
 
 impl IntoElement for EditorElement {
     type Element = Self;
@@ -1361,6 +1422,32 @@ impl Element for EditorElement {
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line_height = window.line_height();
 
+        // **The gutter takes its width off the left of the text area**, and everything below
+        // works in the narrower box. The mouse, the caret and the IME all position from
+        // `last_bounds`, which is this box, so moving its edge moves all of them together.
+        let shape = |text: SharedString, color: gpui::Hsla, window: &mut Window| {
+            let runs = [TextRun {
+                len: text.len(),
+                font: style.font(),
+                color,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }];
+            window.text_system().shape_line(text, font_size, &runs, None)
+        };
+        let gutter = if editor.line_numbers {
+            let digits = editor.line_count().max(1).to_string().len();
+            shape("0".into(), style.color, window).width * digits as f32 + px(GUTTER_PAD)
+        } else {
+            px(0.)
+        };
+        let full = bounds;
+        let bounds = Bounds::new(
+            point(full.left() + gutter, full.top()),
+            size((full.size.width - gutter).max(px(0.)), full.size.height),
+        );
+
         // Only shape the lines that can actually be seen. The scroll offset is negative
         // as the view moves down, so -offset.y is how far we've scrolled.
         let scroll_top = -editor.scroll.offset().y;
@@ -1412,7 +1499,8 @@ impl Element for EditorElement {
                     .collect()
             };
             if highlight && !is_empty {
-                spans.extend(token_colours(&text, &theme));
+                let depth = editor.line_depths.get(line_ix).copied().unwrap_or(0);
+                spans.extend(token_colours(&text, depth, &theme));
             }
             let marked = editor.marked_range.as_ref().and_then(|marked| {
                 (marked.start < line_end && marked.end > line_start && !is_empty).then(|| {
@@ -1540,6 +1628,16 @@ impl Element for EditorElement {
             }
         }
 
+        // Right-aligned in the gutter, a half-pad short of the text, in the faint colour the
+        // response viewer's numbers use.
+        let numbers = if editor.line_numbers {
+            (first_line..last_line)
+                .map(|line_ix| (line_ix, shape((line_ix + 1).to_string().into(), theme.text_faint, window)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         Prepaint {
             cursor_offset,
             lines,
@@ -1547,6 +1645,9 @@ impl Element for EditorElement {
             cursor,
             selections,
             h_offset,
+            text_bounds: bounds,
+            numbers,
+            numbers_right: bounds.left() - px(GUTTER_PAD / 2.),
         }
     }
 
@@ -1560,38 +1661,51 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        let text_bounds = prepaint.text_bounds;
         let focus_handle = self.editor.read(cx).focus_handle.clone();
         window.handle_input(
             &focus_handle,
-            ElementInputHandler::new(bounds, self.editor.clone()),
+            ElementInputHandler::new(text_bounds, self.editor.clone()),
             cx,
         );
 
-        for selection in prepaint.selections.drain(..) {
-            window.paint_quad(selection);
-        }
-
         let line_height = prepaint.line_height;
-        for (line_ix, layout) in &prepaint.lines {
+        for (line_ix, layout) in &prepaint.numbers {
             let origin = point(
-                bounds.left() - prepaint.h_offset,
+                prepaint.numbers_right - layout.width,
                 bounds.top() + line_height * (*line_ix as f32),
             );
             layout.paint(origin, line_height, window, cx).ok();
         }
 
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        // Clipped to the text area, so a line scrolled sideways passes under the gutter rather
+        // than over the numbers.
+        window.with_content_mask(Some(gpui::ContentMask { bounds: text_bounds }), |window| {
+            for selection in prepaint.selections.drain(..) {
+                window.paint_quad(selection);
+            }
+
+            for (line_ix, layout) in &prepaint.lines {
+                let origin = point(
+                    text_bounds.left() - prepaint.h_offset,
+                    text_bounds.top() + line_height * (*line_ix as f32),
+                );
+                layout.paint(origin, line_height, window, cx).ok();
+            }
+
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
 
         let lines = std::mem::take(&mut prepaint.lines);
         let h_offset = prepaint.h_offset;
         let cursor_offset = prepaint.cursor_offset;
         self.editor.update(cx, |editor, _| {
             editor.last_layouts = lines;
-            editor.last_bounds = Some(bounds);
+            editor.last_bounds = Some(text_bounds);
             editor.last_line_height = line_height;
             editor.h_offset = h_offset;
             editor.last_cursor = Some(cursor_offset);
@@ -1603,14 +1717,27 @@ impl Element for EditorElement {
 ///
 /// The same palette the response viewer paints with, so a body authored here and the response it
 /// comes back in look like the same language rather than two.
-fn token_colours(line: &str, theme: &crate::theme::Theme) -> Vec<(Range<usize>, gpui::Hsla)> {
+///
+/// Brackets take the depth colours the response viewer uses, counted from `depth`, the nesting at
+/// the start of the line, so a pair matches in colour across lines as it does there.
+fn token_colours(line: &str, depth: u16, theme: &crate::theme::Theme) -> Vec<(Range<usize>, gpui::Hsla)> {
+    let brackets = &theme.syntax.brackets;
+    let mut depth = usize::from(depth);
     zuno_core::highlight::lex_json(line)
         .into_iter()
         .map(|token| {
-            (
-                token.range,
-                crate::ui::syntax_colour(token.kind, &theme.syntax),
-            )
+            let colour = match line.as_bytes().get(token.range.start) {
+                Some(b'{' | b'[') if token.kind == zuno_core::TokenKind::Punct => {
+                    depth += 1;
+                    brackets[(depth - 1) % brackets.len()]
+                }
+                Some(b'}' | b']') if token.kind == zuno_core::TokenKind::Punct => {
+                    depth = depth.saturating_sub(1);
+                    brackets[depth % brackets.len()]
+                }
+                _ => crate::ui::syntax_colour(token.kind, &theme.syntax),
+            };
+            (token.range, colour)
         })
         .collect()
 }
@@ -1695,7 +1822,20 @@ fn underline_problems(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_line_starts;
+    use super::{compute_line_depths, compute_line_starts};
+
+    /// The nesting each line opens at, which decides its brackets' colours. Brackets inside a
+    /// string are text, an unclosed string ends with its line, and a stray close cannot wrap.
+    #[test]
+    fn line_depths_count_brackets_outside_strings() {
+        let body = "{\n  \"a\": [\n    \"}{[\",\n    1\n  ]\n}";
+        assert_eq!(compute_line_depths(body, 6), vec![0, 1, 2, 2, 2, 1]);
+
+        let unclosed = "{\n  \"oops: [\n  \"b\": {\n}";
+        assert_eq!(compute_line_depths(unclosed, 4), vec![0, 1, 1, 2]);
+
+        assert_eq!(compute_line_depths("]]\n{", 2), vec![0, 0]);
+    }
 
     #[test]
     fn line_starts_for_a_single_line() {

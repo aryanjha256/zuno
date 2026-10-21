@@ -7,7 +7,7 @@ the top of the GitHub release page.
 ## Unreleased
 
 ### Added
-- The response body shows line numbers, indent guides and brackets coloured by depth.
+- The response body shows line numbers, indent guides and brackets coloured by depth; the request body editor shows the same line numbers and bracket colours.
 - An empty collection offers Save and Import buttons instead of a line of text.
 - Image responses (PNG, JPEG, GIF, WebP, SVG, BMP, TIFF) show as the picture, with a toggle to the bytes.
 

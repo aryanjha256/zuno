@@ -58,7 +58,11 @@ impl GrpcEditor {
             method: grpc.method.clone(),
             client_streaming: grpc.client_streaming,
             server_streaming: grpc.server_streaming,
-            message: cx.new(|cx| Editor::new(grpc.message.clone(), "{ \"name\": \"zuno\" }", cx)),
+            message: cx.new(|cx| {
+                let mut editor = Editor::new(grpc.message.clone(), "{ \"name\": \"zuno\" }", cx);
+                editor.set_line_numbers(true);
+                editor
+            }),
         }
     }
 
