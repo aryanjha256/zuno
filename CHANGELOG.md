@@ -6,6 +6,8 @@ the top of the GitHub release page.
 
 ## Unreleased
 
+## 0.5.9 - 2026-10-21
+
 ### Added
 - The response body shows line numbers, indent guides and brackets coloured by depth; the request body editor shows the same line numbers and bracket colours.
 - An empty collection offers Save and Import buttons instead of a line of text.
