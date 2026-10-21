@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{App, AppContext, Context, Entity, Focusable, SharedString, Window};
+use gpui::{App, AppContext, Context, Entity, SharedString};
 use zuno_core::{
     Body, FormField, HttpRequest, Method, MultipartField, MultipartValue, QueryParam, RawKind,
 };
@@ -330,12 +330,5 @@ impl HttpEditor {
 
     pub fn multipart_is_file(&self, ix: usize) -> bool {
         self.multipart.get(ix).is_some_and(|part| part.is_file)
-    }
-
-    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.body_editor.read(cx).focus_handle(cx).is_focused(window)
-            || self.query.iter().any(|row| row.is_focused(window, cx))
-            || self.form.iter().any(|row| row.is_focused(window, cx))
-            || self.multipart.iter().any(|part| part.row.is_focused(window, cx))
     }
 }

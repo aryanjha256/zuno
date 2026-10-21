@@ -9,7 +9,7 @@
 //! choose — `KindEditor::method` answers `None` here and the chip hides itself, which is the
 //! case it was made an `Option` for.
 
-use gpui::{App, AppContext, Context, Entity, Focusable, Window};
+use gpui::{App, AppContext, Context, Entity};
 use zuno_core::{SavedMessage, WebSocketRequest};
 
 use crate::input::{Editor, TextInput};
@@ -113,11 +113,6 @@ impl WebSocketEditor {
     /// HTTP answers with its body editor.
     pub fn primary_editor(&self) -> &Entity<Editor> {
         &self.compose
-    }
-
-    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.subprotocols.read(cx).focus_handle(cx).is_focused(window)
-            || self.compose.read(cx).focus_handle(cx).is_focused(window)
     }
 }
 

@@ -1459,46 +1459,6 @@ async fn focus_body_never_lands_on_an_unpainted_handle(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-async fn the_body_region_reports_focus_for_every_body_type(cx: &mut TestAppContext) {
-    // The focus ring around the body used to ask `body_focus`, which is the *editor's* handle —
-    // and the editor is only painted for a raw body. So on a form it stayed grey while you were
-    // plainly typing into a field, because focus was on that row's own `TextInput` instead.
-    //
-    // **What this proves, precisely.** It pins the predicate: reverting the Form arm to ask the
-    // editor's handle fails the assertion below. It does *not* prove `request_pane::render` keys
-    // the border off it — reverting that call site leaves this test green, because the test calls
-    // the method directly and nothing in the headless platform can observe a paint. Same
-    // admission as `clicking_the_headers_tab_switches_the_response_view`: the wiring is held by
-    // review, and saying so is the point, since a test that looks like it covers the border
-    // would stop anyone checking.
-    let (_, view, mut cx) = boot(cx, None, None);
-
-    let focused = |view: &gpui::Entity<RequestView>, cx: &mut VisualTestContext| {
-        cx.update(|window, cx| view.read(cx).body_region_focused(window, cx))
-    };
-
-    // Raw: focus the editor and the region reports it.
-    cx.press("ctrl-b");
-    assert!(focused(&view, &mut cx), "a raw body is focused through the editor");
-
-    // Form: Ctrl+Shift+F switches the body to a form and focuses the new field's name cell.
-    // That cell belongs to the row, not to the editor.
-    cx.press("ctrl-shift-f");
-    assert!(
-        matches!(spec_of(&view, &mut cx).http().unwrap().body, Body::Form(_)),
-        "ctrl-shift-f switches the body to a form"
-    );
-    assert!(
-        focused(&view, &mut cx),
-        "a form field holds focus, so the body region has it — this is the case that was broken"
-    );
-
-    // Moving focus out of the body clears it, or the ring would never turn off.
-    cx.press("ctrl-l");
-    assert!(!focused(&view, &mut cx), "focus in the URL bar is not focus in the body");
-}
-
-#[gpui::test]
 async fn a_picker_row_spans_the_full_width_of_the_list(cx: &mut TestAppContext) {
     // A layout bug with a functional half, which is the only half a headless platform can see.
     //

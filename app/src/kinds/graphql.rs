@@ -5,7 +5,7 @@
 //! prefix was doing a job a type should do — which is most of the argument for this module
 //! existing at all.
 
-use gpui::{App, AppContext, Context, Entity, Focusable, Window};
+use gpui::{App, AppContext, Context, Entity};
 use zuno_core::{GraphQlRequest, GraphQlTransport, Method};
 
 use crate::input::{Editor, TextInput};
@@ -233,13 +233,5 @@ impl GraphQlEditor {
     /// formatter act on. HTTP answers with its body editor; see `KindEditor::primary_editor`.
     pub fn primary_editor(&self) -> &Entity<Editor> {
         &self.query
-    }
-
-    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.query.read(cx).focus_handle(cx).is_focused(window)
-            || self.variables.read(cx).focus_handle(cx).is_focused(window)
-            || self.connection.read(cx).focus_handle(cx).is_focused(window)
-            || self.operation.read(cx).focus_handle(cx).is_focused(window)
-            || self.schema.read(cx).focus_handle(cx).is_focused(window)
     }
 }

@@ -20,7 +20,7 @@
 //! shadowing this one; it belongs as `service`/`method` fields inside a `GrpcEditor`, where the
 //! struct names them.
 
-use gpui::{App, Context, Entity, SharedString, Window};
+use gpui::{App, Context, Entity, SharedString};
 use zuno_core::{Method, RequestKind};
 
 use crate::input::Editor;
@@ -448,15 +448,6 @@ impl KindEditor {
         match self {
             KindEditor::Grpc(grpc) => Some(grpc),
             KindEditor::Http(_) | KindEditor::GraphQl(_) | KindEditor::WebSocket(_) => None,
-        }
-    }
-
-    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
-        match self {
-            KindEditor::Http(http) => http.is_focused(window, cx),
-            KindEditor::GraphQl(graphql) => graphql.is_focused(window, cx),
-            KindEditor::WebSocket(socket) => socket.is_focused(window, cx),
-            KindEditor::Grpc(grpc) => grpc.is_focused(window, cx),
         }
     }
 }

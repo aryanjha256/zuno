@@ -34,9 +34,6 @@ pub fn render(
     window: &Window,
     cx: &mut gpui::Context<RequestView>,
 ) -> Div {
-    // Read focus state before any `&mut cx` use below — the immutable borrow from
-    // `read` has to end first.
-    let body_focused = view.body_region_focused(window, cx);
     let body_lines = view
         .primary_editor()
         .map_or(0, |editor| editor.read(cx).line_count());
@@ -87,7 +84,7 @@ pub fn render(
                         .as_ref()
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
-                .child(body_region(view, theme, body_focused, window, cx)),
+                .child(body_region(view, theme, window, cx)),
             // **Two tabs, and the first is the half a URL cannot express.** For every other
             // kind the endpoint says what is being called; a gRPC URL is only a host, and the
             // call lives in the schema. So Method is where the schema is chosen and the method
@@ -101,7 +98,7 @@ pub fn render(
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(
-                    editor_region(theme, focused_editor(&grpc.message, window, cx))
+                    editor_region(theme)
                         .child(grpc.message.clone()),
                 ),
             (KindEditor::GraphQl(graphql), 0) => pane
@@ -142,7 +139,7 @@ pub fn render(
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(
-                    editor_region(theme, focused_editor(&graphql.query, window, cx))
+                    editor_region(theme)
                         .child(graphql.query.clone()),
                 )
                 // Under the query, sharing the tab's height: see `schema_browser` for why a split
@@ -164,7 +161,7 @@ pub fn render(
                     theme,
                 ))
                 .child(
-                    editor_region(theme, focused_editor(&graphql.connection, window, cx))
+                    editor_region(theme)
                         .child(graphql.connection.clone()),
                 ),
             (KindEditor::GraphQl(graphql), _) => pane
@@ -202,7 +199,7 @@ pub fn render(
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(
-                    editor_region(theme, focused_editor(&graphql.variables, window, cx))
+                    editor_region(theme)
                         .child(graphql.variables.clone()),
                 ),
             // What is offered at the handshake. One line rather than a row table: an ordered
@@ -226,7 +223,7 @@ pub fn render(
                         .map(|search| body_find_bar(search, theme, cx)),
                 )
                 .child(
-                    editor_region(theme, focused_editor(&socket.compose, window, cx))
+                    editor_region(theme)
                         .child(socket.compose.clone()),
                 )
                 .children(saved_messages(socket, theme, cx)),
@@ -1774,36 +1771,20 @@ fn render_row(
 
 /// The editor entity renders itself; this only supplies the frame, the focus ring, and
 /// the inherited text style it shapes with.
-/// Whether this particular editor holds focus.
-///
-/// Per editor, not per pane: a GraphQL request has two on screen at different times and the
-/// ring has to say which one you are in.
-fn focused_editor(
-    editor: &gpui::Entity<crate::input::Editor>,
-    window: &Window,
-    cx: &gpui::App,
-) -> bool {
-    use gpui::Focusable;
-    editor.read(cx).focus_handle(cx).is_focused(window)
-}
-
-/// The box a multi-line editor sits in — margin, padding, background, and a focus ring.
+/// The area a multi-line editor sits in: padding and background.
 ///
 /// **One definition, used by every editor surface.** The HTTP body had all of this and the
 /// GraphQL editors were hand-rolled without it: no padding, no background, and no focus border,
 /// so nothing on screen said which of the two you were typing into.
 ///
-/// **No visible box at rest, only a ring while focused.** A full-height frame made the request
-/// body look like a different surface from the response beside it, which sits directly on its
-/// pane. The border is kept, transparent, so focusing it does not shift the text by a pixel.
-fn editor_region(theme: &Theme, focused: bool) -> Div {
+/// **No box and no focus ring**, so the request body sits on its pane the way the response does.
+/// The caret, which the editor draws only while it holds focus, is what says you are typing here.
+fn editor_region(theme: &Theme) -> Div {
     div()
         .flex_1()
         .min_h(px(0.))
         .p_2()
         .bg(theme.bg)
-        .border_1()
-        .border_color(if focused { theme.border_focused } else { gpui::transparent_black() })
         .font_family(theme.mono.clone())
         .text_xs()
         .text_color(theme.text)
@@ -1812,11 +1793,10 @@ fn editor_region(theme: &Theme, focused: bool) -> Div {
 fn body_region(
     view: &RequestView,
     theme: &Theme,
-    focused: bool,
     window: &Window,
     cx: &mut gpui::Context<RequestView>,
 ) -> impl IntoElement + use<> {
-    let region = editor_region(theme, focused);
+    let region = editor_region(theme);
 
     // A form, multipart, or binary body can be *held* but not yet edited. Showing the empty
     // editor here would be a lie in the worst way: it looks like the request has no body,

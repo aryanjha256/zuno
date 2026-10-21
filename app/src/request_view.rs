@@ -1525,34 +1525,6 @@ impl RequestView {
         }
     }
 
-    /// Whether anything inside the body region holds focus.
-    ///
-    /// **Not the same question as `body_focus`**, which hands back the *editor's* handle. The
-    /// editor is only painted for `BodyType::Raw`, and a handle belongs to the entity that made
-    /// it whether or not it is on screen — so a focus ring keyed on `body_focus` stayed grey
-    /// while you were plainly editing a form field. Form and multipart rows own their own inputs,
-    /// so there is no single handle to ask and this has to poll them.
-    ///
-    /// Matched exhaustively with no catch-all, like `load`: a new `Body` variant should not
-    /// silently inherit "never focused".
-    pub fn body_region_focused(&self, window: &Window, cx: &App) -> bool {
-        let Some(http) = self.http() else {
-            return self.kind.is_focused(window, cx);
-        };
-        match http.body_type {
-            BodyType::Raw => self
-                .body_focus(cx)
-                .is_some_and(|handle| handle.is_focused(window)),
-            BodyType::Form => http.form.iter().any(|row| row.is_focused(window, cx)),
-            BodyType::Multipart => {
-                http.multipart.iter().any(|part| part.row.is_focused(window, cx))
-            }
-            // Neither has anything focusable: a binary body is a path you click, and an empty
-            // one is a sentence.
-            BodyType::Binary | BodyType::Empty => false,
-        }
-    }
-
     // ---- the send loop ------------------------------------------------------
 
     /// Submit the request as it currently appears on screen.

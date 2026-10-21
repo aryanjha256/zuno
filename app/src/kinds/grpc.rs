@@ -11,7 +11,7 @@
 //! So the schema is read for the picker and for sending, and never to decide what this buffer
 //! is. The three fields round-trip on their own.
 
-use gpui::{App, AppContext, Context, Entity, Focusable, Window};
+use gpui::{App, AppContext, Context, Entity};
 
 use zuno_core::request::GrpcRequest;
 
@@ -143,10 +143,5 @@ impl GrpcEditor {
     /// The message editor — what `Ctrl+F` searches and the formatter rewrites.
     pub fn primary_editor(&self) -> &Entity<Editor> {
         &self.message
-    }
-
-    pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
-        self.proto.read(cx).focus_handle(cx).is_focused(window)
-            || self.message.read(cx).focus_handle(cx).is_focused(window)
     }
 }

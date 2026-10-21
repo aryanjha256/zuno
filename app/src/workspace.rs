@@ -8527,35 +8527,6 @@ impl Workspace {
     }
 
 
-    fn focused_region(&self, window: &Window, cx: &App) -> SharedString {
-        let Some(view) = self.views.get(self.active_ix) else {
-            return SharedString::from("—");
-        };
-        let view = view.read(cx);
-
-        if view.url_focus(cx).is_focused(window) {
-            return SharedString::from("URL");
-        }
-        if view.body_focus(cx).is_some_and(|handle| handle.is_focused(window)) {
-            return SharedString::from("Body");
-        }
-        if view.response_focus.is_focused(window) {
-            return SharedString::from("Response");
-        }
-        if let Some((kind, ix)) = view.focused_row(window, cx) {
-            let label = match kind {
-                RowKind::Header => "header",
-                RowKind::Query => "query",
-                RowKind::Form => "form field",
-                RowKind::Multipart => "part",
-                RowKind::Capture => "capture",
-                RowKind::Assert => "assertion",
-            };
-            return SharedString::from(format!("{label} row {}", ix + 1));
-        }
-        SharedString::from("Window")
-    }
-
     fn status_message(&self, cx: &App) -> Option<SharedString> {
         self.views.get(self.active_ix)?.read(cx).status.clone()
     }
@@ -8572,7 +8543,6 @@ impl Render for Workspace {
         // The root view renders every frame, so this to the last paint is the frame's CPU time.
         let frame_started = Instant::now();
         let theme = cx.theme().clone();
-        let focused_region = self.focused_region(window, cx);
         // Before anything reads it: a GraphQL request's schema is parsed off-thread the first
         // time it is on screen, so completion is ready by the time someone types.
         self.load_graphql_schema(cx);
@@ -8929,7 +8899,6 @@ impl Render for Workspace {
                     }))
             })
             .child(status_bar(
-                focused_region,
                 status_message,
                 cookies,
                 proxy_badge,
@@ -9905,7 +9874,6 @@ fn capitalize(key: &str) -> String {
 }
 
 fn status_bar(
-    focused_region: SharedString,
     message: Option<SharedString>,
     cookies: bool,
     proxy: SharedString,
@@ -9987,12 +9955,16 @@ fn status_bar(
                 .items_center()
                 .gap_2()
                 .min_w(gpui::px(0.))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(theme.accent)
-                        .child(format!("focus: {focused_region}")),
-                )
+                // The performance monitor, where the focus readout used to be: an always-visible
+                // way in, beside the palette row and the app menu entry.
+                .child(crate::ui::icon_button_sized(
+                    "status-perf-monitor",
+                    crate::ui::Icon::Activity,
+                    "Performance monitor",
+                    TogglePerfMonitor,
+                    18.,
+                    theme,
+                ))
                 .children(message.map(|message| {
                     div()
                         .flex_1()
